@@ -47,3 +47,5 @@ zeroize = "1.9"
 # No default features: the optional async-openai integration stays out.
 tiktoken-rs = { version = "0.12.1", default-features = false }
 
+[profile.dev.package.sha2]
+opt-level = 3

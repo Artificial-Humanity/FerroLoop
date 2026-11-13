@@ -3726,130 +3726,225 @@ fn restore_finalize_intent_renews_current_authority_without_replacing_accepting_
     assert_eq!(done.terminal_evidence_context.as_ref().unwrap(), &context);
 }
 
-// Draft regression matrix. UNRUN: these are inert review artifacts.
+// Both 12-case covering arrays meet the mode/member pair lower bound (4 * 3).
+// FL_RECOVERY_EXHAUSTIVE=1 retains the complete cross products and assertions.
+// Dimension order: mode, removal target, generation, mutation kind, later open.
+const TERMINAL_REMOVAL_DIMENSIONS: [usize; 5] = [4, 2, 3, 2, 2];
+const TERMINAL_REMOVAL_PAIRWISE: [[usize; 5]; 12] = [
+    [0, 0, 0, 0, 1],
+    [0, 1, 1, 0, 0],
+    [0, 1, 2, 1, 1],
+    [1, 0, 0, 0, 1],
+    [1, 0, 1, 1, 1],
+    [1, 1, 2, 0, 0],
+    [2, 0, 1, 0, 0],
+    [2, 0, 2, 0, 1],
+    [2, 1, 0, 1, 0],
+    [3, 0, 1, 1, 1],
+    [3, 0, 2, 0, 0],
+    [3, 1, 0, 0, 0],
+];
+// Dimension order: mode, initial cut, sync target, member, mutation kind, later open.
+const TERMINAL_SYNC_DIMENSIONS: [usize; 6] = [4, 2, 3, 3, 2, 2];
+const TERMINAL_SYNC_PAIRWISE: [[usize; 6]; 12] = [
+    [0, 0, 2, 2, 0, 1],
+    [0, 1, 0, 0, 1, 0],
+    [0, 1, 1, 1, 0, 1],
+    [1, 0, 0, 0, 0, 1],
+    [1, 0, 1, 1, 1, 0],
+    [1, 1, 2, 2, 1, 0],
+    [2, 0, 2, 1, 0, 1],
+    [2, 1, 0, 2, 1, 1],
+    [2, 1, 1, 0, 0, 0],
+    [3, 0, 1, 2, 0, 1],
+    [3, 0, 2, 0, 0, 0],
+    [3, 1, 0, 1, 1, 1],
+];
+
+fn terminal_matrix_cases<const N: usize>(
+    exhaustive: bool,
+    dimensions: [usize; N],
+    pairwise: &[[usize; N]],
+) -> Vec<[usize; N]> {
+    if !exhaustive {
+        return pairwise.to_vec();
+    }
+    (0..dimensions.iter().product())
+        .map(|mut index| {
+            let mut row = [0; N];
+            for i in (0..N).rev() {
+                row[i] = index % dimensions[i];
+                index /= dimensions[i];
+            }
+            row
+        })
+        .collect()
+}
+
+fn assert_terminal_schedule<const N: usize>(
+    dimensions: [usize; N],
+    pairwise: &[[usize; N]],
+    exhaustive_count: usize,
+) {
+    for (exhaustive, expected) in [(false, 12), (true, exhaustive_count)] {
+        let rows = terminal_matrix_cases(exhaustive, dimensions, pairwise);
+        assert_eq!(rows.len(), expected, "exhaustive={exhaustive}");
+        let unique: std::collections::BTreeSet<_> = rows.iter().collect();
+        assert_eq!(unique.len(), rows.len(), "duplicate cases");
+        for row in &rows {
+            for i in 0..N {
+                assert!(row[i] < dimensions[i], "out of range: {row:?}");
+            }
+        }
+        for i in 0..N {
+            for j in i + 1..N {
+                for a in 0..dimensions[i] {
+                    for b in 0..dimensions[j] {
+                        assert!(
+                            rows.iter().any(|row| row[i] == a && row[j] == b),
+                            "missing dimensions {i}/{j}, values {a}/{b}, exhaustive={exhaustive}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn restore_terminal_removal_schedule_covers_all_dimension_pairs() {
+    assert_terminal_schedule(TERMINAL_REMOVAL_DIMENSIONS, &TERMINAL_REMOVAL_PAIRWISE, 96);
+}
+
+#[test]
+fn restore_terminal_sync_schedule_covers_all_dimension_pairs() {
+    assert_terminal_schedule(TERMINAL_SYNC_DIMENSIONS, &TERMINAL_SYNC_PAIRWISE, 288);
+}
+
 #[test]
 fn restore_terminal_all_generations_are_held_across_removal_and_later_authority_open() {
-    for mode in [
+    let modes = [
         TerminalFixtureMode::Selected,
         TerminalFixtureMode::Original,
         TerminalFixtureMode::Absence,
         TerminalFixtureMode::Abandon,
-    ] {
-        for target in [
-            RecoveryEvent::RestoreGuardRemove,
-            RecoveryEvent::RestorePinRemove,
-        ] {
-            for member in 0..3 {
-                for same_inode in [false, true] {
-                    for later_open in [false, true] {
-                        let (f, journal, lease) = terminal_fixture(mode);
-                        let cut = Arc::new(TerminalCutIo::new(RecoveryEvent::RestoreGuardRemove));
-                        assert!(
-                            terminal_call(
-                                mode,
-                                &journal,
-                                &lease,
-                                &CutFs {
-                                    f: &f,
-                                    io: cut,
-                                    limits: limits()
-                                },
-                                false
-                            )
-                            .is_err()
-                        );
-                        let journal_path = journal.staging.join("journal.bin");
-                        let terminal =
-                            load_restore_journal(&journal_path, &lease, &f.filesystem()).unwrap();
-                        let log = fs::read(&journal_path).unwrap();
-                        let paths = [
-                            terminal.destination.clone(),
-                            terminal.staging.join("candidate.fls"),
-                            terminal.staging.join("original.fls"),
-                        ];
-                        let path = paths[member].clone();
-                        let others: Vec<_> = paths
-                            .iter()
-                            .enumerate()
-                            .filter(|(i, _)| *i != member)
-                            .map(|(_, path)| {
-                                (
-                                    path.clone(),
-                                    fs::read(path).ok(),
-                                    fs::metadata(path).ok().map(|m| m.ino()),
-                                )
-                            })
-                            .collect();
-                        let mut replacement = fs::read(&path).unwrap_or_default();
-                        if replacement.is_empty() {
-                            replacement.push(0x55);
-                        } else {
-                            replacement[0] ^= 0x55;
-                        }
-                        let hook = Arc::new(ReplaceTerminalMetadata {
-                            target,
-                            path: path.clone(),
-                            same_inode,
-                            later_open,
-                            armed: false.into(),
-                            fired: false.into(),
-                            replacement: replacement.clone(),
-                        });
-                        let result = terminal_call(
-                            mode,
-                            &terminal,
-                            &lease,
-                            &CutFs {
-                                f: &f,
-                                io: hook.clone(),
-                                limits: limits(),
-                            },
-                            true,
-                        );
-                        assert!(
-                            hook.fired.load(Ordering::Acquire),
-                            "missed {mode:?}/{target:?}/{member}/{same_inode}/{later_open}"
-                        );
-                        if target == RecoveryEvent::RestoreGuardRemove {
-                            assert!(result.is_err());
-                        } else {
-                            assert!(matches!(
-                                result.unwrap(),
-                                RestoreOutcome::OutcomeUnknown { .. }
-                            ));
-                        }
-                        assert_eq!(
-                            fs::read(&path).unwrap(),
-                            replacement,
-                            "mutated generation was altered"
-                        );
-                        assert_eq!(
-                            fs::read(&journal_path).unwrap(),
-                            log,
-                            "terminal retry appended"
-                        );
-                        assert!(
-                            f.backups
-                                .join(".catalog/restore-pins")
-                                .join(format!("{}.json", terminal.operation_id))
-                                .exists(),
-                            "pin was removed after a generation mutation"
-                        );
-                        if target == RecoveryEvent::RestoreGuardRemove {
-                            assert!(
-                                terminal
-                                    .destination
-                                    .with_extension("fls.restore-guard")
-                                    .exists()
-                            );
-                        }
-                        for (path, bytes, inode) in others {
-                            assert_eq!(fs::read(&path).ok(), bytes);
-                            assert_eq!(fs::metadata(&path).ok().map(|m| m.ino()), inode);
-                        }
-                    }
-                }
-            }
+    ];
+    let targets = [
+        RecoveryEvent::RestoreGuardRemove,
+        RecoveryEvent::RestorePinRemove,
+    ];
+    for [mode, target, member, same_inode, later_open] in terminal_matrix_cases(
+        std::env::var("FL_RECOVERY_EXHAUSTIVE").as_deref() == Ok("1"),
+        TERMINAL_REMOVAL_DIMENSIONS,
+        &TERMINAL_REMOVAL_PAIRWISE,
+    ) {
+        let mode = modes[mode];
+        let target = targets[target];
+        let same_inode = same_inode != 0;
+        let later_open = later_open != 0;
+        let (f, journal, lease) = terminal_fixture(mode);
+        let cut = Arc::new(TerminalCutIo::new(RecoveryEvent::RestoreGuardRemove));
+        assert!(
+            terminal_call(
+                mode,
+                &journal,
+                &lease,
+                &CutFs {
+                    f: &f,
+                    io: cut,
+                    limits: limits()
+                },
+                false
+            )
+            .is_err()
+        );
+        let journal_path = journal.staging.join("journal.bin");
+        let terminal = load_restore_journal(&journal_path, &lease, &f.filesystem()).unwrap();
+        let log = fs::read(&journal_path).unwrap();
+        let paths = [
+            terminal.destination.clone(),
+            terminal.staging.join("candidate.fls"),
+            terminal.staging.join("original.fls"),
+        ];
+        let path = paths[member].clone();
+        let others: Vec<_> = paths
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != member)
+            .map(|(_, path)| {
+                (
+                    path.clone(),
+                    fs::read(path).ok(),
+                    fs::metadata(path).ok().map(|m| m.ino()),
+                )
+            })
+            .collect();
+        let mut replacement = fs::read(&path).unwrap_or_default();
+        if replacement.is_empty() {
+            replacement.push(0x55);
+        } else {
+            replacement[0] ^= 0x55;
+        }
+        let hook = Arc::new(ReplaceTerminalMetadata {
+            target,
+            path: path.clone(),
+            same_inode,
+            later_open,
+            armed: false.into(),
+            fired: false.into(),
+            replacement: replacement.clone(),
+        });
+        let result = terminal_call(
+            mode,
+            &terminal,
+            &lease,
+            &CutFs {
+                f: &f,
+                io: hook.clone(),
+                limits: limits(),
+            },
+            true,
+        );
+        assert!(
+            hook.fired.load(Ordering::Acquire),
+            "missed {mode:?}/{target:?}/{member}/{same_inode}/{later_open}"
+        );
+        if target == RecoveryEvent::RestoreGuardRemove {
+            assert!(result.is_err());
+        } else {
+            assert!(matches!(
+                result.unwrap(),
+                RestoreOutcome::OutcomeUnknown { .. }
+            ));
+        }
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            replacement,
+            "mutated generation was altered"
+        );
+        assert_eq!(
+            fs::read(&journal_path).unwrap(),
+            log,
+            "terminal retry appended"
+        );
+        assert!(
+            f.backups
+                .join(".catalog/restore-pins")
+                .join(format!("{}.json", terminal.operation_id))
+                .exists(),
+            "pin was removed after a generation mutation"
+        );
+        if target == RecoveryEvent::RestoreGuardRemove {
+            assert!(
+                terminal
+                    .destination
+                    .with_extension("fls.restore-guard")
+                    .exists()
+            );
+        }
+        for (path, bytes, inode) in others {
+            assert_eq!(fs::read(&path).ok(), bytes);
+            assert_eq!(fs::metadata(&path).ok().map(|m| m.ino()), inode);
         }
     }
 }
@@ -3864,112 +3959,110 @@ fn restore_terminal_absent_guard_and_pin_recheck_authority_and_layout_after_ever
         RecoveryEvent::Sync(Directory::RestorePinParent),
         RecoveryEvent::Sync(Directory::CatalogParent),
     ];
-    for mode in [
+    let modes = [
         TerminalFixtureMode::Selected,
         TerminalFixtureMode::Original,
         TerminalFixtureMode::Absence,
         TerminalFixtureMode::Abandon,
-    ] {
-        for initial_cut in cuts {
-            for target in boundaries {
-                for member in 0..3 {
-                    for same_inode in [false, true] {
-                        for later_open in [false, true] {
-                            let (f, journal, lease) = terminal_fixture(mode);
-                            let guard = journal.destination.with_extension("fls.restore-guard");
-                            let guard_bytes = fs::read(&guard).unwrap();
-                            let hook = Arc::new(TerminalCutIo::new(initial_cut));
-                            assert!(matches!(
-                                terminal_call(
-                                    mode,
-                                    &journal,
-                                    &lease,
-                                    &CutFs {
-                                        f: &f,
-                                        io: hook,
-                                        limits: limits()
-                                    },
-                                    false
-                                )
-                                .unwrap(),
-                                RestoreOutcome::OutcomeUnknown { .. }
-                            ));
-                            assert!(!guard.exists());
-                            let journal_path = journal.staging.join("journal.bin");
-                            let terminal =
-                                load_restore_journal(&journal_path, &lease, &f.filesystem())
-                                    .unwrap();
-                            let log = fs::read(&journal_path).unwrap();
-                            let path = match member {
-                                0 => lease.path().to_path_buf(),
-                                1 => terminal.destination.clone(),
-                                _ => guard.clone(),
-                            };
-                            let replacement = match member {
-                                0 => {
-                                    let mut value: serde_json::Value =
-                                        serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-                                    value["operator"] = serde_json::json!("mutated-authority");
-                                    serde_json::to_vec(&value).unwrap()
-                                }
-                                1 => {
-                                    let mut bytes = fs::read(&path).unwrap_or_default();
-                                    if bytes.is_empty() {
-                                        bytes.push(0x33);
-                                    } else {
-                                        bytes[0] ^= 0x33;
-                                    }
-                                    bytes
-                                }
-                                _ => guard_bytes,
-                            };
-                            let hook = Arc::new(ReplaceTerminalMetadata {
-                                target,
-                                path: path.clone(),
-                                same_inode,
-                                later_open,
-                                armed: false.into(),
-                                fired: false.into(),
-                                replacement: replacement.clone(),
-                            });
-                            let result = terminal_call(
-                                mode,
-                                &terminal,
-                                &lease,
-                                &CutFs {
-                                    f: &f,
-                                    io: hook.clone(),
-                                    limits: limits(),
-                                },
-                                true,
-                            );
-                            assert!(
-                                hook.fired.load(Ordering::Acquire),
-                                "missed absent branch {mode:?}/{initial_cut:?}/{target:?}/{member}/{same_inode}/{later_open}"
-                            );
-                            assert!(matches!(
-                                result.unwrap(),
-                                RestoreOutcome::OutcomeUnknown { .. }
-                            ));
-                            assert_eq!(fs::read(&path).unwrap(), replacement);
-                            assert_eq!(
-                                fs::read(&journal_path).unwrap(),
-                                log,
-                                "terminal retry appended"
-                            );
-                            if initial_cut == cuts[0] && target == boundaries[0] {
-                                assert!(
-                                    f.backups
-                                        .join(".catalog/restore-pins")
-                                        .join(format!("{}.json", terminal.operation_id))
-                                        .exists(),
-                                    "pin removed before safe durable guard absence"
-                                );
-                            }
-                        }
-                    }
-                }
+    ];
+    for [mode, initial_cut, target, member, same_inode, later_open] in terminal_matrix_cases(
+        std::env::var("FL_RECOVERY_EXHAUSTIVE").as_deref() == Ok("1"),
+        TERMINAL_SYNC_DIMENSIONS,
+        &TERMINAL_SYNC_PAIRWISE,
+    ) {
+        let mode = modes[mode];
+        let initial_cut = cuts[initial_cut];
+        let target = boundaries[target];
+        let same_inode = same_inode != 0;
+        let later_open = later_open != 0;
+        let (f, journal, lease) = terminal_fixture(mode);
+        let guard = journal.destination.with_extension("fls.restore-guard");
+        let guard_bytes = fs::read(&guard).unwrap();
+        let hook = Arc::new(TerminalCutIo::new(initial_cut));
+        assert!(matches!(
+            terminal_call(
+                mode,
+                &journal,
+                &lease,
+                &CutFs {
+                    f: &f,
+                    io: hook,
+                    limits: limits()
+                },
+                false
+            )
+            .unwrap(),
+            RestoreOutcome::OutcomeUnknown { .. }
+        ));
+        assert!(!guard.exists());
+        let journal_path = journal.staging.join("journal.bin");
+        let terminal = load_restore_journal(&journal_path, &lease, &f.filesystem()).unwrap();
+        let log = fs::read(&journal_path).unwrap();
+        let path = match member {
+            0 => lease.path().to_path_buf(),
+            1 => terminal.destination.clone(),
+            _ => guard.clone(),
+        };
+        let replacement = match member {
+            0 => {
+                let mut value: serde_json::Value =
+                    serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+                value["operator"] = serde_json::json!("mutated-authority");
+                serde_json::to_vec(&value).unwrap()
             }
+            1 => {
+                let mut bytes = fs::read(&path).unwrap_or_default();
+                if bytes.is_empty() {
+                    bytes.push(0x33);
+                } else {
+                    bytes[0] ^= 0x33;
+                }
+                bytes
+            }
+            _ => guard_bytes,
+        };
+        let hook = Arc::new(ReplaceTerminalMetadata {
+            target,
+            path: path.clone(),
+            same_inode,
+            later_open,
+            armed: false.into(),
+            fired: false.into(),
+            replacement: replacement.clone(),
+        });
+        let result = terminal_call(
+            mode,
+            &terminal,
+            &lease,
+            &CutFs {
+                f: &f,
+                io: hook.clone(),
+                limits: limits(),
+            },
+            true,
+        );
+        assert!(
+            hook.fired.load(Ordering::Acquire),
+            "missed absent branch {mode:?}/{initial_cut:?}/{target:?}/{member}/{same_inode}/{later_open}"
+        );
+        assert!(matches!(
+            result.unwrap(),
+            RestoreOutcome::OutcomeUnknown { .. }
+        ));
+        assert_eq!(fs::read(&path).unwrap(), replacement);
+        assert_eq!(
+            fs::read(&journal_path).unwrap(),
+            log,
+            "terminal retry appended"
+        );
+        if initial_cut == cuts[0] && target == boundaries[0] {
+            assert!(
+                f.backups
+                    .join(".catalog/restore-pins")
+                    .join(format!("{}.json", terminal.operation_id))
+                    .exists(),
+                "pin removed before safe durable guard absence"
+            );
         }
     }
 }
