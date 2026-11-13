@@ -317,6 +317,7 @@ describe("SpinUpAgentModal", () => {
     expect(options.find(o => o.value === "assistant")?.textContent).toBe("Software Engineer");
 
     expect(RECAST_ROLE_OPTIONS).toEqual([
+      { value: "director", label: "director" },
       { value: "lead", label: "lead" },
       { value: "assistant", label: "assistant" },
       { value: "lab_manager", label: "lab_manager" },

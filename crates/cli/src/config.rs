@@ -68,6 +68,8 @@ pub struct Entry {
     pub name: Option<String>,
     pub root: PathBuf,
     pub store: PathBuf,
+    #[serde(default)]
+    pub cwd: Option<toml::Value>,
     /// `None`: the tracker is the local store.
     #[serde(default)]
     pub tracker: Option<TrackerBinding>,
@@ -704,6 +706,17 @@ pub fn parse(path: &Path, text: &str) -> Result<Config> {
     }
     let mut seen_names = std::collections::BTreeSet::new();
     for e in &mut file.project {
+        if let Some(value) = &e.cwd
+            && !matches!(value.as_str(), Some("workspace" | "exact"))
+        {
+            let name = e
+                .inferred_slug()
+                .unwrap_or_else(|| e.root.display().to_string());
+            bail!(
+                "{}: project binding `{name}`: `cwd` must be `workspace` or `exact`",
+                path.display()
+            );
+        }
         if let Some(raw_name) = &e.name {
             let norm = validate_slug(raw_name).map_err(|err| {
                 anyhow::anyhow!("{}: invalid project `name`: {err}", path.display())
@@ -1604,6 +1617,7 @@ mod tests {
                 store: store.clone(),
                 tracker: None,
                 state: None,
+                cwd: None,
             },
             Entry {
                 name: None,
@@ -1615,6 +1629,7 @@ mod tests {
                     ledger: None,
                 }),
                 state: None,
+                cwd: None,
             },
         ];
         let msg = format!("{:#}", bound_entry(&entries, root.path()).unwrap_err());
@@ -1636,6 +1651,7 @@ mod tests {
                 ledger: None,
             }),
             state: None,
+            cwd: None,
         };
         let got = bound_entry(&[e.clone(), e], root.path()).unwrap().unwrap();
         assert_eq!(got.tracker.unwrap().github, "acme/widgets");
@@ -1709,6 +1725,7 @@ mod tests {
             store: store.clone(),
             tracker: None,
             state: None,
+            cwd: None,
         }];
         let got = bound_entry(&entries, &link).unwrap().map(|e| e.store);
         assert_eq!(got, Some(store));
@@ -1724,6 +1741,7 @@ mod tests {
                 store: PathBuf::from("/tmp/fl-config-test-one.redb"),
                 tracker: None,
                 state: None,
+                cwd: None,
             },
             Entry {
                 name: None,
@@ -1731,6 +1749,7 @@ mod tests {
                 store: PathBuf::from("/tmp/fl-config-test-two.redb"),
                 tracker: None,
                 state: None,
+                cwd: None,
             },
         ];
         let err = bound_entry(&entries, root.path()).unwrap_err();
@@ -1840,6 +1859,7 @@ mod tests {
                 store: PathBuf::from("/tmp/fl-config-test-same.redb"),
                 tracker: Some(binding(None)),
                 state: None,
+                cwd: None,
             },
             Entry {
                 name: None,
@@ -1847,6 +1867,7 @@ mod tests {
                 store: PathBuf::from("/tmp/fl-config-test-same.redb"),
                 tracker: Some(binding(Some(LedgerChoice::Github))),
                 state: None,
+                cwd: None,
             },
         ];
         let msg = format!("{:#}", bound_entry(&entries, root.path()).unwrap_err());
@@ -1944,6 +1965,24 @@ mod tests {
 
     // MCP spec §2.2: the `[[project]]` rule — the entry whose root is the
     // longest ancestor of the working directory — and no other.
+    #[test]
+    fn project_cwd_policy_is_validated_with_binding_name() {
+        for value in ["workspace", "exact"] {
+            let text = format!(
+                "[[project]]\nname = 'kaggle'\nroot = '/r'\nstore = '/s'\ncwd = '{value}'\n"
+            );
+            load_text(&text).unwrap();
+        }
+        let error =
+            load_text("[[project]]\nname = 'kaggle'\nroot = '/r'\nstore = '/s'\ncwd = 'bad'\n")
+                .unwrap_err()
+                .to_string();
+        assert!(
+            error.contains("kaggle") && error.contains("workspace") && error.contains("exact"),
+            "{error}"
+        );
+    }
+
     #[test]
     fn mcp_entry_picks_the_entry_with_the_longest_root() {
         let outer = tempfile::tempdir().unwrap();
@@ -2113,6 +2152,7 @@ mod tests {
             store: PathBuf::from("/tmp/my-project.redb"),
             tracker: None,
             state: None,
+            cwd: None,
         };
         assert!(fallback_entry.matches_slug("my-project"));
         assert_eq!(fallback_entry.inferred_slug(), Some("my-project".into()));
