@@ -118,7 +118,7 @@ tier does today.
 ### 2.2 Two kinds of grant
 
 A role profile holds two lists. They answer different questions and are enforced in different
-places.
+places. It also holds the `defaults` map described after the example.
 
 - **Tool rules** — the canonical capability rules of #103 §2 (`fs_*`, `shell_exec`,
   `network_web`, `mcp_tool_call`) plus `posture` and `sandbox`. They say what the vendor tool
@@ -132,6 +132,12 @@ places.
   "schema_version": 1,
   "tier": "lead",
   "policy": { "posture": "auto", "sandbox": "vendor-default", "rules": [ … ] },
+  "defaults": {
+    "fs_read_workspace": "ask",  "fs_read_external": "ask",
+    "fs_write_workspace": "ask", "fs_write_external": "ask",
+    "fs_write_protected": "deny",
+    "shell_exec": "ask", "network_web": "ask", "mcp_tool_call": "ask"
+  },
   "actions": [
     {"action": "github.issue.create",  "scope": "own-project"},
     {"action": "github.pr.review",     "scope": "own-team"},
@@ -141,7 +147,18 @@ places.
 }
 ```
 
-`policy` is exactly the #103 `PermissionPolicy`; this spec adds no capability. Action names
+`policy` is exactly the #103 `PermissionPolicy`; this spec adds no capability and does not
+change that object.
+
+`defaults` belongs to the profile, not to `policy`. It is a required map with one effect
+(`allow`, `ask` or `deny`) for each of the eight capabilities. The effect applies to a call of
+that capability that matches no rule, whether or not the capability has rules (§3.3). A
+profile without a complete map is refused; a missing entry is never filled in. The map is part
+of the profile that the owner approves (§1 decision 4, §6), and the values above only show the
+form. It is layered as §2.3 layers rules: a lower layer may tighten an entry freely, and
+widening one needs Owner authority.
+
+Action names
 form a closed enum in `fl-core`, generated into docs (capability truth lives in code). Scopes:
 `own-project`, `own-team` (agents whose registry `reports_to` is the caller), `own-approved`
 (the caller opened it and the required reviewer approved the current head), `portfolio` (a
@@ -211,17 +228,39 @@ targets:
 ### 3.3 The tool gate
 
 `fl wire hook` gains `PreToolUse` (and `PermissionRequest` where the vendor has it). The gate
-evaluates the caller's complete effective policy (§2.3), canonical defaults included: a
-capability that no rule names takes the profile's canonical deny/ask default, never an unknown
-vendor default (#103 §2). Every call therefore gets one of three outcomes. There is no "no
-rule" outcome, and the gate never hands an undecided call to the vendor layer.
+evaluates the caller's complete effective policy (§2.3).
+
+**The gate is total.** The canonical default of #103 §2 covers only a capability that no rule
+names (the compiler's `omitted()`, code-verified). It gives no outcome for a call of a
+capability that has rules and matches none of them, and every role profile has `shell_exec`
+rules (§3.2): a shell command that is neither a raw `gh` write nor `fl github` matches no
+rule. The `defaults` map of the role profile (§2.2) closes this. The gate uses the map's
+effect for a call of a capability that matches no rule, whether or not the capability has
+rules. Every call therefore gets one of three outcomes. There is no "no rule" outcome, and the
+gate never hands an undecided call to the vendor layer.
+
+The map relates to #103 as follows:
+
+- `policy` stays exactly the #103 `PermissionPolicy`, and the #103 canonical default stays the
+  floor. For a capability with no rules, the entry must not be more permissive than that
+  default (deny for `fs_write_protected`, ask for the others; code-verified). A profile that
+  breaks this is refused.
+- For a capability with rules, the entry is the owner's choice, approved with the profile
+  (§1 decision 4, §6).
+- The compiler receives the map with the policy. It compiles an entry where the vendor can
+  express a default for that capability. An `allow` entry that the vendor cannot express is
+  reported in the receipt as gate-only; like an allow rule, it never stops the vendor layer
+  from tightening. A `deny` or `ask` entry is a restriction and follows the rule below: a
+  native form, or a refused plan.
+
+The three outcomes:
 
 - **deny** → the hook blocks the call and returns the reason and, where one exists, the broker
   command to use instead;
 - **ask** → the gate never allows the call by itself. The call goes to a real prompt channel:
   the vendor's own prompt, or a FerroDeck channel on a transport where #103 §3 proves one.
-  Where no prompt channel is proven for that vendor, transport and posture, ask is treated as
-  deny (#103 §2: a deny never degrades to ask, and an ask with no prompt is a run);
+  Where no prompt channel is proven for that vendor, transport and posture (M7), ask is
+  treated as deny (#103 §2: a deny never degrades to ask, and an ask with no prompt is a run);
 - **allow** → the hook pre-answers only where Phase 0 (M1, M2) proves that the vendor honours
   it. Elsewhere the gate does not answer for the vendor: the vendor layer may still prompt or
   refuse, which can only tighten the result.
@@ -231,12 +270,32 @@ It is a local policy engine with a bounded timeout: pre-answer by rule, not remo
 the call cannot be classified) the result is deny, for every call. This is the #103 rule:
 bounded timeout, deny on timeout.
 
+**The gate is never the sole control for a restriction.** Every deny and every ask in the
+effective policy, the `defaults` entries included, must have a compiled native restriction
+(§3.2) that is at least as strict:
+
+- a deny has a native deny;
+- an ask has a native ask where the vendor has one and a prompt channel is proven for that
+  vendor, transport and posture (M7). Otherwise it has a native deny.
+
+A plan that cannot give a restriction such a native form is refused at spin-up. This is the
+#103 §2 rule: an unsupported deny must remain denied through a proven native restriction or
+the plan is refused, and an ask holds only through a proven interactive channel. Posture
+follows the same rule. A profile whose restrictions cannot be expressed natively under the
+requested posture is refused or compiled to the stricter form. It is never applied with the
+gate as the only control.
+
+On top of the native rules the gate adds what they do not give: the reason, the broker hint,
+the journal, and the pre-answer of allowed calls.
+
 Fallback never widens. No path through the gate yields a more permissive result than the
 canonical policy: the gate can refuse a call or leave it to a layer that can only tighten,
-and it cannot turn a deny or an ask into a run. What a vendor does when the hook process
-returns no decision at all is vendor behaviour and is unmeasured. Until it is proven to
-block, the gate is not counted as the control for that vendor, and a deny rests on the
-compiled rules of §3.2.
+and it cannot turn a deny or an ask into a run. If the hook returns no decision at all (the
+hook process crashes, or the vendor's own hook timeout fires), the native rules decide, so
+the result is never more permissive than the canonical policy. That a vendor applies its
+native rules in that case is vendor behaviour and is unmeasured (M8). Until M8 proves it for a
+vendor, the gate hook is not installed for that vendor, and the compiled rules of §3.2 work
+alone.
 
 Every decision is journaled. FerroLoop installs the hook through the same per-session
 settings as §3.2; the hand-registered user-level entries are retired with it.
@@ -248,9 +307,11 @@ counted as a control in this design.
 
 ## 4. Phase 0 — measure before building §3.2 and §3.3
 
-One fact decides how much §3.2 and §3.3 can deliver, and it is unmeasured for every vendor:
-which mechanism takes priority over the vendor's own reviewer. The only observation so far is
-not conclusive: with `Bash(gh issue create:*)` allowed at user level and posture `auto`, a
+Three facts decide how much §3.2 and §3.3 can deliver, and each is unmeasured for every
+vendor: which mechanism takes priority over the vendor's own reviewer (M1 to M6), whether an
+ask reaches a prompt that an operator can answer (M7), and what the vendor does with a call
+when a hook returns no decision (M8). The only observation so far concerns the first fact and
+is not conclusive: with `Bash(gh issue create:*)` allowed at user level and posture `auto`, a
 compound command ending in `gh issue create` was refused by the Claude classifier, and a
 later one succeeded after the owner granted permission in the conversation.
 
@@ -265,6 +326,8 @@ runtime-proven rows in `docs/permissions.md`:
 | M4 | Do prefix rules match a compound command (`cd x && gh …`, pipes, `env A=B gh …`)? |
 | M5 | Are per-session settings loaded, in what order against user and project settings, and are edits picked up live? |
 | M6 | Can the session itself rewrite the per-session settings or hook file, and does the vendor's protected-path handling stop it? |
+| M7 | Under each posture, is a call that matches a native ask rule held for a prompt that an operator can answer on this transport (the vendor's own prompt, or a channel of #103 §3), or does it run or fail without one? |
+| M8 | When a `PreToolUse` or `PermissionRequest` hook returns no decision (the hook process crashes, or the vendor's own hook timeout fires), does the vendor apply its native rules to the call (a native deny blocks, a native ask prompts), or does the call run? |
 
 §3.1 depends on Phase 0 least: it needs one allow rule (`fl github`) per vendor, and if M1
 fails for a vendor the fallback is that vendor's reviewer judging one stable command instead
@@ -274,7 +337,7 @@ of every `gh` form.
 
 | Phase | Content | Depends on |
 |---|---|---|
-| P0 | Measurements M1–M6 on five vendors | — |
+| P0 | Measurements M1–M8 on five vendors | — |
 | P1 | Role model: `tier`, bare slugs, the Record #193 rename and migration (§7); action enum; role profiles in the store; `fl role` and `/api/v1/roles` read and write them | Owner-approved profiles (§6) |
 | P2 | Broker: hosted-caller identity, the new `fl github` commands, action checks, journal; raw `gh` write deny rules through the existing hand-written settings as an interim | P1 |
 | P3 | Compiler wiring: `permission_policy` in spin-up, per-session writers, receipts on the hosted record and in FerroDeck (closes Record #160, completes Record #103 §4) | P0, P1 |
@@ -319,27 +382,54 @@ The epoch is a store format version: a new constant on the `fl_store` format lad
 style of `FORMAT_WITH_WORKFLOW` and `FORMAT_WITH_AREA_DELETE`, called
 `FORMAT_WITH_ROLE_NAMESPACE` here. It takes the next free number on the ladder (the newest is
 9 at main `361e75f7`). It is durable and it only rises: `raise_format` never lowers a format.
-It is the only statement of which namespace the live role state of a store is in. The live
-role state is the role value of every registry record and every role record.
+Its job is fencing: a build older than the epoch cannot open the store file (§7.5).
+
+The format number alone does not state the namespace. It has max semantics, and paths other
+than the migration raise it (code-verified): an inbound sync batch that carries a
+schema-version put on the ladder raises it, and each ladder constant is raised on the first
+use of its feature, so a constant added after the epoch would lift a store past the epoch the
+same way. A store can then stand at or above the epoch without the rewrite of §7.2.
+
+The statement is a dedicated, durable **role-namespace marker** in the store. This is design
+for the P1 plan, which also sets its key and encoding. The migration writes the marker in the
+same transaction as the rewrite. The marker, not the ladder number alone, says which namespace
+the live role state of a store is in: namespace 2 with the marker, namespace 1 without it. The
+live role state is the role value of every registry record and every role record.
+
+Invariant:
+
+- Only the migration writes the marker. Inbound sync never writes it and never applies a
+  peer's copy of it.
+- A build at the epoch that finds the format at or above the epoch and no marker refuses role
+  reads and role writes, the import of role-bearing events included, and names the migration.
+
+An inbound sync batch applies a peer's documents in ordinary collections as they are today
+(code-verified). The P1 plan must say what such a batch does when it carries role-bearing
+documents to a store without the marker: it must not leave namespace-2 values in a store that
+the migration will then rewrite.
 
 ### 7.2 The rewrite
 
 One store migration, one transaction. In this order it:
 
-1. reads the stored format. At or above the epoch it changes nothing and reports that;
+1. reads the role-namespace marker (§7.1). With the marker present it changes nothing and
+   reports that. The format number does not decide this: a store at or above the epoch
+   without the marker is not yet migrated, so the rewrite runs;
 2. checks the `custom:` collisions of §7.4 and refuses, before any write, if one has no Owner
    mapping;
 3. rewrites every `director` role value and role record to `project-manager`;
 4. then rewrites every `lab-manager` / `lab_manager` value to `director`;
 5. strips `custom:` where §7.4 allows it, and makes `council-chair` a built-in role with tier
    `council-chair`;
-6. raises the store format to the epoch.
+6. appends a namespace-2 `AgentUpsert` event to the registry event log for every agent record
+   that steps 3 to 5 rewrote (§7.3);
+7. raises the store format to the epoch and writes the role-namespace marker.
 
-Steps 3 to 6 commit together or not at all. No committed store holds new names below the
-epoch or old names at it. Step 1 guards on a format that only rises, so the rewrite cannot
-run a second time on a store: a repeated run is a no-op, and in particular it does not turn
-the new `director` into `project-manager`. No agent holds `director` today, so step 3 is
-empty in this workspace; it still runs before step 4.
+Steps 3 to 7 commit together or not at all. No committed store holds new names without the
+marker or old names with it. Step 1 guards on the marker, which only the migration writes and
+nothing removes, so the rewrite cannot run a second time on a store: a repeated run is a
+no-op, and in particular it does not turn the new `director` into `project-manager`. No agent
+holds `director` today, so step 3 is empty in this workspace; it still runs before step 4.
 
 ### 7.3 Decoding by namespace
 
@@ -357,11 +447,17 @@ input to the decoder; no reader infers it from the text of the value.
   message written before the epoch. An unversioned or pre-epoch `director` means Project
   Director and is read as `project-manager`. It never silently acquires the new Director
   meaning.
-- `director` means the new Director only in the live role state of a store at the epoch, and
-  in records and messages that state namespace 2.
-- Every stored role value is in one of two classes: the migration rewrites it in the
-  transaction of §7.2, or it is history and is decoded as namespace 1. There is no third
-  class.
+- `director` means the new Director only in the live role state of a store that holds the
+  role-namespace marker (§7.1), and in records, events and messages that state namespace 2.
+- Every stored role value is in one of three classes. There is no fourth class.
+  - **Live state**: the role value of a registry record or a role record. The migration
+    rewrites it in the transaction of §7.2.
+  - **History**: posted markers, FerroWire messages and journal entries. It is only read, and
+    it is decoded in the namespace it was written in.
+  - **Replayable events**: the registry event log. It is not only read:
+    `RegistryEventKind::AgentUpsert` carries a whole agent record, the role included, and
+    `import_registry_events` writes that record into live state (code-verified). It is
+    translated on import, as described below.
 - A build at the epoch reads a role that its operator gives it as a command argument as
   namespace 2. A role that arrives from another process is covered by §7.5.
 
@@ -371,9 +467,40 @@ namespace: a pre-epoch `lab_manager` or `lab-manager` is the Director tier, and 
 `director` is the Project Manager tier. New markers carry an explicit role-namespace field
 (`role_ns: 2`), and so do new messages and journal entries that carry a role. A marker without
 the field is namespace 1. Verification decodes the role of a marker under that marker's
-namespace and then compares tiers, not spellings. The marker struct refuses unknown fields
-today (code-verified), so a build older than the epoch cannot read a new marker as an old
-one; it fails closed.
+namespace and then compares tiers, not spellings.
+
+The marker struct refuses unknown fields today, and a review whose marker does not parse is
+left out of the approval fold (code-verified). A build older than the epoch therefore cannot
+read a new marker as an old one: it ignores the review. This fails closed for an approval
+only: a post-epoch approval does not count for the older build. It does not fail closed for a
+rejection. The older build does not see a post-epoch `CHANGES_REQUESTED` review, or a
+dismissed review that carries a new marker, so an earlier approval by the same reviewer on
+the same head stays in force for it. The supported upgrade order of §7.5 leaves no older build
+that verifies approvals; the rollback contract of §7.5 covers the case where one returns.
+
+**Replayable events are translated on import.** The registry event log reaches live state
+through `import_registry_events`, which the `fl/state` branch sync and the FerroWire peer
+frames call (code-verified: `state_sync.rs`, `daemon.rs`). The branch log is append-only, so
+the migration cannot rewrite the events already in it. The rules below are design for the P1
+plan:
+
+- Every registry event that a build at the epoch writes carries the role namespace. An event
+  without it is namespace 1.
+- A build at the epoch translates a namespace-1 event to namespace 2 when it imports it, with
+  the mapping of §7.2 and §7.4. It never applies the role of such an event verbatim, and
+  never reads it as namespace 2. An event whose role needs an Owner mapping (§7.4) that the
+  store does not hold is refused, not applied.
+- The translation applies to the live record that the import writes. The stored copy of the
+  event keeps its text: the import compares a repeated event with its stored copy today
+  (code-verified), and the log stays append-only.
+- For every agent record that it rewrites, the migration appends a new namespace-2
+  `AgentUpsert` event in the transaction of §7.2 (step 6). A replay of the whole log, in
+  order, therefore ends at the migrated state. The log carries agent records, not role
+  records (code-verified: its four event kinds).
+- `RegistryEvent` and `AgentRecord` refuse unknown fields today (code-verified), so a build
+  older than the epoch cannot decode an event with a new field and cannot apply a namespace-2
+  role as namespace 1. The P1 plan must keep that property in the form it gives the
+  namespace.
 
 ### 7.4 The `custom:` prefix
 
@@ -403,23 +530,50 @@ the same transaction as the rest of §7.2.
 
 ### 7.5 Older writers, upgrade order and rollback
 
-**Fencing.** The store already refuses a format that is not on its ladder: a build older than
-the epoch gets `FormatVersion` from a store at the epoch, as an older build does today from a
-store raised to `FORMAT_WITH_WORKFLOW` or `FORMAT_WITH_AREA_DELETE` (code-verified). This
-mechanism is the fence. Once the epoch is committed, the store refuses a hub, wire daemon,
-CLI, store server or hosted hook older than the epoch as a writer. A mixed-version write
-fails closed. It is never accepted with an old spelling and never translated on the way in.
+**Fencing.** Two fences are required. The first exists. The second is new work for the P1
+plan.
 
-Two cases need more than the format check, and the P1 plan must close both:
+*Fence 1, the file format (existing).* A process that opens the store file itself checks the
+stored format against its ladder (`check_format`). A build older than the epoch gets
+`FormatVersion` from a store at the epoch, as an older build does today from a store raised to
+`FORMAT_WITH_WORKFLOW` or `FORMAT_WITH_AREA_DELETE` (code-verified). This fences a direct or
+embedded open by an older build, and with it an older store server, which opens the file
+itself.
 
-- A process that opened the store before the epoch was committed. Whether it meets the format
-  check again on a later write is not verified here. The upgrade order below removes the
-  case; the migration must also refuse to start while another process holds the store, or the
-  plan must prove that such a write is refused.
-- A role that reaches a build at the epoch from another process (a hub request, a FerroWire
-  frame) and not through the store. It must state namespace 2, by a field or by a protocol
-  version that implies it. A role-bearing write without that statement is refused; it is not
-  decoded as namespace 2.
+It does not fence a client of a store server. The shared store open (`FerroStore::auto`)
+returns a client of the `ferrostore serve` server when one listens at the store's socket, and
+opens the file only when none does. The server handshake is authentication only: it carries
+no format check and no version of the role namespace. The body of a remote write runs in the
+client (code-verified: `ferrostore/mod.rs`, `auth.rs`, `server.rs`, `remote_txn.rs`). In the
+deployed topology a store server runs, so the hub, the wire daemon, the CLI and the hooks are
+its clients. Without a second fence, an older client could write old role spellings through
+the socket of a store at the epoch.
+
+*Fence 2, the store server handshake (new, P1 plan).* The store server protocol carries the
+client's role-namespace capability, or a protocol version that implies it, in the handshake.
+A server at the epoch refuses a client that does not state it. An older client cannot state
+it, so it is refused before any write: it fails closed. This is not existing behaviour, and
+the migration must not be released without it.
+
+With both fences, once the epoch is committed a hub, wire daemon, CLI, store server or hosted
+hook older than the epoch cannot write to the store, by a direct open or as a client. A
+mixed-version live write fails closed. It is never accepted with an old spelling and never
+translated on the way in. Translation exists only for the events of the registry log (§7.3).
+
+Two cases need more than the fences, and the P1 plan must close both:
+
+- A process that opened the store, or connected to its server, before the epoch was
+  committed. Whether it meets a fence again on a later write is not verified here. The
+  upgrade order below removes the case; the migration must also refuse to start while another
+  process holds the store or a connection to its server, or the plan must prove that such a
+  write is refused.
+- A live role-bearing write that reaches a build at the epoch from another process (a hub
+  request, a FerroWire message) and not through the store. It must state namespace 2, by a
+  field or by a protocol version that implies it. A live write without that statement is
+  refused; it is not decoded as namespace 2. This rule does not apply to a registry event,
+  which is a replayable record and not a live request: an event that states namespace 2 is
+  applied, and an event without a namespace is namespace 1 and is translated on import
+  (§7.3). It is neither refused for the missing statement nor applied verbatim.
 
 **Supported upgrade order.**
 
@@ -430,16 +584,23 @@ Two cases need more than the format check, and the P1 plan must close both:
 4. Start the writers.
 
 No other order is supported. A build at the epoch that finds a store below the epoch refuses
-role writes and names the migration; it does not migrate implicitly on first write. A new,
-empty store is the trivial case: the migration has nothing to rewrite and only raises the
-format. Whether a build at the epoch creates a new store at the epoch directly is for the P1
-plan.
+role writes and names the migration; it does not migrate implicitly on first write. It does
+the same, for role reads also, on a store at or above the epoch without the marker (§7.1). A
+new, empty store is the trivial case: the migration has nothing to rewrite and only raises
+the format and writes the marker. Whether a build at the epoch creates a new store at the
+epoch, with the marker, directly is for the P1 plan.
 
 **Rollback.** Before it writes, the migration takes a backup of the pre-migration store and
 reports where the backup is. Rollback is: stop every writer, restore that backup, reinstall
-the builds older than the epoch. There is no in-place downgrade: the format never lowers, and
-a reverse rewrite would be ambiguous for the same reason the forward one must run once. Writes
-made after the migration are lost by a restore.
+the builds older than the epoch, and request the approvals of every open pull request again.
+There is no in-place downgrade: the format never lowers, and a reverse rewrite would be
+ambiguous for the same reason the forward one must run once. Writes made after the migration
+are lost by a restore.
+
+The approvals are requested again because a review posted after the epoch is not readable by
+an older build (§7.3). That build does not count a post-epoch approval, and it does not see a
+post-epoch rejection, so an earlier approval by the same reviewer on the same head would still
+count. After a rollback, no pull request is merged on a review posted before the rollback.
 
 ### 7.6 Renames that follow
 
@@ -468,8 +629,9 @@ made after the migration are lost by a restore.
 - Migration fixtures: a store below the epoch holding `lab_manager`, `lab-manager`,
   `director`, `custom:director`, `custom:council-chair` and `custom:reviewer` reads back as
   `director`, `director`, `project-manager`, `project-manager`, `council-chair` and
-  `reviewer`, at the epoch format. The agent that held `custom:reviewer` has the same role
-  record, tier `member` and the same profile as before the run.
+  `reviewer`, at the epoch format and with the role-namespace marker. The agent that held
+  `custom:reviewer` has the same role record, tier `member` and the same profile as before the
+  run.
 - Repeated run: a second run of the migration on that store is a no-op. Role values and the
   format are unchanged, and the agent that became `director` is still `director`, not
   `project-manager`.
@@ -480,9 +642,18 @@ made after the migration are lost by a restore.
 - After the migration, `custom:reviewer` on input is read as `reviewer`; `custom:lead`,
   `custom:director` and `custom:lab_manager` on input are refused with the message of §2.1;
   creating a user-defined role named `lead` or `project-manager` is refused.
-- Mixed version: after the epoch is committed, a write by a build older than the epoch is
-  refused with `FormatVersion` and the store is unchanged; no `lab_manager` or `custom:` value
-  is written. A role-bearing request without namespace 2 to a hub at the epoch is refused.
+- Mixed version, direct open: after the epoch is committed, a build older than the epoch that
+  opens the store file itself (an embedded open, or an older store server) is refused with
+  `FormatVersion`, and the store is unchanged.
+- Mixed version, client: a client older than the epoch that connects to a store server at the
+  epoch states no role-namespace capability and is refused in the handshake, before any
+  write. The store is unchanged; no `lab_manager` or `custom:` value is written. A
+  role-bearing request without namespace 2 to a hub at the epoch is refused.
+- Event replay: a new store and a lagging store each import a registry log that holds
+  pre-epoch `AgentUpsert` events with `lab_manager`, `director` and `custom:reviewer`,
+  followed by the migration's namespace-2 events. Each store ends with the same roles as the
+  migrated store. A pre-epoch `director` event, imported alone by a build at the epoch, gives
+  `project-manager` and never the new Director. The stored copy of every event is unchanged.
 - Marker decoding: a posted marker without a namespace field and with role `lab_manager`
   verifies as the Director tier, and one with role `director` verifies as the Project Manager
   tier. A marker with `role_ns: 2` and role `director` verifies as the Director tier. Neither
@@ -496,7 +667,8 @@ made after the migration are lost by a restore.
   by the Director; and whether a Project Manager may merge a blocked author's pull request
   that it approved, as a Lead and the Director may.
 - **O3.** The gate timeout duration, and how a timeout or a gate error is reported to the
-  operator, after M2 and M3. The authorization semantics of §3.3 are fixed and not open:
-  canonical defaults, an ask is never auto-allowed, and deny on timeout or error.
+  operator, after M2 and M3. The authorization semantics of §3.3 are fixed and not open: the
+  profile's `defaults` map, an ask is never auto-allowed, deny on timeout or error, and no
+  restriction rests on the gate alone.
 - **O4.** Whether the interim deny rules for raw `gh` writes (P2) ship before or with the new
   broker commands; before means a short period in which members cannot file issues at all.
