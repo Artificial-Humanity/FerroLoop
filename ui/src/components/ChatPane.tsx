@@ -1324,6 +1324,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
     React.useState<SessionQuotaUsage | null>(null);
   const [compacting, setCompacting] = React.useState<boolean>(false);
   const [compactFeedback, setCompactFeedback] = React.useState<string | null>(null);
+  const [modelSwitchFeedback, setModelSwitchFeedback] = React.useState<string | null>(null);
   const [internalAgentSettingsOpen, setInternalAgentSettingsOpen] =
     React.useState<boolean>(false);
   const [clearModalOpen, setClearModalOpen] = React.useState<boolean>(false);
@@ -1412,6 +1413,18 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
   // still belongs to the agent/session they were started for.
   const currentTargetRef = React.useRef<string>(targetSessionOrAgent);
   currentTargetRef.current = targetSessionOrAgent;
+  const modelTargetGeneration = React.useRef(0);
+  const modelTargetRef = React.useRef(targetSessionOrAgent);
+  if (modelTargetRef.current !== targetSessionOrAgent) {
+    modelTargetRef.current = targetSessionOrAgent;
+    modelTargetGeneration.current += 1;
+  }
+  React.useEffect(() => {
+    setSwitchingModel(false);
+    setModelSwitchFeedback(null);
+    setCompactFeedback(null);
+    setSubmitError(null);
+  }, [targetSessionOrAgent]);
   const [, refreshPendingPrompts] = React.useReducer((n: number) => n + 1, 0);
   React.useEffect(() => {
     pendingPromptListeners.add(refreshPendingPrompts);
@@ -1820,6 +1833,13 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
     nextModel: string,
     nextThinkingLevel?: string,
   ) => {
+    const requestTarget = targetSessionOrAgent;
+    const requestGeneration = modelTargetGeneration.current;
+    const isCurrent = () => currentTargetRef.current === requestTarget && modelTargetGeneration.current === requestGeneration;
+    const showModelFeedback = (message: string | null) => {
+      setCompactFeedback(message);
+      setModelSwitchFeedback(message);
+    };
     const prevModel = selectedModel;
     const prevThinking = selectedThinkingLevel;
     const rawThinking =
@@ -1841,7 +1861,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
       return;
     }
     setSwitchingModel(true);
-    setCompactFeedback(null);
+    showModelFeedback(null);
     setSubmitError(null);
     try {
       let result: unknown;
@@ -1853,6 +1873,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
           nextModel,
           thinkingArg,
         );
+        if (!isCurrent()) return;
         // Refreshing the view must not turn a saved change into a failed save.
         try {
           onRefresh?.();
@@ -1862,6 +1883,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
       } else {
         throw new Error("No session route is configured for switching model.");
       }
+      if (!isCurrent()) return;
       const response = result as Partial<SetSessionModelResponse> | null | undefined;
       if (
         typeof response?.persisted !== "boolean" ||
@@ -1870,7 +1892,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
       ) {
         setSelectedModel(prevModel);
         setSelectedThinkingLevel(prevThinking);
-        setCompactFeedback("Model change status unavailable.");
+        showModelFeedback("Model change status unavailable.");
       } else {
         const { persisted, live } = response;
         if (!persisted && live.status !== "applied") {
@@ -1883,29 +1905,30 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
           const retry = live.status === "held"
             ? ` The command was not queued. Retry${persisted && response.restart_applies ? " or restart" : ""}.`
             : "";
-          setCompactFeedback(`${saved}${partial} ${live.status}.${retry}`);
+          showModelFeedback(`${saved}${partial} ${live.status}.${retry}`);
         } else if (!persisted) {
-          setCompactFeedback(live.status === "applied"
+          showModelFeedback(live.status === "applied"
             ? "Model changed for this session; the choice was not saved."
             : `Model change ${live.status}; the choice was not saved.`);
         } else if (live.status === "deferred") {
-          setCompactFeedback(response.restart_applies
+          showModelFeedback(response.restart_applies
             ? "Model saved. Applies on next restart."
             : "Model saved. Live change deferred.");
         } else {
-          setCompactFeedback(effectiveThinking
+          showModelFeedback(effectiveThinking
             ? `Model: ${nextModel} (${effectiveThinking})`
             : `Model: ${nextModel}`);
         }
       }
     } catch (err) {
+      if (!isCurrent()) return;
       setSelectedModel(prevModel);
       setSelectedThinkingLevel(prevThinking);
-      setSubmitError(
-        err instanceof Error ? err.message : "Failed to switch model",
-      );
+      const message = err instanceof Error ? err.message : "Failed to switch model";
+      setSubmitError(message);
+      setModelSwitchFeedback(message);
     } finally {
-      setSwitchingModel(false);
+      if (isCurrent()) setSwitchingModel(false);
     }
   };
 
@@ -4881,6 +4904,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
         selectedThinkingLevel={selectedThinkingLevel}
         availableModels={availableModels}
         switchingModel={switchingModel}
+        modelSwitchFeedback={modelSwitchFeedback}
         onChangeModelAndThinking={(nextModel, nextThinking) =>
           void handleChangeModelAndThinking(nextModel, nextThinking)
         }

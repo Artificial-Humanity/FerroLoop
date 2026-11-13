@@ -1,4 +1,4 @@
-import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import React from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import App from "../App";
@@ -421,7 +421,7 @@ describe("Track 1 FerroDeck+ Operator Controls UI (Records 47, 48, 44, 30)", () 
         onSetSessionModel={onSetSessionModel} />);
       const select = screen.getByTestId("session-model-select") as HTMLSelectElement;
       fireEvent.change(select, { target: { value: "claude-sonnet-5-5" } });
-      await waitFor(() => expect(screen.getByText("Save failed")).toBeInTheDocument());
+      await waitFor(() => expect(screen.getByTestId("model-switch-feedback")).toHaveTextContent("Save failed"));
       expect(select.value).toBe("claude-opus-5-5");
     });
 
@@ -438,6 +438,33 @@ describe("Track 1 FerroDeck+ Operator Controls UI (Records 47, 48, 44, 30)", () 
       fireEvent.change(select, { target: { value: "claude-sonnet-5-5" } });
       await waitFor(() => expect(screen.getByTestId("compact-feedback")).toHaveTextContent(/saved.*failed/i));
       expect(select.value).toBe("claude-sonnet-5-5");
+    });
+
+    it("announces the model result inside the open settings dialog", async () => {
+      const onSetSessionModel = vi.fn().mockResolvedValue({ persisted: true, record_id: "hosted-ada", restart_applies: true,
+        live: { status: "deferred", mechanism: "override", model_applied: false, queued: false } });
+      render(<ChatPane agentName="ada" adapter="claude" model="claude-opus-5-5" thinkingLevel="high"
+        sessionId="sess-ada" turns={[]} agentSettingsOpen onSetSessionModel={onSetSessionModel} />);
+      fireEvent.change(screen.getByTestId("session-model-select"), { target: { value: "claude-sonnet-5-5" } });
+      const dialog = screen.getByTestId("agent-settings-modal");
+      await waitFor(() => expect(within(dialog).getByRole("status")).toHaveTextContent(/applies on next restart/i));
+    });
+
+    it.each(["resolve", "reject"])("ignores model request %s after changing agents", async (outcome) => {
+      let finish!: (value: unknown) => void;
+      let fail!: (error: Error) => void;
+      const pending = new Promise((resolve, reject) => { finish = resolve; fail = reject; });
+      const onSetSessionModel = vi.fn().mockReturnValue(pending);
+      const { rerender } = render(<ChatPane agentName="ada" adapter="claude" model="claude-opus-5-5"
+        thinkingLevel="high" sessionId="sess-ada" turns={[]} agentSettingsOpen onSetSessionModel={onSetSessionModel} />);
+      fireEvent.change(screen.getByTestId("session-model-select"), { target: { value: "claude-sonnet-5-5" } });
+      rerender(<ChatPane agentName="bob" adapter="claude" model="claude-haiku-4-5" thinkingLevel="low"
+        sessionId="sess-bob" turns={[]} agentSettingsOpen onSetSessionModel={onSetSessionModel} />);
+      await act(async () => { if (outcome === "reject") fail(new Error("old target error")); else finish({ persisted: false, live: { status: "failed" } }); });
+      expect((screen.getByTestId("session-model-select") as HTMLSelectElement).value).toBe("claude-haiku-4-5");
+      expect(screen.getByTestId("session-model-select")).not.toBeDisabled();
+      expect(screen.queryByText("old target error")).toBeNull();
+      expect(screen.queryByText(/choice was not saved/i)).toBeNull();
     });
 
     it("keeps the previous model after App refreshes an unpersisted and unapplied change", async () => {

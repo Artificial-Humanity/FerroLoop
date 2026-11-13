@@ -354,6 +354,7 @@ export interface AgentSettingsModalProps {
   selectedThinkingLevel: string;
   availableModels?: string[] | null;
   switchingModel?: boolean;
+  modelSwitchFeedback?: string | null;
   onChangeModelAndThinking: (nextModel: string, nextThinkingLevel: string) => void;
   contextEstimate: EstimatedContextUsage;
   /**
@@ -498,6 +499,7 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
   selectedThinkingLevel,
   availableModels,
   switchingModel = false,
+  modelSwitchFeedback,
   onChangeModelAndThinking,
   contextEstimate,
   quotaUsage,
@@ -1526,6 +1528,14 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
                     </option>
                   ))}
                 </select>
+              </div>
+              <div
+                role="status"
+                aria-live="polite"
+                data-testid="model-switch-feedback"
+                style={{ gridColumn: "1 / -1", color: "var(--text-secondary)", fontSize: "12px" }}
+              >
+                {modelSwitchFeedback}
               </div>
               {agyThinkingRequired && (
                 <div
