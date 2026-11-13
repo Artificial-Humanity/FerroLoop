@@ -475,6 +475,9 @@ impl VendorHostAdapter for ClaudeHostAdapter {
                     _ => Ok(AdapterReadiness::Unknown),
                 };
             }
+            // A trailing queued prompt reads as Busy. Before using this probe for delivery,
+            // check what Claude writes when a queued prompt is removed before it runs; if
+            // nothing is written, the session would otherwise remain Busy indefinitely.
             if path.extension().and_then(|s| s.to_str()) == Some("jsonl")
                 && path.is_file()
                 && let Ok(report) = self.normalize_session_transcript_file(path, None)
