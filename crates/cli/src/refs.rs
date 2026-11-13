@@ -344,6 +344,7 @@ mod tests {
             store: "/s/main.redb".into(),
             tracker: None,
             state: None,
+            cwd: None,
         }];
         let resolved =
             resolve_project_slug_with_entries(&s, "memory", "widgets", &cfg_entries).unwrap();
@@ -357,6 +358,7 @@ mod tests {
                 store: "/s/a.redb".into(),
                 tracker: None,
                 state: None,
+                cwd: None,
             },
             crate::config::Entry {
                 name: None,
@@ -364,6 +366,7 @@ mod tests {
                 store: "/s/b.redb".into(),
                 tracker: None,
                 state: None,
+                cwd: None,
             },
         ];
         let cfg_err = resolve_project_slug_with_entries(&s, "memory", "widgets", &conflicting_cfg)

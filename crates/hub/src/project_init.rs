@@ -311,9 +311,24 @@ pub(crate) struct ConfigEntry {
     pub(crate) root: String,
     pub(crate) store: Option<String>,
     pub(crate) tracker: Option<(String, String)>,
+    pub(crate) cwd: Option<Item>,
 }
 
 impl ConfigEntry {
+    /// Exact-root opt-in; malformed values must not silently select another directory.
+    pub(crate) fn exact_cwd(&self) -> Result<bool, String> {
+        match self.cwd.as_ref() {
+            None => Ok(false),
+            Some(item) => match item.as_str() {
+                Some("workspace") => Ok(false),
+                Some("exact") => Ok(true),
+                _ => Err(format!(
+                    "project binding `{}`: `cwd` must be `workspace` or `exact`",
+                    self.slug().unwrap_or_else(|| self.root.clone())
+                )),
+            },
+        }
+    }
     /// The tracker binding the block has, if it names a GitHub repository.
     pub(crate) fn tracker_binding(&self) -> Option<Tracker> {
         self.tracker.as_ref().map(|(github, credential)| Tracker {
@@ -332,6 +347,37 @@ impl ConfigEntry {
                 .and_then(|s| s.to_str())
                 .map(str::to_ascii_lowercase),
         }
+    }
+}
+
+/// Resolve all bindings for a project as one canonical root and policy.
+/// A present but invalid or conflicting binding must never fall back to a decoy.
+pub(crate) fn resolve_bound_project(
+    entries: &[ConfigEntry],
+    name: &str,
+) -> Result<Option<(PathBuf, bool)>, String> {
+    let mut resolved = Vec::new();
+    for entry in entries
+        .iter()
+        .filter(|e| e.slug().is_some_and(|slug| slug.eq_ignore_ascii_case(name)))
+    {
+        let exact = entry.exact_cwd()?;
+        let path = Path::new(&entry.root);
+        let root = path
+            .is_absolute()
+            .then(|| path.canonicalize().ok().filter(|p| p.is_dir()))
+            .flatten()
+            .ok_or_else(|| format!("registered project root unavailable for {name}"))?;
+        resolved.push((root, exact));
+    }
+    resolved.sort();
+    resolved.dedup();
+    match resolved.len() {
+        0 => Ok(None),
+        1 => Ok(resolved.pop()),
+        _ => Err(format!(
+            "project binding `{name}` has conflicting roots or cwd policies"
+        )),
     }
 }
 
@@ -383,6 +429,7 @@ fn entry_of(t: &Table) -> Option<ConfigEntry> {
         root,
         store: text("store"),
         tracker,
+        cwd: t.get("cwd").cloned(),
     })
 }
 

@@ -2875,12 +2875,12 @@ impl SpinUpRequest {
             Err(_) => false,
         };
         if virtual_scope {
-            if let Some(dir) =
-                resolve_project_cwd(store, &project, Some(workspace_root), home_override)
-            {
-                self.cwd = Some(dir);
-            } else if workspace_root.is_dir() {
-                self.cwd = Some(workspace_root.to_string_lossy().into_owned());
+            match resolve_project_cwd(store, &project, Some(workspace_root), home_override) {
+                Ok(Some(dir)) => self.cwd = Some(dir),
+                Ok(None) if workspace_root.is_dir() => {
+                    self.cwd = Some(workspace_root.to_string_lossy().into_owned())
+                }
+                _ => {} // spin_up surfaces a binding error before starting anything
             }
         }
         self
@@ -5531,45 +5531,29 @@ fn resolve_project_cwd<S: Catalog>(
     project: &str,
     workspace_root: Option<&Path>,
     home_override: Option<&Path>,
-) -> Option<String> {
-    use crate::project_init::{config_entries, read_config, user_config_path};
+) -> Result<Option<String>, LifecycleError> {
+    use crate::project_init::{
+        config_entries, read_config, resolve_bound_project, user_config_path,
+    };
 
     if let Some(config) = user_config_path(home_override)
         && let Ok(entries) = read_config(&config).and_then(|doc| config_entries(&doc, &config))
     {
-        let bindings: Vec<_> = entries
-            .iter()
-            .filter(|entry| {
-                entry
-                    .slug()
-                    .is_some_and(|slug| slug.eq_ignore_ascii_case(project))
-            })
-            .collect();
-        if !bindings.is_empty() {
-            // Every matching binding must resolve before any may supply a runtime path.
-            let mut roots: Vec<_> = bindings
-                .into_iter()
-                .map(|entry| {
-                    let root = Path::new(&entry.root);
-                    root.is_absolute()
-                        .then(|| root.canonicalize().ok().filter(|path| path.is_dir()))
-                        .flatten()
-                })
-                .collect::<Option<_>>()?;
-            roots.sort();
-            roots.dedup();
-            if roots.len() != 1 {
-                return None;
-            }
-            let root = roots.pop()?;
-            let cwd = workspace_root
-                .and_then(|workspace| workspace.canonicalize().ok())
-                .and_then(|workspace| {
-                    let child = root.strip_prefix(&workspace).ok()?.components().next()?;
-                    Some(workspace.join(child))
-                })
-                .unwrap_or(root);
-            return Some(cwd.display().to_string());
+        if let Some((root, exact)) =
+            resolve_bound_project(&entries, project).map_err(LifecycleError::Invalid)?
+        {
+            let cwd = if exact {
+                root
+            } else {
+                workspace_root
+                    .and_then(|workspace| workspace.canonicalize().ok())
+                    .and_then(|workspace| {
+                        let child = root.strip_prefix(&workspace).ok()?.components().next()?;
+                        Some(workspace.join(child))
+                    })
+                    .unwrap_or(root)
+            };
+            return Ok(Some(cwd.display().to_string()));
         }
     }
     if let Ok(projects) = store.list_projects() {
@@ -5579,12 +5563,16 @@ fn resolve_project_cwd<S: Catalog>(
                 continue;
             };
             if name.eq_ignore_ascii_case(project) && root.is_dir() {
-                return Some(root.display().to_string());
+                return Ok(Some(root.display().to_string()));
             }
         }
     }
-    let workspace = workspace_root?;
-    let entries = std::fs::read_dir(workspace).ok()?;
+    let Some(workspace) = workspace_root else {
+        return Ok(None);
+    };
+    let Ok(entries) = std::fs::read_dir(workspace) else {
+        return Ok(None);
+    };
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir()
@@ -5593,10 +5581,10 @@ fn resolve_project_cwd<S: Catalog>(
                 .to_string_lossy()
                 .eq_ignore_ascii_case(project)
         {
-            return Some(path.display().to_string());
+            return Ok(Some(path.display().to_string()));
         }
     }
-    None
+    Ok(None)
 }
 
 type HostedSessionLockKey = (Option<PathBuf>, Option<PathBuf>, String);
@@ -5693,8 +5681,10 @@ where
         )
         .map_err(LifecycleError::Invalid)?;
     }
+    let project_cwd =
+        resolve_project_cwd(store, &v.project, env.workspace_root, env.home_override)?;
     if v.cwd.is_none() {
-        v.cwd = resolve_project_cwd(store, &v.project, env.workspace_root, env.home_override);
+        v.cwd = project_cwd;
     }
     // Before any side effect: an API vendor whose key is missing would register an agent that
     // can never run.
@@ -7750,6 +7740,15 @@ where
         record.project = agent.project;
         record.role = role_label_of(&agent.role);
     }
+    let project_cwd = resolve_project_cwd(
+        store,
+        &record.project,
+        env.workspace_root,
+        env.home_override,
+    )?;
+    if record.cwd.is_none() {
+        record.cwd = project_cwd;
+    }
     let config_home = preflight_vendor_launch(env, &record.vendor, record.hosted, &mut record.cwd)?;
     if record.hosted && vendor_has_runtime(&record.vendor) && env.spawn_runtime {
         env.runtime.preflight_spawn(&record.session_id)?;
@@ -9004,6 +9003,7 @@ fn plan_remodel<S: AgentRegistry + StateStore + Catalog>(
     let from_model = old.and_then(|r| r.model.clone());
     let from_thinking_level = old.and_then(|r| r.thinking_level.clone());
     let from_posture = old.map_or(fl_core::permissions::Posture::Auto, |r| r.posture);
+    let project_cwd = resolve_project_cwd(store, &project, env.workspace_root, env.home_override)?;
     let resolved_cwd = if trimmed_opt(&req.cwd).is_some() {
         req.cwd.clone()
     } else {
@@ -9012,8 +9012,7 @@ fn plan_remodel<S: AgentRegistry + StateStore + Catalog>(
             _ => false,
         };
         if old_cwd.is_none() || old_is_ws_root {
-            resolve_project_cwd(store, &project, env.workspace_root, env.home_override)
-                .or_else(|| old_cwd.clone())
+            project_cwd.or_else(|| old_cwd.clone())
         } else {
             old_cwd.clone()
         }
@@ -11372,6 +11371,158 @@ mod tests {
     }
 
     #[test]
+    fn exact_binding_starts_in_nested_root() {
+        let home = TempDir::new().unwrap();
+        let workspace = home.path().join("workspace");
+        let root = workspace.join("Kaggle/Competition");
+        std::fs::create_dir_all(&root).unwrap();
+        write_project_bindings(home.path(), std::slice::from_ref(&root));
+        let config = home.path().join(".config/fl/config.toml");
+        let content = std::fs::read_to_string(&config).unwrap();
+        std::fs::write(&config, format!("{content}cwd = 'exact'\n")).unwrap();
+        assert_eq!(
+            resolve_project_cwd(
+                &MemStore::default(),
+                "audio-suite",
+                Some(&workspace),
+                Some(home.path())
+            )
+            .unwrap(),
+            Some(root.canonicalize().unwrap().display().to_string())
+        );
+    }
+
+    #[test]
+    fn exact_binding_survives_respawn_and_remodel() {
+        let home = TempDir::new().unwrap();
+        let workspace = home.path().join("workspace");
+        let root = workspace.join("Kaggle/Competition");
+        std::fs::create_dir_all(&root).unwrap();
+        write_project_bindings(home.path(), std::slice::from_ref(&root));
+        let config = home.path().join(".config/fl/config.toml");
+        let text = std::fs::read_to_string(&config).unwrap();
+        std::fs::write(config, format!("{text}cwd='exact'\n")).unwrap();
+        let store = MemStore::default();
+        let fake = FakeRuntime::default();
+        let mut e = fake.env(home.path());
+        e.workspace_root = Some(&workspace);
+        let mut request = req("ada", "assistant", "claude");
+        request.project = "audio-suite".into();
+        spin_up(&store, &e, &request, "owner", Caller::Owner).unwrap();
+        fake.live.borrow_mut().clear();
+        restart_hosted_session(&store, &e, "claude:ada", "owner").unwrap();
+        assert_eq!(
+            fake.spawn_cwds.borrow().last().unwrap().as_deref(),
+            root.to_str()
+        );
+        let target = SessionTarget::resolve(&store, "claude:ada", None).unwrap();
+        let result = remodel_session(
+            &store,
+            &e,
+            &target,
+            &RemodelRequest {
+                vendor: "muse".into(),
+                ..Default::default()
+            },
+            "owner",
+            Caller::Owner,
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(result.cwd.as_deref(), root.to_str());
+        assert_eq!(
+            fake.spawn_cwds.borrow().last().unwrap().as_deref(),
+            root.to_str()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exact_symlink_binding_keeps_canonical_external_root() {
+        let home = TempDir::new().unwrap();
+        let workspace = home.path().join("workspace");
+        let outside = home.path().join("outside/competition");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let link = workspace.join("Kaggle");
+        std::os::unix::fs::symlink(outside.parent().unwrap(), &link).unwrap();
+        write_project_bindings(home.path(), &[link.join("competition")]);
+        let config = home.path().join(".config/fl/config.toml");
+        let text = std::fs::read_to_string(&config).unwrap();
+        std::fs::write(config, format!("{text}cwd='exact'\n")).unwrap();
+        assert_eq!(
+            resolve_project_cwd(
+                &MemStore::default(),
+                "audio-suite",
+                Some(&workspace),
+                Some(home.path())
+            )
+            .unwrap(),
+            Some(outside.canonicalize().unwrap().display().to_string())
+        );
+    }
+
+    #[test]
+    fn exact_binding_refuses_invalid_and_conflicting_policies() {
+        let home = TempDir::new().unwrap();
+        let workspace = home.path().join("workspace");
+        let root = workspace.join("Kaggle/Competition");
+        let decoy = workspace.join("audio-suite");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&decoy).unwrap();
+        let store = MemStore::default();
+        store.add_project(decoy.to_str().unwrap()).unwrap();
+        let config = home.path().join(".config/fl/config.toml");
+        for suffix in [
+            "cwd = 'bad'\n",
+            "cwd = 123\n",
+            "cwd = 'exact'\n[[project]]\nname = 'Audio-Suite'\nroot = 'PLACEHOLDER'\ncwd = 'workspace'\n",
+        ] {
+            write_project_bindings(home.path(), std::slice::from_ref(&root));
+            let text = std::fs::read_to_string(&config).unwrap();
+            std::fs::write(
+                &config,
+                format!(
+                    "{text}{}",
+                    suffix.replace("PLACEHOLDER", root.to_str().unwrap())
+                ),
+            )
+            .unwrap();
+            let mut request = req("ada", "assistant", "claude");
+            request.project = "audio-suite".into();
+            let request = request.with_default_cwd_for_home(&store, &workspace, Some(home.path()));
+            let mut e = env(&home);
+            e.workspace_root = Some(&workspace);
+            let error = spin_up(&store, &e, &request, "owner", Caller::Owner).unwrap_err();
+            assert!(format!("{error}").contains("audio-suite"));
+            assert!(store.agent_by_name("ada").unwrap().is_none());
+        }
+    }
+
+    #[test]
+    fn sonora_and_kaggle_gemma4_default_bindings_keep_workspace_behavior() {
+        let home = TempDir::new().unwrap();
+        let workspace = home.path().join("workspace");
+        let config = home.path().join(".config/fl/config.toml");
+        std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+        let sonora = workspace.join("Sonora/github");
+        let kaggle = workspace.join("Kaggle-Gemma4");
+        std::fs::create_dir_all(&sonora).unwrap();
+        std::fs::create_dir_all(&kaggle).unwrap();
+        std::fs::write(config, format!("[[project]]\nname='sonora'\nroot={:?}\n[[project]]\nname='kaggle-gemma4'\nroot={:?}\ncwd='workspace'\n", sonora.to_str().unwrap(), kaggle.to_str().unwrap())).unwrap();
+        let store = MemStore::default();
+        for (name, expected) in [
+            ("sonora", workspace.join("Sonora")),
+            ("kaggle-gemma4", kaggle),
+        ] {
+            assert_eq!(
+                resolve_project_cwd(&store, name, Some(&workspace), Some(home.path())).unwrap(),
+                Some(expected.canonicalize().unwrap().display().to_string())
+            );
+        }
+    }
+
+    #[test]
     fn named_binding_cwd_uses_umbrella_before_catalog_or_workspace_names() {
         let home = TempDir::new().unwrap();
         let workspace = home.path().join("workspace");
@@ -11467,11 +11618,10 @@ mod tests {
             test_env.workspace_root = Some(&workspace);
             let mut request = req("ada", "assistant", "claude");
             request.project = "audio-suite".into();
-            spin_up(&store, &test_env, &request, "owner", Caller::Owner).unwrap();
-            let record = find_hosted_session(&store, &["claude:ada"])
-                .unwrap()
-                .unwrap();
-            assert_eq!(record.cwd, None, "bindings: {roots:?}");
+            assert!(
+                spin_up(&store, &test_env, &request, "owner", Caller::Owner).is_err(),
+                "bindings: {roots:?}"
+            );
         }
     }
 
