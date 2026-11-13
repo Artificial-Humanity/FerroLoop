@@ -7,14 +7,38 @@ export interface RoleOption {
   label: string;
 }
 
+/** Default presentation when the catalog has not loaded or lacks a runtime role.
+ * Catalog labels remain authoritative whenever supplied by the hub. */
+const RUNTIME_ROLE_LABELS: Readonly<Record<string, string>> = {
+  assistant: "Software Engineer",
+  lead: "Project Lead",
+  "lab-manager": "Lab Manager",
+  "ui-developer": "UI & Full-Stack Application Developer",
+  "web-developer": "Web Developer",
+  "mobile-developer": "Mobile Developer",
+  "system-developer": "System / Backend Developer",
+  "data-engineer": "Data Engineer",
+  tester: "QA & Tester",
+  strategist: "Research & Architecture Strategist",
+  journalist: "Journalist & Technical Scribe",
+};
+
 /** Preserve wire identity while removing the origin prefix from fallback presentation. */
 export function roleLabel(
   value: string,
   roles: readonly RoleRecord[] = [],
 ): string {
+  const custom = /^custom:/i.test(value);
   const slug = value.replace(/^custom:/i, "");
+  if (custom) {
+    const structural = ["lead", "assistant", "lab-manager", "lab_manager"].includes(slug.toLowerCase());
+    const label = roles.find((role) => role.slug === slug && (!structural || !role.builtin))?.label;
+    return label ?? slug.replace(/[-_]+/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
+  }
   const catalogSlug = slug === "lab_manager" ? "lab-manager" : slug;
-  return roles.find((role) => role.slug === catalogSlug)?.label ?? slug;
+  const label = roles.find((role) => role.slug === catalogSlug)?.label;
+  if (catalogSlug === "assistant" && (!label || label === "Assisting Engineer")) return "Software Engineer";
+  return label ?? RUNTIME_ROLE_LABELS[catalogSlug] ?? slug.replace(/[-_]+/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
 }
 
 /** Fixed executable IDs determine structural roles, never catalog labels or flags. */
@@ -23,7 +47,7 @@ export function roleOptions(
   roles: readonly RoleRecord[],
 ): RoleOption[] {
   const options = new Map(
-    legacy.map((option) => [option.value, { ...option }]),
+    legacy.map((option) => [option.value, { value: option.value, label: roleLabel(option.value, roles) }]),
   );
   for (const role of roles) {
     const slug = role.slug.toLowerCase();
@@ -31,9 +55,15 @@ export function roleOptions(
       slug === "lab-manager" ? ["lab-manager", "lab_manager"] : [slug];
     const value =
       compatible.find((id) => options.has(id)) ?? `custom:${role.slug}`;
-    options.set(value, { value, label: role.label });
+    options.set(value, { value, label: roleLabel(value, roles) });
   }
-  return Array.from(options.values());
+  return Array.from(options.values()).sort((a, b) => a.label.localeCompare(b.label));
+}
+
+/** Keep an existing unknown selection in alphabetical order while its catalog loads. */
+export function selectedRoleOptions(options: RoleOption[], value: string, roles: readonly RoleRecord[]): RoleOption[] {
+  if (!value || value === "__create_custom__" || options.some((o) => o.value === value)) return options;
+  return [...options, { value, label: roleLabel(value, roles) }].sort((a, b) => a.label.localeCompare(b.label));
 }
 
 /** A modal session owns its catalog request and reconciles acknowledged mutations. */
@@ -68,7 +98,7 @@ export function useRoles(enabled: boolean, apiClient?: HubApiClient) {
           if (!Array.isArray(loaded))
             throw new Error("Invalid role catalog response");
           if (session.current === currentSession) {
-            const reconciled = new Map(loaded.map((role) => [role.slug, role]));
+            const reconciled = new Map(loaded.map((role) => [role.slug, role.slug === "assistant" && role.label === "Assisting Engineer" ? { ...role, label: "Software Engineer" } : role]));
             for (const [slug, record] of overlays) {
               if (record) reconciled.set(slug, record);
               else reconciled.delete(slug);

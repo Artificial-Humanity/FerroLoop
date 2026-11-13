@@ -1,3 +1,4 @@
+import type { RoleRecord } from "../../types/api";
 import React from "react";
 import type { AgentRecord, DiscoveredSessionSummary } from "../../types/api";
 import { PhoneBottomNav } from "./PhoneBottomNav";
@@ -6,6 +7,7 @@ import { PhoneTopBar } from "./PhoneTopBar";
 import type { PhoneView } from "./phoneNavigation";
 
 export interface PhoneShellProps {
+  roles?: readonly RoleRecord[];
   view: PhoneView;
   onNavigate: (view: PhoneView) => void;
   /** Leaves a tool view and returns to Chat. */
@@ -24,6 +26,7 @@ export interface PhoneShellProps {
 }
 
 export const PhoneShell: React.FC<PhoneShellProps> = ({
+  roles = [],
   view,
   onNavigate,
   onBack,
@@ -77,6 +80,7 @@ export const PhoneShell: React.FC<PhoneShellProps> = ({
       data-phone-view={view}
     >
       <PhoneTopBar
+        roles={roles}
         view={view}
         selectedAgent={selectedAgent}
         sessions={sessions}

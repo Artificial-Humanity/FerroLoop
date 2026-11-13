@@ -1,9 +1,11 @@
+import type { RoleRecord } from "../../types/api";
 import React from "react";
 import type { AgentRecord, DiscoveredSessionSummary } from "../../types/api";
 import { formatRoleLabel } from "../RosterSidebar";
 import { isPhoneToolView, phoneViewLabel, type PhoneView } from "./phoneNavigation";
 
 export interface PhoneTopBarProps {
+  roles?: readonly RoleRecord[];
   view: PhoneView;
   selectedAgent: AgentRecord | null;
   sessions: DiscoveredSessionSummary[];
@@ -14,6 +16,7 @@ export interface PhoneTopBarProps {
 }
 
 export const PhoneTopBar: React.FC<PhoneTopBarProps> = ({
+  roles = [],
   view,
   selectedAgent,
   sessions,
@@ -52,7 +55,7 @@ export const PhoneTopBar: React.FC<PhoneTopBarProps> = ({
           </span>
           {selectedAgent && (
             <span className="fd-badge" data-testid="phone-agent-role-badge">
-              {formatRoleLabel(selectedAgent.role)}
+              {formatRoleLabel(selectedAgent.role, roles)}
             </span>
           )}
         </span>

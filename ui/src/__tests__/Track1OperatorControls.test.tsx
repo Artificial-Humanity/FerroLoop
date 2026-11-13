@@ -417,7 +417,7 @@ describe("Track 1 FerroDeck+ Operator Controls UI (Records 47, 48, 44, 30)", () 
       );
       // Antigravity thinking options must not label `high` as `(Default)`.
       const highOption = Array.from(thinkingSelect.options).find((o) => o.value === "high");
-      expect(highOption?.textContent).toBe("high");
+      expect(highOption?.textContent).toBe("High");
       expect(highOption?.textContent).not.toContain("Default");
 
       // Operator picks a model, then changes their mind to another model before picking a level:

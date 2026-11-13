@@ -1,3 +1,4 @@
+import { useRoles } from "./hooks/useRoles";
 import {
   codexSendNowReceipt,
   isPromptDeliveryFailure,
@@ -9,7 +10,7 @@ import { HubApiClient, HubApiError, normalizeHubSettings } from "./api/client";
 import { HubWsClient } from "./api/ws";
 import { createTranscriptReadGuard, isObservedTranscriptTurns, isTransientTranscriptReadError, type TranscriptReadOwner } from "./lib/transcriptReadGuard";
 import { ArtifactPreviewPane } from "./components/ArtifactPreviewPane";
-import { ChatPane } from "./components/ChatPane";
+import { ChatPane, coalesceTurnsWithToolOutputs } from "./components/ChatPane";
 import { ContextHeader, RightPanelHeader } from "./components/ContextHeader";
 import { GitPrPane } from "./components/GitPrPane";
 import {
@@ -494,6 +495,18 @@ export function preserveOptimisticTurn(
     if (isPromptOnDisk(turns, item.content, item.sentAt, item.sentAtAnchored)) {
       continue;
     }
+    // Only suppress when a disk user turn is later even after allowing for the
+    // same clock skew as prompt matching. Keep the pending prompt for matching.
+    const skewMs = item.sentAtAnchored
+      ? PROMPT_DISK_ANCHORED_SKEW_MS
+      : PROMPT_DISK_CLOCK_SKEW_MS;
+    if (turns.some((turn) => {
+      if ((turn.role || "").toLowerCase() !== "user" || !turn.created_at) return false;
+      const createdAt = Date.parse(turn.created_at);
+      return Number.isFinite(createdAt) && createdAt > item.sentAt + skewMs;
+    })) {
+      continue;
+    }
     pending.push(item);
   }
   if (pending.length === 0) {
@@ -508,13 +521,22 @@ export function preserveOptimisticTurn(
     const maxIndex = out.reduce((max, t) => Math.max(max, t.index), -1);
     const nextTurn: TranscriptTurn = {
       index: maxIndex + 1,
+      optimistic: true,
       role: "user",
       content: item.content,
       thinking: null,
       tool_calls: [],
       created_at: new Date(item.sentAt).toISOString(),
     };
-    out.push(nextTurn);
+    // Insert only between display groups so a tool result stays attached to
+    // its assistant call, while preserving disk order and indices.
+    const laterGroup = coalesceTurnsWithToolOutputs(out).find(({ turn }) => {
+      if (!turn.created_at) return false;
+      const createdAt = Date.parse(turn.created_at);
+      return Number.isFinite(createdAt) && createdAt > item.sentAt;
+    });
+    if (!laterGroup) out.push(nextTurn);
+    else out.splice(out.indexOf(laterGroup.turn), 0, nextTurn);
   }
   return out.length === turns.length ? turns : out;
 }
@@ -695,6 +717,7 @@ export const App: React.FC<AppProps> = ({
   const [pairingError, setPairingError] = useState<string | null>(null);
   const [nodesModalOpen, setNodesModalOpen] = useState<boolean>(false);
   const [settingsModalOpen, setSettingsModalOpen] = useState<boolean>(false);
+  const { roles: rosterRoles } = useRoles(Boolean(authority) && !settingsModalOpen, apiClient);
   const [settingsInitialProject, setSettingsInitialProject] = useState<string | null>(null);
   const [settingsInitialProjectFilter, setSettingsInitialProjectFilter] =
     useState<string | null>(null);
@@ -3721,6 +3744,7 @@ export const App: React.FC<AppProps> = ({
 
   const renderRosterSidebar = (embedded: boolean) => (
     <RosterSidebar
+          roles={rosterRoles}
       projects={projects}
       showEmptyProjects={projectsFromHub}
       loading={loading}
@@ -3842,6 +3866,7 @@ export const App: React.FC<AppProps> = ({
     >
       {isPhoneLayout ? (
         <PhoneShell
+          roles={rosterRoles}
           view={effectivePhoneView}
           hasAgent={Boolean(selectedAgent)}
           onNavigate={setPhoneView}
@@ -3871,6 +3896,7 @@ export const App: React.FC<AppProps> = ({
       ) : (
         <>
           <ContextHeader
+          roles={rosterRoles}
             selectedAgent={selectedAgent}
             sessions={mergedRoutes}
             selectedSessionId={activeSession?.id ?? null}
