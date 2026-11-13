@@ -21,8 +21,31 @@ impl Machine {
             .env("XDG_CONFIG_HOME", &self.cfg_dir)
             .env("XDG_DATA_HOME", &self.data_dir)
             .env("FL_WIRE_DISABLE_HOST_DISCOVERY", "1")
+            .env_remove("FL_HOST_SOCK")
+            .env_remove("FL_WIRE_SOCKET")
+            .env_remove("FL_WIRE_ROUTES")
             .env_remove("FL_DB");
         cmd
+    }
+}
+
+#[test]
+fn fixture_scrubs_inherited_endpoints() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path().to_path_buf();
+    let machine = Machine {
+        cfg_dir: root.join("config"),
+        data_dir: root.join("data"),
+        repo_dir: root.join("repo"),
+        root,
+    };
+    let cmd = machine.fl();
+    for key in ["FL_HOST_SOCK", "FL_WIRE_SOCKET", "FL_WIRE_ROUTES"] {
+        assert!(
+            cmd.get_envs()
+                .any(|(name, value)| name == key && value.is_none()),
+            "fixture must remove inherited {key}"
+        );
     }
 }
 

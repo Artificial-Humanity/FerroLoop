@@ -453,6 +453,7 @@ fn fl_flow_step_runs_a_configured_vendor_with_its_rate_card_and_a_vault_key() {
             .env("FL_WIRE_ROUTES", root.join("routes.json"))
             .env("FL_WIRE_SOCKET", root.join("wire.sock"))
             .env("FL_WIRE_DISABLE_HOST_DISCOVERY", "1")
+            .env_remove("FL_HOST_SOCK")
             .env_remove("FL_DB")
             .env_remove("AGENT_PERSONA")
             .env_remove("FL_VAULT_PATH")

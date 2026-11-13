@@ -98,6 +98,7 @@ impl PrFixture {
             .env("FL_WIRE_SOCKET", self.home.path().join("run/wire.sock"))
             .env("FL_WIRE_ROUTES", self.home.path().join("state/routes.json"))
             .env("FL_WIRE_DISABLE_HOST_DISCOVERY", "1")
+            .env_remove("FL_HOST_SOCK")
             .env("FL_GITHUB_TOKEN", "user-token")
             .env("FL_GITHUB_API_URL", self.fake.url())
             .env_remove("GITHUB_TOKEN")

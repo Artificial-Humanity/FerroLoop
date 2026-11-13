@@ -10,6 +10,27 @@ use fl_core::store::{Catalog, Ledger};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
+#[test]
+fn fixture_scrubs_inherited_host_socket() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path().to_path_buf();
+    let fixture = WorkflowFixture {
+        _tmp: tmp,
+        cfg_dir: root.join("config"),
+        data_dir: root.join("data"),
+        repo_dir: root.join("repo"),
+        store_path: root.join("store"),
+        routes_file: root.join("routes"),
+        sock_file: root.join("wire.sock"),
+        root,
+    };
+    let cmd = fixture.fl();
+    assert!(
+        cmd.get_envs()
+            .any(|(key, value)| key == "FL_HOST_SOCK" && value.is_none())
+    );
+}
+
 fn git(dir: &Path, args: &[&str]) {
     let out = Command::new("git")
         .args(args)
@@ -109,6 +130,7 @@ impl WorkflowFixture {
             .env("FL_WIRE_ROUTES", &self.routes_file)
             .env("FL_WIRE_SOCKET", &self.sock_file)
             .env("FL_WIRE_DISABLE_HOST_DISCOVERY", "1")
+            .env_remove("FL_HOST_SOCK")
             .env_remove("FL_DB")
             .env_remove("AGENT_PERSONA")
             .env_remove("AGENT_NAME")

@@ -63,6 +63,9 @@ impl TestEnv {
             .env("FL_WIRE_SOCKET", &self.sock_file)
             .env("FL_WIRE_DISABLE_HOST_DISCOVERY", "1")
             .env_remove("FL_HOST_SOCK")
+            .env_remove("FL_WIRE_CODEX_CONTROL_SOCK")
+            .env("CODEX_HOME", self.root.join("codex-home"))
+            .env("FL_WIRE_CODEX_BIN", self.root.join("absent-codex"))
             .env_remove("FL_DB")
             .env_remove("AGENT_PERSONA")
             .env_remove("AGENT_NAME")
@@ -106,7 +109,15 @@ fn fixture_scrubs_inherited_live_routes() {
         cmd.get_envs()
             .any(|(name, value)| name == "FL_HOST_SOCK" && value.is_none())
     );
+    assert!(
+        cmd.get_envs()
+            .any(|(name, value)| name == "FL_WIRE_CODEX_CONTROL_SOCK" && value.is_none())
+    );
+    let codex_home = env.root.join("codex-home");
+    let codex_bin = env.root.join("absent-codex");
     for (key, expected) in [
+        ("CODEX_HOME", &codex_home),
+        ("FL_WIRE_CODEX_BIN", &codex_bin),
         ("FL_WIRE_SOCKET", &env.sock_file),
         ("FL_WIRE_ROUTES", &env.routes_file),
         ("XDG_RUNTIME_DIR", &env.root),
