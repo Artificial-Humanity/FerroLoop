@@ -70,6 +70,15 @@ pub enum RecoveryError {
         resource: &'static str,
     },
     #[error(
+        "recovery {operation_id}: {resource} offers {offered_bytes} encoded bytes; limit {limit_bytes} encoded bytes (JSON quotes and escaping included); journal unchanged"
+    )]
+    RestoreTerminalInputQuota {
+        operation_id: uuid::Uuid,
+        resource: &'static str,
+        offered_bytes: u64,
+        limit_bytes: u64,
+    },
+    #[error(
         "recovery {operation_id}: journal {journal:?} frame at offset {offset} declares {declared_bytes} bytes above cap {cap}; no repair or unfence attempted"
     )]
     RestoreJournalFrameQuota {

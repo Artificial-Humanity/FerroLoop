@@ -2323,6 +2323,13 @@ fn terminal_control(
 // A frame must have room for every future scalar/phase and one accepted
 // context/evidence pair before the admission name can be published. The saved
 // capacity is the only byte budget; current process build text is not an input.
+// Encoded JSON string bytes, including quotes and escapes. At the default
+// 1MiB metadata budget P=10,168; these leave 1,613 evidence bytes in the
+// dependency-bearing unit fixture (maximum-operator mandatory record: 1,205).
+// 126 plain operator bytes and 254 plain attestation bytes accommodate shift
+// changes and a ticket-backed exclusion statement; escapes consume that room.
+const ACCEPTING_OPERATOR_ENCODED_MAX: u64 = 128;
+const ACCEPTING_EXCLUSION_EVIDENCE_ENCODED_MAX: u64 = 256;
 const TERMINAL_CONTEXT_ENVELOPE_MAX: u64 = 768; // Current schema maximum: 732.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct TerminalCaps {
@@ -2436,9 +2443,16 @@ fn terminal_caps(j: &RestoreJournal, l: &OperationLimits) -> Result<TerminalCaps
     b = replace_encoded(b, &j.forensic_handling_required, &false, p, l)?;
     b = replace_encoded(b, &j.generation_metadata_sha256, &[255u8; 32], p, l)?;
     let r = measure(&maximum_report(&j.binding.build), p, l)?.0;
-    let operator = measure(&j.binding.operator, p, l)?.0;
+    let operator = ACCEPTING_OPERATOR_ENCODED_MAX;
     let binding = &j.binding;
+    let admission_exclusion = measure(&binding.exclusion.evidence, p, l)?.0;
     let mut lease = measure(binding, p, l)?.0;
+    lease = lease
+        .checked_sub(measure(&binding.operator, p, l)?.0)
+        .and_then(|n| n.checked_add(ACCEPTING_OPERATOR_ENCODED_MAX))
+        .and_then(|n| n.checked_sub(admission_exclusion))
+        .and_then(|n| n.checked_add(ACCEPTING_EXCLUSION_EVIDENCE_ENCODED_MAX))
+        .ok_or_else(|| l.verification())?;
     lease = replace_encoded(lease, &binding.issued_at_unix_ms, &u128::MAX, p, l)?;
     lease = replace_encoded(lease, &binding.expires_at_unix_ms, &u128::MAX, p, l)?;
     // Use the same tagged representation as FileBinding without allocating its
@@ -2617,12 +2631,21 @@ fn check_terminal_reservation(
             unresolved_items: [],
             index: IndexReadiness::Degraded,
         };
-        let q = measure(&template, p, l)?.0;
+        // The future operator also occurs in reconciliation, independently of
+        // its occurrence in the accepting lease. Reserve both at their maxima.
+        let template_bytes = measure(&template, p, l)?.0;
+        let q = template_bytes
+            .checked_sub(measure(&j.binding.operator, p, l)?.0)
+            .and_then(|n| n.checked_add(ACCEPTING_OPERATOR_ENCODED_MAX))
+            .ok_or_else(|| l.verification())?;
         l.quota(q, caps.evidence, "restore mandatory terminal evidence")?;
         // The borrowed template has no heap allocation. Admit its owned model,
         // the selected synthetic report and readiness scratch BEFORE allocating
         // any of them, one role at a time. Immutable loaded metadata stays borrowed.
+        // The readiness witness still borrows admission values; a historical
+        // admission operator may exceed the new accepting allowance.
         let scratch = q
+            .max(template_bytes)
             .checked_mul(64)
             .and_then(|n| n.checked_add(8192))
             .and_then(|n| {
@@ -2735,10 +2758,44 @@ fn check_terminal_reservation(
             evidence_sha256: RESERVATION_SHA,
         };
         l.quota(
-            measure(&absence, p, l)?.0,
+            measure(&absence, p, l)?
+                .0
+                .checked_sub(measure(&j.binding.operator, p, l)?.0)
+                .and_then(|n| n.checked_add(ACCEPTING_OPERATOR_ENCODED_MAX))
+                .ok_or_else(|| l.verification())?,
             caps.evidence,
             "restore mandatory absence evidence",
         )?;
+    }
+    Ok(())
+}
+
+// Shape admission has already bounded the borrowed string capacity. JSON
+// encodes each input byte in at most six output bytes plus the two quotes.
+// This finite counting-only bound permits an exact scalar diagnostic; full
+// lease/evidence measurements remain under the existing frame payload bound.
+fn accepting_string_bytes(value: &str, l: &OperationLimits) -> Result<u64, RecoveryError> {
+    let encoded_bound = (value.len() as u64)
+        .checked_mul(6)
+        .and_then(|n| n.checked_add(2))
+        .ok_or_else(|| l.verification())?;
+    Ok(super::restore_metadata::measure(value, encoded_bound, l)?.0)
+}
+
+fn terminal_input_quota(
+    l: &OperationLimits,
+    offered_bytes: u64,
+    limit_bytes: u64,
+    resource: &'static str,
+) -> Result<(), RecoveryError> {
+    l.check()?;
+    if offered_bytes > limit_bytes {
+        return Err(RecoveryError::RestoreTerminalInputQuota {
+            operation_id: l.operation_id,
+            resource,
+            offered_bytes,
+            limit_bytes,
+        });
     }
     Ok(())
 }
@@ -2766,25 +2823,37 @@ fn terminal_input_scope(
     }
     let scoped = shape.finish(2, l)?;
     let reserved = terminal_caps(j, &scoped)?;
-    l.quota(
-        metadata::measure(&lease.request.operator, caps.payload, &scoped)?.0,
+    // Scalar checks report exact escaping/quote costs. Full lease/evidence
+    // above P can still hit the tighter existing metadata-byte refusal first.
+    terminal_input_quota(
+        l,
+        accepting_string_bytes(&lease.request.operator, &scoped)?,
         reserved.operator,
         "restore accepting operator",
     )?;
-    l.quota(
+    terminal_input_quota(
+        l,
+        accepting_string_bytes(&lease.request.exclusion.evidence, &scoped)?,
+        ACCEPTING_EXCLUSION_EVIDENCE_ENCODED_MAX,
+        "restore accepting lease exclusion evidence",
+    )?;
+    terminal_input_quota(
+        l,
         metadata::measure(&lease.request, caps.payload, &scoped)?.0,
         reserved.lease,
         "restore accepting lease",
     )?;
     if let Some(record) = record {
-        l.quota(
+        terminal_input_quota(
+            l,
             metadata::measure(record, caps.payload, &scoped)?.0,
             reserved.evidence,
             "restore accepting evidence",
         )?;
     }
     if let Some(record) = absence {
-        l.quota(
+        terminal_input_quota(
+            l,
             metadata::measure(record, caps.payload, &scoped)?.0,
             reserved.evidence,
             "restore accepting evidence",
@@ -6220,9 +6289,9 @@ mod metadata_tests {
         let l = limits();
         let mut j = fixture();
         let expected = TerminalCaps {
-            operator: 18,
-            lease: 1120,
-            evidence: 1945,
+            operator: 128,
+            lease: 1452,
+            evidence: 1613,
         };
         assert_eq!(terminal_caps(&j, &l).unwrap(), expected);
         j.phase = RestorePhase::OriginalAbsenceFinalized;
@@ -6283,6 +6352,124 @@ mod metadata_tests {
                 .0;
         assert_eq!(envelope, 732);
         assert!(envelope <= TERMINAL_CONTEXT_ENVELOPE_MAX);
+    }
+    fn encoded_string(bytes: u64) -> String {
+        let mut value = "\u{1}".repeat(((bytes - 2) / 6) as usize);
+        value.push_str(&"x".repeat(((bytes - 2) % 6) as usize));
+        assert_eq!(serde_json::to_vec(&value).unwrap().len() as u64, bytes);
+        value
+    }
+    #[test]
+    fn terminal_reservation_accepting_fields_are_independent_of_admission_lengths() {
+        let l = limits();
+        let mut j = fixture();
+        let initial = terminal_caps(&j, &l).unwrap();
+        j.binding.operator = encoded_string(129);
+        j.binding.exclusion.evidence = encoded_string(257);
+        let expanded = terminal_caps(&j, &l).unwrap();
+        assert_eq!(expanded.operator, initial.operator);
+        assert_eq!(expanded.lease, initial.lease);
+        assert!(expanded.evidence < initial.evidence); // Immutable original binding remains.
+        check_terminal_reservation(&j, &l).unwrap();
+    }
+    #[test]
+    fn terminal_reservation_admission_reserves_reconciliation_operator_occurrence() {
+        let l = limits();
+        let mut j = fixture();
+        // At E=1,150 the 1,095-byte admission-operator record fits, but
+        // the 1,205-byte maximum-accepting-operator record cannot fit.
+        j.journal_capacity -= (1613 - 1150) * metadata::MAX_FRAMES;
+        assert_eq!(terminal_caps(&j, &l).unwrap().evidence, 1150);
+        assert!(matches!(
+            check_terminal_reservation(&j, &l),
+            Err(RecoveryError::Quota {
+                resource: "restore mandatory terminal evidence",
+                ..
+            })
+        ));
+    }
+    #[test]
+    fn terminal_reservation_maximum_accepting_fields_fit_every_terminal_mode() {
+        let l = limits();
+        for mode in [
+            TerminalMode::Selected,
+            TerminalMode::Original,
+            TerminalMode::OriginalAbsence,
+            TerminalMode::Abandon,
+        ] {
+            let mut j = fixture();
+            let cap = metadata::Caps::new(j.journal_capacity, &l).unwrap().payload;
+            let reserved = terminal_caps(&j, &l).unwrap();
+            let mut authority = j.binding.clone();
+            authority.operator = encoded_string(128);
+            authority.exclusion.evidence = encoded_string(256);
+            authority.issued_at_unix_ms = u128::MAX;
+            authority.expires_at_unix_ms = u128::MAX;
+            authority.expected_file = FileBinding::Readable {
+                identity: (u64::MAX, u64::MAX),
+                bytes: u64::MAX,
+                sha256: RESERVATION_SHA.into(),
+            };
+            authority.exclusion.legacy_and_cached_handles_excluded = false;
+            authority.exclusion.external_dispatch_excluded = false;
+            authority.exclusion.active_owner_excluded = false;
+            assert_eq!(
+                serde_json::to_vec(&authority).unwrap().len() as u64,
+                reserved.lease
+            );
+            // Deliberately impossible combined maxima dominate every valid
+            // report/lease. This is a size proof, not an accepted context.
+            j.verification = Some(
+                serde_json::from_slice(
+                    &serde_json::to_vec(&maximum_report(&j.binding.build)).unwrap(),
+                )
+                .unwrap(),
+            );
+            j.phase = match mode {
+                TerminalMode::Selected => RestorePhase::Finalized,
+                TerminalMode::Original => RestorePhase::OriginalFinalized,
+                TerminalMode::OriginalAbsence => RestorePhase::OriginalAbsenceFinalized,
+                TerminalMode::Abandon => RestorePhase::Abandoned,
+            };
+            j.resume_finalize_attempts = u32::MAX;
+            j.rollback_attempts = u32::MAX;
+            j.current_attempt = u32::MAX;
+            j.attempt_deadline_unix_ms = u128::MAX;
+            j.generation_metadata_sha256 = [255; 32];
+            if matches!(mode, TerminalMode::Selected | TerminalMode::Original) {
+                let mut record = selected_record(&j);
+                record.operator = authority.operator.clone();
+                record.recorded_at_unix_ms = u128::MAX;
+                let n = serde_json::to_vec(&record).unwrap().len() as u64;
+                record.affected_scopes[0].push_str(&"x".repeat((reserved.evidence - n) as usize));
+                assert_eq!(
+                    serde_json::to_vec(&record).unwrap().len() as u64,
+                    reserved.evidence
+                );
+                j.reconciliation = Some(record);
+            } else if matches!(mode, TerminalMode::OriginalAbsence) {
+                j.absence_reconciliation = Some(AbsenceReconciliationRecord {
+                    version: u32::MAX,
+                    operation_id: j.operation_id,
+                    candidate_sha256: j.candidate_sha256.clone(),
+                    operator: authority.operator.clone(),
+                    recorded_at_unix_ms: u128::MAX,
+                    no_client_opened_path_while_installed: false,
+                    evidence_sha256: RESERVATION_SHA.into(),
+                });
+            }
+            j.terminal_evidence_context = Some(TerminalEvidenceContext {
+                mode,
+                accepting_lease: authority,
+                accepting_lease_sha256: [255; 32],
+                admission_generation_sha256: [255; 32],
+                prepared_report_sha256: Some([255; 32]),
+                reconciliation_sha256: Some([255; 32]),
+                accepted_at_unix_ms: u128::MAX,
+            });
+            let bytes = serde_json::to_vec(&j).unwrap().len() as u64;
+            assert!(bytes <= cap, "{mode:?}: {bytes}>{cap}");
+        }
     }
     fn selected_record(j: &RestoreJournal) -> ReconciliationRecord {
         let dep = &j.selected_dependencies.references[0];

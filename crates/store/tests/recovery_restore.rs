@@ -7168,7 +7168,11 @@ fn reservation_expected_caps(j: &RestoreJournal) -> (u64, u64, u64) {
     ] {
         binding["exclusion"][field] = json!(false);
     }
-    let l = reservation_json_bytes(&binding) + 38;
+    let l = reservation_json_bytes(&binding) + 38
+        - reservation_json_bytes(&j.binding.operator)
+        - reservation_json_bytes(&j.binding.exclusion.evidence)
+        + 128
+        + 256;
     let mut report = serde_json::to_value(
         j.verification
             .as_ref()
@@ -7210,7 +7214,7 @@ fn reservation_expected_caps(j: &RestoreJournal) -> (u64, u64, u64) {
     let e = (j.journal_capacity / 96 - 72)
         .checked_sub(b + r + l + 768)
         .unwrap();
-    (reservation_json_bytes(&j.binding.operator), l, e)
+    (128, l, e)
 }
 fn reservation_pad_record(
     j: &RestoreJournal,
@@ -7242,17 +7246,10 @@ fn restore_terminal_reservation_padded_admission_refuses_before_guard() {
     eprintln!("reservation admission padded lease: 1 case");
 }
 fn reservation_exact_lease(j: &RestoreJournal, lease: &OfflineLease, f: &Fixture) -> OfflineLease {
-    let (o, l, _) = reservation_expected_caps(j);
     let mut binding = fixture_lease_request(lease);
     binding.expected_file = inspect_file_binding(&j.destination, &limits()).unwrap();
-    let bytes = reservation_json_bytes(&binding);
-    assert!(bytes <= l);
-    binding
-        .exclusion
-        .evidence
-        .push_str(&"x".repeat((l - bytes) as usize));
-    assert_eq!(reservation_json_bytes(&binding.operator), o);
-    assert_eq!(reservation_json_bytes(&binding), l);
+    binding.operator = reservation_encoded_string("next shift ", 128);
+    binding.exclusion.evidence = reservation_encoded_string("new exclusion ticket ", 256);
     fs::remove_file(lease.path()).unwrap();
     create_offline_lease(&binding, &f.filesystem(), &limits()).unwrap()
 }
@@ -7271,7 +7268,13 @@ fn restore_terminal_reservation_exact_e_and_restart_complete() {
         let path = journal.staging.join("journal.bin");
         let restarted = load_restore_journal(&path, &lease, &f.filesystem()).unwrap();
         assert_eq!(reservation_expected_caps(&restarted), expected);
-        let record = reservation_pad_record(&restarted, original, expected.2);
+        let mut record = reservation_pad_record(
+            &restarted,
+            original,
+            expected.2 - (128 - reservation_json_bytes(&restarted.binding.operator)),
+        );
+        record.operator = fixture_lease_request(&lease).operator;
+        assert_eq!(reservation_json_bytes(&record), expected.2);
         let outcome = if original {
             finalize_rollback(&restarted, &lease, &record, &f.filesystem())
         } else {
@@ -7308,7 +7311,7 @@ fn restore_terminal_reservation_exact_e_and_restart_complete() {
             reservation_json_bytes(&fixture_lease_request(&lease).operator),
             o
         );
-        terminal_call(mode, &journal, &lease, &f.filesystem(), false).unwrap();
+        reservation_call_with_operator(mode, &journal, &lease, &f).unwrap();
         let done = load_restore_journal(
             &journal.staging.join("journal.bin"),
             &lease,
@@ -7330,62 +7333,75 @@ fn restore_terminal_reservation_exact_e_and_restart_complete() {
 #[test]
 fn restore_terminal_reservation_one_byte_over_caps_is_free() {
     use fl_store::recovery::readiness::finalize_restore;
-    for kind in ["operator", "lease", "evidence"] {
-        let (f, journal, lease) = terminal_fixture(TerminalFixtureMode::Selected);
-        let (o, l, e) = reservation_expected_caps(&journal);
-        let mut binding = fixture_lease_request(&lease);
-        let mut record = generation_evidence(&journal, false);
-        if kind == "operator" {
-            binding.operator.push('x');
-            record.operator = binding.operator.clone();
-            assert_eq!(reservation_json_bytes(&binding.operator), o + 1);
-        } else if kind == "lease" {
-            // Current-file renewal is semantically valid, but its accepted lease is L+1.
+    for mode in [
+        TerminalFixtureMode::Selected,
+        TerminalFixtureMode::Original,
+        TerminalFixtureMode::Absence,
+        TerminalFixtureMode::Abandon,
+    ] {
+        for kind in ["operator", "exclusion", "evidence"] {
+            if kind == "evidence" && !matches!(mode, TerminalFixtureMode::Selected) {
+                continue;
+            }
+            let (f, journal, lease) = terminal_fixture(mode);
+            let (_, _, e) = reservation_expected_caps(&journal);
+            let mut binding = fixture_lease_request(&lease);
             binding.expected_file = inspect_file_binding(&journal.destination, &limits()).unwrap();
-            let n = reservation_json_bytes(&binding);
-            assert!(n <= l + 1);
-            binding
-                .exclusion
-                .evidence
-                .push_str(&"x".repeat((l + 1 - n) as usize));
-            assert_eq!(reservation_json_bytes(&binding), l + 1);
-        } else {
-            record = reservation_pad_record(&journal, false, e + 1);
+            let (resource, offered, limit) = if kind == "operator" {
+                binding.operator = reservation_encoded_string("second shift ", 129);
+                ("restore accepting operator", 129, 128)
+            } else if kind == "exclusion" {
+                binding.exclusion.evidence = reservation_encoded_string("renewed exclusion ", 257);
+                ("restore accepting lease exclusion evidence", 257, 256)
+            } else {
+                ("restore accepting evidence", e + 1, e)
+            };
+            fs::remove_file(lease.path()).unwrap();
+            let current = create_offline_lease(&binding, &f.filesystem(), &limits()).unwrap();
+            let before = terminal_negative_metadata(&f, &journal);
+            let error = if kind == "evidence" {
+                let record = reservation_pad_record(&journal, false, e + 1);
+                finalize_restore(&journal, &current, &record, &f.filesystem()).unwrap_err()
+            } else {
+                reservation_call_with_operator(mode, &journal, &current, &f).unwrap_err()
+            };
+            assert!(
+                matches!(error,
+                fl_store::recovery::RecoveryError::RestoreTerminalInputQuota {
+                    resource: r, offered_bytes: o, limit_bytes: l, ..
+                } if r == resource && o == offered && l == limit),
+                "{mode:?}/{kind}: {error:?}"
+            );
+            let diagnostic = error.to_string();
+            assert!(
+                diagnostic.contains(&format!("offers {offered} encoded bytes")),
+                "{diagnostic}"
+            );
+            assert!(
+                diagnostic.contains(&format!("limit {limit} encoded bytes")),
+                "{diagnostic}"
+            );
+            assert_eq!(
+                terminal_negative_metadata(&f, &journal),
+                before,
+                "{mode:?}/{kind} over cap changed durable metadata"
+            );
+            let loaded = load_restore_journal(
+                &journal.staging.join("journal.bin"),
+                &current,
+                &f.filesystem(),
+            )
+            .unwrap();
+            assert_eq!(
+                terminal_negative_counters(&loaded),
+                terminal_negative_counters(&journal)
+            );
+            eprintln!("reservation {mode:?} {kind}+1 free refusal: {diagnostic}");
         }
-        binding.expected_file = inspect_file_binding(&journal.destination, &limits()).unwrap();
-        fs::remove_file(lease.path()).unwrap();
-        let current = create_offline_lease(&binding, &f.filesystem(), &limits()).unwrap();
-        let before = terminal_negative_metadata(&f, &journal);
-        let error = finalize_restore(&journal, &current, &record, &f.filesystem()).unwrap_err();
-        let expected_resource = match kind {
-            "operator" => "restore accepting operator",
-            "lease" => "restore accepting lease",
-            _ => "restore accepting evidence",
-        };
-        assert!(
-            matches!(error, fl_store::recovery::RecoveryError::Quota { resource, .. } if resource == expected_resource),
-            "wrong refusal for {kind}: {error:?}"
-        );
-        assert_eq!(
-            terminal_negative_metadata(&f, &journal),
-            before,
-            "{kind} over cap changed durable metadata"
-        );
-        let loaded = load_restore_journal(
-            &journal.staging.join("journal.bin"),
-            &current,
-            &f.filesystem(),
-        )
-        .unwrap();
-        assert_eq!(
-            terminal_negative_counters(&loaded),
-            terminal_negative_counters(&journal)
-        );
-        eprintln!("reservation {kind}+1 refusal without attempt/append/namespace change");
     }
 }
 
-fn reservation_retry_compatibility(historical: bool) {
+fn reservation_retry_compatibility(historical: u8) {
     use fl_store::recovery::readiness::finalize_restore;
     let (f, journal, lease) = terminal_fixture(TerminalFixtureMode::Selected);
     let cut = CutFs {
@@ -7407,8 +7423,8 @@ fn reservation_retry_compatibility(historical: bool) {
     let path = journal.staging.join("journal.bin");
     let mut intent = load_restore_journal(&path, &lease, &f.filesystem()).unwrap();
     assert_eq!(intent.phase, RestorePhase::FinalizeIntent);
-    if historical {
-        // Genuine durable intent from a pre-reservation writer: authentication,
+    if historical == 1 {
+        // Synthetic old-context compatibility fixture: authentication,
         // context digest and semantics remain valid; only the new E is exceeded.
         let mut legacy = intent.clone();
         let e = reservation_expected_caps(&intent).2;
@@ -7432,6 +7448,24 @@ fn reservation_retry_compatibility(historical: bool) {
             reservation_json_bytes(intent.reconciliation.as_ref().unwrap()),
             e + 1
         );
+    }
+    if historical == 2 {
+        // Synthetic old-context compatibility, not new writer output. A prior
+        // accepting context can have valid authority/evidence beyond new O/X.
+        let mut legacy = intent.clone();
+        let operator = reservation_encoded_string("historical accepted operator ", 129);
+        legacy.reconciliation.as_mut().unwrap().operator = operator.clone();
+        let digest = terminal_negative_digest(legacy.reconciliation.as_ref().unwrap());
+        let context = legacy.terminal_evidence_context.as_mut().unwrap();
+        context.accepting_lease.operator = operator;
+        context.accepting_lease.expected_file =
+            inspect_file_binding(&intent.destination, &limits()).unwrap();
+        context.accepting_lease.exclusion.evidence =
+            reservation_encoded_string("historical accepted exclusion ", 257);
+        context.accepting_lease_sha256 = terminal_negative_digest(&context.accepting_lease);
+        context.reconciliation_sha256 = Some(digest);
+        terminal_negative_reframe_last(&intent, &legacy);
+        intent = load_restore_journal(&path, &lease, &f.filesystem()).unwrap();
     }
     let accepted = intent.reconciliation.as_ref().unwrap().clone();
     let context = intent.terminal_evidence_context.as_ref().unwrap().clone();
@@ -7470,11 +7504,15 @@ fn reservation_retry_compatibility(historical: bool) {
 }
 #[test]
 fn restore_terminal_reservation_long_renewal_preserves_acceptance() {
-    reservation_retry_compatibility(false);
+    reservation_retry_compatibility(0);
 }
 #[test]
 fn restore_terminal_reservation_historical_large_accepted_record_retries() {
-    reservation_retry_compatibility(true);
+    reservation_retry_compatibility(1);
+}
+#[test]
+fn restore_terminal_reservation_historical_large_accepting_fields_retry() {
+    reservation_retry_compatibility(2);
 }
 #[test]
 fn restore_terminal_reservation_dependency_graph_admission() {
@@ -7517,6 +7555,10 @@ fn restore_terminal_reservation_dependency_graph_admission() {
             drop(owner);
             let (mut request, lease) = prepare_restore_bundle(&f, &f.source, bundle);
             if original {
+                // Fixed future O/X reserve needs additional frame room;
+                // this dependency-focused fixture provisions 32KiB more from
+                // the existing per-request budget (341 frame bytes).
+                request.metadata_byte_limit += 32 << 10;
                 request.original_profile.dependencies = dependencies;
             }
             request.available_dependencies = vec![DependencyResolution {
@@ -7539,8 +7581,28 @@ fn restore_terminal_reservation_dependency_graph_admission() {
                     };
                     journal = next;
                 }
+                if original {
+                    let (_, lease_cap, evidence_cap) = reservation_expected_caps(&journal);
+                    eprintln!(
+                        "original unique graph metadata={} P={} L={lease_cap} E={evidence_cap}",
+                        request.metadata_byte_limit,
+                        journal.journal_capacity / 96 - 72
+                    );
+                }
                 let mut record = generation_evidence(&journal, original);
                 record.dependencies = request.available_dependencies.clone();
+                if original {
+                    let mut maximum = record.clone();
+                    maximum.operator = "x".repeat(126);
+                    maximum.recorded_at_unix_ms = u128::MAX;
+                    maximum.affected_scopes =
+                        vec![journal.original_profile.catalog_identity.clone()];
+                    maximum.index = IndexReadiness::Degraded;
+                    eprintln!(
+                        "original unique mandatory max-O record={}",
+                        reservation_json_bytes(&maximum)
+                    );
+                }
                 let outcome = if original {
                     finalize_rollback(&journal, &lease, &record, &f.filesystem())
                 } else {
@@ -9233,5 +9295,168 @@ fn restore_completed_continuations_refuse_expiry_and_replaced_generation_without
         fs::remove_file(&candidate).unwrap();
         fs::rename(parked, candidate).unwrap();
         assert_eq!(review15_artifact_snapshot(&f, &journal), before);
+    }
+}
+
+// JSON quotes and escaping count toward both accepting-field allowances.
+fn reservation_encoded_string(prefix: &str, bytes: u64) -> String {
+    let mut value = prefix.to_owned();
+    let remaining = bytes.checked_sub(reservation_json_bytes(&value)).unwrap();
+    value.push_str(&"\u{1}".repeat((remaining / 6) as usize));
+    value.push_str(&"x".repeat((remaining % 6) as usize));
+    assert_eq!(reservation_json_bytes(&value), bytes);
+    value
+}
+fn reservation_call_with_operator(
+    mode: TerminalFixtureMode,
+    j: &RestoreJournal,
+    lease: &OfflineLease,
+    f: &Fixture,
+) -> Result<RestoreOutcome, fl_store::recovery::RecoveryError> {
+    use fl_store::recovery::readiness::*;
+    if matches!(
+        mode,
+        TerminalFixtureMode::Selected | TerminalFixtureMode::Original
+    ) {
+        let mut record = generation_evidence(j, matches!(mode, TerminalFixtureMode::Original));
+        record.operator = fixture_lease_request(lease).operator;
+        record.recorded_at_unix_ms = f.filesystem().io().unix_ms().unwrap();
+        if matches!(mode, TerminalFixtureMode::Original) {
+            finalize_rollback(j, lease, &record, &f.filesystem())
+        } else {
+            finalize_restore(j, lease, &record, &f.filesystem())
+        }
+    } else {
+        terminal_call(mode, j, lease, &f.filesystem(), false)
+    }
+}
+#[test]
+fn restore_terminal_reservation_fixed_accepting_allowances_all_modes() {
+    for mode in [
+        TerminalFixtureMode::Abandon,
+        TerminalFixtureMode::Selected,
+        TerminalFixtureMode::Original,
+        TerminalFixtureMode::Absence,
+    ] {
+        let (f, journal, lease) = terminal_fixture(mode);
+        let mut binding = fixture_lease_request(&lease);
+        binding.expected_file = inspect_file_binding(&journal.destination, &limits()).unwrap();
+        binding.operator = reservation_encoded_string("second shift operator ", 128);
+        binding.exclusion.evidence =
+            reservation_encoded_string("renewed exclusion ticket 12345 ", 256);
+        assert!(binding.operator.len() > journal.binding.operator.len());
+        assert!(
+            reservation_json_bytes(&binding.exclusion.evidence)
+                > reservation_json_bytes(&journal.binding.exclusion.evidence) + 100
+        );
+        fs::remove_file(lease.path()).unwrap();
+        let current = create_offline_lease(&binding, &f.filesystem(), &limits()).unwrap();
+        reservation_call_with_operator(mode, &journal, &current, &f)
+            .unwrap_or_else(|error| panic!("{mode:?} fixed accepting allowance: {error}"));
+        let path = journal.staging.join("journal.bin");
+        let done = load_restore_journal(&path, &current, &f.filesystem()).unwrap();
+        let context = done.terminal_evidence_context.as_ref().unwrap();
+        assert_eq!(context.accepting_lease.operator, binding.operator);
+        assert_eq!(
+            context.accepting_lease.exclusion.evidence,
+            binding.exclusion.evidence
+        );
+        let bytes = fs::read(&path).unwrap();
+        assert!(
+            journal_frame_ranges(&bytes)
+                .iter()
+                .all(|frame| (frame.end - frame.start - 72) as u64
+                    <= journal.journal_capacity / 96 - 72)
+        );
+        assert!(
+            !journal
+                .destination
+                .with_extension("fls.restore-guard")
+                .exists()
+        );
+        eprintln!("fixed accepting encoded O=128/X=256 complete {mode:?}");
+    }
+}
+
+#[test]
+fn restore_terminal_reservation_default_original_dependency_budget_refuses() {
+    use fl_store::recovery::{
+        profiles::{DependencyPolicy, ReferenceDependency},
+        readiness::{DependencyResolution, IndexReadiness},
+    };
+    for provisioned in [true, false] {
+        let f = Fixture::new();
+        let (mut request, lease) = prepare_restore(&f, &f.source);
+        // Keep the refusal away from inode/device decimal-width boundaries.
+        let catalog_identity = "reservation-dependency-".to_owned() + &"x".repeat(64);
+        request.original_profile.dependencies = vec![ReferenceDependency {
+            reference_sha256: "a".repeat(64),
+            catalog_identity: catalog_identity.clone(),
+            required_sequence: Some(17),
+            policy: DependencyPolicy::ReconcileBeforeAdmission,
+        }];
+        request.available_dependencies = vec![DependencyResolution {
+            reference_sha256: "a".repeat(64),
+            catalog_identity,
+            observed_sequence: 17,
+            evidence_sha256: "e".repeat(64),
+        }];
+        assert_eq!(request.metadata_byte_limit, 1 << 20);
+        if provisioned {
+            request.metadata_byte_limit += 32 << 10;
+            let RestoreOutcome::Installed { journal } =
+                restore_offline(&request, &lease, &f.filesystem()).unwrap()
+            else {
+                panic!("not installed")
+            };
+            let (_, _, provisioned_e) = reservation_expected_caps(&journal);
+            let mut default = journal.clone();
+            default.journal_capacity -= 32 << 10;
+            default.budget.metadata_payload_ceiling -= 32 << 10;
+            let (_, _, default_e) = reservation_expected_caps(&default);
+            let mut maximum = generation_evidence(&journal, true);
+            maximum.dependencies = request.available_dependencies.clone();
+            maximum.operator = "x".repeat(126);
+            maximum.recorded_at_unix_ms = u128::MAX;
+            maximum.affected_scopes = vec![journal.original_profile.catalog_identity.clone()];
+            maximum.index = IndexReadiness::Degraded;
+            let required = reservation_json_bytes(&maximum);
+            assert!(required <= provisioned_e);
+            assert!(
+                required >= default_e + 128,
+                "default E={default_e} required={required}"
+            );
+            let admission_o = reservation_json_bytes(&journal.binding.operator);
+            let admission_x = reservation_json_bytes(&journal.binding.exclusion.evidence);
+            let old_e = default_e + (128 - admission_o) + (256 - admission_x);
+            let old_required = required - (128 - admission_o);
+            assert!(
+                old_e >= old_required + 128,
+                "old E={old_e} required={old_required}"
+            );
+            assert!(
+                journal.budget.candidate_bytes
+                    + journal.budget.rollback_new_bytes
+                    + journal.budget.verifier_scratch_bytes
+                    + journal.budget.metadata_bytes
+                    <= journal.budget.allocation_ceiling
+            );
+            eprintln!(
+                "dependency64 oracle defaultP={} E={default_e} required={required}; oldE={old_e} oldrequired={old_required}; provisionedE={provisioned_e}",
+                default.journal_capacity / 96 - 72
+            );
+        } else {
+            let before = fs::read(&f.source).unwrap();
+            let error = restore_offline(&request, &lease, &f.filesystem()).unwrap_err();
+            assert!(
+                format!("{error:?}").contains("restore mandatory terminal evidence"),
+                "{error:?}"
+            );
+            assert_eq!(fs::read(&f.source).unwrap(), before);
+            assert!(!f.source.with_extension("fls.restore-guard").exists());
+            eprintln!(
+                "default metadata=1048576 original dependency64 refuses fixed future reservation before guard"
+            );
+        }
     }
 }

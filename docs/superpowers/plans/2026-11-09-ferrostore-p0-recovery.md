@@ -221,6 +221,8 @@ it leaves the original task checkboxes and operational gates unchanged.
 **Operational HOLD remains: no deployment, restart, live backup, restore or purge.
 Only isolated local fixture tests are in scope.**
 
+The first post-release change to the accepting operator or exclusion-evidence allowances (O128 and X256 encoded bytes) must add a persisted reservation-policy version. First acceptance from earlier branch journals is unsupported because those journals exist only in fixtures on this unmerged operational HOLD; historically accepted contexts retain their authenticated retry path.
+
 - Admission now reserves the worst-case terminal journal frame before publishing
   the guard, including both verification reports, the accepting lease, terminal
   context and reconciliation or absence evidence. Later new inputs have matching
