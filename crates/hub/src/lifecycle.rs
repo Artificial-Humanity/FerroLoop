@@ -15381,6 +15381,43 @@ mod tests {
     }
 
     #[test]
+    fn restart_launches_with_saved_model_and_effort_for_codex_and_claude() {
+        for (vendor, model) in [("codex", "gpt-6-sol"), ("claude", "claude-sonnet-5-5")] {
+            let home = TempDir::new().unwrap();
+            let _trusted = trusted_codex_home(home.path(), &std::env::current_dir().unwrap());
+            let store = MemStore::default();
+            let fake = FakeRuntime::default();
+            let env = fake.env(home.path());
+            let id = format!("{vendor}:ada");
+            spin_up(
+                &store,
+                &env,
+                &req("ada", "assistant", vendor),
+                "owner",
+                Caller::Owner,
+            )
+            .unwrap();
+            set_hosted_session_model(&store, &[&id], model, Some("high"), "owner")
+                .unwrap()
+                .unwrap();
+            fake.live.borrow_mut().clear();
+            restart_hosted_session(&store, &env, &id, "owner").unwrap();
+            let launches = fake.launches.borrow();
+            let launch = launches.last().unwrap().1.as_ref().unwrap();
+            assert!(
+                launch.argv.iter().any(|arg| arg.contains(model)),
+                "{vendor}: {:?}",
+                launch.argv
+            );
+            assert!(
+                launch.argv.iter().any(|arg| arg.contains("high")),
+                "{vendor}: {:?}",
+                launch.argv
+            );
+        }
+    }
+
+    #[test]
     fn spin_up_restart_and_remodel_read_configured_auto_approval_setting() {
         use fl_core::permissions::ReceiptClass;
 

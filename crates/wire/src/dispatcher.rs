@@ -6099,6 +6099,44 @@ fn probe_composer_ready_from_screen(
     }
 }
 
+/// Deliver a Claude slash command to its terminal only. Never fall back to the peer socket.
+pub fn deliver_to_live_claude_pane(route: &VendorRoute, text: &str) -> Result<(), String> {
+    let VendorRoute::Claude {
+        pid,
+        session_id,
+        socket_path,
+        key_path,
+    } = route
+    else {
+        return Err("not a claude route".into());
+    };
+    if *pid != 0 && !Path::new(&format!("/proc/{pid}")).exists() {
+        return Err(format!("claude pid {pid} is no longer running"));
+    }
+    let key = read_claude_key(*pid, socket_path, key_path.as_deref())
+        .ok()
+        .map(|(_, key)| key);
+    let record = read_claude_session_record(*pid, key_path.as_deref());
+    let pane = claude_live_pane(*pid, record.as_ref(), || key)
+        .or_else(|| {
+            (!session_id.trim().is_empty())
+                .then(|| session_id.trim().to_string())
+                .filter(|id| resolve_live_host_session(id).is_some())
+        })
+        .ok_or_else(|| "the claude route has no live terminal".to_string())?;
+    deliver_via_tmux_paste_with_opts(
+        &pane,
+        &sanitize_for_paste(text),
+        TmuxPasteOptions {
+            bracketed: true,
+            verify_submission: true,
+            session_id: Some(session_id.as_str()).filter(|s| !s.trim().is_empty()),
+            is_muse_route: false,
+            composer_style: ComposerStyle::Ruled,
+        },
+    )
+}
+
 pub fn dispatch_operator_prompt_to_route(
     route: &VendorRoute,
     sender_name: &str,
@@ -8154,6 +8192,26 @@ mod tests {
             socket_frames(&listener).is_none(),
             "the peer socket must receive nothing"
         );
+    }
+
+    #[test]
+    fn model_switch_claude_terminal_only_never_uses_peer_socket() {
+        let _tmux_lock = TMUX_ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let tmp = TempDir::new().unwrap();
+        let (tmux_bin, _tmux_out, tmux_stdin) = write_fake_tmux(tmp.path(), true);
+        let _env = EnvGuard::set("FL_WIRE_TMUX_BIN", &tmux_bin);
+        let (route, listener) = claude_route_with_mock_socket(tmp.path(), Some("Felicity:@12.%12"));
+        deliver_to_live_claude_pane(&route, "/model sonnet").unwrap();
+        assert_eq!(
+            fs::read_to_string(tmux_stdin).unwrap().trim(),
+            "/model sonnet"
+        );
+        assert!(socket_frames(&listener).is_none());
+        drop(listener);
+        let _ = fs::remove_file(tmp.path().join("claude-tmux.sock"));
+        let (route, listener) = claude_route_with_mock_socket(tmp.path(), None);
+        assert!(deliver_to_live_claude_pane(&route, "/model sonnet").is_err());
+        assert!(socket_frames(&listener).is_none());
     }
 
     #[test]

@@ -7111,11 +7111,9 @@ mod tests {
             state.session_model_override("ms-ada").unwrap().model,
             "gpt-6-sol"
         );
-        // The accepted `/model` command was typed into the route's own pane, exactly once.
-        let log = tmux.log();
-        assert_eq!(log.matches("paste-buffer").count(), 1, "{log}");
-        assert!(log.contains("paste-buffer -d -b"), "{log}");
-        assert!(log.contains("-t =muse:=ada"), "{log}");
+        // Muse's route is deferred without a proven terminal-only switch.
+        assert_eq!(ok.json_value().unwrap()["live"]["status"], "deferred");
+        assert_eq!(tmux.log(), "");
     }
 
     #[test]
@@ -7376,12 +7374,11 @@ mod tests {
     }
 
     #[test]
-    fn model_endpoint_validates_overrides_the_summary_and_dispatches_the_command() {
+    fn model_endpoint_validates_and_defers_unproven_webhook_delivery() {
         let tmp = TempDir::new().unwrap();
         let state = test_hub_state(&tmp);
         let socket = tmp.path().join("felicia.sock");
         install_route(tmp.path(), "felicia", webhook_route(&socket));
-        let lines = collect_webhook_lines(socket, 2);
         let url = "/api/v1/sessions/felicia/model";
 
         let unauth = handle_http_request(
@@ -7436,8 +7433,12 @@ mod tests {
                 "vendor": "webhook",
                 "model": "claude-opus-5-5",
                 "thinking_level": "high",
-                "switched": true,
-                "method": "operator-prompt",
+                "switched": false,
+                "method": "override-only",
+                "persisted": false,
+                "record_id": null,
+                "restart_applies": false,
+                "live": {"status": "deferred", "mechanism": "override-only"},
             })
         );
         let frame = frames.try_recv().unwrap();
@@ -7474,19 +7475,96 @@ mod tests {
             .find(|s| s["id"] == "webhook-felicia")
             .unwrap();
         assert_eq!(felicia["model"], "gpt-6-sol");
+    }
 
-        // The CLI got `/model <id>` once per accepted call (the trimmed id, not the raw one).
-        let delivered = lines.join().unwrap();
-        let bodies: Vec<String> = delivered
-            .iter()
-            .map(|l| {
-                serde_json::from_str::<Value>(l).unwrap()["body"]
-                    .as_str()
-                    .unwrap()
-                    .to_string()
-            })
-            .collect();
-        assert_eq!(bodies, vec!["/model claude-opus-5-5", "/model gpt-6-sol"]);
+    #[test]
+    fn model_store_open_failure_has_no_override_or_delivery() {
+        let tmp = TempDir::new().unwrap();
+        let mut state = test_hub_state(&tmp);
+        install_route(
+            tmp.path(),
+            "ada",
+            webhook_route(&tmp.path().join("ada.sock")),
+        );
+        let bad_store = tmp.path().join("store-is-a-directory");
+        fs::create_dir_all(&bad_store).unwrap();
+        state.config.store_path = bad_store;
+        let result = call(
+            &state,
+            "POST",
+            "/api/v1/sessions/ada/model",
+            OWNER,
+            &json!({"model":"new"}),
+        );
+        assert_eq!(result.status, 500);
+        assert!(state.session_model_override("webhook-ada").is_none());
+        assert!(state.session_model_override("ada").is_none());
+    }
+
+    #[test]
+    fn model_switch_by_codex_thread_id_persists_against_persona_without_dispatch() {
+        use fl_wire::identity::VendorRoute;
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        let mut body = spin_up_body("ada");
+        body["vendor"] = json!("codex");
+        assert_eq!(spin_up(&state, &body).status, 200);
+        install_route(
+            tmp.path(),
+            "ada",
+            VendorRoute::Codex {
+                thread_id: "thread-uuid-1".into(),
+                cwd: None,
+            },
+        );
+        let resp = call(
+            &state,
+            "POST",
+            "/api/v1/sessions/thread-uuid-1/model",
+            OWNER,
+            &json!({"model": "gpt-6-sol", "thinking_level": "high"}),
+        );
+        assert_eq!(resp.status, 200, "{}", error_text(&resp));
+        let result = resp.json_value().unwrap();
+        assert_eq!(result["persisted"], true);
+        assert_eq!(result["record_id"], "codex:ada");
+        assert_eq!(result["restart_applies"], true);
+        assert_eq!(result["live"]["status"], "deferred");
+        let list = call(&state, "GET", "/api/v1/hosted-sessions", OWNER, &json!({}));
+        let rec = &list.json_value().unwrap()["sessions"][0];
+        assert_eq!(rec["model"], "gpt-6-sol");
+        assert_eq!(rec["thinking_level"], "high");
+    }
+
+    #[test]
+    fn model_save_survives_failed_claude_terminal_delivery() {
+        use fl_wire::identity::VendorRoute;
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        assert_eq!(spin_up(&state, &spin_up_body("ada")).status, 200);
+        install_route(
+            tmp.path(),
+            "ada",
+            VendorRoute::Claude {
+                pid: 0,
+                session_id: "cs-ada".into(),
+                socket_path: tmp.path().join("does-not-exist"),
+                key_path: Some(tmp.path().join("missing")),
+            },
+        );
+        let resp = call(
+            &state,
+            "POST",
+            "/api/v1/sessions/ada/model",
+            OWNER,
+            &json!({"model":"sonnet"}),
+        );
+        assert_eq!(resp.status, 200, "{}", error_text(&resp));
+        let result = resp.json_value().unwrap();
+        assert_eq!(result["persisted"], true);
+        assert_eq!(result["live"]["status"], "failed");
+        let list = call(&state, "GET", "/api/v1/hosted-sessions", OWNER, &json!({}));
+        assert_eq!(list.json_value().unwrap()["sessions"][0]["model"], "sonnet");
     }
 
     fn set_model(state: &HubState, target: &str, model: &str) {
@@ -7817,8 +7895,8 @@ mod tests {
         // Clear: the override of the discovered session id goes.
         let socket = tmp.path().join("felicia.sock");
         install_route(tmp.path(), "felicia", webhook_route(&socket));
-        // The webhook takes `/model model-a`, then `/clear`.
-        let lines = collect_webhook_lines(socket, 2);
+        // Only `/clear` is dispatched to the webhook.
+        let lines = collect_webhook_lines(socket, 1);
         set_model(&state, "felicia", "model-a");
         assert!(state.session_model_override("webhook-felicia").is_some());
         let cleared = call(
@@ -7895,7 +7973,9 @@ mod tests {
             assert_eq!(body["method"], "override-only", "{target}");
             assert_eq!(body["session_id"], session);
             assert_eq!(body["vendor"], vendor);
-            assert_eq!(body["switched"], true);
+            assert_eq!(body["switched"], false);
+            assert_eq!(body["live"]["status"], "deferred");
+            assert_eq!(body["persisted"], false);
             assert_eq!(
                 state.session_model_override(session).unwrap().model,
                 "gemini-4-argon"
