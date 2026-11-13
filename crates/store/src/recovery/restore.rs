@@ -1878,6 +1878,12 @@ pub fn resume_restore(
             required_action,
         ));
     }
+    if j.phase == RestorePhase::OriginalAbsenceRestored {
+        // This rollback is complete. Reinstalling its retained candidate requires
+        // a new operation, even though its layout also looks prepared.
+        continuation_limits(&j, lease, filesystem, &lock)?;
+        return Ok(RestoreOutcome::OriginalAbsenceRestored { journal: j });
+    }
     inspect_phase_layout(&j, filesystem.reconciliation_limits())?;
     let (l, control) = attempt(&mut j, lease, filesystem, false)?;
     let (dest, candidate, original) = inspect_layout(&j, &l)?;

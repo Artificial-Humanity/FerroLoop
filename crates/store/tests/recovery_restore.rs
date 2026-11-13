@@ -6217,3 +6217,130 @@ fn restore_forensic_admitted_abandon_refuses_changed_original_binding_without_at
         );
     }
 }
+
+#[derive(Debug, PartialEq, Eq)]
+struct AbsenceResumeSnapshot {
+    metadata: [Vec<u8>; 3],
+    identities: Vec<(u64, u64)>,
+    candidate_sha256: String,
+}
+fn absence_resume_snapshot(f: &Fixture, j: &RestoreJournal) -> AbsenceResumeSnapshot {
+    let candidate = j.staging.join("candidate.fls");
+    let paths = [
+        j.staging.join("journal.bin"),
+        j.destination.with_extension("fls.restore-guard"),
+        f.backups
+            .join(".catalog/restore-pins")
+            .join(format!("{}.json", j.operation_id)),
+        candidate.clone(),
+    ];
+    AbsenceResumeSnapshot {
+        metadata: terminal_negative_metadata(f, j),
+        identities: paths
+            .iter()
+            .map(|path| {
+                let metadata = fs::metadata(path).unwrap();
+                (metadata.dev(), metadata.ino())
+            })
+            .collect(),
+        candidate_sha256: format!("{:x}", sha2::Sha256::digest(fs::read(candidate).unwrap())),
+    }
+}
+#[derive(Default)]
+struct AbsenceResumeIo {
+    now: Option<u128>,
+    events: Mutex<Vec<RecoveryEvent>>,
+}
+impl RecoveryIo for AbsenceResumeIo {
+    fn unix_ms(&self) -> std::io::Result<u128> {
+        match self.now {
+            Some(now) => Ok(now),
+            None => fl_store::recovery::fs::NativeRecoveryIo.unix_ms(),
+        }
+    }
+    fn before(&self, event: RecoveryEvent) -> std::io::Result<()> {
+        self.events.lock().unwrap().push(event);
+        Ok(())
+    }
+}
+fn assert_absence_resume_read_only(io: &AbsenceResumeIo) {
+    let events = io.events.lock().unwrap();
+    assert!(
+        events.iter().all(|event| matches!(
+            event,
+            RecoveryEvent::OpenFile
+                | RecoveryEvent::LockFile
+                | RecoveryEvent::RestoreOperationLock
+                | RecoveryEvent::RestoreOperationLockWait
+                | RecoveryEvent::CatalogLock
+                | RecoveryEvent::CatalogLockWait
+        )),
+        "resume performed a mutation: {events:?}"
+    );
+}
+#[test]
+fn restore_absence_resume_keeps_completed_rollback_unchanged() {
+    let (f, journal, lease) = terminal_fixture(TerminalFixtureMode::Absence);
+    assert_eq!(journal.phase, RestorePhase::OriginalAbsenceRestored);
+    assert!(!journal.destination.exists());
+    let before = absence_resume_snapshot(&f, &journal);
+    assert_eq!(before.candidate_sha256, journal.candidate_sha256);
+    let io = Arc::new(AbsenceResumeIo::default());
+    let filesystem = CutFs {
+        f: &f,
+        io: io.clone(),
+        limits: limits(),
+    };
+    let outcome = resume_restore(&journal, &lease, &filesystem).unwrap();
+    let RestoreOutcome::OriginalAbsenceRestored { journal: resumed } = outcome else {
+        panic!("resume reinstalled a completed absent-original rollback: {outcome:?}")
+    };
+    assert_eq!(resumed.phase, RestorePhase::OriginalAbsenceRestored);
+    assert_eq!(
+        serde_json::to_value(&resumed).unwrap(),
+        serde_json::to_value(&journal).unwrap()
+    );
+    assert!(!journal.destination.exists());
+    assert_eq!(absence_resume_snapshot(&f, &journal), before);
+    assert_absence_resume_read_only(&io);
+}
+#[test]
+fn restore_absence_resume_refuses_expired_authority_without_mutation() {
+    let (f, journal, lease) = terminal_fixture(TerminalFixtureMode::Absence);
+    let before = absence_resume_snapshot(&f, &journal);
+    let io = Arc::new(AbsenceResumeIo {
+        now: Some(journal.binding.expires_at_unix_ms + 1),
+        ..Default::default()
+    });
+    let filesystem = CutFs {
+        f: &f,
+        io: io.clone(),
+        limits: limits(),
+    };
+    assert!(resume_restore(&journal, &lease, &filesystem).is_err());
+    assert!(!journal.destination.exists());
+    assert_eq!(absence_resume_snapshot(&f, &journal), before);
+    assert_absence_resume_read_only(&io);
+}
+#[test]
+fn restore_absence_resume_refuses_changed_layout_without_mutation() {
+    let (f, journal, lease) = terminal_fixture(TerminalFixtureMode::Absence);
+    let candidate = journal.staging.join("candidate.fls");
+    let before = absence_resume_snapshot(&f, &journal);
+    let parked = journal.staging.join("unexpected-candidate.fls");
+    fs::rename(&candidate, &parked).unwrap();
+    let metadata_before = terminal_negative_metadata(&f, &journal);
+    let io = Arc::new(AbsenceResumeIo::default());
+    let filesystem = CutFs {
+        f: &f,
+        io: io.clone(),
+        limits: limits(),
+    };
+    assert!(resume_restore(&journal, &lease, &filesystem).is_err());
+    assert!(!journal.destination.exists());
+    assert!(!candidate.exists());
+    assert_eq!(terminal_negative_metadata(&f, &journal), metadata_before);
+    assert_absence_resume_read_only(&io);
+    fs::rename(&parked, &candidate).unwrap();
+    assert_eq!(absence_resume_snapshot(&f, &journal), before);
+}
