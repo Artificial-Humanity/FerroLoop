@@ -949,6 +949,7 @@ impl HubState {
         let Some(queue) = guard.queues.get_mut(session_key) else {
             return Vec::new();
         };
+        let mut finished_ok = false;
         if let Some(pos) = queue
             .iter()
             .position(|q| q.id == prompt_id && q.delivery_state == QueuedDeliveryState::Sending)
@@ -956,6 +957,7 @@ impl HubState {
             match result {
                 Ok(()) => {
                     queue.remove(pos);
+                    finished_ok = true;
                 }
                 Err(fl_wire::dispatcher::PushError::NotConnected(error)) => {
                     queue[pos].delivery_state = QueuedDeliveryState::Pending;
@@ -984,6 +986,9 @@ impl HubState {
                     .is_some_and(is_composer_occupied_error)
         });
         let out = queue.clone();
+        if finished_ok {
+            guard.composer_hold_probes.remove(prompt_id);
+        }
         if composer_held {
             guard
                 .composer_hold_probes
@@ -991,6 +996,16 @@ impl HubState {
                 .or_insert((0, stamp::now().unix_millis() as i64));
         }
         out
+    }
+
+    /// Reset the bounded re-probe budget for a composer-held prompt; used when an
+    /// owner action (Send-now) arms a new hold, mirroring wire's
+    /// `reset_composer_occupied_reprobe`.
+    pub(crate) fn reset_composer_hold_probe(&self, prompt_id: &str, now_ms: i64) {
+        let mut guard = self.prompt_queues.lock().unwrap_or_else(|e| e.into_inner());
+        guard
+            .composer_hold_probes
+            .insert(prompt_id.to_string(), (0, now_ms));
     }
 
     /// Whether `prompt_id` in `session_key`'s queue is a retryable composer-occupied hold.
@@ -1113,6 +1128,7 @@ impl HubState {
         })?;
         let item = queue.remove(pos);
         let remaining = queue.clone();
+        guard.composer_hold_probes.remove(prompt_id);
         if item.delivery_state == QueuedDeliveryState::Unconfirmed {
             // Only unwind-owned fences carry queue aliases. Do not clear a later direct
             // dispatch's unrelated unknown fence, or another alias's unresolved item.
@@ -1750,6 +1766,46 @@ mod tests {
         let queue = state.finish_queued_prompt("ada", &item.id, Ok(()));
         claim2.finish();
         assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn composer_hold_probes_cleaned_on_remove_and_reset_on_owner_rearm() {
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        let (item, _) = state.enqueue_session_prompt(
+            "ada",
+            None,
+            "hello".into(),
+            "hello".into(),
+            "owner".into(),
+            vec![],
+        );
+        let (_c, claim) = state
+            .claim_queued_for_dispatch("ada", "ada", &item.id, false)
+            .unwrap();
+        state.finish_queued_prompt(
+            "ada",
+            &item.id,
+            Err(fl_wire::dispatcher::PushError::Failed(
+                "composer_occupied_by_non_wire_input: busy".into(),
+            )),
+        );
+        claim.finish();
+        let now_ms = stamp::now().unix_millis() as i64;
+        for _ in 0..COMPOSER_HELD_MAX_PROBES {
+            assert!(state.note_composer_hold_probe(&item.id, now_ms).is_some());
+        }
+        assert!(state.note_composer_hold_probe(&item.id, now_ms).is_none());
+        // Owner re-arm resets the exhausted budget.
+        state.reset_composer_hold_probe(&item.id, now_ms);
+        assert!(state.composer_hold_probe_due(&item.id, now_ms));
+        assert!(state.note_composer_hold_probe(&item.id, now_ms).is_some());
+        // Removing the prompt drops its probe entry (due again as a fresh prompt).
+        state.remove_queued_prompt("ada", &item.id).unwrap();
+        {
+            let guard = state.prompt_queues.lock().unwrap();
+            assert!(!guard.composer_hold_probes.contains_key(&item.id));
+        }
     }
 
     #[test]

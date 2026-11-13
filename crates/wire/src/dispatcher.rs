@@ -4484,37 +4484,91 @@ fn lines_have_strong_dialog_markers(candidate_lines: &[&str]) -> bool {
 }
 
 /// Dialog check for regions outside a located composer box (the single-rule footer and the
-/// ruleless tail below the last output marker). Weak markers count only when they form a
-/// dialog block at the very bottom of the region: a question plus paired choices whose last
-/// non-empty line is a choice, as a live menu renders. An agent reply that ends with a
-/// question, or lists options above an empty composer, is prose, not a dialog.
+/// ruleless tail below the last output marker). Once the region is restricted to below the
+/// last output marker or below the single rule, weak markers fail closed: a question plus
+/// paired `1. `/`2. ` choices is a dialog regardless of trailing lines (further choices or
+/// nav/confirm hints), and paired choices plus a nav/confirm hint is a dialog even without
+/// the question. Prose above a retained empty composer is handled separately and exempt.
 fn lines_have_dialog_markers_in_tail(candidate_lines: &[&str]) -> bool {
     if lines_have_strong_dialog_markers(candidate_lines) {
         return true;
     }
     let mut saw_question = false;
     let mut saw_choice_1 = false;
-    let mut saw_choice_2 = false;
+    let mut saw_choice_2_or_more = false;
+    let mut saw_nav_hint = false;
     for &line in candidate_lines {
         let trimmed = line.trim_start();
-        if trimmed.to_ascii_lowercase().contains("do you want") {
+        let lower = trimmed.to_ascii_lowercase();
+        if lower.contains("do you want") {
             saw_question = true;
         }
         if starts_with_numbered_choice(trimmed, "1. ") {
             saw_choice_1 = true;
         }
-        if starts_with_numbered_choice(trimmed, "2. ") {
-            saw_choice_2 = true;
+        if starts_with_numbered_choice(trimmed, "2. ")
+            || starts_with_numbered_choice(trimmed, "3. ")
+            || starts_with_numbered_choice(trimmed, "4. ")
+            || starts_with_numbered_choice(trimmed, "5. ")
+        {
+            saw_choice_2_or_more = true;
+        }
+        if lower.contains("to navigate")
+            || lower.contains("to confirm")
+            || lower.contains("enter to confirm")
+            || lower.contains("enter to select")
+        {
+            saw_nav_hint = true;
         }
     }
-    if !(saw_question && saw_choice_1 && saw_choice_2) {
-        return false;
+    saw_choice_1 && saw_choice_2_or_more && (saw_question || saw_nav_hint)
+}
+
+/// Weak dialog above a retained empty composer: a question that precedes paired choices
+/// (dialog order), as opposed to reply prose that lists options and then asks a question.
+fn lines_have_weak_dialog_before_empty_prompt(candidate_lines: &[&str]) -> bool {
+    if lines_have_strong_dialog_markers(candidate_lines) {
+        // A selector choice is a live dialog even above a retained prompt; other strong
+        // markers in scrollback are handled by the caller exemption, so require the
+        // selector form here via the ordered weak check below as well.
+        let has_selector_choice = candidate_lines.iter().any(|line| {
+            let trimmed = line.trim_start();
+            trimmed
+                .strip_prefix('❯')
+                .or_else(|| trimmed.strip_prefix('›'))
+                .or_else(|| trimmed.strip_prefix('>'))
+                .is_some_and(|rest| rest.trim_start().starts_with("1."))
+        });
+        if has_selector_choice {
+            return true;
+        }
     }
-    candidate_lines
-        .iter()
-        .rev()
-        .find(|l| !l.trim().is_empty())
-        .is_some_and(|last| starts_with_numbered_choice(last.trim_start(), "2. "))
+    let mut question_idx: Option<usize> = None;
+    let mut saw_choice_1_after = false;
+    let mut saw_choice_2_after = false;
+    let mut saw_nav_hint = false;
+    for (idx, &line) in candidate_lines.iter().enumerate() {
+        let trimmed = line.trim_start();
+        let lower = trimmed.to_ascii_lowercase();
+        if lower.contains("do you want") && question_idx.is_none() {
+            question_idx = Some(idx);
+        }
+        if lower.contains("to navigate") || lower.contains("to confirm") {
+            saw_nav_hint = true;
+        }
+        if question_idx.is_some_and(|q| idx > q) {
+            if starts_with_numbered_choice(trimmed, "1. ") {
+                saw_choice_1_after = true;
+            }
+            if starts_with_numbered_choice(trimmed, "2. ")
+                || starts_with_numbered_choice(trimmed, "3. ")
+            {
+                saw_choice_2_after = true;
+            }
+        }
+    }
+    (saw_choice_1_after && saw_choice_2_after)
+        || (saw_nav_hint && saw_choice_1_after && saw_choice_2_after)
 }
 
 /// Index of a trailing empty composer prompt (`❯`/`›`/`>` with nothing after it) at the
@@ -4645,10 +4699,11 @@ fn screen_has_dialog_or_menu_markers_with_context(
         }
         return lines_have_dialog_markers_in_tail(&after[after.len().saturating_sub(12)..]);
     }
-    // No composer box could be located. An empty composer at the bottom means no dialog
-    // is active: everything above it is reply prose, however it is phrased.
+    // No composer box could be located. An empty composer at the bottom exempts reply
+    // prose above it, but a dialog in dialog order (question before paired choices)
+    // above a retained empty prompt is still a live dialog and fails closed.
     if let Some(prompt_idx) = empty_composer_prompt_index(&lines) {
-        return lines_have_dialog_markers_in_tail(&lines[prompt_idx..]);
+        return lines_have_weak_dialog_before_empty_prompt(&lines[..prompt_idx]);
     }
     let tail_start = lines
         .iter()
@@ -14645,6 +14700,20 @@ exit 1"#,
         let ruleless_dialog =
             "⏺ Tool call pending\nDo you want to allow always?\n› 1. Yes\n  2. No";
         assert!(screen_has_dialog_or_menu_markers(ruleless_dialog));
+        // Weak 3-choice dialog with trailing nav hint and no strong markers fails closed.
+        let weak_three_choice = "⏺ Tool call pending\nDo you want to proceed?\n  1. Yes\n  2. No\n  3. Maybe later\n  ↑↓ to navigate • Enter to confirm";
+        assert!(
+            screen_has_dialog_or_menu_markers(weak_three_choice),
+            "weak 3-choice dialog with trailing hint must be a dialog:\n{weak_three_choice}"
+        );
+        // Same weak dialog above a retained empty prompt is not dismissed as prose.
+        let weak_above_prompt = "Do you want to proceed?\n  1. Yes\n  2. No\n  3. Maybe later\n  ↑↓ to navigate • Enter to confirm\n❯ ";
+        assert!(screen_has_dialog_or_menu_markers(weak_above_prompt));
+        // Single-rule footer variant with trailing hint.
+        let single_rule_weak = format!(
+            "⏺ Ready\n{rule}\nDo you want to proceed?\n  1. Yes\n  2. No\n  3. Maybe later\n  ↑↓ to navigate • Enter to confirm\n  footer line\n  another footer\n  more footer\n  still footer\n  footer five\n  footer six\n  footer seven\n  footer eight"
+        );
+        assert!(screen_has_dialog_or_menu_markers(&single_rule_weak));
     }
 
     #[test]

@@ -2490,17 +2490,16 @@ where
                                 None,
                             );
                         }
-                        // A remodel/vendor change (an explicit `--replace` registration, or a
-                        // different vendor) creates a new route identity: the retained fence
-                        // belonged to the old route and must be released after publication.
-                        // A passive same-vendor re-registration keeps the fence, since the
-                        // unconfirmed delivery may have reached that same session.
+                        // Any route-identity change (explicit `--replace`, a different
+                        // vendor, or a new session identity on the same vendor) creates a
+                        // new route identity when the new entry won registration: the
+                        // retained fence belonged to the old route and must be released
+                        // after publication. A passive same-identity re-registration
+                        // keeps the fence, since the unconfirmed delivery may have
+                        // reached that same session.
                         if let Some(new_entry) = routes.get(&norm)
                             && let Some(old_entry) = before.entries.get(&norm)
                             && route_identity_changed(&old_entry.route, &new_entry.route)
-                            && (replace
-                                || old_entry.route.canonical_vendor()
-                                    != new_entry.route.canonical_vendor())
                         {
                             fence_release = true;
                         }
@@ -4139,6 +4138,45 @@ mod tests {
                 }
             }
             assert_eq!(received, vec![first_id, second_id]);
+        });
+    }
+
+    #[test]
+    fn same_vendor_new_session_without_replace_releases_fence() {
+        let (_tmp, inner) = fault_rig();
+        lock(&inner.store.writes).push_back(Fault::Error);
+        with_transport(Ok(()), || {
+            let _first = run_fault_job(&inner, "held");
+            assert!(lock(&inner.overflow_recipients).contains("held"));
+            // Same-identity passive re-registration keeps the fence.
+            let (response, _) = inner.handle_local_request(LocalRequest::register(
+                "held",
+                VendorRoute::Codex {
+                    thread_id: "SESSION_SECRET".into(),
+                    cwd: Some("/CWD_SECRET".into()),
+                },
+                false,
+            ));
+            assert!(matches!(response, LocalResponse::RouteRegistered));
+            assert!(
+                lock(&inner.overflow_recipients).contains("held"),
+                "same-identity passive re-registration must keep the fence"
+            );
+            // Same vendor, new session identity, no --replace: identity changed and
+            // the new entry won registration, so the old fence must be released.
+            let (response, _) = inner.handle_local_request(LocalRequest::register(
+                "held",
+                VendorRoute::Codex {
+                    thread_id: "new-session".into(),
+                    cwd: None,
+                },
+                false,
+            ));
+            assert!(matches!(response, LocalResponse::RouteRegistered));
+            assert!(
+                !lock(&inner.overflow_recipients).contains("held"),
+                "same-vendor new-session registration must release the old fence"
+            );
         });
     }
 
