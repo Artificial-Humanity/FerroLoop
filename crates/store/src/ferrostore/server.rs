@@ -2535,6 +2535,8 @@ impl RecoverySocket {
         }
     }
     fn connect(path: &Path, deadline: Instant) -> std::io::Result<Self> {
+        #[cfg(feature = "wire-test-isolation")]
+        crate::test_isolation::validate_unix(path)?;
         use std::os::{
             fd::{AsRawFd, FromRawFd},
             unix::ffi::OsStrExt,
@@ -3879,5 +3881,42 @@ mod recovery_deadline_tests {
                 assert!(matches!(outcome, Err(OwnerCallError::OutcomeUnknown)));
             }
         }
+    }
+}
+
+#[cfg(all(test, feature = "wire-test-isolation"))]
+mod recovery_test_isolation {
+    #[test]
+    fn recovery_socket_refuses_unregistered_path_before_connect() {
+        const CHILD: &str = "FL_STORE_RECOVERY_ISOLATION_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "ferrostore::server::recovery_test_isolation::recovery_socket_refuses_unregistered_path_before_connect", "--test-threads=1"])
+                .env(CHILD, "1").output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        fn deny_unix(_: &std::path::Path) -> std::io::Result<()> {
+            Err(std::io::ErrorKind::PermissionDenied.into())
+        }
+        fn deny_tcp(_: &str) -> std::io::Result<()> {
+            Err(std::io::ErrorKind::PermissionDenied.into())
+        }
+        crate::test_isolation::install(deny_unix, deny_tcp);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fixture.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let error = match super::RecoverySocket::connect(
+            &path,
+            std::time::Instant::now() + std::time::Duration::from_secs(1),
+        ) {
+            Ok(_) => panic!("unregistered recovery socket connected"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
     }
 }
