@@ -1208,7 +1208,7 @@ mod read_tests {
 
     #[test]
     fn oversized_parsed_json_still_refuses_before_owned_decode() {
-        let root = tempfile::tempdir().unwrap();
+        let root = super::super::test_support::fixture_root();
         std::fs::set_permissions(
             root.path(),
             std::os::unix::fs::PermissionsExt::from_mode(0o700),

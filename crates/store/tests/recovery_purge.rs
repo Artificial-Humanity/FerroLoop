@@ -2681,3 +2681,156 @@ fn purge_review14_metadata_diagnostics_name_only_root_relative_entries() {
         );
     }
 }
+
+// Bind every publication interval to its lexical row and bytes, so the initial
+// intent re-sync cannot stand in for a later member or final completion sync.
+#[test]
+fn purge_every_named_audit_row_is_file_and_catalog_synced_before_next_action() {
+    use fl_store::recovery::fs::Member;
+    use std::{os::unix::fs::MetadataExt, sync::Mutex};
+    type Row = (String, (u64, u64), serde_json::Value);
+    struct RowTrace {
+        catalog: std::path::PathBuf,
+        prefix: String,
+        events: Mutex<Vec<(RecoveryEvent, Option<Row>)>>,
+    }
+    impl RecoveryIo for RowTrace {
+        fn before(&self, event: RecoveryEvent) -> std::io::Result<()> {
+            let mut events = self.events.lock().unwrap();
+            let row = if event == RecoveryEvent::RenameEntry {
+                let temps: Vec<_> = fs::read_dir(&self.catalog)?
+                    .map(|e| e.map(|e| e.path()))
+                    .collect::<Result<Vec<_>, _>>()?
+                    .into_iter()
+                    .filter(|p| {
+                        let name = p.file_name().unwrap().to_string_lossy();
+                        name.starts_with(&self.prefix) && name.ends_with(".json.tmp")
+                    })
+                    .collect();
+                assert_eq!(temps.len(), 1, "one audit row must own each rename");
+                let path = &temps[0];
+                let name = path
+                    .file_name()
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .strip_suffix(".tmp")
+                    .unwrap()
+                    .to_owned();
+                let m = fs::metadata(path)?;
+                Some((
+                    name,
+                    (m.dev(), m.ino()),
+                    serde_json::from_slice(&fs::read(path)?)?,
+                ))
+            } else if event == RecoveryEvent::Sync(Directory::CatalogParent) {
+                if let Some((_, Some((name, identity, value)))) = events
+                    .iter()
+                    .rev()
+                    .find(|(e, _)| *e == RecoveryEvent::RenameEntry)
+                {
+                    let path = self.catalog.join(name);
+                    let m = fs::metadata(&path)?;
+                    assert_eq!(
+                        (m.dev(), m.ino()),
+                        *identity,
+                        "sync must cover renamed inode"
+                    );
+                    assert_eq!(
+                        serde_json::from_slice::<serde_json::Value>(&fs::read(path)?)?,
+                        *value
+                    );
+                    assert!(!self.catalog.join(format!("{name}.tmp")).exists());
+                    Some((name.clone(), *identity, value.clone()))
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            events.push((event, row));
+            Ok(())
+        }
+    }
+    let f = empty_fixture();
+    let (op, lease) = quarantined(&f);
+    let report = purge_quarantined(&inspection(op), &lease, &f.filesystem(), &limits()).unwrap();
+    let trace = Arc::new(RowTrace {
+        catalog: f.backups.join(".catalog"),
+        prefix: format!("purge-{op}."),
+        events: Mutex::new(Vec::new()),
+    });
+    let done = purge_quarantined(
+        &confirmation(&report),
+        &lease,
+        &HookFs {
+            f: &f,
+            io: trace.clone(),
+            limits: limits(),
+        },
+        &limits(),
+    )
+    .unwrap();
+    assert!(done.complete && done.audit_durable);
+    // This snapshot is taken after return: the last interval must contain the
+    // final completion's sync even though no later unlink can bound it.
+    let events = trace.events.lock().unwrap();
+    let renames: Vec<_> = events
+        .iter()
+        .enumerate()
+        .filter(|(_, (e, _))| *e == RecoveryEvent::RenameEntry)
+        .collect();
+    assert_eq!(renames.len(), report.members.len() + 2);
+    for (row_index, (at, (_, row))) in renames.iter().enumerate() {
+        let (name, identity, value) = row.as_ref().unwrap();
+        let expected_name = if row_index == 0 {
+            format!("purge-{op}.intent.json")
+        } else if row_index == report.members.len() + 1 {
+            format!("purge-{op}.complete.json")
+        } else {
+            format!("purge-{op}.member-{}.json", row_index - 1)
+        };
+        assert_eq!(*name, expected_name);
+        assert_eq!(value["operation_id"], op.to_string());
+        if row_index == 0 {
+            assert_eq!(
+                value["members"].as_array().unwrap().len(),
+                report.members.len()
+            );
+        } else if row_index == report.members.len() + 1 {
+            assert!(
+                value["member_index"].is_null(),
+                "final completion row required"
+            );
+        } else {
+            assert_eq!(value["member_index"], row_index - 1);
+        }
+        let write = events[..*at]
+            .iter()
+            .rposition(|(e, _)| *e == RecoveryEvent::Write(Member::PurgeAudit))
+            .unwrap();
+        assert!(
+            events[write + 1..*at]
+                .iter()
+                .any(|(e, _)| *e == RecoveryEvent::Flush(Member::PurgeAudit)),
+            "audit row {name} renamed before its own temporary file sync"
+        );
+        let end = events[*at + 1..]
+            .iter()
+            .position(|(e, _)| {
+                matches!(
+                    e,
+                    RecoveryEvent::PurgeUnlink | RecoveryEvent::Write(Member::PurgeAudit)
+                )
+            })
+            .map_or(events.len(), |offset| *at + 1 + offset);
+        assert!(
+            events[*at + 1..end].iter().any(|(e, row)| *e
+                == RecoveryEvent::Sync(Directory::CatalogParent)
+                && row
+                    .as_ref()
+                    .is_some_and(|(n, i, v)| n == name && i == identity && v == value)),
+            "audit row {name} renamed without its catalog sync before next unlink/publication/return"
+        );
+    }
+}

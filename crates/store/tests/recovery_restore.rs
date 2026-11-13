@@ -9554,3 +9554,169 @@ fn restore_terminal_reservation_default_original_dependency_budget_refuses() {
         }
     }
 }
+
+struct CorruptUnpublishedPinWrite {
+    armed: AtomicBool,
+    corrupted: Mutex<Option<Vec<u8>>>,
+}
+impl RecoveryIo for CorruptUnpublishedPinWrite {
+    fn before(&self, event: RecoveryEvent) -> std::io::Result<()> {
+        if event == RecoveryEvent::Write(Member::RestorePin) {
+            self.armed.store(true, Ordering::Release);
+        }
+        Ok(())
+    }
+    fn write_at(&self, file: &fs::File, bytes: &[u8], offset: u64) -> std::io::Result<usize> {
+        use std::os::unix::fs::FileExt;
+        if self.armed.swap(false, Ordering::AcqRel) {
+            let mut corrupted = bytes.to_vec();
+            corrupted[0] ^= 0x20;
+            *self.corrupted.lock().unwrap() = Some(corrupted.clone());
+            file.write_at(&corrupted, offset)
+        } else {
+            file.write_at(bytes, offset)
+        }
+    }
+}
+#[test]
+fn restore_pin_publication_checks_actual_temp_hash_before_publish() {
+    let f = Fixture::new();
+    let (request, lease) = prepare_restore(&f, &f.source);
+    let source_before = fs::read(&f.source).unwrap();
+    let manifest = request.selected_bundle.path().join("manifest.json");
+    let manifest_before = fs::read(&manifest).unwrap();
+    let hook = Arc::new(CorruptUnpublishedPinWrite {
+        armed: AtomicBool::new(false),
+        corrupted: Mutex::new(None),
+    });
+    let error = restore_offline(
+        &request,
+        &lease,
+        &CutFs {
+            f: &f,
+            io: hook.clone(),
+            limits: limits(),
+        },
+    )
+    .unwrap_err();
+    let fl_store::recovery::RecoveryError::RestoreAdmissionArtifactsRetained { staging, .. } =
+        error
+    else {
+        panic!(
+            "corrupt private pin must refuse before publication with retained artifacts: {error:?}"
+        )
+    };
+    let corrupted = hook
+        .corrupted
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("pin corruption hook fired");
+    let pins = f.backups.join(".catalog/restore-pins");
+    assert!(
+        !pins.join(format!("{}.json", request.operation_id)).exists(),
+        "corrupt private pin must never acquire the final published name"
+    );
+    let temporary = pins.join(format!("{}.json.tmp", request.operation_id));
+    assert_eq!(
+        fs::read(&temporary).unwrap(),
+        corrupted,
+        "retain exact corrupted unpublished bytes"
+    );
+    assert!(staging.join("journal.bin").is_file());
+    assert!(staging.join("journal.bin.lock").is_file());
+    assert!(!f.source.with_extension("fls.restore-guard").exists());
+    assert_eq!(fs::read(&f.source).unwrap(), source_before);
+    assert_eq!(fs::read(&manifest).unwrap(), manifest_before);
+}
+
+#[test]
+fn restore_initial_lease_cap_stops_frozen_wall_clock_namespace_stall() {
+    struct FrozenStall {
+        now: u128,
+        destination: std::path::PathBuf,
+        before_layout: Mutex<Option<(std::path::PathBuf, RestoreExpiryLayout)>>,
+        stalled: AtomicBool,
+        later_actions: AtomicUsize,
+    }
+    impl RecoveryIo for FrozenStall {
+        fn unix_ms(&self) -> std::io::Result<u128> {
+            Ok(self.now)
+        }
+        fn before(&self, event: RecoveryEvent) -> std::io::Result<()> {
+            if matches!(
+                event,
+                RecoveryEvent::RestoreInstall | RecoveryEvent::RestoreRelocate
+            ) {
+                if self.stalled.swap(true, Ordering::AcqRel) {
+                    self.later_actions.fetch_add(1, Ordering::AcqRel);
+                } else {
+                    let guard: serde_json::Value = serde_json::from_slice(&fs::read(
+                        self.destination.with_extension("fls.restore-guard"),
+                    )?)?;
+                    let staging = std::path::Path::new(guard["journal"].as_str().unwrap())
+                        .parent()
+                        .unwrap()
+                        .to_path_buf();
+                    *self.before_layout.lock().unwrap() = Some((
+                        staging.clone(),
+                        restore_expiry_layout(&self.destination, &staging),
+                    ));
+                    std::thread::sleep(std::time::Duration::from_secs(6));
+                }
+            }
+            Ok(())
+        }
+    }
+    let f = Fixture::new();
+    let (request, lease) = prepare_restore(&f, &f.source);
+    let before = fs::read(&f.source).unwrap();
+    let before_identity = fs::metadata(&f.source).unwrap();
+    let binding = fixture_lease_request(&lease);
+    let hook = Arc::new(FrozenStall {
+        now: binding.expires_at_unix_ms - 4000,
+        destination: f.source.clone(),
+        before_layout: Mutex::new(None),
+        stalled: AtomicBool::new(false),
+        later_actions: AtomicUsize::new(0),
+    });
+    let result = restore_offline(
+        &request,
+        &lease,
+        &CutFs {
+            f: &f,
+            io: hook.clone(),
+            limits: limits(),
+        },
+    );
+    // A slow runner may legitimately exhaust the cap before the action seam.
+    // In either case the namespace must remain untouched. Without the initial
+    // cap the frozen wall clock permits the install and this assertion fails.
+    let after_identity = fs::metadata(&f.source).unwrap();
+    assert_eq!(
+        (after_identity.dev(), after_identity.ino()),
+        (before_identity.dev(), before_identity.ino()),
+        "initial monotonic cap must prevent namespace replacement under frozen wall clock"
+    );
+    assert_eq!(
+        sha2::Sha256::digest(fs::read(&f.source).unwrap()),
+        sha2::Sha256::digest(&before),
+        "initial monotonic cap must preserve source bytes"
+    );
+    if let Some((staging, layout)) = hook.before_layout.lock().unwrap().as_ref() {
+        assert_eq!(
+            restore_expiry_layout(&f.source, staging),
+            *layout,
+            "initial monotonic cap must stop namespace action after real-time stall"
+        );
+    }
+    assert_eq!(hook.later_actions.load(Ordering::Acquire), 0);
+    assert!(
+        result.is_err(),
+        "initial monotonic cap must refuse expired real-time authority: {result:?}"
+    );
+    eprintln!(
+        "frozen_wall_stall_reached={} namespace_preserved=true",
+        hook.stalled.load(Ordering::Acquire)
+    );
+}
