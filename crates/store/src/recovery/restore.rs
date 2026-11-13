@@ -834,6 +834,18 @@ pub fn restore_offline(
         log_frames: 0,
     };
     check_terminal_reservation(&journal, &l)?;
+    terminal_input_quota(
+        &l,
+        accepting_string_bytes(&lease.request.operator, &l)?,
+        ACCEPTING_OPERATOR_ENCODED_MAX,
+        "restore accepting operator",
+    )?;
+    terminal_input_quota(
+        &l,
+        accepting_string_bytes(&lease.request.exclusion.evidence, &l)?,
+        ACCEPTING_EXCLUSION_EVIDENCE_ENCODED_MAX,
+        "restore accepting lease exclusion evidence",
+    )?;
     drop(_catalog_access);
     let mut admission_staging_identity = None;
     let mut admission_lock_identity = None;

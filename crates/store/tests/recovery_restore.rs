@@ -7395,6 +7395,133 @@ fn reservation_refuses_without_artifacts(
     );
     error
 }
+fn admission_scalar_refuses_without_artifacts(
+    f: &Fixture,
+    request: &RestoreRequest,
+    lease: &OfflineLease,
+    resource: &'static str,
+    offered: u64,
+    limit: u64,
+) {
+    let before = reservation_artifacts(f);
+    let hook = journal_boundary_io(None);
+    let filesystem = CutFs {
+        f,
+        io: hook.clone(),
+        limits: limits(),
+    };
+    let error = restore_offline(request, lease, &filesystem).unwrap_err();
+    match error {
+        fl_store::recovery::RecoveryError::RestoreTerminalInputQuota {
+            operation_id,
+            resource: actual_resource,
+            offered_bytes,
+            limit_bytes,
+        } => {
+            assert_eq!(operation_id, request.operation_id);
+            assert_eq!(actual_resource, resource);
+            assert_eq!(offered_bytes, offered);
+            assert_eq!(limit_bytes, limit);
+        }
+        other => panic!("expected admission scalar quota: {other}"),
+    }
+    assert_eq!(reservation_artifacts(f), before);
+    assert!(
+        !hook.events.lock().unwrap().iter().any(|event| matches!(
+            event,
+            RecoveryEvent::CreateDirectory | RecoveryEvent::Create(_)
+        )),
+        "scalar refusal created restore artifacts"
+    );
+}
+fn reservation_admission_scalar(operator: bool, over: bool) {
+    for original in [true, false] {
+        let f = journal_fixture();
+        if !original {
+            // An absent destination budgets against the compact selected image.
+            // Give that real image enough content for existing metadata overhead.
+            let writer = FerroStore::open(&f.source).unwrap();
+            writer
+                .put_doc(
+                    "fixture_unknown",
+                    "one",
+                    &serde_json::json!({"body": "x".repeat(20 << 20)}),
+                )
+                .unwrap();
+            drop(writer);
+        }
+        let destination = if original {
+            f.source.clone()
+        } else {
+            f.root.path().join("absent.fls")
+        };
+        let (request, lease) = prepare_restore(&f, &destination);
+        let mut binding = fixture_lease_request(&lease);
+        let (resource, limit) = if operator {
+            ("restore accepting operator", 128)
+        } else {
+            ("restore accepting lease exclusion evidence", 256)
+        };
+        let offered = limit + u64::from(over);
+        let value = reservation_encoded_string("admission ", offered);
+        assert!(
+            value.len() as u64 + 2 < offered,
+            "fixture must exercise JSON escaping"
+        );
+        if operator {
+            binding.operator = value;
+        } else {
+            binding.exclusion.evidence = value;
+        }
+        fs::remove_file(lease.path()).unwrap();
+        let lease = create_offline_lease(&binding, &f.filesystem(), &limits()).unwrap();
+        if over {
+            admission_scalar_refuses_without_artifacts(
+                &f, &request, &lease, resource, offered, limit,
+            );
+        } else {
+            let RestoreOutcome::Installed { journal } =
+                restore_offline(&request, &lease, &f.filesystem()).unwrap()
+            else {
+                panic!("exact-bound admission did not install")
+            };
+            reservation_call_with_operator(TerminalFixtureMode::Selected, &journal, &lease, &f)
+                .unwrap();
+            assert!(!destination.with_extension("fls.restore-guard").exists());
+            let done = load_restore_journal(
+                &journal.staging.join("journal.bin"),
+                &lease,
+                &f.filesystem(),
+            )
+            .unwrap();
+            assert_eq!(done.phase, RestorePhase::Finalized);
+            assert_eq!(done.binding, binding);
+            assert_eq!(
+                done.terminal_evidence_context.unwrap().accepting_lease,
+                binding
+            );
+        }
+        eprintln!(
+            "admission scalar operator={operator} over={over} original={original}: {offered}/{limit}"
+        );
+    }
+}
+#[test]
+fn restore_terminal_reservation_admission_operator_exact_bound() {
+    reservation_admission_scalar(true, false);
+}
+#[test]
+fn restore_terminal_reservation_admission_operator_one_byte_over() {
+    reservation_admission_scalar(true, true);
+}
+#[test]
+fn restore_terminal_reservation_admission_exclusion_exact_bound() {
+    reservation_admission_scalar(false, false);
+}
+#[test]
+fn restore_terminal_reservation_admission_exclusion_one_byte_over() {
+    reservation_admission_scalar(false, true);
+}
 #[test]
 fn restore_terminal_reservation_padded_admission_refuses_before_guard() {
     let f = journal_fixture();
@@ -7411,12 +7538,26 @@ fn restore_terminal_reservation_padded_admission_refuses_before_guard() {
         unreachable!()
     };
     request.metadata_byte_limit = required_bytes + 4096;
-    assert!(matches!(
-        restore_offline(&request, &lease, &f.filesystem()).unwrap(),
-        RestoreOutcome::Installed { .. }
-    ));
+    admission_scalar_refuses_without_artifacts(
+        &f,
+        &request,
+        &lease,
+        "restore accepting lease exclusion evidence",
+        reservation_json_bytes(&binding.exclusion.evidence),
+        256,
+    );
+    binding.exclusion.evidence = reservation_encoded_string("admission exclusion ", 256);
+    fs::remove_file(lease.path()).unwrap();
+    let lease = create_offline_lease(&binding, &f.filesystem(), &limits()).unwrap();
+    let RestoreOutcome::Installed { journal } =
+        restore_offline(&request, &lease, &f.filesystem()).unwrap()
+    else {
+        panic!("bounded admission did not install")
+    };
+    reservation_call_with_operator(TerminalFixtureMode::Selected, &journal, &lease, &f).unwrap();
+    assert!(!f.source.with_extension("fls.restore-guard").exists());
     eprintln!(
-        "reservation padded lease: artifact-free refusal; required metadata plus 4096 bytes admits"
+        "reservation padded lease: artifact-free reservation and scalar refusals; bounded lease admits and finalizes"
     );
 }
 fn reservation_exact_lease(j: &RestoreJournal, lease: &OfflineLease, f: &Fixture) -> OfflineLease {
