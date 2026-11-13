@@ -1921,9 +1921,11 @@ pub fn resume_restore(
         | RestorePhase::ExchangeIntent
         | RestorePhase::RelocateIntent
         | RestorePhase::Installed
-        | RestorePhase::ReverseIntent
         | RestorePhase::RolledBack
         | RestorePhase::OriginalAbsenceRestored => None,
+        RestorePhase::ReverseIntent => Some(
+            "restore resume refused: use typed rollback_restore to complete the rollback already started",
+        ),
         RestorePhase::Admitted | RestorePhase::Abandoned => Some(
             "restore resume refused: use typed abandon_restore for the unprepared restore or its retained cleanup",
         ),

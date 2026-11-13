@@ -2358,6 +2358,125 @@ fn restore_finalize_rollback_refuses_reverse_intent_without_spending_attempts() 
 }
 
 #[test]
+fn restore_resume_reverse_intent_refuses_for_free_and_typed_rollback_finishes() {
+    struct ReverseCut {
+        marker: RecoveryEvent,
+        after: bool,
+        seen: AtomicBool,
+        fired: AtomicBool,
+    }
+    impl RecoveryIo for ReverseCut {
+        fn before(&self, event: RecoveryEvent) -> std::io::Result<()> {
+            if event == self.marker {
+                self.seen.store(true, Ordering::Release);
+            }
+            let cut = if self.after {
+                self.seen.load(Ordering::Acquire)
+                    && event == RecoveryEvent::Sync(Directory::RestoreDestinationParent)
+            } else {
+                event == self.marker
+            };
+            if cut && !self.fired.swap(true, Ordering::AcqRel) {
+                return Err(std::io::Error::from_raw_os_error(libc::EIO));
+            }
+            Ok(())
+        }
+    }
+    for (absent, after) in [(true, true), (false, false), (false, true)] {
+        let f = journal_fixture();
+        if absent {
+            let writer = FerroStore::open(&f.source).unwrap();
+            writer
+                .put_doc(
+                    "fixture_unknown",
+                    "one",
+                    &serde_json::json!({"body": "x".repeat(20 << 20)}),
+                )
+                .unwrap();
+            drop(writer);
+        }
+        let destination = if absent {
+            f.root.path().join("absent.fls")
+        } else {
+            f.source.clone()
+        };
+        let original = inspect_file_binding(&destination, &limits()).unwrap();
+        let (request, lease) = prepare_restore(&f, &destination);
+        let RestoreOutcome::Installed { journal } =
+            restore_offline(&request, &lease, &f.filesystem()).unwrap()
+        else {
+            panic!("not installed")
+        };
+        let cut = Arc::new(ReverseCut {
+            marker: if absent {
+                RecoveryEvent::RestoreRelocate
+            } else {
+                RecoveryEvent::RestoreReverseExchange
+            },
+            after,
+            seen: AtomicBool::new(false),
+            fired: AtomicBool::new(false),
+        });
+        let filesystem = CutFs {
+            f: &f,
+            io: cut.clone(),
+            limits: limits(),
+        };
+        assert!(rollback_restore(&journal, &lease, &filesystem).is_err());
+        assert!(cut.fired.load(Ordering::Acquire));
+        let path = journal.staging.join("journal.bin");
+        let journal = load_restore_journal(&path, &lease, &f.filesystem()).unwrap();
+        assert_eq!(journal.phase, RestorePhase::ReverseIntent);
+        assert_eq!(
+            inspect_file_binding(&destination, &limits()).unwrap() == original,
+            after,
+            "cut must establish the intended side of the reverse rename"
+        );
+        let metadata = terminal_negative_metadata(&f, &journal);
+        let frames = journal_frame_ranges(&metadata[0]).len();
+        let layout = restore_expiry_layout(&destination, &journal.staging);
+        // Phase diagnostics precede forward validation even without the bundle.
+        let parked = f.backups.join("parked-selected-bundle");
+        for retry in 0..14 {
+            if retry == 1 {
+                fs::rename(request.selected_bundle.path(), &parked).unwrap();
+            }
+            let error = resume_restore(&journal, &lease, &f.filesystem()).unwrap_err();
+            assert!(error.to_string().contains("rollback_restore"), "{error}");
+            assert_eq!(terminal_negative_metadata(&f, &journal), metadata);
+            assert_eq!(
+                restore_expiry_layout(&destination, &journal.staging),
+                layout
+            );
+        }
+        let loaded = load_restore_journal(&path, &lease, &f.filesystem()).unwrap();
+        assert_eq!(
+            terminal_negative_counters(&loaded),
+            terminal_negative_counters(&journal)
+        );
+        assert_eq!(
+            loaded.forensic_handling_required,
+            journal.forensic_handling_required
+        );
+        assert_eq!(
+            journal_frame_ranges(&fs::read(&path).unwrap()).len(),
+            frames
+        );
+        let next = match rollback_restore(&loaded, &lease, &f.filesystem()).unwrap() {
+            RestoreOutcome::OriginalAbsenceRestored { journal } if absent => journal,
+            RestoreOutcome::RolledBack { journal } if !absent => journal,
+            other => panic!("typed rollback did not finish: {other:?}"),
+        };
+        assert_eq!(next.rollback_attempts, journal.rollback_attempts + 1);
+        assert_eq!(
+            inspect_file_binding(&destination, &limits()).unwrap(),
+            original
+        );
+        eprintln!("reverse_intent_resume absent={absent} after={after} free=true typed_retry=true");
+    }
+}
+
+#[test]
 fn restore_failed_candidate_copy_keeps_a_loadable_admitted_journal() {
     struct CutCopy;
     impl RecoveryIo for CutCopy {
@@ -2852,12 +2971,22 @@ fn restore_adjacent_intents_admit_only_their_before_and_after_layouts() {
                 .lock()
                 .unwrap()
                 .contains(&RecoveryEvent::Write(Member::RestoreJournal));
-            assert_eq!(attempted, admitted, "{phase:?} {layout}: {result:?}");
-            if !admitted {
-                assert!(matches!(
-                    result,
-                    Err(fl_store::recovery::RecoveryError::Verification { .. })
-                ));
+            // Typed rollback takes precedence over every reverse-intent layout.
+            if phase == RestorePhase::ReverseIntent {
+                assert!(!attempted, "{layout}: {result:?}");
+                let error = result.unwrap_err();
+                assert!(
+                    error.to_string().contains("rollback_restore"),
+                    "{layout}: {error}"
+                );
+            } else {
+                assert_eq!(attempted, admitted, "{phase:?} {layout}: {result:?}");
+                if !admitted {
+                    assert!(matches!(
+                        result,
+                        Err(fl_store::recovery::RecoveryError::Verification { .. })
+                    ));
+                }
             }
             assert_eq!(fs::read(&path).unwrap(), prefix);
         }
