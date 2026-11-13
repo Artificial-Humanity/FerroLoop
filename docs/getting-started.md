@@ -980,3 +980,12 @@ $ git submodule status                                 # the pinned commits
 
 `git submodule update --remote` changes the pinned commit in your working tree. Commit the
 changed `submodules/<Name>` entry to record the new pin.
+
+## Project Director role
+
+Register or spin up an agent with `--role director` for a Project Director who
+coordinates a portfolio of projects. Existing `custom:director` registrations
+normalize to `director`. Use `@role:director` to reach directors across the
+workspace, or `@area:<project>/director` to reach directors covering an area,
+including their extra areas. A project's lead remains its first contact; the
+role does not grant additional review authority.

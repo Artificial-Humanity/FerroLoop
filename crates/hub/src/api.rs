@@ -8374,6 +8374,7 @@ fn contextual_reforge_prompt(state: &HubState, snapshot: ReforgePromptSnapshot) 
 
 pub(crate) fn reforge_role_label(role: &AgentRole) -> String {
     match role {
+        AgentRole::Director => "director".to_string(),
         AgentRole::Lead => "lead".to_string(),
         AgentRole::Assistant => "assistant".to_string(),
         AgentRole::LabManager => "lab_manager".to_string(),
@@ -9607,8 +9608,12 @@ mod tests {
         let (status, list) = roles_call(&state, "GET", "/api/v1/roles", owner, None);
         assert_eq!(status, 200);
         let list = list.as_array().unwrap();
-        assert_eq!(list.len(), 12);
-        assert_eq!(list.iter().filter(|r| r["builtin"] == true).count(), 11);
+        assert_eq!(list.len(), 13);
+        assert_eq!(list.iter().filter(|r| r["builtin"] == true).count(), 12);
+        assert!(
+            list.iter()
+                .any(|r| r["slug"] == "director" && r["label"] == "Project Director")
+        );
 
         // Custom create -> 201, builtin=false; then listed.
         let (status, saved) = roles_call(
@@ -9622,7 +9627,7 @@ mod tests {
         assert_eq!(saved["slug"], "reviewer");
         assert_eq!(saved["builtin"], false);
         let (_, list) = roles_call(&state, "GET", "/api/v1/roles", owner, None);
-        assert_eq!(list.as_array().unwrap().len(), 13);
+        assert_eq!(list.as_array().unwrap().len(), 14);
         assert!(
             list.as_array()
                 .unwrap()
