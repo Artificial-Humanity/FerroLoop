@@ -1048,6 +1048,17 @@ fn hold_evidence(
     row
 }
 
+/// True when `new` is a different route identity than `old`: another vendor, another
+/// vendor session, or (for identity-less routes such as webhooks) a different endpoint.
+fn route_identity_changed(
+    old: &crate::identity::VendorRoute,
+    new: &crate::identity::VendorRoute,
+) -> bool {
+    old.canonical_vendor() != new.canonical_vendor()
+        || old.session_identity() != new.session_identity()
+        || (old.session_identity().is_none() && old != new)
+}
+
 fn log_first_holds(rows: Vec<FenceDiagnostic>) {
     for row in rows {
         // All strings are bounded safe projections; JSON escapes control bytes.
@@ -1807,6 +1818,57 @@ where
         }
     }
 
+    /// Release a retained fence because registration replaced the route identity
+    /// (a remodel or vendor change): the fence was raised against the old, now-dead
+    /// route, so it must not block the new session. Pending receipts are rescheduled
+    /// for delivery to the new route. The diagnostic first-hold record is kept.
+    fn release_fence_for_new_route(self: &Arc<Self>, recipient: &str, now: At) {
+        let name =
+            normalize_persona(recipient).unwrap_or_else(|| recipient.trim().to_ascii_lowercase());
+        if name.is_empty() {
+            return;
+        }
+        let is_fenced = lock(&self.overflow_recipients).contains(&name)
+            || lock(&self.dispatch_queues)
+                .get(&name)
+                .is_some_and(|q| q.overflowed);
+        if !is_fenced {
+            return;
+        }
+        warn(&format!(
+            "released retained fence for {}: route identity replaced by remodel/vendor change; rescheduling pending delivery to the new route",
+            sanitize_for_warning(&name)
+        ));
+        lock(&self.composer_occupied_reprobes).remove(&name);
+        let _order = lock(&self.enqueue_gate);
+        let Ok(unread) = self.store.list_wire_inbox(&WireFilter {
+            recipient: Some(name.clone()),
+            unread_only: true,
+            ..Default::default()
+        }) else {
+            return;
+        };
+        let mut first_holds = Vec::new();
+        lock(&self.overflow_recipients).remove(&name);
+        if let Some(queue) = lock(&self.dispatch_queues).get_mut(&name) {
+            queue.overflowed = false;
+        }
+        for item in &unread {
+            if item.receipt.status == DeliveryStatus::Pending
+                && let Err(message) = self.schedule_dispatch(
+                    &item.message,
+                    std::slice::from_ref(&item.receipt),
+                    now.clone(),
+                    &mut first_holds,
+                )
+            {
+                warn(&message);
+            }
+        }
+        drop(_order);
+        log_first_holds(first_holds);
+    }
+
     /// Clear `overflow_recipients` and resume queued/pending push delivery for `recipient`
     /// once all unconfirmed (`Pending` with `attempts > 0`) receipts have been acknowledged.
     fn maybe_unfence_and_resume(self: &Arc<Self>, recipient: &str, now: At) {
@@ -2245,6 +2307,7 @@ where
                     &DispatchReport::default(),
                 );
                 let mut first_holds = Vec::new();
+                let mut fence_release = false;
                 let allow_probes =
                     crate::identity::host_probes_allowed(self.config.home_override.as_deref());
                 let started_at = Instant::now();
@@ -2427,6 +2490,20 @@ where
                                 None,
                             );
                         }
+                        // A remodel/vendor change (an explicit `--replace` registration, or a
+                        // different vendor) creates a new route identity: the retained fence
+                        // belonged to the old route and must be released after publication.
+                        // A passive same-vendor re-registration keeps the fence, since the
+                        // unconfirmed delivery may have reached that same session.
+                        if let Some(new_entry) = routes.get(&norm)
+                            && let Some(old_entry) = before.entries.get(&norm)
+                            && route_identity_changed(&old_entry.route, &new_entry.route)
+                            && (replace
+                                || old_entry.route.canonical_vendor()
+                                    != new_entry.route.canonical_vendor())
+                        {
+                            fence_release = true;
+                        }
                         // Route publication and the worker's wake generation must be observed
                         // together: a no-route worker may not evict in between them.
                         self.wake_recipient_after_registration(
@@ -2440,6 +2517,9 @@ where
                     break;
                 }
                 log_first_holds(first_holds);
+                if fence_release {
+                    self.release_fence_for_new_route(&norm, now.clone());
+                }
                 self.drain_awaiting_daemon_messages(true);
                 (LocalResponse::RouteRegistered, None)
             }
@@ -4011,6 +4091,54 @@ mod tests {
                 DeliveryStatus::Acked
             );
             assert_eq!(inner.diagnostics_snapshot(), first);
+        });
+    }
+
+    #[test]
+    fn remodel_new_vendor_route_releases_fence_and_redelivers_pending() {
+        let (tmp, inner) = fault_rig();
+        lock(&inner.store.writes).push_back(Fault::Error);
+        with_transport(Ok(()), || {
+            let first_id = run_fault_job(&inner, "held");
+            assert!(lock(&inner.overflow_recipients).contains("held"));
+            // A second message arrives while fenced: stored, never dispatched.
+            let (second, _) = inner.store.send_wire(mail("held", "second")).unwrap();
+            let second_id = second.id.clone();
+
+            // Remodel: a new vendor route replaces the old Codex route (`--replace`).
+            let socket = tmp.path().join("remodel.sock");
+            let listener = UnixListener::bind(&socket).unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let (response, _) = inner.handle_local_request(LocalRequest::RegisterRoute {
+                persona: "held".into(),
+                route: VendorRoute::Webhook {
+                    socket_path: socket,
+                },
+                explicit: true,
+                replace: true,
+                hosted_id: None,
+                hydration_generation: None,
+                hosted_session_verified: false,
+                unverified_process: false,
+            });
+            assert!(matches!(response, LocalResponse::RouteRegistered));
+            assert!(
+                !lock(&inner.overflow_recipients).contains("held"),
+                "fence from the dead old route must not block the remodelled session"
+            );
+            // Both pending messages are delivered to the new route, in order.
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut received = Vec::new();
+            while received.len() < 2 && Instant::now() < deadline {
+                if let Ok((stream, _)) = listener.accept() {
+                    let mut line = String::new();
+                    BufReader::new(stream).read_line(&mut line).unwrap();
+                    received.push(serde_json::from_str::<WireMessage>(&line).unwrap().id);
+                } else {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
+            assert_eq!(received, vec![first_id, second_id]);
         });
     }
 
