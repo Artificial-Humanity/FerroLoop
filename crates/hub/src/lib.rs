@@ -3721,6 +3721,20 @@ mod tests {
             queued_prompt_text(&state, &owner_item).as_deref(),
             Some("Owner queued prompt")
         );
+        // Authorization precedes body validation: an unauthorized empty PATCH is 403, not 400.
+        let peer_empty_patch = call(
+            &state,
+            "PATCH",
+            format!("/api/v1/sessions/ferris/queue/{owner_item}"),
+            "peer-tok-secret",
+            Some("mallory"),
+            Some(json!({ "prompt": "" })),
+        );
+        assert_eq!(peer_empty_patch.status, 403, "peer empty PATCH owner item");
+        assert_eq!(
+            queued_prompt_text(&state, &owner_item).as_deref(),
+            Some("Owner queued prompt")
+        );
         let peer_delete = call(
             &state,
             "DELETE",

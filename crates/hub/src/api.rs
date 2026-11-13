@@ -6667,6 +6667,13 @@ fn handle_patch_queued_prompt(
         prompt: String,
     }
 
+    let (canonical_id, target_persona) = resolve_session_target(state, raw_session_id);
+    if let Some(refusal) =
+        queued_prompt_refusal(state, authority, &canonical_id, raw_session_id, prompt_id)
+    {
+        return refusal;
+    }
+
     let payload: PatchQueuedPromptPayload = match req.json() {
         Ok(p) => p,
         Err(e) => return HttpResponse::json(400, json!({ "error": e })),
@@ -6674,13 +6681,6 @@ fn handle_patch_queued_prompt(
     let trimmed = payload.prompt.trim().to_string();
     if trimmed.is_empty() {
         return HttpResponse::json(400, json!({ "error": "prompt must not be empty" }));
-    }
-
-    let (canonical_id, target_persona) = resolve_session_target(state, raw_session_id);
-    if let Some(refusal) =
-        queued_prompt_refusal(state, authority, &canonical_id, raw_session_id, prompt_id)
-    {
-        return refusal;
     }
     let updated = state
         .update_queued_prompt(&canonical_id, prompt_id, trimmed.clone())
