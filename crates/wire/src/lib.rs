@@ -73,6 +73,7 @@ mod host_isolation_tests {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("owned.sock");
         let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let _fixture = crate::test_isolation::register_unix_socket(&path).unwrap();
         assert!(
             crate::daemon::LocalClient::connect(&path, std::time::Duration::from_millis(50))
                 .is_ok()
@@ -88,6 +89,59 @@ mod host_isolation_tests {
             Err(err) => err,
         };
         assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wire_test_binary_rejects_direct_unregistered_host_clients() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("host.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let endpoint = fl_host_proto::HostEndpoint::unix(&path).unwrap();
+        let err = fl_host_proto::BlockingHostClient::connect(&endpoint)
+            .err()
+            .expect("unregistered host refused");
+        assert!(err.to_string().contains("unregistered wire test socket"));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let err = runtime
+            .block_on(fl_host_proto::AsyncHostClient::connect_with(
+                &endpoint,
+                fl_host_proto::ConnectOptions::default(),
+            ))
+            .unwrap_err();
+        assert!(err.to_string().contains("unregistered wire test socket"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wire_unix_registration_rejects_unregistered_replaced_and_symlinked_sockets() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("socket");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        assert!(crate::test_isolation::ensure_socket(&path).is_err());
+        assert!(
+            crate::daemon::LocalClient::connect(&path, std::time::Duration::from_millis(50))
+                .is_err()
+        );
+        let guard = crate::test_isolation::register_unix_socket(&path).unwrap();
+        assert!(crate::test_isolation::ensure_socket(&path).is_ok());
+        std::fs::remove_file(&path).unwrap();
+        let replacement = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        assert!(crate::test_isolation::ensure_socket(&path).is_err());
+        assert!(
+            crate::daemon::LocalClient::connect(&path, std::time::Duration::from_millis(50))
+                .is_err()
+        );
+        drop(replacement);
+        drop(listener);
+        std::fs::remove_file(&path).unwrap();
+        std::os::unix::fs::symlink("/run/user/1000/ferroloop/fl-host.sock", &path).unwrap();
+        assert!(crate::test_isolation::register_unix_socket(&path).is_err());
+        assert!(crate::test_isolation::ensure_socket(&path).is_err());
+        drop(guard);
     }
 
     #[test]

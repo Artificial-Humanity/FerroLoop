@@ -17,6 +17,8 @@ pub use auth::{
     client_proof, decode_challenge, read_frame_async, reject_equal_nonces, server_handshake,
     server_proof, verify_client_proof, verify_server_proof, write_frame_async,
 };
+#[cfg(feature = "hub-test-isolation")]
+pub use client::install_test_endpoint_validator;
 pub use client::{
     AsyncHostClient, BlockingHostClient, ConnectOptions, ExtensionEventStream, HostEventStream,
     ReliableControllerGrant, ReliableEventStream, events,

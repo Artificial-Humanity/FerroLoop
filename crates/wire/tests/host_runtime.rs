@@ -60,6 +60,9 @@ fn with_endpoint_host(
             let mut config = HostConfig::new(endpoint);
             config.frame_timeout = Duration::from_secs(2);
             let mut listener = HostListener::bind(config).await.unwrap();
+            let _fixture =
+                fl_wire::test_isolation::register_unix_socket(listener.endpoint().socket_path())
+                    .unwrap();
             ready_tx.send(listener.endpoint().clone()).unwrap();
             let mut conn = tokio::time::timeout(Duration::from_secs(3), listener.accept())
                 .await

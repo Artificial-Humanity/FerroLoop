@@ -46,6 +46,10 @@ pub fn enable() {
         }
     }
     fl_host_proto::enable_hub_test_isolation();
+    fl_host_proto::install_test_endpoint_validator(|endpoint| {
+        ensure_socket(endpoint.socket_path())
+            .map_err(|err| fl_host_proto::HostError::Protocol(err.to_string()))
+    });
     ACTIVE.store(true, Ordering::SeqCst);
 }
 
@@ -89,6 +93,121 @@ pub(crate) fn ensure_fixture(path: &Path) -> std::io::Result<()> {
         return Err(invalid());
     }
     Ok(())
+}
+
+#[cfg(unix)]
+static UNIX_FIXTURES: std::sync::Mutex<Vec<(PathBuf, u64, u64)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Exact registered path and inode, scoped to the life of the listener.
+#[cfg(unix)]
+#[doc(hidden)]
+pub struct UnixFixture {
+    path: PathBuf,
+    dev: u64,
+    ino: u64,
+}
+
+#[cfg(unix)]
+impl Drop for UnixFixture {
+    fn drop(&mut self) {
+        let mut fixtures = UNIX_FIXTURES.lock().unwrap();
+        if let Some(i) = fixtures
+            .iter()
+            .position(|f| f == &(self.path.clone(), self.dev, self.ino))
+        {
+            fixtures.remove(i);
+        }
+    }
+}
+
+/// Register an already bound socket inside this process's private fixture root.
+#[cfg(unix)]
+#[doc(hidden)]
+pub fn register_unix_socket(path: &Path) -> std::io::Result<UnixFixture> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    ensure_fixture(path)?;
+    let metadata = std::fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_socket() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "fixture is not a socket",
+        ));
+    }
+    let fixture = UnixFixture {
+        path: path.to_path_buf(),
+        dev: metadata.dev(),
+        ino: metadata.ino(),
+    };
+    UNIX_FIXTURES
+        .lock()
+        .unwrap()
+        .push((fixture.path.clone(), fixture.dev, fixture.ino));
+    Ok(fixture)
+}
+
+#[cfg(unix)]
+pub(crate) fn ensure_socket(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    if !is_enabled() {
+        return Ok(());
+    }
+    let denied = || {
+        std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "unregistered wire test socket",
+        )
+    };
+    ensure_fixture(path)?;
+    let metadata = std::fs::symlink_metadata(path).map_err(|_| denied())?;
+    if metadata.file_type().is_socket()
+        && UNIX_FIXTURES.lock().unwrap().contains(&(
+            path.to_path_buf(),
+            metadata.dev(),
+            metadata.ino(),
+        ))
+    {
+        Ok(())
+    } else {
+        Err(denied())
+    }
+}
+
+#[cfg(not(unix))]
+pub(crate) fn ensure_socket(_path: &Path) -> std::io::Result<()> {
+    if !is_enabled() {
+        Ok(())
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "wire test host endpoints unsupported",
+        ))
+    }
+}
+
+#[cfg(unix)]
+#[cfg(test)]
+pub struct RegisteredUnixListener {
+    listener: std::os::unix::net::UnixListener,
+    _fixture: UnixFixture,
+}
+#[cfg(unix)]
+#[cfg(test)]
+impl std::ops::Deref for RegisteredUnixListener {
+    type Target = std::os::unix::net::UnixListener;
+    fn deref(&self) -> &Self::Target {
+        &self.listener
+    }
+}
+#[cfg(unix)]
+#[cfg(test)]
+pub fn bind_unix_fixture(path: impl AsRef<Path>) -> std::io::Result<RegisteredUnixListener> {
+    let listener = std::os::unix::net::UnixListener::bind(path.as_ref())?;
+    let fixture = register_unix_socket(path.as_ref())?;
+    Ok(RegisteredUnixListener {
+        listener,
+        _fixture: fixture,
+    })
 }
 
 pub(crate) fn tmux_fixture() -> PathBuf {

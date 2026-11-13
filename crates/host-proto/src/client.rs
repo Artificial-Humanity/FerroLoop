@@ -105,6 +105,22 @@ impl std::fmt::Debug for AsyncHostClient {
     }
 }
 
+// Optional guard installed before wire test processes start. Production and other test
+// binaries never install it, including when Cargo unifies this feature.
+#[cfg(feature = "hub-test-isolation")]
+type TestEndpointValidator = fn(&HostEndpoint) -> Result<(), HostError>;
+#[cfg(feature = "hub-test-isolation")]
+static TEST_ENDPOINT_VALIDATOR: std::sync::OnceLock<TestEndpointValidator> =
+    std::sync::OnceLock::new();
+
+#[cfg(feature = "hub-test-isolation")]
+#[doc(hidden)]
+pub fn install_test_endpoint_validator(validator: fn(&HostEndpoint) -> Result<(), HostError>) {
+    TEST_ENDPOINT_VALIDATOR
+        .set(validator)
+        .expect("host test validator installed twice");
+}
+
 impl AsyncHostClient {
     pub async fn connect(endpoint: &HostEndpoint) -> Result<Self, HostError> {
         Self::connect_with(endpoint, ConnectOptions::default()).await
@@ -114,6 +130,10 @@ impl AsyncHostClient {
         endpoint: &HostEndpoint,
         options: ConnectOptions,
     ) -> Result<Self, HostError> {
+        #[cfg(feature = "hub-test-isolation")]
+        if let Some(validate) = TEST_ENDPOINT_VALIDATOR.get() {
+            validate(endpoint)?;
+        }
         #[cfg(unix)]
         {
             let mut client = connect_retry(endpoint, &options).await?;

@@ -775,7 +775,7 @@ pub struct LocalClient {
 impl LocalClient {
     pub fn connect(socket_path: &Path, timeout: Duration) -> io::Result<Self> {
         #[cfg(feature = "wire-test-isolation")]
-        crate::test_isolation::ensure_fixture(socket_path)?;
+        crate::test_isolation::ensure_socket(socket_path)?;
         let stream = UnixStream::connect(socket_path)?;
         stream.set_read_timeout(Some(timeout))?;
         stream.set_write_timeout(Some(timeout))?;
@@ -3199,6 +3199,8 @@ pub struct DaemonHandle {
     poll_join_handle: Option<std::thread::JoinHandle<()>>,
     #[cfg(feature = "wire-test-isolation")]
     _tcp_fixture: Option<crate::test_isolation::TcpFixture>,
+    #[cfg(feature = "wire-test-isolation")]
+    _unix_fixture: Option<crate::test_isolation::UnixFixture>,
 }
 
 impl DaemonHandle {
@@ -3212,9 +3214,24 @@ impl DaemonHandle {
 
     pub fn stop(&mut self) {
         self.shutdown.store(true, Ordering::SeqCst);
-        let _ = UnixStream::connect(&self.socket_path);
+        #[cfg(feature = "wire-test-isolation")]
+        let unix_safe = crate::test_isolation::ensure_socket(&self.socket_path).is_ok();
+        #[cfg(not(feature = "wire-test-isolation"))]
+        let unix_safe = true;
+        if unix_safe {
+            let _ = UnixStream::connect(&self.socket_path);
+        }
         if let Some(ref addr) = self.listen_addr {
-            let _ = TcpStream::connect(addr);
+            #[cfg(feature = "wire-test-isolation")]
+            let tcp_safe = addr
+                .parse()
+                .ok()
+                .is_some_and(|address| crate::test_isolation::ensure_tcp(&address).is_ok());
+            #[cfg(not(feature = "wire-test-isolation"))]
+            let tcp_safe = true;
+            if tcp_safe {
+                let _ = TcpStream::connect(addr);
+            }
         }
         if let Some(h) = self.join_handle.take() {
             let _ = h.join();
@@ -3280,6 +3297,14 @@ where
         fs::set_permissions(&config.socket_path, fs::Permissions::from_mode(0o600))?;
     }
     unix_listener.set_nonblocking(true)?;
+    #[cfg(feature = "wire-test-isolation")]
+    let unix_fixture = if crate::test_isolation::is_enabled() {
+        Some(crate::test_isolation::register_unix_socket(
+            &config.socket_path,
+        )?)
+    } else {
+        None
+    };
 
     let tcp_listener = if let Some(ref bind_addr) = config.listen_addr {
         #[cfg(feature = "wire-test-isolation")]
@@ -3497,6 +3522,8 @@ where
         poll_join_handle: Some(poll_join_handle),
         #[cfg(feature = "wire-test-isolation")]
         _tcp_fixture: tcp_fixture,
+        #[cfg(feature = "wire-test-isolation")]
+        _unix_fixture: unix_fixture,
     })
 }
 
@@ -4239,7 +4266,7 @@ mod tests {
 
             // Remodel: a new vendor route replaces the old Codex route (`--replace`).
             let socket = tmp.path().join("remodel.sock");
-            let listener = UnixListener::bind(&socket).unwrap();
+            let listener = crate::test_isolation::bind_unix_fixture(&socket).unwrap();
             listener.set_nonblocking(true).unwrap();
             let (response, _) = inner.handle_local_request(LocalRequest::RegisterRoute {
                 persona: "held".into(),
@@ -4923,7 +4950,7 @@ mod tests {
             },
         );
         let socket = rig._tmp.path().join("overflow.sock");
-        let listener = UnixListener::bind(&socket).unwrap();
+        let listener = crate::test_isolation::bind_unix_fixture(&socket).unwrap();
         listener.set_nonblocking(true).unwrap();
         let (response, _) = rig.inner.handle_local_request(LocalRequest::register(
             "overflow",
@@ -5004,7 +5031,7 @@ mod tests {
         }
         assert_eq!(rig.inner.diagnostics_snapshot().records[0], first_hold);
         let socket = rig._tmp.path().join("limited.sock");
-        let listener = UnixListener::bind(&socket).unwrap();
+        let listener = crate::test_isolation::bind_unix_fixture(&socket).unwrap();
         listener.set_nonblocking(true).unwrap();
         let (response, _) = rig.inner.handle_local_request(LocalRequest::register(
             "limited",
@@ -5058,7 +5085,7 @@ mod tests {
         };
         no_route_rx.recv_timeout(Duration::from_secs(3)).unwrap();
         let socket = rig._tmp.path().join("register-race.sock");
-        let listener = UnixListener::bind(&socket).unwrap();
+        let listener = crate::test_isolation::bind_unix_fixture(&socket).unwrap();
         listener.set_nonblocking(true).unwrap();
         let (locked_tx, locked_rx) = mpsc::channel();
         let (resume_register_tx, resume_register_rx) = mpsc::channel();
@@ -5190,7 +5217,7 @@ mod tests {
     fn enqueue_racing_empty_worker_exit_starts_a_new_worker() {
         let rig = rig();
         let socket = rig._tmp.path().join("empty-exit.sock");
-        let listener = UnixListener::bind(&socket).unwrap();
+        let listener = crate::test_isolation::bind_unix_fixture(&socket).unwrap();
         listener.set_nonblocking(true).unwrap();
         lock(&rig.inner.routes).upsert_explicit(
             "live",
@@ -5268,7 +5295,7 @@ mod tests {
         assert!(lock(&rig.inner.dispatch_queues).is_empty());
         assert!(lock(&rig.inner.overflow_recipients).is_empty());
         let socket = rig._tmp.path().join("live.sock");
-        let listener = UnixListener::bind(&socket).unwrap();
+        let listener = crate::test_isolation::bind_unix_fixture(&socket).unwrap();
         listener.set_nonblocking(true).unwrap();
         lock(&rig.inner.routes).upsert_explicit(
             "live",
@@ -5350,7 +5377,7 @@ mod tests {
             );
         }
         let socket = rig._tmp.path().join("capacity.sock");
-        let listener = UnixListener::bind(&socket).unwrap();
+        let listener = crate::test_isolation::bind_unix_fixture(&socket).unwrap();
         listener.set_nonblocking(true).unwrap();
         lock(&rig.inner.routes).upsert_explicit(
             "live",
@@ -5398,10 +5425,10 @@ mod tests {
             assert!(Instant::now() < deadline, "first push never failed");
             std::thread::sleep(Duration::from_millis(10));
         }
-        let slow_listener = UnixListener::bind(&slow_socket).unwrap();
+        let slow_listener = crate::test_isolation::bind_unix_fixture(&slow_socket).unwrap();
         slow_listener.set_nonblocking(true).unwrap();
         let fast_socket = rig._tmp.path().join("other.sock");
-        let fast_listener = UnixListener::bind(&fast_socket).unwrap();
+        let fast_listener = crate::test_isolation::bind_unix_fixture(&fast_socket).unwrap();
         fast_listener.set_nonblocking(true).unwrap();
         lock(&rig.inner.routes).upsert_explicit(
             "other",
@@ -5485,7 +5512,7 @@ mod tests {
                 .unwrap();
         }
         let socket = rig._tmp.path().join("broadcast-fast.sock");
-        let listener = UnixListener::bind(&socket).unwrap();
+        let listener = crate::test_isolation::bind_unix_fixture(&socket).unwrap();
         listener.set_nonblocking(true).unwrap();
         lock(&rig.inner.routes).upsert_explicit(
             "fast",
@@ -5523,7 +5550,7 @@ mod tests {
     fn startup_warns_about_inbox_recovery_without_dispatch() {
         let tmp = TempDir::new().unwrap();
         let socket = tmp.path().join("saved-route.sock");
-        let listener = UnixListener::bind(&socket).unwrap();
+        let listener = crate::test_isolation::bind_unix_fixture(&socket).unwrap();
         listener.set_nonblocking(true).unwrap();
         let store = Arc::new(RedbStore::open(&tmp.path().join("s.redb")).unwrap());
         let (pending, _) = store.send_wire(mail("slow", "pending")).unwrap();
@@ -5592,7 +5619,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         let socket = rig._tmp.path().join("late-route.sock");
-        let listener = UnixListener::bind(&socket).unwrap();
+        let listener = crate::test_isolation::bind_unix_fixture(&socket).unwrap();
         listener.set_nonblocking(true).unwrap();
         let (response, _) = rig.inner.handle_local_request(LocalRequest::register(
             "new-route",
@@ -5627,7 +5654,7 @@ mod tests {
             .recv_timeout(Duration::from_secs(3))
             .expect("no-route discovery did not pause");
         let socket = rig._tmp.path().join("racing-route.sock");
-        let listener = UnixListener::bind(&socket).unwrap();
+        let listener = crate::test_isolation::bind_unix_fixture(&socket).unwrap();
         listener.set_nonblocking(true).unwrap();
         let (response, _) = rig.inner.handle_local_request(LocalRequest::register(
             "racing-route",
@@ -5671,7 +5698,7 @@ mod tests {
         };
         entered_rx.recv_timeout(Duration::from_secs(3)).unwrap();
         let socket = rig._tmp.path().join("passive-race.sock");
-        let listener = UnixListener::bind(&socket).unwrap();
+        let listener = crate::test_isolation::bind_unix_fixture(&socket).unwrap();
         listener.set_nonblocking(true).unwrap();
         // Model a route becoming passively discoverable, without RegisterRoute.
         lock(&rig.inner.routes).upsert_explicit(
@@ -6255,7 +6282,7 @@ mod tests {
 
         // Set up a webhook Unix listener for Kayla on host B to verify push delivery + auto-Ack propagation
         let webhook_sock = tmp.path().join("kayla-webhook.sock");
-        let webhook_listener = UnixListener::bind(&webhook_sock).unwrap();
+        let webhook_listener = crate::test_isolation::bind_unix_fixture(&webhook_sock).unwrap();
         let routes_b = tmp.path().join("routes-b.json");
         let mut routes = RouteTable::load(Some(&routes_b));
         routes.upsert_explicit(
@@ -6576,7 +6603,7 @@ mod tests {
             })
             .unwrap();
         let other_socket = tmp.path().join("other.sock");
-        let other_listener = UnixListener::bind(&other_socket).unwrap();
+        let other_listener = crate::test_isolation::bind_unix_fixture(&other_socket).unwrap();
         other_listener.set_nonblocking(true).unwrap();
         // The daemon serves one request per connection.
         let mut probe = LocalClient::connect(&sock, Duration::from_secs(5)).unwrap();
@@ -6743,7 +6770,7 @@ mod tests {
         let sock = cfg.socket_path.clone();
         let _daemon = spawn_daemon(Arc::clone(&store), cfg).unwrap();
         let fast_socket = tmp.path().join("fast.sock");
-        let listener = UnixListener::bind(&fast_socket).unwrap();
+        let listener = crate::test_isolation::bind_unix_fixture(&fast_socket).unwrap();
         listener.set_nonblocking(true).unwrap();
         for (persona, route) in [
             (
@@ -6912,7 +6939,7 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::AddrInUse);
         drop(first);
         // A socket file left behind by a crashed daemon is stale and gets replaced.
-        drop(UnixListener::bind(&cfg.socket_path).unwrap());
+        drop(crate::test_isolation::bind_unix_fixture(&cfg.socket_path).unwrap());
         assert!(cfg.socket_path.exists());
         let deadline = Instant::now() + Duration::from_secs(10);
         let replaced = loop {
@@ -7037,7 +7064,7 @@ mod tests {
     fn a_request_to_a_slow_daemon_succeeds_with_the_default_timeout() {
         let dir = TempDir::new().unwrap();
         let sock = dir.path().join("slow.sock");
-        let listener = UnixListener::bind(&sock).unwrap();
+        let listener = crate::test_isolation::bind_unix_fixture(&sock).unwrap();
         let fake = std::thread::spawn(move || {
             let (stream, _) = listener.accept().unwrap();
             let mut reader = BufReader::new(stream.try_clone().unwrap());
@@ -7067,7 +7094,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         // A socket file that nothing listens on any more refuses the connect.
         let stale = dir.path().join("stale.sock");
-        drop(UnixListener::bind(&stale).unwrap());
+        drop(crate::test_isolation::bind_unix_fixture(&stale).unwrap());
         for sock in [dir.path().join("none.sock"), stale] {
             let started = Instant::now();
             let err = LocalClient::connect(&sock, DEFAULT_LOCAL_RPC_TIMEOUT);
@@ -7105,7 +7132,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
 
-        let ack_listener = UnixListener::bind(&ack_socket).unwrap();
+        let ack_listener = crate::test_isolation::bind_unix_fixture(&ack_socket).unwrap();
         ack_listener.set_nonblocking(true).unwrap();
 
         let (resp2, _) = rig.inner.handle_local_request(LocalRequest::Send {
@@ -7169,7 +7196,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
 
-        let read_listener = UnixListener::bind(&read_socket).unwrap();
+        let read_listener = crate::test_isolation::bind_unix_fixture(&read_socket).unwrap();
         read_listener.set_nonblocking(true).unwrap();
 
         let (read_resp, _) = rig.inner.handle_local_request(LocalRequest::Read {
@@ -7677,7 +7704,7 @@ mod tests {
             .path()
             .join(".codex/app-server-control/app-server-control.sock");
         fs::create_dir_all(control_sock.parent().unwrap()).unwrap();
-        let listener = UnixListener::bind(&control_sock).unwrap();
+        let listener = crate::test_isolation::bind_unix_fixture(&control_sock).unwrap();
         listener.set_nonblocking(true).unwrap();
 
         let accept_count = Arc::new(AtomicUsize::new(0));
@@ -8686,7 +8713,7 @@ mod tests {
         RouteTable::default().save(Some(&routes_file)).unwrap();
 
         let hook_sock = tmp.path().join("felicia-hook.sock");
-        let hook_listener = UnixListener::bind(&hook_sock).unwrap();
+        let hook_listener = crate::test_isolation::bind_unix_fixture(&hook_sock).unwrap();
         hook_listener.set_nonblocking(true).unwrap();
 
         let base_ms = now_at().unix_millis();
@@ -9036,7 +9063,7 @@ mod tests {
     fn composer_occupied_zero_key_hold_auto_retries_with_backoff_and_delivers_when_cleared() {
         let (tmp, inner) = fault_rig();
         let webhook_sock = tmp.path().join("held-webhook.sock");
-        let webhook_listener = std::os::unix::net::UnixListener::bind(&webhook_sock).unwrap();
+        let webhook_listener = crate::test_isolation::bind_unix_fixture(&webhook_sock).unwrap();
         webhook_listener.set_nonblocking(true).unwrap();
         lock(&inner.routes).upsert_explicit(
             "held",

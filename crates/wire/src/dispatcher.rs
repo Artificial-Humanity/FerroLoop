@@ -398,7 +398,7 @@ fn push_webhook_operator_prompt(
 /// Write `line` and a newline on one new connection to the webhook socket.
 fn push_webhook_line(socket_path: &Path, mut line: String) -> Result<(), PushError> {
     #[cfg(feature = "wire-test-isolation")]
-    crate::test_isolation::ensure_fixture(socket_path)
+    crate::test_isolation::ensure_socket(socket_path)
         .map_err(|e| PushError::Failed(e.to_string()))?;
     let mut stream = UnixStream::connect(socket_path).map_err(|e| {
         let text = format!(
@@ -495,7 +495,7 @@ fn push_claude_socket(
         .ok_or_else(|| format!("missing `peerToken` in {}", kpath.display()))?;
 
     #[cfg(feature = "wire-test-isolation")]
-    crate::test_isolation::ensure_fixture(socket_path).map_err(|e| e.to_string())?;
+    crate::test_isolation::ensure_socket(socket_path).map_err(|e| e.to_string())?;
     let mut stream = UnixStream::connect(socket_path).map_err(|e| {
         format!(
             "failed to connect to claude socket {}: {e}",
@@ -6421,7 +6421,7 @@ pub fn dispatch_operator_prompt_to_route(
                 .ok_or_else(|| format!("missing `peerToken` in {}", kpath.display()))?;
 
             #[cfg(feature = "wire-test-isolation")]
-            crate::test_isolation::ensure_fixture(socket_path).map_err(|e| e.to_string())?;
+            crate::test_isolation::ensure_socket(socket_path).map_err(|e| e.to_string())?;
             let mut stream = UnixStream::connect(socket_path).map_err(|e| {
                 format!(
                     "failed to connect to claude socket {}: {e}",
@@ -6894,6 +6894,9 @@ mod tests {
                 let mut config = HostConfig::new(endpoint);
                 config.minor = 1;
                 let mut listener = HostListener::bind(config).await.unwrap();
+                let _socket_fixture =
+                    crate::test_isolation::register_unix_socket(listener.endpoint().socket_path())
+                        .unwrap();
                 ready_tx.send(()).unwrap();
                 loop {
                     let mut conn = tokio::select! {
@@ -7609,7 +7612,7 @@ mod tests {
         let key_path = tmp.path().join("0.key");
         fs::write(&key_path, "{\"peerToken\":\"tok-xyz\"}").unwrap();
 
-        let listener = UnixListener::bind(&sock_path).unwrap();
+        let listener = crate::test_isolation::bind_unix_fixture(&sock_path).unwrap();
         let handle = std::thread::spawn(move || {
             let (stream, _) = listener.accept().unwrap();
             let reader = std::io::BufReader::new(stream);
@@ -7879,7 +7882,7 @@ mod tests {
         let key_path = tmp.path().join("0.key");
         fs::write(&key_path, "{\"peerToken\":\"tok-op\"}").unwrap();
 
-        let claude_listener = UnixListener::bind(&claude_sock).unwrap();
+        let claude_listener = crate::test_isolation::bind_unix_fixture(&claude_sock).unwrap();
         let claude_handle = std::thread::spawn(move || {
             let (stream, _) = claude_listener.accept().unwrap();
             let reader = std::io::BufReader::new(stream);
@@ -7914,7 +7917,7 @@ mod tests {
         assert_eq!(user["message"]["content"], "Check the queue status");
 
         let webhook_sock = tmp.path().join("webhook-op.sock");
-        let webhook_listener = UnixListener::bind(&webhook_sock).unwrap();
+        let webhook_listener = crate::test_isolation::bind_unix_fixture(&webhook_sock).unwrap();
         let webhook_handle = std::thread::spawn(move || {
             let (stream, _) = webhook_listener.accept().unwrap();
             let reader = std::io::BufReader::new(stream);
@@ -7964,7 +7967,7 @@ mod tests {
     fn claude_route_with_mock_socket(
         dir: &Path,
         tmux_field: Option<&str>,
-    ) -> (VendorRoute, UnixListener) {
+    ) -> (VendorRoute, crate::test_isolation::RegisteredUnixListener) {
         let sock_path = dir.join("claude-tmux.sock");
         let key_path = dir.join("0.key");
         let key = match tmux_field {
@@ -7972,7 +7975,7 @@ mod tests {
             None => serde_json::json!({ "peerToken": "tok-t" }),
         };
         fs::write(&key_path, key.to_string()).unwrap();
-        let listener = UnixListener::bind(&sock_path).unwrap();
+        let listener = crate::test_isolation::bind_unix_fixture(&sock_path).unwrap();
         listener.set_nonblocking(true).unwrap();
         (
             VendorRoute::Claude {
@@ -8199,7 +8202,7 @@ mod tests {
                 "missing" => tmp.path().join("gone.sock"),
                 _ => {
                     let path = tmp.path().join("refused.sock");
-                    drop(UnixListener::bind(&path).unwrap());
+                    drop(crate::test_isolation::bind_unix_fixture(&path).unwrap());
                     path
                 }
             };
@@ -8423,7 +8426,7 @@ mod tests {
         let (tmux_bin, tmux_out, _) = write_fake_tmux(tmp.path(), true);
         let _env = EnvGuard::set("FL_WIRE_TMUX_BIN", &tmux_bin);
         let sock = tmp.path().join("live.sock");
-        let listener = UnixListener::bind(&sock).unwrap();
+        let listener = crate::test_isolation::bind_unix_fixture(&sock).unwrap();
         let reader = std::thread::spawn(move || {
             let (stream, _) = listener.accept().unwrap();
             std::io::BufReader::new(stream)
@@ -10371,9 +10374,9 @@ mod tests {
     /// returns, so every push connects, then reads them with [`pushed_lines`]. A helper thread
     /// that accepted one push and then closed the listener refused any later push, and that
     /// refusal ran the stale-route repair and its discovery.
-    fn webhook(dir: &Path, name: &str) -> (PathBuf, UnixListener) {
+    fn webhook(dir: &Path, name: &str) -> (PathBuf, crate::test_isolation::RegisteredUnixListener) {
         let sock = dir.join(name);
-        let listener = UnixListener::bind(&sock).unwrap();
+        let listener = crate::test_isolation::bind_unix_fixture(&sock).unwrap();
         (sock, listener)
     }
 
@@ -10524,7 +10527,7 @@ mod tests {
             "{\"peerToken\":\"tok-g\"}",
         )
         .unwrap();
-        let listener = UnixListener::bind(&sock_path).unwrap();
+        let listener = crate::test_isolation::bind_unix_fixture(&sock_path).unwrap();
         let handle = std::thread::spawn(move || {
             let (stream, _) = listener.accept().unwrap();
             std::io::BufReader::new(stream)
@@ -11113,6 +11116,9 @@ exit 1"#,
                 let mut cfg = HostConfig::new(ep_srv);
                 cfg.minor = 1;
                 let mut listener = HostListener::bind(cfg).await.unwrap();
+                let _socket_fixture =
+                    crate::test_isolation::register_unix_socket(listener.endpoint().socket_path())
+                        .unwrap();
                 let _ = ready_tx.send(());
                 while let Ok(mut conn) = listener.accept().await {
                     let summaries_conn = summaries_srv.clone();
@@ -11374,6 +11380,9 @@ exit 1"#,
                 let mut cfg = HostConfig::new(ep_srv);
                 cfg.minor = 1;
                 let mut listener = HostListener::bind(cfg).await.unwrap();
+                let _socket_fixture =
+                    crate::test_isolation::register_unix_socket(listener.endpoint().socket_path())
+                        .unwrap();
                 let _ = ready_tx.send(());
                 while let Ok(mut conn) = listener.accept().await {
                     let summary = summary.clone();
@@ -11495,6 +11504,9 @@ exit 1"#,
                 let mut cfg = HostConfig::new(ep_srv);
                 cfg.minor = 1;
                 let mut listener = HostListener::bind(cfg).await.unwrap();
+                let _socket_fixture =
+                    crate::test_isolation::register_unix_socket(listener.endpoint().socket_path())
+                        .unwrap();
                 let _ = ready_tx.send(());
                 loop {
                     let mut conn = tokio::select! {
@@ -11774,6 +11786,9 @@ exit 1"#,
                 let mut cfg = HostConfig::new(ep_srv);
                 cfg.minor = 1;
                 let mut listener = HostListener::bind(cfg).await.unwrap();
+                let _socket_fixture =
+                    crate::test_isolation::register_unix_socket(listener.endpoint().socket_path())
+                        .unwrap();
                 let _ = ready_tx.send(());
                 while let Ok(mut conn) = listener.accept().await {
                     let summary = summary.clone();
@@ -12426,6 +12441,9 @@ exit 1"#,
                 let mut cfg = HostConfig::new(ep_srv);
                 cfg.minor = 1;
                 let mut listener = HostListener::bind(cfg).await.unwrap();
+                let _socket_fixture =
+                    crate::test_isolation::register_unix_socket(listener.endpoint().socket_path())
+                        .unwrap();
                 let _ = ready_tx.send(());
                 loop {
                     let mut conn = tokio::select! {
@@ -13177,6 +13195,9 @@ exit 1"#,
                 let mut cfg = HostConfig::new(ep_srv);
                 cfg.minor = 1;
                 let mut listener = HostListener::bind(cfg).await.unwrap();
+                let _socket_fixture =
+                    crate::test_isolation::register_unix_socket(listener.endpoint().socket_path())
+                        .unwrap();
                 let _ = ready_tx.send(());
                 loop {
                     let mut conn = tokio::select! {
@@ -13413,6 +13434,9 @@ exit 1"#,
                 let mut cfg = HostConfig::new(ep_srv);
                 cfg.minor = 1;
                 let mut listener = HostListener::bind(cfg).await.unwrap();
+                let _socket_fixture =
+                    crate::test_isolation::register_unix_socket(listener.endpoint().socket_path())
+                        .unwrap();
                 let _ = ready_tx.send(());
                 loop {
                     let mut conn = tokio::select! {
@@ -13758,6 +13782,7 @@ exit 1"#,
                 let mut cfg = HostConfig::new(ep_srv);
                 cfg.minor = 1;
                 let mut listener = HostListener::bind(cfg).await.unwrap();
+                let _socket_fixture = crate::test_isolation::register_unix_socket(listener.endpoint().socket_path()).unwrap();
                 let _ = ready_tx.send(());
                 loop {
                     let mut conn = tokio::select! {
@@ -14308,6 +14333,9 @@ exit 1"#,
                 let mut cfg = HostConfig::new(ep_srv);
                 cfg.minor = 1;
                 let mut listener = HostListener::bind(cfg).await.unwrap();
+                let _socket_fixture =
+                    crate::test_isolation::register_unix_socket(listener.endpoint().socket_path())
+                        .unwrap();
                 let _ = ready_tx.send(());
                 loop {
                     let mut conn = tokio::select! {
@@ -14747,6 +14775,7 @@ exit 1"#,
                 let mut cfg = HostConfig::new(ep_srv);
                 cfg.minor = 1;
                 let mut listener = HostListener::bind(cfg).await.unwrap();
+                let _socket_fixture = crate::test_isolation::register_unix_socket(listener.endpoint().socket_path()).unwrap();
                 let _ = ready_tx.send(());
                 loop {
                     let mut conn = tokio::select! {
@@ -15354,6 +15383,9 @@ exit 1"#,
                 let mut cfg = HostConfig::new(ep_srv);
                 cfg.minor = 1;
                 let mut listener = HostListener::bind(cfg).await.unwrap();
+                let _socket_fixture =
+                    crate::test_isolation::register_unix_socket(listener.endpoint().socket_path())
+                        .unwrap();
                 let _ = ready_tx.send(());
                 loop {
                     let mut conn = tokio::select! {
@@ -15664,6 +15696,7 @@ exit 1"#,
                 let mut cfg = HostConfig::new(ep_srv);
                 cfg.minor = 1;
                 let mut listener = HostListener::bind(cfg).await.unwrap();
+                let _socket_fixture = crate::test_isolation::register_unix_socket(listener.endpoint().socket_path()).unwrap();
                 let _ = ready_tx.send(());
                 loop {
                     let mut conn = tokio::select! {
@@ -15992,6 +16025,9 @@ exit 1"#,
                 let mut cfg = HostConfig::new(ep_srv);
                 cfg.minor = 1;
                 let mut listener = HostListener::bind(cfg).await.unwrap();
+                let _socket_fixture =
+                    crate::test_isolation::register_unix_socket(listener.endpoint().socket_path())
+                        .unwrap();
                 let _ = ready_tx.send(());
                 loop {
                     let mut conn = tokio::select! {
@@ -16583,6 +16619,9 @@ exit 1"#,
                 let mut cfg = HostConfig::new(ep_srv);
                 cfg.minor = 1;
                 let mut listener = HostListener::bind(cfg).await.unwrap();
+                let _socket_fixture =
+                    crate::test_isolation::register_unix_socket(listener.endpoint().socket_path())
+                        .unwrap();
                 let _ = ready_tx.send(());
                 loop {
                     let mut conn = tokio::select! {
@@ -16866,6 +16905,7 @@ exit 1"#,
                 let mut cfg = HostConfig::new(ep_srv);
                 cfg.minor = 1;
                 let mut listener = HostListener::bind(cfg).await.unwrap();
+                let _socket_fixture = crate::test_isolation::register_unix_socket(listener.endpoint().socket_path()).unwrap();
                 let _ = ready_tx.send(());
                 loop {
                     let mut conn = tokio::select! {
@@ -17234,6 +17274,7 @@ exit 1"#,
                 let mut cfg = HostConfig::new(ep_srv);
                 cfg.minor = 1;
                 let mut listener = HostListener::bind(cfg).await.unwrap();
+                let _socket_fixture = crate::test_isolation::register_unix_socket(listener.endpoint().socket_path()).unwrap();
                 let _ = ready_tx.send(());
                 loop {
                     let mut conn = tokio::select! {
@@ -17509,6 +17550,7 @@ exit 1"#,
                 let mut cfg = HostConfig::new(ep_srv);
                 cfg.minor = 1;
                 let mut listener = HostListener::bind(cfg).await.unwrap();
+                let _socket_fixture = crate::test_isolation::register_unix_socket(listener.endpoint().socket_path()).unwrap();
                 let _ = ready_tx.send(());
                 loop {
                     let mut conn = tokio::select! {
@@ -18034,6 +18076,7 @@ exit 1"#,
                 let mut cfg = HostConfig::new(ep_srv);
                 cfg.minor = 1;
                 let mut listener = HostListener::bind(cfg).await.unwrap();
+                let _socket_fixture = crate::test_isolation::register_unix_socket(listener.endpoint().socket_path()).unwrap();
                 let _ = ready_tx.send(());
                 loop {
                     let mut conn = tokio::select! {
@@ -18512,6 +18555,9 @@ exit 1"#,
                 let mut cfg = HostConfig::new(ep_srv);
                 cfg.minor = 1;
                 let mut listener = HostListener::bind(cfg).await.unwrap();
+                let _socket_fixture =
+                    crate::test_isolation::register_unix_socket(listener.endpoint().socket_path())
+                        .unwrap();
                 let _ = ready_tx.send(());
                 while let Ok(mut conn) = listener.accept().await {
                     let summary = summary.clone();
