@@ -117,6 +117,41 @@ mod host_isolation_tests {
 
     #[cfg(unix)]
     #[test]
+    fn wire_listeners_refuse_external_bind_before_filesystem_changes() {
+        let external = tempfile::Builder::new().tempdir_in("/var/tmp").unwrap();
+        let parent = external.path().join("uncreated");
+        let host_socket = parent.join("host.sock");
+        let endpoint = fl_host_proto::HostEndpoint::unix(&host_socket).unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        assert!(
+            runtime
+                .block_on(fl_host_proto::HostListener::bind(
+                    fl_host_proto::HostConfig::new(endpoint)
+                ))
+                .is_err()
+        );
+        assert!(
+            !parent.exists(),
+            "host bind created an external parent or sidecar"
+        );
+        assert!(
+            fl_store::FerroStoreServer::bind_unix(
+                parent.join("store.sock"),
+                fl_store::FerroStore::in_memory()
+            )
+            .is_err()
+        );
+        assert!(
+            !parent.exists(),
+            "store bind created an external parent or socket"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn wire_host_listener_refuses_unregistered_socket_probe() {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::Builder::new()

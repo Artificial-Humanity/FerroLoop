@@ -304,6 +304,12 @@ impl FerroStoreServer {
             ));
         }
         let path = path.as_ref();
+        #[cfg(feature = "wire-test-isolation")]
+        if let Err(err) = crate::test_isolation::validate_unix(path)
+            && err.kind() != io::ErrorKind::NotFound
+        {
+            return Err(backend(err.to_string()));
+        }
         let parent = match path.parent() {
             Some(parent) if !parent.as_os_str().is_empty() => parent,
             _ => Path::new("."),

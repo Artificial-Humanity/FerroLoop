@@ -64,6 +64,10 @@ pub fn enable() {
         },
     );
     fl_host_proto::enable_hub_test_isolation();
+    fl_host_proto::install_test_bind_validator(|endpoint| {
+        ensure_fixture(endpoint.socket_path())
+            .map_err(|err| fl_host_proto::HostError::Protocol(err.to_string()))
+    });
     fl_host_proto::install_test_endpoint_validator(|endpoint| {
         ensure_socket(endpoint.socket_path())
             .map_err(|err| fl_host_proto::HostError::Protocol(err.to_string()))

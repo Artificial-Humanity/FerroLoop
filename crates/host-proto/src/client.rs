@@ -114,6 +114,25 @@ static TEST_ENDPOINT_VALIDATOR: std::sync::OnceLock<TestEndpointValidator> =
     std::sync::OnceLock::new();
 
 #[cfg(feature = "hub-test-isolation")]
+static TEST_BIND_VALIDATOR: std::sync::OnceLock<TestEndpointValidator> = std::sync::OnceLock::new();
+
+#[cfg(feature = "hub-test-isolation")]
+#[doc(hidden)]
+pub fn install_test_bind_validator(validator: TestEndpointValidator) {
+    TEST_BIND_VALIDATOR
+        .set(validator)
+        .expect("host test bind validator installed twice");
+}
+
+#[cfg(feature = "hub-test-isolation")]
+pub(crate) fn validate_test_bind(endpoint: &HostEndpoint) -> Result<(), HostError> {
+    if let Some(validate) = TEST_BIND_VALIDATOR.get() {
+        validate(endpoint)?;
+    }
+    Ok(())
+}
+
+#[cfg(feature = "hub-test-isolation")]
 #[doc(hidden)]
 pub fn install_test_endpoint_validator(validator: fn(&HostEndpoint) -> Result<(), HostError>) {
     TEST_ENDPOINT_VALIDATOR

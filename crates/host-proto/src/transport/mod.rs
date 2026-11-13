@@ -383,6 +383,8 @@ impl std::fmt::Debug for HostListener {
 
 impl HostListener {
     pub async fn bind(config: HostConfig) -> Result<Self, HostError> {
+        #[cfg(feature = "hub-test-isolation")]
+        crate::client::validate_test_bind(&config.endpoint)?;
         #[cfg(unix)]
         {
             let setup = unix::bind_setup(&config.endpoint)?;
