@@ -7228,22 +7228,124 @@ fn reservation_pad_record(
     assert_eq!(reservation_json_bytes(&record), bytes);
     record
 }
+type ReservationArtifacts =
+    std::collections::BTreeMap<std::path::PathBuf, (u64, u64, Option<Vec<u8>>)>;
+fn reservation_artifacts(f: &Fixture) -> ReservationArtifacts {
+    fn visit(root: &std::path::Path, path: &std::path::Path, entries: &mut ReservationArtifacts) {
+        let metadata = fs::symlink_metadata(path).unwrap();
+        entries.insert(
+            path.strip_prefix(root).unwrap().to_path_buf(),
+            (
+                metadata.dev(),
+                metadata.ino(),
+                metadata.is_file().then(|| fs::read(path).unwrap()),
+            ),
+        );
+        if metadata.is_dir() {
+            for entry in fs::read_dir(path).unwrap() {
+                visit(root, &entry.unwrap().path(), entries);
+            }
+        }
+    }
+    let mut entries = std::collections::BTreeMap::new();
+    visit(f.root.path(), f.root.path(), &mut entries);
+    entries
+}
+fn reservation_refuses_without_artifacts(
+    f: &Fixture,
+    request: &RestoreRequest,
+    lease: &OfflineLease,
+) -> fl_store::recovery::RecoveryError {
+    let before = reservation_artifacts(f);
+    let hook = journal_boundary_io(None);
+    let filesystem = CutFs {
+        f,
+        io: hook.clone(),
+        limits: limits(),
+    };
+    let error = restore_offline(request, lease, &filesystem).unwrap_err();
+    let created = hook
+        .events
+        .lock()
+        .unwrap()
+        .iter()
+        .copied()
+        .filter(|event| {
+            matches!(
+                event,
+                RecoveryEvent::CreateDirectory
+                    | RecoveryEvent::Create(
+                        Member::Image
+                            | Member::RestoreProbe
+                            | Member::RestoreJournal
+                            | Member::RestoreOperationLock
+                            | Member::RestorePin
+                            | Member::RestoreGuard
+                    )
+            )
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        created.is_empty(),
+        "reservation refusal created restore artifacts: {created:?}; {error}"
+    );
+    assert_eq!(
+        reservation_artifacts(f),
+        before,
+        "reservation refusal changed source, bundle or namespace"
+    );
+    let diagnostic = error.to_string();
+    let fl_store::recovery::RecoveryError::RestoreMetadataReservationQuota {
+        offered_bytes,
+        required_bytes,
+        ..
+    } = &error
+    else {
+        panic!("{diagnostic}")
+    };
+    assert_eq!(*offered_bytes, request.metadata_byte_limit);
+    assert!(
+        *required_bytes > *offered_bytes && *required_bytes <= 512 << 20,
+        "{diagnostic}"
+    );
+    assert!(
+        diagnostic.contains(&required_bytes.to_string()),
+        "{diagnostic}"
+    );
+    assert!(diagnostic.contains("metadata_byte_limit"), "{diagnostic}");
+    assert!(
+        diagnostic.contains(&request.metadata_byte_limit.to_string()),
+        "{diagnostic}"
+    );
+    assert!(
+        diagnostic.contains("requires") && diagnostic.contains("increase"),
+        "{diagnostic}"
+    );
+    error
+}
 #[test]
 fn restore_terminal_reservation_padded_admission_refuses_before_guard() {
     let f = journal_fixture();
-    let (request, lease) = prepare_restore(&f, &f.source);
+    let (mut request, lease) = prepare_restore(&f, &f.source);
     let mut binding = fixture_lease_request(&lease);
     binding.exclusion.evidence.push_str(&"x".repeat(3000));
     fs::remove_file(lease.path()).unwrap();
     let lease = create_offline_lease(&binding, &f.filesystem(), &limits()).unwrap();
-    let before = fs::read(&f.source).unwrap();
-    assert!(
-        restore_offline(&request, &lease, &f.filesystem()).is_err(),
-        "no terminal frame was reserved before admission"
+    let error = reservation_refuses_without_artifacts(&f, &request, &lease);
+    let fl_store::recovery::RecoveryError::RestoreMetadataReservationQuota {
+        required_bytes, ..
+    } = error
+    else {
+        unreachable!()
+    };
+    request.metadata_byte_limit = required_bytes + 4096;
+    assert!(matches!(
+        restore_offline(&request, &lease, &f.filesystem()).unwrap(),
+        RestoreOutcome::Installed { .. }
+    ));
+    eprintln!(
+        "reservation padded lease: artifact-free refusal; required metadata plus 4096 bytes admits"
     );
-    assert!(!f.source.with_extension("fls.restore-guard").exists());
-    assert_eq!(fs::read(&f.source).unwrap(), before);
-    eprintln!("reservation admission padded lease: 1 case");
 }
 fn reservation_exact_lease(j: &RestoreJournal, lease: &OfflineLease, f: &Fixture) -> OfflineLease {
     let mut binding = fixture_lease_request(lease);
@@ -7554,11 +7656,10 @@ fn restore_terminal_reservation_dependency_graph_admission() {
             };
             drop(owner);
             let (mut request, lease) = prepare_restore_bundle(&f, &f.source, bundle);
+            // Provision this dependency fixture for fixed future O/X plus
+            // conservative maximum-width identities before staging exists.
+            request.metadata_byte_limit += if original { 64 << 10 } else { 32 << 10 };
             if original {
-                // Fixed future O/X reserve needs additional frame room;
-                // this dependency-focused fixture provisions 32KiB more from
-                // the existing per-request budget (341 frame bytes).
-                request.metadata_byte_limit += 32 << 10;
                 request.original_profile.dependencies = dependencies;
             }
             request.available_dependencies = vec![DependencyResolution {
@@ -9403,7 +9504,7 @@ fn restore_terminal_reservation_default_original_dependency_budget_refuses() {
         }];
         assert_eq!(request.metadata_byte_limit, 1 << 20);
         if provisioned {
-            request.metadata_byte_limit += 32 << 10;
+            request.metadata_byte_limit += 64 << 10;
             let RestoreOutcome::Installed { journal } =
                 restore_offline(&request, &lease, &f.filesystem()).unwrap()
             else {
@@ -9411,8 +9512,8 @@ fn restore_terminal_reservation_default_original_dependency_budget_refuses() {
             };
             let (_, _, provisioned_e) = reservation_expected_caps(&journal);
             let mut default = journal.clone();
-            default.journal_capacity -= 32 << 10;
-            default.budget.metadata_payload_ceiling -= 32 << 10;
+            default.journal_capacity -= 64 << 10;
+            default.budget.metadata_payload_ceiling -= 64 << 10;
             let (_, _, default_e) = reservation_expected_caps(&default);
             let mut maximum = generation_evidence(&journal, true);
             maximum.dependencies = request.available_dependencies.clone();
@@ -9446,14 +9547,7 @@ fn restore_terminal_reservation_default_original_dependency_budget_refuses() {
                 default.journal_capacity / 96 - 72
             );
         } else {
-            let before = fs::read(&f.source).unwrap();
-            let error = restore_offline(&request, &lease, &f.filesystem()).unwrap_err();
-            assert!(
-                format!("{error:?}").contains("restore mandatory terminal evidence"),
-                "{error:?}"
-            );
-            assert_eq!(fs::read(&f.source).unwrap(), before);
-            assert!(!f.source.with_extension("fls.restore-guard").exists());
+            reservation_refuses_without_artifacts(&f, &request, &lease);
             eprintln!(
                 "default metadata=1048576 original dependency64 refuses fixed future reservation before guard"
             );

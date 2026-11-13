@@ -70,6 +70,15 @@ pub enum RecoveryError {
         resource: &'static str,
     },
     #[error(
+        "recovery {operation_id}: metadata_byte_limit offers {offered_bytes} bytes; restore terminal reservation requires at least {required_bytes} bytes; {action}"
+    )]
+    RestoreMetadataReservationQuota {
+        operation_id: uuid::Uuid,
+        offered_bytes: u64,
+        required_bytes: u64,
+        action: &'static str,
+    },
+    #[error(
         "recovery {operation_id}: {resource} offers {offered_bytes} encoded bytes; limit {limit_bytes} encoded bytes (JSON quotes and escaping included); journal unchanged"
     )]
     RestoreTerminalInputQuota {

@@ -781,6 +781,59 @@ pub fn restore_offline(
     lease.validate(filesystem, &l)?;
     let staging_name = format!(".restore-{}-{}", request.operation_id, uuid::Uuid::now_v7());
     let staging_path = parent.path.join(&staging_name);
+    let capacity = request.metadata_byte_limit - GUARD_ALLOWANCE;
+    let maximum_identity = (u64::MAX, u64::MAX);
+    // Keep one owned journal throughout admission. Before touching the namespace,
+    // maximum-width filesystem identities conservatively bound every real frame.
+    let mut journal = RestoreJournal {
+        version: 1,
+        operation_id: request.operation_id,
+        destination: physical.clone(),
+        staging: staging_path.clone(),
+        rollback: binding_identity(&original).map(|_| staging_path.join("original.fls")),
+        original: original.clone(),
+        original_verification: original_report.clone(),
+        original_read_error: original_read_error.clone(),
+        selected_profile: profile.clone(),
+        selected_dependencies: super::manifest::DependencyManifest {
+            references: manifest.reference_dependencies.clone(),
+        },
+        selected_sequence: manifest.published_sequence,
+        selected_logical_sha256: manifest.logical_sha256.clone(),
+        generation_metadata_sha256: [0; 32],
+        terminal_evidence_context: None,
+        original_dependencies: super::manifest::DependencyManifest {
+            references: request.original_profile.dependencies.clone(),
+        },
+        original_profile: request.original_profile.clone(),
+        candidate_bytes: manifest.image_bytes,
+        probe_identities: [maximum_identity; 2],
+        candidate_identity: maximum_identity,
+        candidate_sha256: manifest.image_sha256.clone(),
+        staging_identity: maximum_identity,
+        journal_identity: maximum_identity,
+        operation_lock_identity: maximum_identity,
+        journal_capacity: capacity,
+        selected_bundle_operation: uuid::Uuid::parse_str(&manifest.operation_id)
+            .map_err(|_| l.verification())?,
+        selected_bundle_sha256: bundle_digest.clone(),
+        binding: lease.request.clone(),
+        verification: None,
+        budget: budget.clone(),
+        phase: RestorePhase::Admitted,
+        resume_finalize_attempts: 0,
+        rollback_attempts: 0,
+        current_attempt: 0,
+        attempt_deadline_unix_ms: deadline_unix(filesystem, &l, lease)?,
+        forensic_handling_required: false,
+        reconciliation: None,
+        absence_reconciliation: None,
+        log_end: 0,
+        log_hash: [0; 32],
+        torn_tail_bytes: 0,
+        log_frames: 0,
+    };
+    check_terminal_reservation(&journal, &l)?;
     drop(_catalog_access);
     let mut admission_staging_identity = None;
     let mut admission_lock_identity = None;
@@ -828,56 +881,13 @@ pub fn restore_offline(
             &l,
         )?;
         let log = PrivateFile::open(&staging.path.join("journal.bin"), true, &l)?;
-        let capacity = request.metadata_byte_limit - GUARD_ALLOWANCE;
         control.allocate(&log.file, capacity, true, &l)?;
-        let mut journal = RestoreJournal {
-            version: 1,
-            operation_id: request.operation_id,
-            destination: physical.clone(),
-            staging: staging.path.clone(),
-            rollback: binding_identity(&original).map(|_| staging.path.join("original.fls")),
-            original: original.clone(),
-            original_verification: original_report.clone(),
-            original_read_error: original_read_error.clone(),
-            selected_profile: profile.clone(),
-            selected_dependencies: super::manifest::DependencyManifest {
-                references: manifest.reference_dependencies.clone(),
-            },
-            selected_sequence: manifest.published_sequence,
-            selected_logical_sha256: manifest.logical_sha256.clone(),
-            generation_metadata_sha256: [0; 32],
-            terminal_evidence_context: None,
-            original_dependencies: super::manifest::DependencyManifest {
-                references: request.original_profile.dependencies.clone(),
-            },
-            original_profile: request.original_profile.clone(),
-            candidate_bytes: manifest.image_bytes,
-            probe_identities: [probe_a.identity(), probe_b.identity()],
-            candidate_identity: candidate.identity(),
-            candidate_sha256: manifest.image_sha256.clone(),
-            staging_identity: fs::identity(&staging.file, &l)?,
-            journal_identity: log.identity(),
-            operation_lock_identity: lock.held.identity(),
-            journal_capacity: capacity,
-            selected_bundle_operation: uuid::Uuid::parse_str(&manifest.operation_id)
-                .map_err(|_| l.verification())?,
-            selected_bundle_sha256: bundle_digest.clone(),
-            binding: lease.request.clone(),
-            verification: None,
-            budget: budget.clone(),
-            phase: RestorePhase::Admitted,
-            resume_finalize_attempts: 0,
-            rollback_attempts: 0,
-            current_attempt: 0,
-            attempt_deadline_unix_ms: deadline_unix(filesystem, &l, lease)?,
-            forensic_handling_required: false,
-            reconciliation: None,
-            absence_reconciliation: None,
-            log_end: 0,
-            log_hash: [0; 32],
-            torn_tail_bytes: 0,
-            log_frames: 0,
-        };
+        journal.probe_identities = [probe_a.identity(), probe_b.identity()];
+        journal.candidate_identity = candidate.identity();
+        journal.staging_identity = fs::identity(&staging.file, &l)?;
+        journal.journal_identity = log.identity();
+        journal.operation_lock_identity = lock.held.identity();
+        journal.attempt_deadline_unix_ms = deadline_unix(filesystem, &l, lease)?;
         journal.generation_metadata_sha256 = super::restore_metadata::measure(
             &generation_metadata(&journal),
             metadata_caps.payload,
@@ -2422,8 +2432,27 @@ fn maximum_report(build: &super::manifest::BuildIdentity) -> MaximumVerification
     }
 }
 fn terminal_caps(j: &RestoreJournal, l: &OperationLimits) -> Result<TerminalCaps, RecoveryError> {
-    use super::restore_metadata::{Caps, measure};
+    use super::restore_metadata::Caps;
     let p = Caps::new(j.journal_capacity, l)?.payload;
+    let (reserved, operator, lease) = terminal_reservation_base(j, p, l)?;
+    let evidence = p.checked_sub(reserved).ok_or_else(|| {
+        fs::refused(
+            l,
+            "immutable restore metadata leaves no terminal reservation",
+        )
+    })?;
+    Ok(TerminalCaps {
+        operator,
+        lease,
+        evidence,
+    })
+}
+fn terminal_reservation_base(
+    j: &RestoreJournal,
+    p: u64,
+    l: &OperationLimits,
+) -> Result<(u64, u64, u64), RecoveryError> {
+    use super::restore_metadata::measure;
     // Exact field substitutions preserve the serializer's existing field names,
     // punctuation and immutable fields, without owning a normalized journal.
     let mut b = measure(j, p, l)?.0;
@@ -2484,22 +2513,12 @@ fn terminal_caps(j: &RestoreJournal, l: &OperationLimits) -> Result<TerminalCaps
     ] {
         lease = replace_encoded(lease, &flag, &false, p, l)?;
     }
-    let evidence = b
+    let reserved = b
         .checked_add(r)
         .and_then(|n| n.checked_add(TERMINAL_CONTEXT_ENVELOPE_MAX))
         .and_then(|n| n.checked_add(lease))
-        .and_then(|n| p.checked_sub(n))
-        .ok_or_else(|| {
-            fs::refused(
-                l,
-                "immutable restore metadata leaves no terminal reservation",
-            )
-        })?;
-    Ok(TerminalCaps {
-        operator,
-        lease,
-        evidence,
-    })
+        .ok_or_else(|| l.verification())?;
+    Ok((reserved, operator, lease))
 }
 
 #[derive(Serialize)]
@@ -2557,13 +2576,53 @@ fn check_terminal_reservation(
     j: &RestoreJournal,
     l: &OperationLimits,
 ) -> Result<(), RecoveryError> {
+    let maximum_payload =
+        super::restore_metadata::Caps::new((512 << 20) - GUARD_ALLOWANCE, l)?.payload;
+    match check_terminal_reservation_bounded(j, maximum_payload, l) {
+        Err(RecoveryError::Quota {
+            resource: "restore metadata bytes",
+            ..
+        }) => Err(terminal_reservation_quota(j, maximum_payload + 1, l)),
+        result => result,
+    }
+}
+fn terminal_reservation_quota(
+    j: &RestoreJournal,
+    required_payload: u64,
+    l: &OperationLimits,
+) -> RecoveryError {
+    let Some(required_bytes) = required_payload
+        .checked_add(super::restore_metadata::FRAME_HEADER)
+        .and_then(|n| n.checked_mul(super::restore_metadata::MAX_FRAMES))
+        .and_then(|n| n.checked_add(GUARD_ALLOWANCE))
+    else {
+        return l.verification();
+    };
+    RecoveryError::RestoreMetadataReservationQuota {
+        operation_id: l.operation_id,
+        offered_bytes: j.budget.metadata_payload_ceiling,
+        required_bytes,
+        action: if required_bytes > 512 << 20 {
+            "required reservation exceeds the supported 536870912-byte maximum; increasing metadata_byte_limit cannot admit this restore"
+        } else {
+            // A larger limit may widen its own serialized budget scalars.
+            "increase metadata_byte_limit with headroom for encoded budget widths, within the supported 536870912-byte maximum"
+        },
+    }
+}
+fn check_terminal_reservation_bounded(
+    j: &RestoreJournal,
+    p: u64,
+    l: &OperationLimits,
+) -> Result<(), RecoveryError> {
     use super::{
         manifest::Availability,
         readiness::*,
         restore_metadata::{Caps, measure},
     };
-    let caps = terminal_caps(j, l)?;
-    let p = Caps::new(j.journal_capacity, l)?.payload;
+    let offered_payload = Caps::new(j.journal_capacity, l)?.payload;
+    let (reserved, _, _) = terminal_reservation_base(j, p, l)?;
+    let mut required_payload = reserved;
     for original in [false, true] {
         if original && j.original_verification.is_none() {
             continue;
@@ -2638,7 +2697,8 @@ fn check_terminal_reservation(
             .checked_sub(measure(&j.binding.operator, p, l)?.0)
             .and_then(|n| n.checked_add(ACCEPTING_OPERATOR_ENCODED_MAX))
             .ok_or_else(|| l.verification())?;
-        l.quota(q, caps.evidence, "restore mandatory terminal evidence")?;
+        required_payload =
+            required_payload.max(reserved.checked_add(q).ok_or_else(|| l.verification())?);
         // The borrowed template has no heap allocation. Admit its owned model,
         // the selected synthetic report and readiness scratch BEFORE allocating
         // any of them, one role at a time. Immutable loaded metadata stays borrowed.
@@ -2757,15 +2817,16 @@ fn check_terminal_reservation(
             no_client_opened_path_while_installed: true,
             evidence_sha256: RESERVATION_SHA,
         };
-        l.quota(
-            measure(&absence, p, l)?
-                .0
-                .checked_sub(measure(&j.binding.operator, p, l)?.0)
-                .and_then(|n| n.checked_add(ACCEPTING_OPERATOR_ENCODED_MAX))
-                .ok_or_else(|| l.verification())?,
-            caps.evidence,
-            "restore mandatory absence evidence",
-        )?;
+        let q = measure(&absence, p, l)?
+            .0
+            .checked_sub(measure(&j.binding.operator, p, l)?.0)
+            .and_then(|n| n.checked_add(ACCEPTING_OPERATOR_ENCODED_MAX))
+            .ok_or_else(|| l.verification())?;
+        required_payload =
+            required_payload.max(reserved.checked_add(q).ok_or_else(|| l.verification())?);
+    }
+    if required_payload > offered_payload {
+        return Err(terminal_reservation_quota(j, required_payload, l));
     }
     Ok(())
 }
