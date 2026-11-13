@@ -365,6 +365,114 @@ describe("FerroWatchPane — Antigravity hosted model suffix", () => {
       within(row).getByTestId("watch-liveness-remodel-btn-ferris"),
     ).toBeInTheDocument();
   });
+
+  it("prefers the row adapter over a decommissioned record's vendor when picking the live session", async () => {
+    const summary = makeSampleWatchSummary();
+    summary.health!.agents = [
+      {
+        ...summary.health!.agents[0],
+        adapter: "antigravity",
+        hosted_session: {
+          ...summary.health!.agents[0].hosted_session!,
+          session_id: "63c8a662-stale",
+          vendor: "claude",
+          status: "decommissioned",
+        },
+      },
+    ];
+    const fetchImpl = vi.fn(async (input: RequestInfo | URL) => {
+      const body = String(input).includes("/api/v1/watch/summary") ? summary : {};
+      return new Response(JSON.stringify(body), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    });
+    render(
+      <FerroWatchPane
+        authority={{ tier: "owner", login: "lmcfarlin" }}
+        apiClient={new HubApiClient({ fetchImpl: fetchImpl as unknown as typeof fetch })}
+        sessions={[
+          {
+            id: "codex-sub",
+            source: "route",
+            adapter: "codex",
+            persona: "ferris",
+            status: "active",
+            context_usage: { used_tokens: 111000, max_tokens: 200000, source: "reported" },
+          },
+          {
+            id: "conv-live",
+            source: "route",
+            adapter: "antigravity",
+            persona: "ferris",
+            status: "active",
+            context_usage: { used_tokens: 222000, max_tokens: 200000, source: "reported" },
+          },
+        ]}
+      />,
+    );
+    const row = await screen.findByTestId("watch-liveness-row-ferris");
+    const live = within(row).getByTestId("watch-liveness-live-unmanaged-ferris");
+    expect(live).toHaveTextContent("conv-live");
+    expect(live).not.toHaveTextContent("codex-sub");
+    expect(row).not.toHaveTextContent("codex-sub");
+    const context = within(row).getByTestId("watch-liveness-context-ferris");
+    expect(context).toHaveTextContent("222");
+    expect(context).not.toHaveTextContent("111");
+  });
+
+  it("falls back to the decommissioned record's vendor when the row names no adapter", async () => {
+    const summary = makeSampleWatchSummary();
+    summary.health!.agents = [
+      {
+        ...summary.health!.agents[0],
+        adapter: null,
+        hosted_session: {
+          ...summary.health!.agents[0].hosted_session!,
+          session_id: "63c8a662-stale",
+          vendor: "claude",
+          status: "decommissioned",
+        },
+      },
+    ];
+    const fetchImpl = vi.fn(async (input: RequestInfo | URL) => {
+      const body = String(input).includes("/api/v1/watch/summary") ? summary : {};
+      return new Response(JSON.stringify(body), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    });
+    render(
+      <FerroWatchPane
+        authority={{ tier: "owner", login: "lmcfarlin" }}
+        apiClient={new HubApiClient({ fetchImpl: fetchImpl as unknown as typeof fetch })}
+        sessions={[
+          {
+            id: "codex-sub",
+            source: "route",
+            adapter: "codex",
+            persona: "ferris",
+            status: "active",
+            context_usage: { used_tokens: 111000, max_tokens: 200000, source: "reported" },
+          },
+          {
+            id: "claude-live",
+            source: "route",
+            adapter: "claude",
+            persona: "ferris",
+            status: "active",
+            context_usage: { used_tokens: 333000, max_tokens: 200000, source: "reported" },
+          },
+        ]}
+      />,
+    );
+    const row = await screen.findByTestId("watch-liveness-row-ferris");
+    const live = within(row).getByTestId("watch-liveness-live-unmanaged-ferris");
+    expect(live).toHaveTextContent("claude-live");
+    expect(live).not.toHaveTextContent("codex-sub");
+    const context = within(row).getByTestId("watch-liveness-context-ferris");
+    expect(context).toHaveTextContent("333");
+  });
 });
 
 describe("FerroWatchPane — Telemetry, Quota Matrix, Re-Model/Balance, Liveness & Rollups", () => {

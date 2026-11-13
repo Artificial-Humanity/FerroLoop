@@ -2631,7 +2631,17 @@ export const FerroWatchPane: React.FC<FerroWatchPaneProps> = ({
                   // discovered session exists for the persona, show that live
                   // unmanaged session, not the stale record id. Actions in this
                   // row already target the persona (`key`).
-                  const rowVendor = item.hosted_session?.vendor ?? item.adapter ?? null;
+                  const isDecommissioned =
+                    (item.hosted_session?.status ?? "")
+                      .trim()
+                      .toLowerCase() === "decommissioned";
+                  const rowAdapter = item.adapter?.trim() ? item.adapter : null;
+                  const hostedVendor = item.hosted_session?.vendor?.trim()
+                    ? item.hosted_session.vendor
+                    : null;
+                  const rowVendor = isDecommissioned
+                    ? (rowAdapter ?? hostedVendor)
+                    : (hostedVendor ?? rowAdapter);
                   const activeSessions = sessions.filter(
                     (sess) =>
                       (sess.persona ?? "").trim().toLowerCase() === key &&
