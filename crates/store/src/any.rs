@@ -205,6 +205,8 @@ pub(crate) fn open_store_sink_env(
         None => choose_backend(path, env)?,
     };
     let physical = physical_path(path, kind);
+    crate::recovery::admission::check_restore_admission(&physical)
+        .map_err(|e| backend(e.to_string()))?;
     let (backend_store, label) = match kind {
         BackendKind::Redb => {
             warn_if_fls_beside(&physical, sink);
@@ -463,6 +465,7 @@ fn lock_failed(physical: &Path, err: &std::io::Error) -> StoreError {
 /// (what `fl store migrate` runs; [`crate::migrate::migrate_verified`] itself
 /// takes no lock). Forgets an earlier automatic fallback of this store.
 pub fn migrate_locked(redb: &Path, fls: &Path) -> Result<crate::migrate::ParityReport, StoreError> {
+    crate::recovery::admission::check_restore_admission(fls).map_err(|e| backend(e.to_string()))?;
     let _lock = MigrationLock::acquire(fls, true)
         .map_err(|err| {
             backend(format!(

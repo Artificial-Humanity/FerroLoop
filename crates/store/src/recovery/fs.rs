@@ -23,6 +23,7 @@ use std::{
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Member {
     Image,
+    Original,
     VerificationCopy,
     Validation,
     Report,
@@ -34,6 +35,15 @@ pub enum Member {
     VaultCiphertext,
     Receipt,
     LockDiagnostics,
+    Lease,
+    RestoreGuard,
+    RestoreJournal,
+    RestoreOperationLock,
+    RestorePin,
+    RestoreProbe,
+    Reconciliation,
+    PurgeAudit,
+    CatalogLock,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Directory {
@@ -44,10 +54,31 @@ pub enum Directory {
     StagingParent,
     CatalogParent,
     QuarantineParent,
+    LeaseParent,
+    RestoreDestinationParent,
+    RestoreStagingParent,
+    RestoreJournalParent,
+    RestoreOperationLockParent,
+    RestoreGuardParent,
+    RestorePinParent,
+    PurgeParent,
+    CatalogLockParent,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RecoveryEvent {
     Capture,
+    CatalogLock,
+    CatalogLockWait,
+    Exchange,
+    RestoreInstall,
+    RestoreExchangeProbe,
+    RestoreRelocate,
+    RestoreReverseExchange,
+    RestoreGuardRemove,
+    RestorePinRemove,
+    RestoreOperationLock,
+    RestoreOperationLockWait,
+    PurgeUnlink,
     OpenFile,
     CreateDirectory,
     Allocate,
@@ -64,6 +95,12 @@ pub enum RecoveryEvent {
 /// Implementations may fail reads or fail or shorten destination writes. Native
 /// operations are the default; successful hooks alone prove nothing.
 pub trait RecoveryIo: Send + Sync {
+    fn unix_ms(&self) -> io::Result<u128> {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .map_err(|_| io::Error::other("clock unavailable"))
+    }
     fn before(&self, _: RecoveryEvent) -> io::Result<()> {
         Ok(())
     }
@@ -349,14 +386,29 @@ impl Dir {
         expected: (u64, u64),
         l: &OperationLimits,
     ) -> Result<(), RecoveryError> {
+        self.remove_file_checked(name, expected, l, |_| Ok(()))
+    }
+    /// Bind deletion authority after the last injectable descriptor open. The
+    /// validator must finish injected reads before its final authority checks;
+    /// only noninjectable held/name checks remain before unlinkat.
+    pub(crate) fn remove_file_checked(
+        &self,
+        name: &str,
+        expected: (u64, u64),
+        l: &OperationLimits,
+        validate: impl FnOnce(&PrivateFile) -> Result<(), RecoveryError>,
+    ) -> Result<(), RecoveryError> {
         self.same_name(l)?;
+        let component = component(name, l)?;
         let held = PrivateFile::open(&self.path.join(name), false, l)?;
         if held.identity() != expected {
             return Err(l.verification());
         }
-        let name = component(name, l)?;
+        validate(&held)?;
+        held.unchanged(l)?;
+        self.same_name(l)?;
         // SAFETY: validated single component relative to held private directory.
-        if unsafe { libc::unlinkat(self.file.as_raw_fd(), name.as_ptr(), 0) } != 0 {
+        if unsafe { libc::unlinkat(self.file.as_raw_fd(), component.as_ptr(), 0) } != 0 {
             return Err(destination(l));
         }
         Ok(())
@@ -963,12 +1015,24 @@ pub(crate) fn read_json<T: serde::de::DeserializeOwned>(
     name: &str,
     l: &OperationLimits,
 ) -> Result<T, RecoveryError> {
+    Ok(read_json_retained(dir, name, &mut l.clone())?.0)
+}
+
+/// Decode one held JSON member with the existing 32x bound, then retain that
+/// model reservation in the caller's scope. Decode scratch is charged once;
+/// subsequent reads/hashes add their buffers alongside the surviving model.
+pub(crate) fn read_json_retained<T: serde::de::DeserializeOwned>(
+    dir: &Dir,
+    name: &str,
+    l: &mut OperationLimits,
+) -> Result<(T, u64), RecoveryError> {
     let file = PrivateFile::open(&dir.path.join(name), false, l)?;
     let len = file.file.metadata().map_err(|_| destination(l))?.len();
     l.quota(len, l.byte_limit, "metadata bytes")?;
+    let model_bytes = len.checked_mul(32).ok_or_else(|| l.verification())?;
     l.admit_memory(
-        len.checked_mul(32)
-            .and_then(|n| n.checked_add(65536))
+        model_bytes
+            .checked_add(65536)
             .ok_or_else(|| l.verification())?,
     )?;
     let n = usize::try_from(len).map_err(|_| l.verification())?;
@@ -980,7 +1044,8 @@ pub(crate) fn read_json<T: serde::de::DeserializeOwned>(
     let value = serde_json::from_slice(&bytes).map_err(|_| l.verification())?;
     file.unchanged(l)?;
     l.check()?;
-    Ok(value)
+    *l = l.with_retained_memory(model_bytes)?;
+    Ok((value, model_bytes))
 }
 
 #[cfg(test)]
@@ -1110,6 +1175,143 @@ mod lock_tests {
 mod read_tests {
     use super::*;
 
+    #[derive(Default)]
+    struct CountJsonReads {
+        calls: AtomicU64,
+        bytes: AtomicU64,
+    }
+    impl RecoveryIo for CountJsonReads {
+        fn read_exact_at(&self, file: &File, bytes: &mut [u8], offset: u64) -> io::Result<()> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            file.read_exact_at(bytes, offset)?;
+            self.bytes.fetch_add(bytes.len() as u64, Ordering::Relaxed);
+            Ok(())
+        }
+    }
+    fn counted_json_limits() -> (OperationLimits, Arc<CountJsonReads>) {
+        let reads = Arc::new(CountJsonReads::default());
+        let mut l = OperationLimits::new(
+            std::time::Instant::now() + std::time::Duration::from_secs(10),
+            1 << 20,
+            1 << 20,
+            super::super::CancelToken::new(),
+        );
+        l.publication_io = Some(Arc::new(PublicationIo::new(
+            reads.clone(),
+            1 << 20,
+            1 << 20,
+            1 << 20,
+            4096,
+        )));
+        (l, reads)
+    }
+
+    #[test]
+    fn oversized_parsed_json_still_refuses_before_owned_decode() {
+        let root = super::super::test_support::fixture_root();
+        std::fs::set_permissions(
+            root.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
+        let bytes = serde_json::to_vec(&"x".repeat(32768)).unwrap();
+        std::fs::write(root.path().join("parsed.json"), &bytes).unwrap();
+        std::fs::set_permissions(
+            root.path().join("parsed.json"),
+            std::os::unix::fs::PermissionsExt::from_mode(0o600),
+        )
+        .unwrap();
+        let (l, reads) = counted_json_limits();
+        let dir = Dir::open(root.path(), &l).unwrap();
+        assert!(matches!(
+            read_json::<String>(&dir, "parsed.json", &l),
+            Err(RecoveryError::Quota {
+                resource: "working memory",
+                ..
+            })
+        ));
+        assert_eq!(
+            reads.calls.load(Ordering::Relaxed),
+            0,
+            "oversized JSON must refuse before any read"
+        );
+        assert_eq!(
+            reads.bytes.load(Ordering::Relaxed),
+            0,
+            "oversized JSON must refuse before reading any bytes"
+        );
+        assert_eq!(
+            std::fs::read(root.path().join("parsed.json")).unwrap(),
+            bytes
+        );
+    }
+
+    #[test]
+    fn fitting_parsed_json_reads_and_decodes_under_same_memory_ceiling() {
+        let root = crate::recovery::test_support::fixture_root();
+        let value = "fits".repeat(1024);
+        let bytes = serde_json::to_vec(&value).unwrap();
+        std::fs::write(root.path().join("parsed.json"), &bytes).unwrap();
+        std::fs::set_permissions(
+            root.path().join("parsed.json"),
+            std::os::unix::fs::PermissionsExt::from_mode(0o600),
+        )
+        .unwrap();
+        let (l, reads) = counted_json_limits();
+        let dir = Dir::open(root.path(), &l).unwrap();
+        assert_eq!(read_json::<String>(&dir, "parsed.json", &l).unwrap(), value);
+        assert!(reads.calls.load(Ordering::Relaxed) > 0);
+        assert_eq!(reads.bytes.load(Ordering::Relaxed), bytes.len() as u64);
+        assert_eq!(
+            std::fs::read(root.path().join("parsed.json")).unwrap(),
+            bytes
+        );
+    }
+
+    #[test]
+    fn retained_json_models_coexist_across_sequential_reads() {
+        let root = crate::recovery::test_support::fixture_root();
+        let bytes = serde_json::to_vec(&"x".repeat(32768)).unwrap();
+        for name in ["first.json", "second.json"] {
+            std::fs::write(root.path().join(name), &bytes).unwrap();
+            std::fs::set_permissions(
+                root.path().join(name),
+                std::os::unix::fs::PermissionsExt::from_mode(0o600),
+            )
+            .unwrap();
+        }
+        let mut l = OperationLimits::new(
+            std::time::Instant::now() + std::time::Duration::from_secs(10),
+            1 << 20,
+            2 << 20,
+            super::super::CancelToken::new(),
+        );
+        let model = bytes.len() as u64 * 32;
+        assert!(model + 65536 <= l.memory_byte_limit);
+        assert!(2 * model + 65536 > l.memory_byte_limit);
+        let dir = Dir::open(root.path(), &l).unwrap();
+        // Each decode fits in isolation, including its fixed read buffer.
+        let mut isolated = l.clone();
+        let (second, _) = read_json_retained::<String>(&dir, "second.json", &mut isolated).unwrap();
+        assert_eq!(second.len(), 32768);
+        drop(second);
+        let (first, _) = read_json_retained::<String>(&dir, "first.json", &mut l).unwrap();
+        assert!(
+            matches!(
+                read_json_retained::<String>(&dir, "second.json", &mut l),
+                Err(RecoveryError::Quota {
+                    resource: "working memory",
+                    ..
+                })
+            ),
+            "second decode must account for the still-live first owned JSON model"
+        );
+        assert_eq!(first, "x".repeat(32768));
+        for name in ["first.json", "second.json"] {
+            assert_eq!(std::fs::read(root.path().join(name)).unwrap(), bytes);
+        }
+    }
+
     #[test]
     fn exact_read_eof_remains_verification_failure() {
         let file = tempfile::tempfile().unwrap();
@@ -1124,4 +1326,203 @@ mod read_tests {
             Err(RecoveryError::Verification { .. })
         ));
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CatalogLockMode {
+    Shared,
+    Exclusive,
+}
+pub(crate) struct CatalogLock {
+    file: File,
+    parent: Dir,
+    root_identity: (u64, u64),
+    mode: CatalogLockMode,
+}
+impl CatalogLock {
+    pub(crate) fn acquire(
+        root: &Dir,
+        mode: CatalogLockMode,
+        create: bool,
+        io: Arc<dyn RecoveryIo>,
+        l: &OperationLimits,
+    ) -> Result<Self, RecoveryError> {
+        root.same_name(l)?;
+        let parent = if create {
+            root.child(".locks", false, l)?
+        } else {
+            Dir::open(&root.path.join(".locks"), l)?
+        };
+        // Empty stable lock payload; its inode/directory allocation is included
+        // in the caller's fixed metadata reserve, never refunded or unlinked.
+        l.quota(65536, l.memory_byte_limit, "catalog lock memory")?;
+        event(&*io, RecoveryEvent::CatalogLock, l)?;
+        let flags = libc::O_RDWR
+            | libc::O_NOFOLLOW
+            | libc::O_NONBLOCK
+            | libc::O_CLOEXEC
+            | if create { libc::O_CREAT } else { 0 };
+        let fd = unsafe {
+            libc::openat(
+                parent.file.as_raw_fd(),
+                c"catalog.lock".as_ptr(),
+                flags,
+                0o600,
+            )
+        };
+        if fd < 0 {
+            return Err(open_error(
+                l,
+                refused(l, "existing private stable catalog lock required"),
+            ));
+        }
+        let file = unsafe { File::from_raw_fd(fd) };
+        verify::privacy(&file, false, l)?;
+        if file.metadata().map_err(|_| destination(l))?.len() != 0 {
+            return Err(l.verification());
+        }
+        let lock = Self {
+            file,
+            parent,
+            root_identity: identity(&root.file, l)?,
+            mode,
+        };
+        loop {
+            l.check()?;
+            lock.validate(root, l)?;
+            let operation = if mode == CatalogLockMode::Shared {
+                libc::LOCK_SH
+            } else {
+                libc::LOCK_EX
+            };
+            if unsafe { libc::flock(lock.file.as_raw_fd(), operation | libc::LOCK_NB) } == 0 {
+                break;
+            }
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::EWOULDBLOCK) {
+                return Err(transient(&error, l).unwrap_or_else(|| destination(l)));
+            }
+            event(&*io, RecoveryEvent::CatalogLockWait, l)?;
+            // Bounded backoff; tests release/cancel via this event, never sleeps.
+            std::thread::park_timeout(std::time::Duration::from_millis(2));
+        }
+        lock.validate(root, l)?;
+        if create {
+            event(&*io, RecoveryEvent::Flush(Member::CatalogLock), l)?;
+            lock.file.sync_all().map_err(|_| destination(l))?;
+            lock.parent.sync(&*io, Directory::CatalogLockParent, l)?;
+            root.sync(&*io, Directory::CatalogLockParent, l)?;
+        }
+        Ok(lock)
+    }
+    pub(crate) fn validate(&self, root: &Dir, l: &OperationLimits) -> Result<(), RecoveryError> {
+        root.same_name(l)?;
+        self.parent.same_name(l)?;
+        if identity(&root.file, l)? != self.root_identity {
+            return Err(l.verification());
+        }
+        let mut current = std::mem::MaybeUninit::<libc::stat>::uninit();
+        if unsafe {
+            libc::fstatat(
+                self.parent.file.as_raw_fd(),
+                c"catalog.lock".as_ptr(),
+                current.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        } != 0
+        {
+            return Err(l.verification());
+        }
+        let current = unsafe { current.assume_init() };
+        if (current.st_dev, current.st_ino) != identity(&self.file, l)?
+            || current.st_mode & libc::S_IFMT != libc::S_IFREG
+            || current.st_nlink != 1
+            || current.st_mode & 0o7777 != 0o600
+        {
+            return Err(l.verification());
+        }
+        Ok(())
+    }
+    pub(crate) fn exclusive(&self) -> bool {
+        self.mode == CatalogLockMode::Exclusive
+    }
+}
+#[cfg(test)]
+mod catalog_lock_tests {
+    use super::*;
+    #[test]
+    fn catalog_lock_serializes_purge_and_publication_without_replacing_inode() {
+        let root = crate::recovery::test_support::fixture_root();
+        let l = OperationLimits::new(
+            std::time::Instant::now() + std::time::Duration::from_secs(10),
+            64 << 20,
+            64 << 20,
+            crate::recovery::CancelToken::new(),
+        );
+        let dir = Dir::open(root.path(), &l).unwrap();
+        let shared = CatalogLock::acquire(
+            &dir,
+            CatalogLockMode::Shared,
+            true,
+            Arc::new(NativeRecoveryIo),
+            &l,
+        )
+        .unwrap();
+        let before = std::fs::metadata(root.path().join(".locks/catalog.lock")).unwrap();
+        let cancel = crate::recovery::CancelToken::new();
+        struct CancelWait(crate::recovery::CancelToken);
+        impl RecoveryIo for CancelWait {
+            fn before(&self, event: RecoveryEvent) -> io::Result<()> {
+                if event == RecoveryEvent::CatalogLockWait {
+                    self.0.cancel();
+                }
+                Ok(())
+            }
+        }
+        let mut blocked = l.clone();
+        blocked.cancel = cancel.clone();
+        assert!(matches!(
+            CatalogLock::acquire(
+                &dir,
+                CatalogLockMode::Exclusive,
+                false,
+                Arc::new(CancelWait(cancel)),
+                &blocked
+            ),
+            Err(RecoveryError::Cancelled { .. })
+        ));
+        drop(shared);
+        let exclusive = CatalogLock::acquire(
+            &dir,
+            CatalogLockMode::Exclusive,
+            false,
+            Arc::new(NativeRecoveryIo),
+            &l,
+        )
+        .unwrap();
+        drop(exclusive);
+        let after = std::fs::metadata(root.path().join(".locks/catalog.lock")).unwrap();
+        assert_eq!((before.dev(), before.ino()), (after.dev(), after.ino()));
+        assert_eq!(after.mode() & 0o7777, 0o600);
+    }
+}
+
+pub(crate) fn writable_existing(
+    path: &Path,
+    held: &super::verify::PrivateFile,
+    l: &OperationLimits,
+) -> Result<std::fs::File, RecoveryError> {
+    use std::os::unix::fs::OpenOptionsExt;
+    held.unchanged(l)?;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+        .open(path)
+        .map_err(|_| destination(l))?;
+    super::verify::privacy(&file, false, l)?;
+    if identity(&file, l)? != held.identity() {
+        return Err(l.verification());
+    }
+    Ok(file)
 }
