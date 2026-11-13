@@ -720,6 +720,16 @@ fn restore_cut_schedule(events: &[RecoveryEvent], exhaustive: bool) -> Vec<usize
         if !events[..index].contains(event) || !events[index + 1..].contains(event) {
             cuts.insert(index);
         }
+        // Prepared is durable before the staging-parent sync preceding install.
+        // Retain that boundary before the ExchangeIntent journal append so the
+        // forward sample also exercises recovery from Prepared.
+        if *event == RecoveryEvent::RestoreInstall
+            && let Some(prepared) = events[..index]
+                .iter()
+                .rposition(|event| *event == RecoveryEvent::Sync(Directory::RestoreStagingParent))
+        {
+            cuts.insert(prepared);
+        }
         // Exercise the intent immediately before and durability immediately
         // after each namespace/authority action, including intermediate ones.
         if matches!(
@@ -845,6 +855,7 @@ fn restore_exchange_and_reverse_exchange_recover_every_cut() {
             cuts.len(),
             events.len()
         );
+        let mut prepared_resumes = 0;
         for cut in cuts {
             let event = &events[cut];
             let f = journal_fixture();
@@ -924,6 +935,11 @@ fn restore_exchange_and_reverse_exchange_recover_every_cut() {
                         ),
                         "cut {cut} {event:?}: {result:?}"
                     );
+                    if !reverse_mode && admitted.phase == RestorePhase::Prepared {
+                        assert!(matches!(result, Ok(RestoreOutcome::Installed { .. })));
+                        prepared_resumes += 1;
+                        eprintln!("restore_prepared_resumed index={cut} event={event:?}");
+                    }
                 }
             } else {
                 assert_eq!(fs::metadata(&f.source).unwrap().ino(), old);
@@ -932,6 +948,12 @@ fn restore_exchange_and_reverse_exchange_recover_every_cut() {
             eprintln!(
                 "restore_cut reverse={reverse_mode} index={cut} event={event:?} errno={errno} fenced={}",
                 guard.exists()
+            );
+        }
+        if !reverse_mode {
+            assert!(
+                prepared_resumes > 0,
+                "forward cut schedule must reload durable Prepared and resume to Installed"
             );
         }
     }
