@@ -88,6 +88,8 @@ pub enum HostError {
     RenameableAncestor,
     #[error("endpoint state is not a private file")]
     EndpointStateDenied,
+    #[error("endpoint state publish temp already exists")]
+    EndpointStateCollision,
     #[error("frame deadline exceeded")]
     FrameTimeout,
     #[error("PTY epoch evicted: {stream}")]
