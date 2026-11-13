@@ -1035,10 +1035,31 @@ pub fn repair_claude_session_transcript_tail(
     Ok(removed_bytes.len())
 }
 
+/// Return a Claude queued prompt attachment only for conversational human or peer input.
+pub fn claude_queued_prompt(val: &Value) -> Option<&Value> {
+    if val.get("isSidechain").and_then(Value::as_bool) == Some(true)
+        || val.get("type").and_then(Value::as_str) != Some("attachment")
+    {
+        return None;
+    }
+    val.get("attachment").filter(|attachment| {
+        attachment.get("type").and_then(Value::as_str) == Some("queued_command")
+            && attachment.get("commandMode").and_then(Value::as_str) == Some("prompt")
+            && attachment
+                .get("prompt")
+                .is_some_and(|p| p.is_string() || p.is_array())
+            && matches!(
+                attachment.pointer("/origin/kind").and_then(Value::as_str),
+                Some("human" | "peer")
+            )
+    })
+}
+
 /// Extract displayable text / tool summary content from a Claude JSONL record.
 pub fn extract_claude_message_content(val: &Value) -> String {
-    let Some(content) = val
-        .get("content")
+    let Some(content) = claude_queued_prompt(val)
+        .and_then(|attachment| attachment.get("prompt"))
+        .or_else(|| val.get("content"))
         .or_else(|| val.pointer("/message/content"))
     else {
         if let Some(s) = val
@@ -1126,6 +1147,9 @@ pub fn classify_claude_turn_role(val: &Value) -> Option<String> {
     let obj = val.as_object()?;
     if obj.get("isSidechain").and_then(Value::as_bool) == Some(true) {
         return None;
+    }
+    if claude_queued_prompt(val).is_some() {
+        return Some("user".to_string());
     }
     if let Some(t) = obj.get("type").and_then(Value::as_str)
         && is_claude_skipped_record_type(t)
@@ -1309,9 +1333,7 @@ pub fn estimate_claude_post_compaction_context(
             continue;
         }
 
-        if matches!(record_type, "user" | "assistant")
-            && !is_claude_skipped_record_type(record_type)
-        {
+        if matches!(record_type, "user" | "assistant") || claude_queued_prompt(&val).is_some() {
             post_compact_conversational_bytes =
                 post_compact_conversational_bytes.saturating_add(no_cr.len() as u64);
         }

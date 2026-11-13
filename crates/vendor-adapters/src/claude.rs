@@ -1167,6 +1167,50 @@ mod tests {
     }
 
     #[test]
+    fn normalizer_keeps_queued_prompts_in_order_and_excludes_notifications() {
+        let adapter = ClaudeHostAdapter::new();
+        let raw = [
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","content":"first tool"}]}}"#,
+            r#"{"type":"attachment","attachment":{"type":"queued_command","commandMode":"prompt","origin":{"kind":"human"},"prompt":"operator prompt"}}"#,
+            r#"{"type":"attachment","attachment":{"type":"queued_command","commandMode":"prompt","origin":{"kind":"peer"},"prompt":"peer prompt"}}"#,
+            r#"{"type":"attachment","attachment":{"type":"queued_command","commandMode":"prompt","origin":{"kind":"task-notification"},"prompt":"notification"}}"#,
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","content":"second tool"}]}}"#,
+        ].join("\n");
+        let report = adapter.normalize_transcript(&raw, None).unwrap();
+        let turns: Vec<_> = report
+            .turns
+            .iter()
+            .map(|t| (t.role.as_str(), t.content.as_str()))
+            .collect();
+        assert_eq!(
+            turns,
+            [
+                ("tool", "first tool"),
+                ("user", "operator prompt"),
+                ("user", "peer prompt"),
+                ("tool", "second tool")
+            ]
+        );
+        let tmp = TempDir::new().unwrap();
+        let project = tmp.path().join(".claude/projects/test");
+        fs::create_dir_all(&project).unwrap();
+        let path = project.join("session.jsonl");
+        fs::write(&path, &raw).unwrap();
+        let context = adapter.estimate_post_compaction_context(&path).unwrap();
+        assert_eq!(context.turn_count, 4);
+        let expected_bytes: usize = raw
+            .lines()
+            .enumerate()
+            .filter(|(i, _)| *i != 3)
+            .map(|(_, line)| line.len())
+            .sum();
+        assert_eq!(
+            context.post_compact_conversational_bytes,
+            expected_bytes as u64
+        );
+    }
+
+    #[test]
     fn archive_and_delete_require_explicit_session_id_and_preserve_sibling_transcripts() {
         let tmp = TempDir::new().unwrap();
         let proj_dir = tmp
