@@ -1092,29 +1092,49 @@ fn restore_renewal_rejects_third_inode_changed_digest_and_phase_mismatch_before_
 
 #[test]
 fn restore_attempt_expiry_stops_at_journal_boundary_without_unfencing_or_expanding_ceilings() {
+    assert_restore_attempt_expiry_at_journal_boundary(false);
+}
+
+#[test]
+fn restore_attempt_expiry_after_preattempt_stall_still_charges_at_journal_boundary() {
+    assert_restore_attempt_expiry_at_journal_boundary(true);
+}
+
+fn assert_restore_attempt_expiry_at_journal_boundary(delay_before_attempt: bool) {
     use std::sync::atomic::AtomicU64;
     struct Expire {
         now: AtomicU64,
         expiry: u64,
+        delay_before_attempt: bool,
+        stalled: AtomicBool,
+        fired: AtomicBool,
     }
     impl RecoveryIo for Expire {
         fn unix_ms(&self) -> std::io::Result<u128> {
             Ok(self.now.load(Ordering::Acquire) as u128)
         }
         fn before(&self, e: RecoveryEvent) -> std::io::Result<()> {
+            // This event follows the lease's conversion into a real-time cap.
+            // A slow precheck must not accidentally consume the expiry scenario.
+            if e == RecoveryEvent::RestoreOperationLock
+                && self.delay_before_attempt
+                && !self.stalled.swap(true, Ordering::AcqRel)
+            {
+                std::thread::sleep(std::time::Duration::from_millis(750));
+            }
             if e == RecoveryEvent::Sync(Directory::RestoreJournalParent) {
+                self.fired.store(true, Ordering::Release);
                 self.now.store(self.expiry, Ordering::Release);
             }
             Ok(())
         }
     }
-    let f = Fixture::new();
-    let (request, lease) = prepare_restore(&f, &f.source);
-    let RestoreOutcome::Installed { journal } =
-        restore_offline(&request, &lease, &f.filesystem()).unwrap()
-    else {
-        panic!("not installed")
-    };
+    // Interrupt a real install before exchange and load its durable intent.
+    // An Installed journal is already complete and resume must be a free no-op.
+    let (f, journal, _lease) =
+        bundleless_fixture_with_bundle(BundlelessLayout::BeforeExchange, false);
+    assert_eq!(journal.phase, RestorePhase::ExchangeIntent);
+    assert_eq!(journal.resume_finalize_attempts, 0);
     let now = journal.binding.expires_at_unix_ms + 1;
     let clock = ClockFs {
         native: f.filesystem(),
@@ -1122,12 +1142,17 @@ fn restore_attempt_expiry_stops_at_journal_boundary_without_unfencing_or_expandi
     };
     let mut binding = journal.binding.clone();
     binding.issued_at_unix_ms = now;
-    binding.expires_at_unix_ms = now + 500;
+    // Keep real-time headroom within the fixture's 180-second operation limit;
+    // the injected journal-sync clock, rather than runner speed, causes expiry.
+    binding.expires_at_unix_ms = now + 60_000;
     binding.expected_file = inspect_file_binding(&f.source, &limits()).unwrap();
     let renewed = create_offline_lease(&binding, &clock, &limits()).unwrap();
     let io = Arc::new(Expire {
         now: AtomicU64::new(now as u64),
         expiry: binding.expires_at_unix_ms as u64,
+        delay_before_attempt,
+        stalled: AtomicBool::new(false),
+        fired: AtomicBool::new(false),
     });
     let mut larger = limits();
     larger.byte_limit = 1 << 30;
@@ -1139,6 +1164,11 @@ fn restore_attempt_expiry_stops_at_journal_boundary_without_unfencing_or_expandi
     };
     let bytes = fs::read(&f.source).unwrap();
     assert!(resume_restore(&journal, &renewed, &filesystem).is_err());
+    assert_eq!(io.stalled.load(Ordering::Acquire), delay_before_attempt);
+    assert!(
+        io.fired.load(Ordering::Acquire),
+        "expiry must occur at the charged attempt's journal sync"
+    );
     assert_eq!(fs::read(&f.source).unwrap(), bytes);
     assert!(f.root.path().join("source.fls.restore-guard").exists());
     let clock = ClockFs {
@@ -1147,7 +1177,10 @@ fn restore_attempt_expiry_stops_at_journal_boundary_without_unfencing_or_expandi
     };
     let renewed = renewed_lease(&journal, &clock);
     let status = restore_status(&journal.staging.join("journal.bin"), &renewed, &clock).unwrap();
-    assert_eq!(status.resume_finalize_attempts, 1);
+    assert_eq!(
+        status.resume_finalize_attempts, 1,
+        "the unfinished resume must charge its attempt before injected expiry"
+    );
     assert_eq!(status.rollback_attempts, 0);
     assert_eq!(status.current_attempt, 1);
     assert_eq!(status.attempt_deadline_unix_ms, binding.expires_at_unix_ms);
