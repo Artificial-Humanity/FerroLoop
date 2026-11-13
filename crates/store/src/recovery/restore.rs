@@ -1971,7 +1971,17 @@ pub fn resume_restore(
         None
     };
     if let Some(path) = forward_candidate {
-        verify_candidate_at(&j, &path, lease, filesystem, &lock, &precheck)?;
+        if j.phase == RestorePhase::RelocateIntent
+            && j.original_verification.is_none()
+            && path == j.destination
+        {
+            // The forward exchange already installed the verified image. Its
+            // durable preservation evidence permits completing relocation even
+            // without the bundle, when the original cannot support rollback.
+            verify_preserved_candidate(&j, &path, &precheck)?;
+        } else {
+            verify_candidate_at(&j, &path, lease, filesystem, &lock, &precheck)?;
+        }
     }
     let (l, control) = attempt(&mut j, lease, filesystem, false)?;
     let (dest, candidate, original) = inspect_layout(&j, &l)?;
