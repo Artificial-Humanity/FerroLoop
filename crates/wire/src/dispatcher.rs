@@ -6099,6 +6099,19 @@ fn probe_composer_ready_from_screen(
     }
 }
 
+// /proc is a Linux interface. On other platforms let the terminal locator verify the route.
+fn claude_pid_may_be_alive(pid: u32) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        pid == 0 || Path::new(&format!("/proc/{pid}")).exists()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pid;
+        true
+    }
+}
+
 /// Deliver a Claude slash command to its terminal only. Never fall back to the peer socket.
 pub fn deliver_to_live_claude_pane(route: &VendorRoute, text: &str) -> Result<(), String> {
     let VendorRoute::Claude {
@@ -6110,7 +6123,7 @@ pub fn deliver_to_live_claude_pane(route: &VendorRoute, text: &str) -> Result<()
     else {
         return Err("not a claude route".into());
     };
-    if *pid != 0 && !Path::new(&format!("/proc/{pid}")).exists() {
+    if !claude_pid_may_be_alive(*pid) {
         return Err(format!("claude pid {pid} is no longer running"));
     }
     let key = read_claude_key(*pid, socket_path, key_path.as_deref())
@@ -8192,6 +8205,16 @@ mod tests {
             socket_frames(&listener).is_none(),
             "the peer socket must receive nothing"
         );
+    }
+
+    #[test]
+    fn claude_model_pid_check_is_platform_appropriate() {
+        assert!(claude_pid_may_be_alive(0));
+        assert!(claude_pid_may_be_alive(std::process::id()));
+        #[cfg(target_os = "linux")]
+        assert!(!claude_pid_may_be_alive(u32::MAX));
+        #[cfg(not(target_os = "linux"))]
+        assert!(claude_pid_may_be_alive(u32::MAX));
     }
 
     #[test]

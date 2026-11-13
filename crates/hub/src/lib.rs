@@ -7107,10 +7107,7 @@ mod tests {
             &json!({ "model": "gpt-6-sol" }),
         );
         assert_eq!(ok.status, 200, "{}", error_text(&ok));
-        assert_eq!(
-            state.session_model_override("ms-ada").unwrap().model,
-            "gpt-6-sol"
-        );
+        assert!(state.session_model_override("ms-ada").is_none());
         // Muse's route is deferred without a proven terminal-only switch.
         assert_eq!(ok.json_value().unwrap()["live"]["status"], "deferred");
         assert_eq!(tmux.log(), "");
@@ -7438,7 +7435,7 @@ mod tests {
                 "persisted": false,
                 "record_id": null,
                 "restart_applies": false,
-                "live": {"status": "deferred", "mechanism": "override-only"},
+                "live": {"status": "deferred", "mechanism": "override-only", "queued": false, "model_applied": false},
             })
         );
         let frame = frames.try_recv().unwrap();
@@ -7447,7 +7444,7 @@ mod tests {
             ("sessions", "session.model_changed")
         );
 
-        // The override shows in the session list.
+        // A deferred, recordless choice must not show as selected after a refresh.
         let listed = call(&state, "GET", "/api/v1/sessions", OWNER, &json!({}));
         let sessions = listed.json_value().unwrap()["sessions"]
             .as_array()
@@ -7457,8 +7454,9 @@ mod tests {
             .iter()
             .find(|s| s["id"] == "webhook-felicia")
             .unwrap();
-        assert_eq!(felicia["model"], "claude-opus-5-5");
-        assert_eq!(felicia["thinking_level"], "high");
+        assert_ne!(felicia["model"], "claude-opus-5-5");
+        assert_ne!(felicia["thinking_level"], "high");
+        assert!(state.session_model_override("webhook-felicia").is_none());
 
         // No thinking level is `null`, and the earlier level is not carried over. A Peer can
         // still read the list.
@@ -7474,7 +7472,7 @@ mod tests {
             .iter()
             .find(|s| s["id"] == "webhook-felicia")
             .unwrap();
-        assert_eq!(felicia["model"], "gpt-6-sol");
+        assert_ne!(felicia["model"], "gpt-6-sol");
     }
 
     #[test]
@@ -7499,6 +7497,121 @@ mod tests {
         assert_eq!(result.status, 500);
         assert!(state.session_model_override("webhook-ada").is_none());
         assert!(state.session_model_override("ada").is_none());
+    }
+
+    #[test]
+    fn model_write_failure_after_read_has_no_override_or_delivery() {
+        use fl_wire::identity::VendorRoute;
+        use std::os::unix::net::UnixListener;
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        assert_eq!(spin_up(&state, &spin_up_body("ada")).status, 200);
+        let socket = tmp.path().join("claude.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        install_route(
+            tmp.path(),
+            "ada",
+            VendorRoute::Claude {
+                pid: 0,
+                session_id: "cs-ada".into(),
+                socket_path: socket,
+                key_path: Some(tmp.path().join("missing")),
+            },
+        );
+        let mut events = state.subscribe();
+        let req = HttpRequest::new("POST", "/api/v1/sessions/ada/model")
+            .with_json_body(&json!({"model":"new"}));
+        let authority = auth::HubAuthority::Owner {
+            login: "owner".into(),
+        };
+        let response = crate::api::handle_post_session_model_with(
+            &state,
+            &authority,
+            "ada",
+            &req,
+            |store, keys, _, _, _| {
+                assert!(
+                    lifecycle::find_hosted_session(store, keys)
+                        .unwrap()
+                        .is_some()
+                );
+                Err(lifecycle::LifecycleError::Store(
+                    "injected write failure".into(),
+                ))
+            },
+            |_, _| panic!("must not dispatch after write failure"),
+        );
+        assert_eq!(response.status, 500);
+        assert!(error_text(&response).contains("injected write failure"));
+        assert!(state.session_model_override("ada").is_none());
+        assert!(state.session_model_override("cs-ada").is_none());
+        assert!(events.try_recv().is_err());
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        let list = call(&state, "GET", "/api/v1/hosted-sessions", OWNER, &json!({}));
+        assert!(list.json_value().unwrap()["sessions"][0]["model"].is_null());
+    }
+
+    #[test]
+    fn recordless_partial_model_delivery_does_not_claim_effort() {
+        use fl_wire::identity::VendorRoute;
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        install_route(
+            tmp.path(),
+            "ada",
+            VendorRoute::Claude {
+                pid: 0,
+                session_id: "cs-ada".into(),
+                socket_path: tmp.path().join("missing"),
+                key_path: Some(tmp.path().join("missing")),
+            },
+        );
+        let req = HttpRequest::new("POST", "/api/v1/sessions/ada/model")
+            .with_json_body(&json!({"model":"sonnet", "thinking_level":"high"}));
+        let authority = auth::HubAuthority::Owner {
+            login: "owner".into(),
+        };
+        let mut commands = Vec::new();
+        let response = crate::api::handle_post_session_model_with(
+            &state,
+            &authority,
+            "ada",
+            &req,
+            lifecycle::set_hosted_session_model,
+            |_, command| {
+                commands.push(command.to_string());
+                if commands.len() == 1 {
+                    Ok(())
+                } else {
+                    Err("composer_occupied_by_non_wire_input: without sending keys".into())
+                }
+            },
+        );
+        assert_eq!(response.status, 200);
+        let result = response.json_value().unwrap();
+        assert_eq!(result["persisted"], false);
+        assert_eq!(result["live"]["status"], "held");
+        assert_eq!(result["live"]["queued"], false);
+        assert_eq!(result["live"]["model_applied"], true);
+        assert_eq!(commands, ["/model sonnet", "/effort high"]);
+        let selected = state.session_model_override("cs-ada").unwrap();
+        assert_eq!(selected.model, "sonnet");
+        assert_eq!(selected.thinking_level, None);
+        let listed = call(&state, "GET", "/api/v1/sessions", OWNER, &json!({}));
+        let sessions = listed.json_value().unwrap()["sessions"]
+            .as_array()
+            .unwrap()
+            .clone();
+        let ada = sessions
+            .iter()
+            .find(|session| session["id"] == "cs-ada")
+            .unwrap();
+        assert_eq!(ada["model"], "sonnet");
+        assert_ne!(ada["thinking_level"], "high");
     }
 
     #[test]
@@ -7597,15 +7710,10 @@ mod tests {
             webhook_route(&tmp.path().join("felicia.sock")),
         );
 
-        // `Felicia` is not the discovered persona, so the request matches no summary, but it
-        // does find the route. The override is keyed by the lowercased persona and still shows.
+        // A recordless deferred request must not create an override, even by persona.
         set_model(&state, "Felicia", "model-a");
-        assert_eq!(
-            state.session_model_override("felicia").unwrap().model,
-            "model-a"
-        );
-        assert!(state.session_model_override("Felicia").is_none());
-        assert_eq!(listed_model(&state, "webhook-felicia"), "model-a");
+        assert!(state.session_model_override("felicia").is_none());
+        assert_ne!(listed_model(&state, "webhook-felicia"), "model-a");
 
         // A hosted session with no route yet: the override waits under its persona, and shows
         // as soon as discovery lists the session.
@@ -7850,6 +7958,10 @@ mod tests {
                 &json!({ "model": model, "thinking_level": effort }),
             );
             assert_eq!(resp.status, 200, "{persona}: {}", error_text(&resp));
+            state.set_session_model_override(
+                &format!("cs-{persona}"),
+                session_actions::ModelOverride::new(model.into(), Some(effort.into())),
+            );
         }
         // The transcripts are newer than settings.json: each session's own report is the
         // baseline, and the choices show.
@@ -7897,7 +8009,10 @@ mod tests {
         install_route(tmp.path(), "felicia", webhook_route(&socket));
         // Only `/clear` is dispatched to the webhook.
         let lines = collect_webhook_lines(socket, 1);
-        set_model(&state, "felicia", "model-a");
+        state.set_session_model_override(
+            "webhook-felicia",
+            session_actions::ModelOverride::new("model-a".into(), None),
+        );
         assert!(state.session_model_override("webhook-felicia").is_some());
         let cleared = call(
             &state,
@@ -7976,10 +8091,7 @@ mod tests {
             assert_eq!(body["switched"], false);
             assert_eq!(body["live"]["status"], "deferred");
             assert_eq!(body["persisted"], false);
-            assert_eq!(
-                state.session_model_override(session).unwrap().model,
-                "gemini-4-argon"
-            );
+            assert!(state.session_model_override(session).is_none());
         }
 
         // A hosted session with no live route: the record takes the model.
