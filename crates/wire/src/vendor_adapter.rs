@@ -1973,6 +1973,24 @@ mod tests {
     }
 
     #[test]
+    fn claude_host_resolution_never_selects_a_competing_vendor() {
+        let codex = summary("fixture.codex", true);
+        let claude = summary("fixture.claude", true);
+        let unit = crate::dispatcher::claude_host_target("fixture").unwrap();
+        assert_eq!(
+            matching_live_host_sessions(&[codex.clone(), claude], &unit),
+            vec![SessionId::new("fixture.claude").unwrap()]
+        );
+        assert!(matching_live_host_sessions(&[codex], &unit).is_empty());
+        assert_eq!(
+            crate::dispatcher::claude_host_target("fixture.claude"),
+            Some(unit)
+        );
+        assert!(crate::dispatcher::claude_host_target("fixture.codex").is_none());
+        assert!(crate::dispatcher::claude_host_target("").is_none());
+    }
+
+    #[test]
     fn unit_and_session_id_round_trip_and_match_live_sessions() {
         let id = unit_to_host_session_id("Ada:claude").unwrap();
         assert_eq!(id.as_str(), "Ada.claude");

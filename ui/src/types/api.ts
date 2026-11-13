@@ -837,6 +837,15 @@ export interface SetSessionModelResponse {
   thinking_level?: string | null;
   switched: boolean;
   method: string;
+  persisted: boolean;
+  record_id: string | null;
+  restart_applies: boolean;
+  live: {
+    status: "applied" | "deferred" | "held" | "failed";
+    mechanism: string;
+    queued: boolean;
+    model_applied: boolean;
+  };
   /**
    * Set only for Antigravity: the effort-suffixed model id stored for the next launch. A
    * running Antigravity session keeps its model; nothing is sent to it.

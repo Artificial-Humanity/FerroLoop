@@ -354,6 +354,8 @@ export interface AgentSettingsModalProps {
   selectedThinkingLevel: string;
   availableModels?: string[] | null;
   switchingModel?: boolean;
+  modelSwitchFeedback?: string | null;
+  onModelValidation?: (message: string) => void;
   onChangeModelAndThinking: (nextModel: string, nextThinkingLevel: string) => void;
   contextEstimate: EstimatedContextUsage;
   /**
@@ -498,6 +500,8 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
   selectedThinkingLevel,
   availableModels,
   switchingModel = false,
+  modelSwitchFeedback,
+  onModelValidation,
   onChangeModelAndThinking,
   contextEstimate,
   quotaUsage,
@@ -1387,7 +1391,7 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
               </div>
               <div style={{ minWidth: 0 }}>
                 <div style={{ fontSize: "10px", color: "var(--text-muted)", textTransform: "uppercase" }}>
-                  Active Model
+                  Model
                 </div>
                 <span
                   className="fd-badge fd-mono"
@@ -1457,6 +1461,7 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
                       agyModelRequiresThinkingLevel(nextModel, effectiveAvailableModels)
                     ) {
                       setPendingAgyModel(nextModel);
+                      onModelValidation?.("Choose a thinking level to switch this Antigravity model.");
                       return;
                     }
                     setPendingAgyModel(null);
@@ -1527,7 +1532,15 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
                   ))}
                 </select>
               </div>
-              {agyThinkingRequired && (
+              <div
+                role="status"
+                aria-live="polite"
+                data-testid="model-switch-feedback"
+                style={{ gridColumn: "1 / -1", color: "var(--text-secondary)", fontSize: "12px" }}
+              >
+                {modelSwitchFeedback}
+              </div>
+              {agyThinkingRequired && !pendingAgyModel && (
                 <div
                   data-testid="agy-thinking-required-hint"
                   style={{

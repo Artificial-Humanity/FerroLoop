@@ -164,7 +164,7 @@ A route made by `fl wire register` has `ls_pid` unset, so it always qualifies fo
 
 ### Model and effort changes
 
-- **In FerroDeck (#463)** a change only stores an override for agy (`api.rs:7187-7360`, `method: override-only`). It applies at the next launch.
+- **In FerroDeck (#463)** a change stores the model on a hosted agy record, when one exists, and reports `switched: false` with `method: override-only`. A recordless change is not saved and does not install an override. Restart application is not verified for agy.
 - **`/model` inside the agent's session** changes the model live, with the same process and ports. FerroLoop shows the change through discovery but does **not** store it on the hosted record. The next restart therefore reverts it.
 - **The global setting.** `/model` also rewrites the global `settings.json` `model`.
 

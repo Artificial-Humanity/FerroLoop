@@ -62,8 +62,7 @@ use fl_store::AnyStore;
 use fl_wire::dispatcher::{
     CodexSteerError, MAX_DELIVER, OperatorPromptError, OperatorPromptIntent, OperatorPromptOutcome,
     PushError, SessionResetMode, clear_or_reforge_session, deliver_to_live_grok_pane,
-    dispatch_operator_prompt_to_route, push_operator_prompt_to_route,
-    push_operator_prompt_with_intent, push_to_route_for_recipient,
+    push_operator_prompt_to_route, push_operator_prompt_with_intent, push_to_route_for_recipient,
 };
 use fl_wire::identity::{RouteTable, normalize_persona};
 use serde::{Deserialize, Serialize};
@@ -7353,21 +7352,191 @@ fn hosted_record_for(
     lifecycle::find_hosted_session(&*store, &all).ok().flatten()
 }
 
-/// `POST /api/v1/sessions/:id/model` (Records 48 and 57): switch the model of a session.
-/// Owner only (403 for a Peer, checked before the body is read). The
-/// choice is kept in `HubState` and overlaid on `GET /api/v1/sessions` (in memory: gone after
-/// a hub restart), written to the hosted-session record when one exists, and sent to a live
-/// CLI as `/model <id>`.
-///
-/// Antigravity is not sent anything. A running Antigravity session keeps its model: FerroDeck
-/// shows the choice, and the stored effort-suffixed id (`cli_model` in the response) applies
-/// when the session is next launched (restart or reforge). The response keeps `switched: true`
-/// and `method: override-only` for compatibility.
+/// `POST /api/v1/sessions/:id/model`: persist before any live delivery or override.
+/// Codex and unsupported routes defer; Claude uses terminal input only.
+// Only Claude has a terminal path proven to submit a slash command safely. The closure is
+// injected so tests can establish that other route kinds never dispatch to a vendor.
+fn model_delivery_outcome(
+    vendor: &str,
+    busy: bool,
+    route: Option<&fl_wire::identity::VendorRoute>,
+    model: &str,
+    effort: Option<&str>,
+    mut send: impl FnMut(&str) -> Result<(), String>,
+) -> (&'static str, &'static str, bool) {
+    if vendor != "claude" || !matches!(route, Some(fl_wire::identity::VendorRoute::Claude { .. })) {
+        return ("deferred", "override-only", false);
+    }
+    if busy {
+        return ("held", "terminal-paste", false);
+    }
+    let classify = |err: &str| {
+        if fl_wire::is_composer_occupied_zero_keys_error(err) {
+            "held"
+        } else {
+            "failed"
+        }
+    };
+    if let Err(err) = send(&session_actions::model_command(model)) {
+        return (classify(&err), "terminal-paste", false);
+    }
+    if let Some(effort) = effort
+        && let Err(err) = send(&session_actions::effort_command(effort))
+    {
+        return (classify(&err), "terminal-paste", true);
+    }
+    ("applied", "terminal-paste", true)
+}
+
+#[cfg(test)]
+mod model_delivery_tests {
+    use super::*;
+
+    #[test]
+    fn model_delivery_does_not_dispatch_non_claude_routes() {
+        use fl_wire::identity::VendorRoute;
+        let routes = [
+            (
+                "codex",
+                VendorRoute::Codex {
+                    thread_id: "id".into(),
+                    cwd: None,
+                },
+            ),
+            (
+                "antigravity",
+                VendorRoute::Agy {
+                    conversation_id: "id".into(),
+                    ls_pid: None,
+                    ls_address: None,
+                    csrf_token: None,
+                    agentapi_exe: None,
+                },
+            ),
+            (
+                "grok",
+                VendorRoute::Grok {
+                    session_id: "id".into(),
+                    cwd: None,
+                    tmux_target: None,
+                    tmux_pane: None,
+                },
+            ),
+            (
+                "muse",
+                VendorRoute::Muse {
+                    session_id: "id".into(),
+                    cwd: None,
+                    tmux_target: None,
+                    tmux_pane: None,
+                },
+            ),
+            (
+                "claude",
+                VendorRoute::HostCli {
+                    vendor: "claude".into(),
+                    session_id: "id".into(),
+                    cwd: None,
+                    tmux_target: None,
+                    tmux_pane: None,
+                },
+            ),
+            (
+                "webhook",
+                VendorRoute::Webhook {
+                    socket_path: std::path::PathBuf::new(),
+                },
+            ),
+        ];
+        for (vendor, route) in routes {
+            let outcome = model_delivery_outcome(vendor, false, Some(&route), "new", None, |_| {
+                panic!("unexpected dispatch")
+            });
+            assert_eq!(outcome, ("deferred", "override-only", false), "{vendor}");
+        }
+    }
+
+    #[test]
+    fn model_delivery_reports_busy_occupied_and_failure() {
+        let route = fl_wire::identity::VendorRoute::Claude {
+            pid: 0,
+            session_id: "test".into(),
+            socket_path: std::path::PathBuf::new(),
+            key_path: None,
+        };
+        let busy = model_delivery_outcome("claude", true, Some(&route), "new", None, |_| {
+            panic!("busy dispatched")
+        });
+        assert_eq!(busy.0, "held");
+        let failed = model_delivery_outcome("claude", false, Some(&route), "new", None, |_| {
+            Err("delivery failed".into())
+        });
+        assert_eq!(failed.0, "failed");
+        let occupied = model_delivery_outcome("claude", false, Some(&route), "new", None, |_| {
+            Err("composer_occupied_by_non_wire_input: holding delivery without sending keys".into())
+        });
+        assert_eq!(occupied.0, "held");
+        let applied =
+            model_delivery_outcome("claude", false, Some(&route), "new", Some("high"), |_| {
+                Ok(())
+            });
+        assert_eq!(applied.0, "applied");
+        for error in [
+            "delivery failed",
+            "composer_occupied_by_non_wire_input: without sending keys",
+        ] {
+            let mut calls = 0;
+            let partial =
+                model_delivery_outcome("claude", false, Some(&route), "new", Some("high"), |_| {
+                    calls += 1;
+                    if calls == 1 {
+                        Ok(())
+                    } else {
+                        Err(error.into())
+                    }
+                });
+            assert!(partial.2, "model was delivered before effort failed");
+            assert_eq!(
+                partial.0,
+                if error.starts_with("composer") {
+                    "held"
+                } else {
+                    "failed"
+                }
+            );
+        }
+    }
+}
+
 fn handle_post_session_model(
     state: &HubState,
     authority: &HubAuthority,
     session_id: &str,
     req: &HttpRequest,
+) -> HttpResponse {
+    handle_post_session_model_with(
+        state,
+        authority,
+        session_id,
+        req,
+        lifecycle::set_hosted_session_model,
+        fl_wire::dispatcher::deliver_to_live_claude_pane,
+    )
+}
+
+pub(crate) fn handle_post_session_model_with(
+    state: &HubState,
+    authority: &HubAuthority,
+    session_id: &str,
+    req: &HttpRequest,
+    save: impl FnOnce(
+        &AnyStore,
+        &[&str],
+        &str,
+        Option<&str>,
+        &str,
+    ) -> Result<Option<lifecycle::HostedSessionRecord>, lifecycle::LifecycleError>,
+    mut deliver: impl FnMut(&fl_wire::identity::VendorRoute, &str) -> Result<(), String>,
 ) -> HttpResponse {
     if !authority.is_owner() {
         return HttpResponse::json(
@@ -7414,7 +7583,44 @@ fn handle_post_session_model(
         None => (trimmed.to_string(), Some(trimmed.to_ascii_lowercase())),
     };
     let route = vendor_route_for_session(state, persona.as_deref(), &canonical_id).ok();
-    let hosted = hosted_record_for(state, &[trimmed, &canonical_id], persona.as_deref());
+    // Do not turn a store error into a recordless success: persistence must precede all effects.
+    let store = match open_store_response(state) {
+        Ok(store) => store,
+        Err(()) => return store_open_failure(),
+    };
+    // When the live route supplies a vendor, never fall back to an unqualified persona:
+    // that could select another vendor's record and persist an incompatible model.
+    let route_vendor_hint = route
+        .as_ref()
+        .map(|route| match route {
+            fl_wire::identity::VendorRoute::HostCli { vendor, .. } => vendor.as_str(),
+            _ => route_vendor(route),
+        })
+        .or_else(|| matched.map(|session| session.adapter.as_str()));
+    let qualified_key = route_vendor_hint.and_then(|vendor| {
+        persona
+            .as_ref()
+            .map(|name| format!("{}:{}", vendor, name.to_ascii_lowercase()))
+    });
+    let keys = if let Some(ref qualified) = qualified_key {
+        vec![qualified.as_str()]
+    } else {
+        vec![trimmed, canonical_id.as_str()]
+    };
+    let hosted = match lifecycle::find_hosted_session(&*store, &keys) {
+        Ok(hosted) => hosted,
+        Err(err) => {
+            return HttpResponse::json(
+                500,
+                json!({"error": format!("failed to find hosted session: {err}")}),
+            );
+        }
+    };
+    // A native session id without a discoverable persona must also never claim a record
+    // belonging to a different adapter.
+    let hosted = hosted.filter(|record| {
+        route_vendor_hint.is_none_or(|vendor| record.vendor.eq_ignore_ascii_case(vendor))
+    });
     if matched.is_none() && route.is_none() && hosted.is_none() {
         return HttpResponse::json(
             404,
@@ -7422,6 +7628,7 @@ fn handle_post_session_model(
         );
     }
     let vendor = match (&route, matched, &hosted) {
+        (Some(fl_wire::identity::VendorRoute::HostCli { vendor, .. }), _, _) => vendor.clone(),
         (Some(route), _, _) => route_vendor(route).to_string(),
         (None, Some(s), _) => s.adapter.clone(),
         (None, None, Some(record)) => record.vendor.clone(),
@@ -7444,9 +7651,35 @@ fn handle_post_session_model(
         }
     }
 
-    // Key the override by the discovered session id. A session discovery does not list (a
-    // route or hosted record only) has no id a summary could match, so it is keyed by its
-    // lowercased persona, which `apply_model_overrides` also matches.
+    // Persist first, including the persona in the lookup for discovery UUIDs.
+    let cli_model = (vendor == "antigravity")
+        .then(|| lifecycle::agy_cli_model_id(&model, thinking_level.as_deref()));
+    let persisted_record = if hosted.is_some() {
+        match save(
+            &store,
+            &keys,
+            cli_model.as_deref().unwrap_or(&model),
+            thinking_level.as_deref(),
+            authority.actor_name(),
+        ) {
+            Ok(Some(record)) => Some(record),
+            Ok(None) => {
+                return HttpResponse::json(
+                    500,
+                    json!({"error":"hosted session disappeared before saving model"}),
+                );
+            }
+            Err(err) => {
+                return HttpResponse::json(
+                    500,
+                    json!({"error":format!("failed to save hosted model: {err}")}),
+                );
+            }
+        }
+    } else {
+        None
+    };
+    drop(store);
     let override_key = match matched {
         Some(s) => s.id.clone(),
         None => hosted
@@ -7456,73 +7689,59 @@ fn handle_post_session_model(
             .unwrap_or(&canonical_id)
             .to_ascii_lowercase(),
     };
-    state.set_session_model_override(
-        &override_key,
-        ModelOverride::new(model.clone(), thinking_level.clone()),
+    let busy = matches!(route, Some(fl_wire::identity::VendorRoute::Claude { .. }))
+        && state.is_session_busy_released(&canonical_id);
+    let (live_status, mechanism, model_applied) = model_delivery_outcome(
+        &vendor,
+        busy,
+        route.as_ref(),
+        &model,
+        thinking_level.as_deref(),
+        |command| deliver(route.as_ref().expect("Claude route"), command),
     );
-    // `agy --model` only takes effort-suffixed ids, so an Antigravity record keeps the mapped id
-    // (a restart launches with it); every other vendor keeps the model as the operator chose it.
-    let cli_model = (vendor == "antigravity")
-        .then(|| lifecycle::agy_cli_model_id(&model, thinking_level.as_deref()));
-    if hosted.is_some() {
-        match open_store_response(state) {
-            Ok(store) => {
-                // Best effort: the override above already answers `GET /api/v1/sessions`.
-                let _ = lifecycle::set_hosted_session_model(
-                    &*store,
-                    &[trimmed, &canonical_id],
-                    cli_model.as_deref().unwrap_or(&model),
-                    thinking_level.as_deref(),
-                    authority.actor_name(),
-                );
-            }
-            Err(()) => return store_open_failure(),
-        }
-    }
-
-    let method = match &route {
-        Some(route) if !matches!(route, fl_wire::identity::VendorRoute::Agy { .. }) => {
-            match dispatch_operator_prompt_to_route(
-                route,
-                authority.actor_name(),
-                &session_actions::model_command(&model),
-            ) {
-                Ok(()) => {
-                    if matches!(route, fl_wire::identity::VendorRoute::Claude { .. })
-                        && let Some(ref effort) = thinking_level
-                    {
-                        // Best effort: the model switch already landed.
-                        if let Err(err) = dispatch_operator_prompt_to_route(
-                            route,
-                            authority.actor_name(),
-                            &session_actions::effort_command(effort),
-                        ) {
-                            eprintln!(
-                                "fl: /effort dispatch for session {canonical_id} failed: {err:?}"
-                            );
-                        }
-                    }
-                    METHOD_OPERATOR_PROMPT
-                }
-                Err(_) => METHOD_OVERRIDE_ONLY,
-            }
-        }
-        _ => METHOD_OVERRIDE_ONLY,
+    let method = if live_status == "applied" {
+        "terminal-paste"
+    } else {
+        METHOD_OVERRIDE_ONLY
     };
-
+    let persisted = persisted_record.is_some();
+    // A recordless choice exists only if the model command actually reached the CLI.
+    // A failed effort command must not be shown as an applied effort.
+    if persisted || model_applied {
+        let override_effort = if persisted || live_status == "applied" {
+            thinking_level.clone()
+        } else {
+            None
+        };
+        state.set_session_model_override(
+            &override_key,
+            ModelOverride::new(model.clone(), override_effort),
+        );
+    }
+    // These launch adapters pass both the stored model and effort on restart.
+    let restart_applies = persisted_record
+        .as_ref()
+        .is_some_and(lifecycle::is_live_hosted)
+        && matches!(vendor.as_str(), "codex" | "claude");
     let mut data = json!({
         "ok": true,
         "session_id": canonical_id,
         "vendor": vendor,
         "model": model,
         "thinking_level": thinking_level,
-        "switched": true,
+        "switched": live_status == "applied",
         "method": method,
+        "persisted": persisted,
+        "record_id": persisted_record.as_ref().map(|record| &record.session_id),
+        "restart_applies": restart_applies,
+        "live": { "status": live_status, "mechanism": mechanism, "queued": false, "model_applied": model_applied },
     });
     if let Some(cli_model) = cli_model {
         data["cli_model"] = json!(cli_model);
     }
-    state.broadcast("sessions", "session.model_changed", data.clone());
+    if persisted || model_applied {
+        state.broadcast("sessions", "session.model_changed", data.clone());
+    }
     HttpResponse::json(200, data)
 }
 

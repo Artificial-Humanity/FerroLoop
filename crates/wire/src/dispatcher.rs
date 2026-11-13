@@ -3566,11 +3566,27 @@ fn deliver_via_tmux_paste_with_opts(
     text: &str,
     opts: TmuxPasteOptions<'_>,
 ) -> Result<(), String> {
+    deliver_via_tmux_paste_with_resolved_host(target, text, opts, None)
+}
+
+fn deliver_via_tmux_paste_with_resolved_host(
+    target: &str,
+    text: &str,
+    opts: TmuxPasteOptions<'_>,
+    resolved: Option<(
+        fl_host_proto::BlockingHostClient,
+        fl_host_proto::StreamId,
+        bool,
+    )>,
+) -> Result<(), String> {
     let trimmed = text.trim();
     let raw_target = target;
-    if std::env::var_os("FL_WIRE_TMUX_BIN").is_none()
-        && let Some((client, stream, is_pty)) = resolve_live_host_session_with_mode(target)
-    {
+    if let Some((client, stream, is_pty)) = resolved.or_else(|| {
+        std::env::var_os("FL_WIRE_TMUX_BIN")
+            .is_none()
+            .then(|| resolve_live_host_session_with_mode(target))
+            .flatten()
+    }) {
         let client_cell = std::cell::RefCell::new(client);
         let grant = client_cell
             .borrow_mut()
@@ -6235,6 +6251,94 @@ fn probe_composer_ready_from_screen(
     }
 }
 
+// /proc is a Linux interface. On other platforms let the terminal locator verify the route.
+fn claude_pid_may_be_alive(pid: u32) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        pid == 0 || Path::new(&format!("/proc/{pid}")).exists()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pid;
+        true
+    }
+}
+
+/// A host lookup for Claude must be vendor-qualified. A bare persona otherwise also
+/// matches the same persona's Codex or other vendor session.
+pub(crate) fn claude_host_target(raw: &str) -> Option<String> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let raw = raw.strip_prefix("claude:").unwrap_or(raw);
+    let persona = if let Some((persona, vendor)) = raw.rsplit_once('.') {
+        if !vendor.eq_ignore_ascii_case("claude") {
+            return None;
+        }
+        persona
+    } else {
+        raw
+    };
+    if persona.is_empty() || persona.contains(':') || persona.contains('.') {
+        return None;
+    }
+    Some(format!("claude:{persona}"))
+}
+
+/// Deliver a Claude slash command to its terminal only. Never fall back to the peer socket.
+pub fn deliver_to_live_claude_pane(route: &VendorRoute, text: &str) -> Result<(), String> {
+    let VendorRoute::Claude {
+        pid,
+        session_id,
+        socket_path,
+        key_path,
+    } = route
+    else {
+        return Err("not a claude route".into());
+    };
+    if !claude_pid_may_be_alive(*pid) {
+        return Err(format!("claude pid {pid} is no longer running"));
+    }
+    let key = read_claude_key(*pid, socket_path, key_path.as_deref())
+        .ok()
+        .map(|(_, key)| key);
+    let record = read_claude_session_record(*pid, key_path.as_deref());
+    if !claude_session_idle(record.as_ref()) {
+        return Err("composer_occupied_by_non_wire_input: Claude session is not idle; holding delivery without sending keys".into());
+    }
+    let discovered = claude_live_pane(*pid, record.as_ref(), || key);
+    let opts = TmuxPasteOptions {
+        bracketed: true,
+        verify_submission: true,
+        session_id: Some(session_id.as_str()).filter(|s| !s.trim().is_empty()),
+        is_muse_route: false,
+        composer_style: ComposerStyle::Ruled,
+    };
+    // Tmux pane IDs are verified by process-tree discovery. A host target must be
+    // resolved as Claude and the exact stream carried through the paste itself.
+    if let Some(pane) = discovered.as_deref().filter(|pane| pane.starts_with('%')) {
+        return deliver_via_tmux_paste_with_opts(pane, &sanitize_for_paste(text), opts);
+    }
+    let target = claude_host_target(discovered.as_deref().unwrap_or(session_id))
+        .ok_or_else(|| "the claude route has no live terminal".to_string())?;
+    let resolved = resolve_live_host_session_with_mode(&target)
+        .filter(|(_, stream, _)| {
+            stream
+                .session
+                .as_str()
+                .rsplit_once('.')
+                .is_some_and(|(_, vendor)| vendor.eq_ignore_ascii_case("claude"))
+        })
+        .ok_or_else(|| "the claude route has no live terminal".to_string())?;
+    deliver_via_tmux_paste_with_resolved_host(
+        &target,
+        &sanitize_for_paste(text),
+        opts,
+        Some(resolved),
+    )
+}
+
 pub fn dispatch_operator_prompt_to_route(
     route: &VendorRoute,
     sender_name: &str,
@@ -6717,6 +6821,164 @@ mod tests {
     use std::os::unix::net::UnixListener;
     use std::sync::Mutex;
     use tempfile::TempDir;
+
+    #[test]
+    fn claude_model_paste_pins_the_claude_stream_and_refuses_codex_only() {
+        use fl_host_proto::{
+            ChildRecord, ChildState, ControllerLease, ExtensionLimits, ExtensionRequest,
+            ExtensionResponse, HostConfig, HostEndpoint, HostInstance, HostListener, HostRequest,
+            HostResponse, InputState, RENDERED_PTY_FEATURE, RenderedScreen, SendOutcome,
+            SessionEpoch, SessionId, SessionMode, SessionSummary, SpawnKind, StreamId,
+        };
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::Arc;
+        let _lock = TMUX_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = TempDir::new().unwrap();
+        fs::set_permissions(tmp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let socket = tmp.path().join("fixture-host.sock");
+        let endpoint = HostEndpoint::unix(&socket).unwrap();
+        let make_summary = |name: &str| {
+            let session = SessionId::new(name).unwrap();
+            SessionSummary {
+                stream: StreamId {
+                    host: HostInstance::new([5; 16]),
+                    session: session.clone(),
+                    epoch: SessionEpoch(3),
+                },
+                mode: SessionMode::Pty,
+                input: InputState::Writable,
+                state: ChildState::Running(ChildRecord {
+                    session,
+                    session_epoch: SessionEpoch(3),
+                    kind: SpawnKind::Pty,
+                    pid: 42,
+                    input: InputState::Writable,
+                    started_at_ms: 0,
+                    exit: None,
+                    consumer_stalled: false,
+                }),
+                acked: 0,
+                latest: 0,
+            }
+        };
+        let codex = make_summary("fixture-536.codex");
+        let claude = make_summary("fixture-536.claude");
+        let claude_stream = claude.stream.clone();
+        let sessions = Arc::new(Mutex::new(vec![codex.clone(), claude]));
+        let writes = Arc::new(Mutex::new(Vec::<(StreamId, Vec<u8>)>::new()));
+        let claims = Arc::new(Mutex::new(Vec::<StreamId>::new()));
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let sessions_server = Arc::clone(&sessions);
+        let writes_server = Arc::clone(&writes);
+        let claims_server = Arc::clone(&claims);
+        let server = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async move {
+                let mut config = HostConfig::new(endpoint);
+                config.minor = 1;
+                let mut listener = HostListener::bind(config).await.unwrap();
+                ready_tx.send(()).unwrap();
+                loop {
+                    let mut conn = tokio::select! {
+                        _ = &mut stop_rx => break,
+                        conn = listener.accept() => conn.unwrap(),
+                    };
+                    let sessions = Arc::clone(&sessions_server);
+                    let writes = Arc::clone(&writes_server);
+                    let claims = Arc::clone(&claims_server);
+                    tokio::spawn(async move {
+                        while let Ok(HostRequest::Extended { id, request }) = conn.recv().await {
+                            let response = match request {
+                                ExtensionRequest::ListSessions => ExtensionResponse::Sessions {
+                                    records: sessions.lock().unwrap().clone(),
+                                },
+                                ExtensionRequest::Capabilities => ExtensionResponse::Capabilities {
+                                    host: HostInstance::new([5; 16]),
+                                    features: RENDERED_PTY_FEATURE,
+                                    limits: ExtensionLimits::default(),
+                                },
+                                ExtensionRequest::ClaimController { stream } => {
+                                    claims.lock().unwrap().push(stream);
+                                    ExtensionResponse::Controller {
+                                        lease: ControllerLease(7),
+                                        acked: 0,
+                                        latest: 0,
+                                    }
+                                }
+                                ExtensionRequest::CaptureRendered { stream } => {
+                                    ExtensionResponse::RenderedCapture {
+                                        screen: RenderedScreen {
+                                            schema: 1,
+                                            stream,
+                                            contents: String::new(),
+                                            cursor_row: 0,
+                                            cursor_col: 0,
+                                            rows: 24,
+                                            cols: 80,
+                                            generation: 1,
+                                            output_seq: 0,
+                                            output_bytes: 0,
+                                        },
+                                    }
+                                }
+                                ExtensionRequest::Write { stream, bytes, .. } => {
+                                    writes.lock().unwrap().push((stream, bytes.into_vec()));
+                                    ExtensionResponse::Input {
+                                        outcome: SendOutcome::Written,
+                                    }
+                                }
+                                ExtensionRequest::CaptureOutput { .. } => {
+                                    ExtensionResponse::CapturedOutput {
+                                        text: String::new(),
+                                    }
+                                }
+                                _ => break,
+                            };
+                            if conn
+                                .respond(&HostResponse::Extended { id, response })
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                    });
+                }
+            });
+        });
+        ready_rx.recv().unwrap();
+        let _no_tmux = EnvGuard::remove("FL_WIRE_TMUX_BIN");
+        let _sock = EnvGuard::set("FL_HOST_SOCK", &socket);
+        let key = tmp.path().join("fixture.key");
+        fs::write(&key, "{}").unwrap();
+        fs::write(tmp.path().join("0.json"), r#"{"status":"idle"}"#).unwrap();
+        let route = VendorRoute::Claude {
+            pid: 0,
+            session_id: "fixture-536".into(),
+            socket_path: tmp.path().join("unused.sock"),
+            key_path: Some(key),
+        };
+        deliver_to_live_claude_pane(&route, "/model sonnet").unwrap();
+        let actual = writes.lock().unwrap().clone();
+        assert!(actual.iter().all(|(stream, _)| stream == &claude_stream));
+        assert!(actual.iter().any(|(_, bytes)| {
+            bytes
+                .windows(b"/model sonnet".len())
+                .any(|w| w == b"/model sonnet")
+        }));
+        assert!(actual.iter().any(|(_, bytes)| bytes == b"\r"));
+        assert_eq!(*claims.lock().unwrap(), vec![claude_stream]);
+        *sessions.lock().unwrap() = vec![codex];
+        assert!(deliver_to_live_claude_pane(&route, "/model sonnet").is_err());
+        assert_eq!(writes.lock().unwrap().len(), actual.len());
+        assert_eq!(claims.lock().unwrap().len(), 1);
+        let _ = stop_tx.send(());
+        server.join().unwrap();
+    }
 
     /// Antigravity reset reads `FL_WIRE_AGY_BIN`, `ANTIGRAVITY_LS_ADDRESS`, and
     /// `ANTIGRAVITY_CSRF_TOKEN`. Tests that change those variables hold this lock
@@ -8292,6 +8554,37 @@ mod tests {
             socket_frames(&listener).is_none(),
             "the peer socket must receive nothing"
         );
+    }
+
+    #[test]
+    fn claude_model_pid_check_is_platform_appropriate() {
+        assert!(claude_pid_may_be_alive(0));
+        assert!(claude_pid_may_be_alive(std::process::id()));
+        #[cfg(target_os = "linux")]
+        assert!(!claude_pid_may_be_alive(u32::MAX));
+        #[cfg(not(target_os = "linux"))]
+        assert!(claude_pid_may_be_alive(u32::MAX));
+    }
+
+    #[test]
+    fn model_switch_claude_terminal_only_never_uses_peer_socket() {
+        let _tmux_lock = TMUX_ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let tmp = TempDir::new().unwrap();
+        let (tmux_bin, _tmux_out, tmux_stdin) = write_fake_tmux(tmp.path(), true);
+        let _env = EnvGuard::set("FL_WIRE_TMUX_BIN", &tmux_bin);
+        let (route, listener) = claude_route_with_mock_socket(tmp.path(), Some("Felicity:@12.%12"));
+        fs::write(tmp.path().join("0.json"), r#"{"status":"idle"}"#).unwrap();
+        deliver_to_live_claude_pane(&route, "/model sonnet").unwrap();
+        assert_eq!(
+            fs::read_to_string(tmux_stdin).unwrap().trim(),
+            "/model sonnet"
+        );
+        assert!(socket_frames(&listener).is_none());
+        drop(listener);
+        let _ = fs::remove_file(tmp.path().join("claude-tmux.sock"));
+        let (route, listener) = claude_route_with_mock_socket(tmp.path(), None);
+        assert!(deliver_to_live_claude_pane(&route, "/model sonnet").is_err());
+        assert!(socket_frames(&listener).is_none());
     }
 
     #[test]

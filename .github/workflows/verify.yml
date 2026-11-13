@@ -14,9 +14,10 @@
 # request, so running on both events ran the same commit twice. To check a
 # branch with no pull request yet, start the workflow by hand.
 #
-# No third-party actions are used. `actions/checkout` is GitHub's own; every
-# other step is a command from the toolchain, so the supply chain for a run is
-# the same one a local `cargo test` already trusts.
+# No third-party actions are used. `actions/checkout` and
+# `actions/setup-node` are GitHub's own; every other step is a command from
+# the toolchain, so the supply chain for a run is the same one a local
+# `cargo test` already trusts.
 name: verify
 
 on:
@@ -141,3 +142,35 @@ jobs:
       - name: cargo test -p fl-host -p fl-host-proto
         shell: bash
         run: cargo test -p fl-host -p fl-host-proto
+
+  # The FerroDeck UI in `ui/` has its own typecheck and test suite, which
+  # previously ran only by hand. This job runs them on every pull request
+  # and push to `main` alongside the trio above.
+  #
+  # Owner action: this job must become a required check in the Main
+  # Protection ruleset (required status check `ui (vitest, tsc)`), as
+  # `test, clippy, fmt` already is. Until that ruleset change is made this
+  # job reports but does not gate the merge.
+  ui:
+    name: ui (vitest, tsc)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ui
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+
+      - name: npm ci
+        run: npm ci
+
+      - name: npx tsc --noEmit -p .
+        run: npx tsc --noEmit -p .
+
+      - name: npx vitest run
+        run: npx vitest run
