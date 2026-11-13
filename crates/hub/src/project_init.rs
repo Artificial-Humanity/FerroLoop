@@ -411,6 +411,31 @@ pub(crate) fn config_entries(
     Ok(blocks.iter().filter_map(entry_of).collect())
 }
 
+/// Preserve named malformed roots for binding resolution, so they cannot fall through
+/// to a catalog or workspace decoy. Other config consumers retain their existing view.
+pub(crate) fn binding_config_entries(
+    doc: &DocumentMut,
+    path: &Path,
+) -> Result<Vec<ConfigEntry>, InitError> {
+    let mut entries = config_entries(doc, path)?;
+    if let Some(blocks) = doc.get("project").and_then(Item::as_array_of_tables) {
+        for table in blocks {
+            if table.get("root").and_then(Item::as_str).is_none()
+                && let Some(name) = table.get("name").and_then(Item::as_str)
+            {
+                entries.push(ConfigEntry {
+                    name: Some(name.to_owned()),
+                    root: String::new(),
+                    store: None,
+                    tracker: None,
+                    cwd: table.get("cwd").cloned(),
+                });
+            }
+        }
+    }
+    Ok(entries)
+}
+
 /// One `[[project]]` table as an entry; `None` for a table with no `root`.
 fn entry_of(t: &Table) -> Option<ConfigEntry> {
     let text = |key: &str| t.get(key).and_then(Item::as_str).map(str::to_string);

@@ -5525,7 +5525,7 @@ fn remove_routes_locked(
 ///
 /// A named config binding wins. Within the workspace, its top-level project umbrella is
 /// the runtime directory; outside it, the registered root is retained. Invalid or ambiguous
-/// bindings leave cwd unset. Without a readable binding, preserve catalog/directory fallback.
+/// bindings refuse launch. Without a binding, preserve catalog/directory fallback.
 fn resolve_project_cwd<S: Catalog>(
     store: &S,
     project: &str,
@@ -5533,12 +5533,18 @@ fn resolve_project_cwd<S: Catalog>(
     home_override: Option<&Path>,
 ) -> Result<Option<String>, LifecycleError> {
     use crate::project_init::{
-        config_entries, read_config, resolve_bound_project, user_config_path,
+        binding_config_entries, read_config, resolve_bound_project, user_config_path,
     };
 
-    if let Some(config) = user_config_path(home_override)
-        && let Ok(entries) = read_config(&config).and_then(|doc| config_entries(&doc, &config))
-    {
+    if let Some(config) = user_config_path(home_override) {
+        let entries = read_config(&config)
+            .and_then(|doc| binding_config_entries(&doc, &config))
+            .map_err(|_| {
+                LifecycleError::Invalid(format!(
+                    "could not read or parse project configuration {}",
+                    config.display()
+                ))
+            })?;
         if let Some((root, exact)) =
             resolve_bound_project(&entries, project).map_err(LifecycleError::Invalid)?
         {
@@ -11626,20 +11632,94 @@ mod tests {
     }
 
     #[test]
-    fn named_binding_cwd_unavailable_or_unbound_config_preserves_catalog_fallback() {
+    fn malformed_named_roots_never_fall_through_to_catalog() {
+        let home = TempDir::new().unwrap();
+        let decoy = home.path().join("audio-suite");
+        std::fs::create_dir(&decoy).unwrap();
+        let config = home.path().join(".config/fl/config.toml");
+        std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+        let store = MemStore::default();
+        store.add_project(decoy.to_str().unwrap()).unwrap();
+        for malformed in ["", "root = 123\n"] {
+            for valid_duplicate in [false, true] {
+                let valid = if valid_duplicate {
+                    format!(
+                        "[[project]]\nname='audio-suite'\nroot={:?}\n",
+                        decoy.to_str().unwrap()
+                    )
+                } else {
+                    String::new()
+                };
+                std::fs::write(
+                    &config,
+                    format!("{valid}[[project]]\nname='audio-suite'\n{malformed}cwd='exact'\n"),
+                )
+                .unwrap();
+                assert!(
+                    resolve_project_cwd(
+                        &store,
+                        "audio-suite",
+                        Some(home.path()),
+                        Some(home.path())
+                    )
+                    .is_err(),
+                    "{malformed:?}, duplicate={valid_duplicate}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn another_malformed_named_binding_does_not_block_an_unbound_project() {
         let home = TempDir::new().unwrap();
         let root = home.path().join("audio-suite");
         std::fs::create_dir(&root).unwrap();
         let config = home.path().join(".config/fl/config.toml");
         std::fs::create_dir_all(config.parent().unwrap()).unwrap();
-        for contents in [None, Some(""), Some("not valid [toml"), Some("directory")] {
+        std::fs::write(config, "[[project]]\nname='other'\nroot=123\n").unwrap();
+        let store = MemStore::default();
+        store.add_project(root.to_str().unwrap()).unwrap();
+        assert_eq!(
+            resolve_project_cwd(&store, "audio-suite", Some(home.path()), Some(home.path()))
+                .unwrap()
+                .as_deref(),
+            root.to_str()
+        );
+    }
+
+    #[test]
+    fn unreadable_or_malformed_config_does_not_select_a_decoy_or_expose_config() {
+        let home = TempDir::new().unwrap();
+        let decoy = home.path().join("audio-suite");
+        std::fs::create_dir(&decoy).unwrap();
+        let config = home.path().join(".config/fl/config.toml");
+        std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+        let store = MemStore::default();
+        store.add_project(decoy.to_str().unwrap()).unwrap();
+        std::fs::write(&config, "secret = 'confidential'\nproject = [\n").unwrap();
+        let error =
+            resolve_project_cwd(&store, "audio-suite", Some(home.path()), Some(home.path()))
+                .unwrap_err()
+                .to_string();
+        assert!(!error.contains("confidential"));
+        std::fs::remove_file(&config).unwrap();
+        std::fs::create_dir(&config).unwrap();
+        assert!(
+            resolve_project_cwd(&store, "audio-suite", Some(home.path()), Some(home.path()))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn named_binding_cwd_missing_or_unbound_config_preserves_catalog_fallback() {
+        let home = TempDir::new().unwrap();
+        let root = home.path().join("audio-suite");
+        std::fs::create_dir(&root).unwrap();
+        let config = home.path().join(".config/fl/config.toml");
+        std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+        for contents in [None, Some("")] {
             if let Some(text) = contents {
-                if text == "directory" {
-                    std::fs::remove_file(&config).unwrap();
-                    std::fs::create_dir(&config).unwrap();
-                } else {
-                    std::fs::write(&config, text).unwrap();
-                }
+                std::fs::write(&config, text).unwrap();
             }
             let store = MemStore::default();
             store.add_project(root.to_str().unwrap()).unwrap();

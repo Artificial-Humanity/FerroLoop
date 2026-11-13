@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use fl_core::store::Catalog;
 use fl_mcp::project_paths::{GitProjectLayout, resolve_git_project};
 
-use crate::project_init::{config_entries, read_config, user_config_path};
+use crate::project_init::{binding_config_entries, read_config, user_config_path};
 
 pub(crate) struct HydrationPrompt {
     pub text: String,
@@ -116,7 +116,7 @@ impl Context {
         let mut invalid_binding = false;
         let mut binding_policies = Vec::new();
         if let Some(config) = user_config_path(home) {
-            match read_config(&config).and_then(|doc| config_entries(&doc, &config)) {
+            match read_config(&config).and_then(|doc| binding_config_entries(&doc, &config)) {
                 Ok(entries) => {
                     if let Err(error) = crate::project_init::resolve_bound_project(&entries, name) {
                         invalid_binding = true;
@@ -406,6 +406,41 @@ mod tests {
     use super::*;
     use fl_core::MemStore;
     use tempfile::TempDir;
+
+    #[test]
+    fn malformed_named_roots_block_catalog_and_duplicate_guidance() {
+        let f = Fixture::new();
+        let config = f.home.path().join(".config/fl/config.toml");
+        f.store.add_project(f.project.to_str().unwrap()).unwrap();
+        for malformed in ["", "root = 123\n"] {
+            for valid_duplicate in [false, true] {
+                let valid = if valid_duplicate {
+                    format!(
+                        "[[project]]\nname='logical-name'\nroot={:?}\n",
+                        f.project.to_str().unwrap()
+                    )
+                } else {
+                    String::new()
+                };
+                std::fs::write(
+                    &config,
+                    format!("{valid}[[project]]\nname='logical-name'\n{malformed}cwd='exact'\n"),
+                )
+                .unwrap();
+                let context = f.context(&f.project);
+                assert!(
+                    context.project.is_none(),
+                    "{malformed:?}, duplicate={valid_duplicate}"
+                );
+                assert!(
+                    context
+                        .warnings
+                        .iter()
+                        .any(|w| w.contains("registered project root unavailable"))
+                );
+            }
+        }
+    }
 
     #[test]
     fn conflicting_cwd_policies_do_not_select_project_guidance() {
