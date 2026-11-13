@@ -2373,7 +2373,7 @@ fn journal_phase(bytes: &[u8], frame: &std::ops::Range<usize>) -> RestorePhase {
     serde_json::from_value(value["phase"].clone()).unwrap()
 }
 #[test]
-fn restore_tail_bad_magic_or_previous_hash_keeps_parseable_length_boundary() {
+fn restore_tail_bad_magic_or_previous_hash_uses_bounded_unauthenticated_extent() {
     let f = journal_fixture();
     let (request, lease) = prepare_restore(&f, &f.source);
     let RestoreOutcome::Installed { journal } =
@@ -2405,14 +2405,14 @@ fn restore_tail_bad_magic_or_previous_hash_keeps_parseable_length_boundary() {
             0
         );
     }
-    // An out-of-range length permits only header bytes, never nonzero payload.
+    // A damaged length cannot bound surviving payload from the same final frame.
     let mut damaged = original.clone();
     damaged[last.start + 4..last.start + 8].copy_from_slice(&u32::MAX.to_le_bytes());
     journal_fixture_write(&path, &damaged);
-    assert!(matches!(
-        load_restore_journal(&path, &lease, &f.filesystem()),
-        Err(fl_store::recovery::RecoveryError::Verification { .. })
-    ));
+    let loaded = load_restore_journal(&path, &lease, &f.filesystem()).unwrap();
+    assert_eq!(loaded.phase, RestorePhase::RelocateIntent);
+    assert!(loaded.torn_tail_bytes > 72);
+    assert_eq!(fs::read(&path).unwrap(), damaged, "read-only load wrote");
     damaged[last.start + 72..].fill(0);
     journal_fixture_write(&path, &damaged);
     assert!(
@@ -2421,15 +2421,171 @@ fn restore_tail_bad_magic_or_previous_hash_keeps_parseable_length_boundary() {
             .torn_tail_bytes
             > 0
     );
-    // A nonzero byte beyond a parseable failed frame is mid-file failure.
+    // A plausible but unauthenticated length cannot hide a bounded torn tail.
     damaged = original.clone();
     damaged[last.start] ^= 1;
     damaged[last.end] = 1;
     journal_fixture_write(&path, &damaged);
-    assert!(matches!(
-        load_restore_journal(&path, &lease, &f.filesystem()),
-        Err(fl_store::recovery::RecoveryError::Verification { .. })
-    ));
+    let loaded = load_restore_journal(&path, &lease, &f.filesystem()).unwrap();
+    assert_eq!(loaded.phase, RestorePhase::RelocateIntent);
+    assert_eq!(loaded.torn_tail_bytes, last.len() as u64 + 1);
+    assert_eq!(fs::read(&path).unwrap(), damaged, "read-only load wrote");
+}
+
+// Exercise crash images through the public loader and preserve the journal and
+// fence byte-for-byte on both recovery and refusal.
+fn assert_tail_load_read_only(
+    f: &Fixture,
+    path: &std::path::Path,
+    lease: &OfflineLease,
+    image: &[u8],
+    expect_torn: bool,
+) {
+    journal_fixture_write(path, image);
+    let guard = f.source.with_extension("fls.restore-guard");
+    let guard_before = fs::read(&guard).unwrap();
+    let before = fs::metadata(path).unwrap();
+    let result = load_restore_journal(path, lease, &f.filesystem());
+    if expect_torn {
+        let loaded = result.unwrap();
+        assert_eq!(loaded.phase, RestorePhase::RelocateIntent);
+        assert!(loaded.torn_tail_bytes > 0);
+    } else {
+        assert!(matches!(
+            result,
+            Err(fl_store::recovery::RecoveryError::Verification { .. })
+        ));
+    }
+    let after = fs::metadata(path).unwrap();
+    assert_eq!(
+        (before.mtime(), before.mtime_nsec()),
+        (after.mtime(), after.mtime_nsec())
+    );
+    assert_eq!(fs::read(path).unwrap(), image, "read-only load wrote");
+    assert_eq!(fs::read(guard).unwrap(), guard_before, "load changed fence");
+}
+#[test]
+fn restore_tail_page_loss_keeps_prior_authenticated_phase_without_writing() {
+    let f = journal_fixture();
+    let (request, lease) = prepare_restore(&f, &f.source);
+    let RestoreOutcome::Installed { journal } =
+        restore_offline(&request, &lease, &f.filesystem()).unwrap()
+    else {
+        panic!("not installed")
+    };
+    let path = journal.staging.join("journal.bin");
+    let original = fs::read(&path).unwrap();
+    let frames = journal_frame_ranges(&original);
+    let last = frames.last().unwrap();
+    let first_page = last.start / 4096;
+    let last_page = (last.end - 1) / 4096;
+    assert!(last_page > first_page, "genuine final frame spans pages");
+    for page in first_page..=last_page {
+        let mut damaged = original.clone();
+        // The first page can also contain the prior authenticated frame.
+        let start = (page * 4096).max(last.start);
+        let end = ((page + 1) * 4096).min(last.end);
+        damaged[start..end].fill(0);
+        assert_tail_load_read_only(&f, &path, &lease, &damaged, true);
+        eprintln!("page-loss {page}: {start}..{end} recovered");
+    }
+}
+#[test]
+fn restore_tail_unauthenticated_header_and_plausible_length_use_one_frame_window() {
+    let f = journal_fixture();
+    let (request, lease) = prepare_restore(&f, &f.source);
+    let RestoreOutcome::Installed { journal } =
+        restore_offline(&request, &lease, &f.filesystem()).unwrap()
+    else {
+        panic!("not installed")
+    };
+    let path = journal.staging.join("journal.bin");
+    let original = fs::read(&path).unwrap();
+    let frames = journal_frame_ranges(&original);
+    let last = frames.last().unwrap();
+    let window_end = last.start + original.len() / 96;
+    assert!(last.end < window_end && window_end < original.len());
+    for kind in 0..4 {
+        let mut damaged = original.clone();
+        match kind {
+            0 => damaged[last.start..last.start + 72].fill(0),
+            1 => damaged[last.start + 4..last.start + 8].copy_from_slice(&u32::MAX.to_le_bytes()),
+            // A partly lost length remains plausible and in-range.
+            2 => {
+                damaged[last.start + 5..last.start + 8].fill(0);
+                assert_ne!(damaged[last.start + 4], 0);
+            }
+            3 => damaged[last.start + 40] ^= 1,
+            _ => unreachable!(),
+        }
+        damaged[window_end - 1] = 1;
+        assert_tail_load_read_only(&f, &path, &lease, &damaged, true);
+        damaged[window_end] = 1;
+        assert_tail_load_read_only(&f, &path, &lease, &damaged, false);
+        eprintln!("unauthenticated kind {kind}: exact window enforced");
+    }
+}
+#[test]
+fn restore_tail_unauthenticated_zero_header_cannot_swallow_complete_frame_or_first_frame_loss() {
+    let f = journal_fixture();
+    let (request, lease) = prepare_restore(&f, &f.source);
+    let RestoreOutcome::Installed { journal } =
+        restore_offline(&request, &lease, &f.filesystem()).unwrap()
+    else {
+        panic!("not installed")
+    };
+    let path = journal.staging.join("journal.bin");
+    let original = fs::read(&path).unwrap();
+    let frames = journal_frame_ranges(&original);
+    let last = frames.last().unwrap();
+    let mut damaged = original.clone();
+    damaged[last.start..last.start + 72].fill(0);
+    // A complete digest-only frame counts even in the damaged payload, with an
+    // unrelated chain and invalid JSON. The scan must not skip to a claimed end.
+    let nested = journal_digest_frame(b"not-json", [0xa5; 32]);
+    let at = last.start + 73;
+    assert!(at + nested.len() < last.end);
+    damaged[at..at + nested.len()].copy_from_slice(&nested);
+    assert_tail_load_read_only(&f, &path, &lease, &damaged, false);
+    let first = &frames[0];
+    damaged = original.clone();
+    damaged[first.end..].fill(0); // no later complete frame to explain refusal
+    damaged[first.start..first.start + 72].fill(0);
+    assert_tail_load_read_only(&f, &path, &lease, &damaged, false);
+}
+#[test]
+fn restore_tail_unauthenticated_fallback_does_not_widen_authenticated_invalid_payload() {
+    let f = journal_fixture();
+    let (request, lease) = prepare_restore(&f, &f.source);
+    let RestoreOutcome::Installed { journal } =
+        restore_offline(&request, &lease, &f.filesystem()).unwrap()
+    else {
+        panic!("not installed")
+    };
+    let path = journal.staging.join("journal.bin");
+    let original = fs::read(&path).unwrap();
+    let frames = journal_frame_ranges(&original);
+    let last = frames.last().unwrap();
+    let previous = original[last.start + 8..last.start + 40]
+        .try_into()
+        .unwrap();
+    let mut typed_invalid: serde_json::Value =
+        serde_json::from_slice(&original[last.start + 72..last.end]).unwrap();
+    typed_invalid["version"] = serde_json::json!("invalid-version");
+    for payload in [
+        b"{".to_vec(),
+        b"{}".to_vec(),
+        serde_json::to_vec(&typed_invalid).unwrap(),
+    ] {
+        let frame = journal_digest_frame(&payload, previous);
+        let mut damaged = original.clone();
+        damaged[last.start..].fill(0);
+        let end = last.start + frame.len();
+        damaged[last.start..end].copy_from_slice(&frame);
+        assert_tail_load_read_only(&f, &path, &lease, &damaged, true);
+        damaged[end] = 1;
+        assert_tail_load_read_only(&f, &path, &lease, &damaged, false);
+    }
 }
 
 struct JournalBoundaryIo {

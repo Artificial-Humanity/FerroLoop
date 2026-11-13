@@ -1249,8 +1249,8 @@ fn read_guard(
     Ok(guard)
 }
 /// Load bounded, chained durable metadata without writing. A final failed frame
-/// with a zero suffix retains the last valid phase and reports a torn tail; live
-/// phase layouts still decide whether any later mutation may proceed.
+/// retains the last valid phase when its surviving bytes fit its authenticated
+/// extent or one maximum frame; live phase layouts still govern later mutation.
 pub fn load_restore_journal(
     path: &Path,
     lease: &OfflineLease,
@@ -1428,12 +1428,19 @@ fn load_journal(
             }
             break;
         }
+        let max_frame_end = offset
+            .checked_add(LOG_HEADER)
+            .and_then(|n| n.checked_add(metadata_caps.payload))
+            .ok_or_else(|| l.verification())?
+            .min(capacity);
         let mut header = [0; LOG_HEADER as usize];
         fs::read_exact_at(&log.file, &mut header, offset, &l)?;
         if header.iter().all(|b| *b == 0) {
-            // A zero header followed by nonzero bytes is not a final torn header.
-            torn_tail_bytes = torn_tail_extent(&log.file, offset, capacity, None, &l)?;
-            if torn_tail_bytes != 0 {
+            // Header-page loss can leave durable payload from this final frame.
+            // A prior authenticated frame is still required to recover state.
+            torn_tail_bytes =
+                torn_tail_extent(&log.file, offset, capacity, Some(max_frame_end), &l)?;
+            if torn_tail_bytes != 0 && last.is_none() {
                 return Err(l.verification());
             }
             break;
@@ -1445,6 +1452,7 @@ fn load_journal(
             .and_then(|n| n.checked_add(length))
             .filter(|n| *n <= capacity);
         let header_valid = &header[..4] == b"RJR1" && header[8..40] == previous;
+        let mut trusted_end = None;
         let parsed = (|| {
             if !header_valid {
                 return Err(l.verification());
@@ -1457,6 +1465,7 @@ fn load_journal(
             if header[40..72] != digest {
                 return Err(l.verification());
             }
+            trusted_end = Some(end);
             let memory = saved_memory_ceiling(&log.file, offset + LOG_HEADER, end, &l)?;
             let mut effective = l.clone();
             if let Some(memory) = memory {
@@ -1528,10 +1537,10 @@ fn load_journal(
                 if last.is_none() {
                     return Err(error);
                 }
-                // Parseable in-range length bounds the final failed frame even
-                // when magic or previous-hash validation failed.
-                let claimed = end;
-                torn_tail_bytes = torn_tail_extent(&log.file, offset, capacity, claimed, &l)?;
+                // Only chain and payload authentication establish the extent.
+                // A torn header can leave any plausible, shorter length behind.
+                let extent = trusted_end.or(Some(max_frame_end));
+                torn_tail_bytes = torn_tail_extent(&log.file, offset, capacity, extent, &l)?;
                 if torn_tail_bytes == 0 {
                     return Err(error);
                 }
