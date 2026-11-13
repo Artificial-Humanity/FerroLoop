@@ -62,6 +62,7 @@ impl TestEnv {
             .env("FL_WIRE_ROUTES", &self.routes_file)
             .env("FL_WIRE_SOCKET", &self.sock_file)
             .env("FL_WIRE_DISABLE_HOST_DISCOVERY", "1")
+            .env_remove("FL_HOST_SOCK")
             .env_remove("FL_DB")
             .env_remove("AGENT_PERSONA")
             .env_remove("AGENT_NAME")
@@ -94,6 +95,27 @@ impl TestEnv {
             std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_fl"), &link).unwrap();
         }
         link
+    }
+}
+
+#[test]
+fn fixture_scrubs_inherited_live_routes() {
+    let env = TestEnv::new();
+    let cmd = env.fl();
+    assert!(
+        cmd.get_envs()
+            .any(|(name, value)| name == "FL_HOST_SOCK" && value.is_none())
+    );
+    for (key, expected) in [
+        ("FL_WIRE_SOCKET", &env.sock_file),
+        ("FL_WIRE_ROUTES", &env.routes_file),
+        ("XDG_RUNTIME_DIR", &env.root),
+    ] {
+        assert!(
+            cmd.get_envs()
+                .any(|(name, value)| name == key && value == Some(expected.as_os_str())),
+            "fixture must set private {key}"
+        );
     }
 }
 
@@ -1811,6 +1833,7 @@ fn mcp_and_cli_discover_daemon_via_run_user_fallback_without_xdg_runtime_dir_and
         .env_remove("FL_WIRE_ROUTES")
         .env("FL_TEST_RUN_USER_DIR", &run_user_dir)
         .env("FL_WIRE_DISABLE_HOST_DISCOVERY", "1")
+        .env_remove("FL_HOST_SOCK")
         .env_remove("AGENT_PERSONA")
         .env_remove("AGENT_NAME")
         .env_remove("FL_HOSTED_ID")
@@ -1843,6 +1866,7 @@ fn mcp_and_cli_discover_daemon_via_run_user_fallback_without_xdg_runtime_dir_and
         .env_remove("FL_WIRE_ROUTES")
         .env("FL_TEST_RUN_USER_DIR", &run_user_dir)
         .env("FL_WIRE_DISABLE_HOST_DISCOVERY", "1")
+        .env_remove("FL_HOST_SOCK")
         .env("AGENT_PERSONA", "felix")
         .env_remove("AGENT_NAME")
         .env_remove("FL_HOSTED_ID")

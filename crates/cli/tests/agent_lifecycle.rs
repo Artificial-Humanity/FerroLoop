@@ -41,6 +41,9 @@ impl Env {
             .env("XDG_CONFIG_HOME", self.path().join("config"))
             .env("XDG_DATA_HOME", self.path().join("data"))
             .env("FL_WIRE_DISABLE_HOST_DISCOVERY", "1")
+            .env_remove("FL_HOST_SOCK")
+            .env_remove("FL_WIRE_SOCKET")
+            .env_remove("FL_WIRE_ROUTES")
             .env("FL_TEST_SPINUP_NO_SPAWN", "1")
             .env_remove("FL_DB")
             .env_remove("AGENT_PERSONA")
@@ -105,6 +108,19 @@ impl Env {
             At::from_unix_millis(1),
         );
         table.save(Some(&self.routes())).unwrap();
+    }
+}
+
+#[test]
+fn fixture_scrubs_inherited_live_routes() {
+    let env = Env::new();
+    let cmd = env.fl();
+    for key in ["FL_HOST_SOCK", "FL_WIRE_SOCKET", "FL_WIRE_ROUTES"] {
+        assert!(
+            cmd.get_envs()
+                .any(|(name, value)| name == key && value.is_none()),
+            "fixture must remove inherited {key}"
+        );
     }
 }
 
@@ -954,6 +970,9 @@ fn hydration_register_live_process_shapes_confirm_and_write_routes_for_each_vend
             .env("XDG_CONFIG_HOME", e.path().join("config"))
             .env("XDG_DATA_HOME", e.path().join("data"))
             .env("FL_WIRE_DISABLE_HOST_DISCOVERY", "1")
+            .env_remove("FL_HOST_SOCK")
+            .env_remove("FL_WIRE_SOCKET")
+            .env_remove("FL_WIRE_ROUTES")
             .env("AGENT_PERSONA", "ada")
             .env("AGENT_HYDRATION_GENERATION", generation)
             .env_remove("FL_HOSTED_ID")
