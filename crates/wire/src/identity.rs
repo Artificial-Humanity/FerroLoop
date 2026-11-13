@@ -4959,22 +4959,10 @@ fn passive_agy_source(path: &Path) -> Result<(u64, String), &'static str> {
 }
 
 pub fn scan_transcript_for_persona(path: &Path, max_lines: usize) -> Option<String> {
-    let (head_text, hit_eof) = read_head_lines_with_eof(path, max_lines)?;
-    if hit_eof {
-        return scan_text_for_persona(&head_text, max_lines);
-    }
-    if first_system_message_is_grok_subagent(&head_text)
-        || first_message_is_agy_subagent(&head_text)
-    {
-        return None;
-    }
-    let tail_lines = max_lines.max(TRANSCRIPT_TAIL_MIN_LINES);
-    let tail_text = read_tail_lines(path, tail_lines).unwrap_or_default();
-    if tail_text.is_empty() {
-        return scan_text_for_persona(&head_text, max_lines);
-    }
-    let combined = format!("{head_text}\n{tail_text}");
-    scan_text_for_persona(&combined, max_lines.saturating_add(tail_lines))
+    // Head only for every non-Muse caller: recent tool arguments or wire payloads in the
+    // tail must never override the identity declared at the head (#498 B2).
+    let (head_text, _) = read_head_lines_with_eof(path, max_lines)?;
+    scan_text_for_persona(&head_text, max_lines)
 }
 
 /// The most bytes [`read_head_lines`] reads for a transcript head.
@@ -5048,9 +5036,27 @@ fn read_tail_lines(path: &Path, max_lines: usize) -> Option<String> {
     Some(lines[keep_from..].join("\n"))
 }
 
-/// [`scan_transcript_for_persona`] for a Muse transcript: reads the bounded head and tail of the file.
+/// Muse only: head scan, plus a tail scan restricted to Muse hydration rows
+/// (`runtime.user_intent.accepted`) so tool arguments/payloads in the tail never count.
 fn scan_muse_transcript_for_persona(path: &Path, max_lines: usize) -> Option<String> {
-    scan_transcript_for_persona(path, max_lines)
+    if let Some(persona) = scan_transcript_for_persona(path, max_lines) {
+        return Some(persona);
+    }
+    let tail_lines = max_lines.max(TRANSCRIPT_TAIL_MIN_LINES);
+    let tail_text = read_tail_lines(path, tail_lines)?;
+    let hydration_lines: Vec<&str> = tail_text
+        .lines()
+        .filter(|line| {
+            serde_json::from_str::<serde_json::Value>(line).is_ok_and(|val| {
+                val.get("payload_type").and_then(|v| v.as_str())
+                    == Some("runtime.user_intent.accepted")
+            })
+        })
+        .collect();
+    if hydration_lines.is_empty() {
+        return None;
+    }
+    scan_text_for_persona(&hydration_lines.join("\n"), hydration_lines.len())
 }
 
 fn scan_text_for_persona(text: &str, max_lines: usize) -> Option<String> {
@@ -5354,8 +5360,9 @@ pub fn detect_current_route() -> Option<VendorRoute> {
 
 /// Resolve the caller's persona name in strict priority order (spec §3.1):
 /// 1. Explicit flag/argument (`explicit`)
-/// 2. `AGENT_PERSONA`, `AGENT_NAME`, or `FL_HOSTED_ID` (`<vendor>:<persona>`) environment variable
-/// 3. Vendor transcript / session / route-cache inspection
+/// 2. `AGENT_PERSONA` or `AGENT_NAME` environment variable
+/// 3. Vendor transcript / session inspection, then `FL_HOSTED_ID` (`<vendor>:<persona>`),
+///    then route-cache inspection
 /// 4. CWD ancestor project lead lookup in `AgentRegistry`
 /// 5. `"unknown"`
 pub fn resolve_persona(
@@ -5483,16 +5490,18 @@ fn resolve_persona_traced(
         }
     }
 
+    if let Some(tp) = transcript_path
+        && let Some(norm) = scan_muse_transcript_for_persona(tp, 50)
+    {
+        return (norm, PersonaSource::Transcript);
+    }
+
+    // After the transcript: an inherited FL_HOSTED_ID must not sign for every vendor when
+    // the session's own transcript declares a different persona (#498 finding 6).
     if let Some(hosted_id) = get_str("FL_HOSTED_ID")
         && let Some(norm) = persona_from_hosted_id(&hosted_id)
     {
         return (norm, PersonaSource::Env);
-    }
-
-    if let Some(tp) = transcript_path
-        && let Some(norm) = scan_transcript_for_persona(tp, 50)
-    {
-        return (norm, PersonaSource::Transcript);
     }
 
     // Past this point the persona is inferred from the process tree, inherited session
@@ -6928,6 +6937,49 @@ mod tests {
         )
         .unwrap();
         assert!(scan_transcript_for_persona(&codex_out, 20).is_none());
+    }
+
+    #[test]
+    fn scan_tail_tool_args_and_mail_never_override_head_persona() {
+        let tmp = TempDir::new().unwrap();
+        // Codex rollout headed Cassandra + tail tool call searching for a register command.
+        let codex = tmp.path().join("codex-tail.jsonl");
+        let mut lines = vec![
+            serde_json::json!({"type":"response_item","payload":{"type":"message","role":"user","content":"You are Cassandra, the reviewer."}}).to_string(),
+        ];
+        for i in 0..60 {
+            lines.push(format!("filler line {i}"));
+        }
+        lines.push(
+            serde_json::json!({"type":"response_item","payload":{"type":"custom_tool_call","name":"exec","input":"rg -n 'fl wire register ' crates/wire"}}).to_string(),
+        );
+        fs::write(&codex, lines.join("\n")).unwrap();
+        assert_eq!(
+            scan_transcript_for_persona(&codex, 50).as_deref(),
+            Some("cassandra")
+        );
+        // Felix headed transcript + tail mail quoting another persona's register command.
+        let felix = tmp.path().join("felix-tail.jsonl");
+        let mut lines = vec!["You are Felix, the builder.".to_string()];
+        for i in 0..60 {
+            lines.push(format!("activity line {i}"));
+        }
+        lines.push(
+            serde_json::json!({"type":"user","content":"[fl-wire mail] quoted: fl wire register melisandre --project x"}).to_string(),
+        );
+        fs::write(&felix, lines.join("\n")).unwrap();
+        assert_eq!(
+            scan_transcript_for_persona(&felix, 50).as_deref(),
+            Some("felix")
+        );
+        // Muse tail scan only counts hydration rows, never tool arguments.
+        let muse = tmp.path().join("muse-tail.jsonl");
+        let mut lines: Vec<String> = (0..60).map(|i| format!("session line {i}")).collect();
+        lines.push(
+            serde_json::json!({"payload_type":"runtime.tool","payload":{"input":"fl wire register melisandre"}}).to_string(),
+        );
+        fs::write(&muse, lines.join("\n")).unwrap();
+        assert_eq!(scan_muse_transcript_for_persona(&muse, 50), None);
     }
 
     #[test]
@@ -13500,7 +13552,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_persona_traced_resolves_fl_hosted_id_before_transcript_and_after_agent_persona() {
+    fn resolve_persona_traced_resolves_fl_hosted_id_after_transcript_and_after_agent_persona() {
         assert_eq!(
             persona_from_hosted_id("muse:Melisandre"),
             Some("melisandre".to_string())
@@ -13533,10 +13585,14 @@ mod tests {
         )
         .unwrap();
 
+        // Transcript beats an inherited FL_HOSTED_ID (#498 finding 6).
         let hosted_env =
             |k: &str| (k == "FL_HOSTED_ID").then(|| std::ffi::OsString::from("muse:Melisandre"));
         let r =
             resolve_persona_traced(None, Some(&tp), cwd, None, RouteTable::default, &hosted_env);
+        assert_eq!(r, ("katie".to_string(), PersonaSource::Transcript));
+        // With no transcript, FL_HOSTED_ID still resolves.
+        let r = resolve_persona_traced(None, None, cwd, None, RouteTable::default, &hosted_env);
         assert_eq!(r, ("melisandre".to_string(), PersonaSource::Env));
 
         let both_env = |k: &str| match k {
@@ -13599,10 +13655,8 @@ mod tests {
             scan_muse_transcript_for_persona(&session_path, 50).as_deref(),
             Some("melisandre")
         );
-        assert_eq!(
-            scan_transcript_for_persona(&session_path, 50).as_deref(),
-            Some("melisandre")
-        );
+        // Generic scan is head-only; only the Muse scan reads tail hydration rows.
+        assert_eq!(scan_transcript_for_persona(&session_path, 50), None);
         let none_env = |_: &str| None;
         assert_eq!(
             resolve_persona_traced(

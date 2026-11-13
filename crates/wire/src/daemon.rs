@@ -1107,6 +1107,8 @@ struct DaemonInner<S> {
     dispatch_diagnostics: Mutex<DiagnosticsState>,
     pending_by_recipient: Mutex<BTreeMap<String, BTreeMap<MessageId, At>>>,
     awaiting_daemon_state: Mutex<BTreeMap<MessageId, AwaitingDaemonEntry>>,
+    // Daemon-lifetime only: in-memory reprobe state, lost on restart (which re-arms the
+    // budget). An exhausted entry is reset only by a new message, a read/ack, or restart.
     composer_occupied_reprobes: Mutex<BTreeMap<String, ComposerOccupiedReprobeEntry>>,
     #[cfg(test)]
     composer_probe_hook: Mutex<Option<ComposerProbeHook>>,
@@ -1924,18 +1926,11 @@ where
         reprobes
             .entry(recipient.to_string())
             .and_modify(|entry| {
-                if entry.probes_run >= COMPOSER_OCCUPIED_MAX_REPROBES {
-                    // A fresh hold for an exhausted recipient must get a fresh budget,
-                    // otherwise the retained entry would never re-arm.
-                    let backoff = COMPOSER_OCCUPIED_REPROBE_INITIAL_BACKOFF;
-                    *entry = ComposerOccupiedReprobeEntry {
-                        next_probe_at: At::from_unix_millis(
-                            now_ms.saturating_add(backoff.as_millis() as u64),
-                        ),
-                        backoff,
-                        probes_run: 0,
-                    };
-                } else {
+                // Never reset an exhausted entry here: this is also called by the hold a
+                // reprobe's own dispatch produces, so resetting would defeat the bound.
+                // Only a new message, read/ack (see `reset_composer_occupied_reprobe`), or
+                // daemon restart re-arms it.
+                if entry.probes_run < COMPOSER_OCCUPIED_MAX_REPROBES {
                     entry.next_probe_at = At::from_unix_millis(
                         now_ms.saturating_add(entry.backoff.as_millis() as u64),
                     );
@@ -1951,6 +1946,20 @@ where
                     probes_run: 0,
                 }
             });
+    }
+
+    /// Re-arm an exhausted reprobe entry; called only on a new message or a read/ack.
+    fn reset_composer_occupied_reprobe(&self, recipient: &str, now: &At) {
+        let name = recipient.trim().to_ascii_lowercase();
+        let mut reprobes = lock(&self.composer_occupied_reprobes);
+        if let Some(entry) = reprobes.get_mut(&name) {
+            entry.probes_run = 0;
+            entry.backoff = COMPOSER_OCCUPIED_REPROBE_INITIAL_BACKOFF;
+            entry.next_probe_at = At::from_unix_millis(
+                now.unix_millis()
+                    .saturating_add(COMPOSER_OCCUPIED_REPROBE_INITIAL_BACKOFF.as_millis() as u64),
+            );
+        }
     }
 
     /// Re-probe recipients held by a zero-key `ComposerOccupiedByNonWireInput` fence on a bounded
@@ -1996,6 +2005,11 @@ where
                     warn(&format!(
                         "composer-occupied reprobe {probes_run}/{COMPOSER_OCCUPIED_MAX_REPROBES} for {recipient}: ready=None (no route), next backoff {backoff:?}"
                     ));
+                    if probes_run >= COMPOSER_OCCUPIED_MAX_REPROBES {
+                        warn(&format!(
+                            "composer-occupied reprobes exhausted for {recipient} after {COMPOSER_OCCUPIED_MAX_REPROBES} probes; holding until new message, read/ack, or daemon restart"
+                        ));
+                    }
                 }
                 continue;
             };
@@ -2032,6 +2046,11 @@ where
             warn(&format!(
                 "composer-occupied reprobe {probes_run}/{COMPOSER_OCCUPIED_MAX_REPROBES} for {recipient}: ready={ready:?}, next backoff {backoff:?}"
             ));
+            if probes_run >= COMPOSER_OCCUPIED_MAX_REPROBES {
+                warn(&format!(
+                    "composer-occupied reprobes exhausted for {recipient} after {COMPOSER_OCCUPIED_MAX_REPROBES} probes; holding until new message, read/ack, or daemon restart"
+                ));
+            }
             // Fail closed: only a probe that positively observed a clean composer (or one
             // exactly matching recorded deliveries) may resume dispatch. `Some(false)` means
             // the composer still holds non-wire input or a dialog, and `None` means the probe
@@ -2066,6 +2085,9 @@ where
                 }
                 match self.store.send_wire(args) {
                     Ok((msg, receipts)) => {
+                        for rcpt in &receipts {
+                            self.reset_composer_occupied_reprobe(&rcpt.recipient_name, &now);
+                        }
                         self.admit_pending_receipts(&msg, &receipts);
                         self.notify_subscribers_message(&msg, &receipts);
                         self.broadcast_to_peers(
@@ -2132,6 +2154,7 @@ where
                         }
                     }
                     drop(_order);
+                    self.reset_composer_occupied_reprobe(rec, &now);
                     self.maybe_unfence_and_resume(rec, now);
                     (LocalResponse::Inbox { items }, None)
                 } else {
@@ -2184,6 +2207,7 @@ where
                 }
                 drop(_order);
                 if !out.is_empty() {
+                    self.reset_composer_occupied_reprobe(&recipient, &now);
                     self.maybe_unfence_and_resume(&recipient, now);
                 }
                 (LocalResponse::Acked { receipts: out }, None)
@@ -8828,7 +8852,7 @@ mod tests {
     }
 
     #[test]
-    fn composer_occupied_fresh_hold_rearms_exhausted_reprobe_entry() {
+    fn composer_occupied_fresh_hold_does_not_rearm_exhausted_reprobe_entry() {
         let (_tmp, inner) = fault_rig();
         let occupied_err =
             "composer_occupied_by_non_wire_input: composer holds non-wire input or active dialog; holding delivery without sending keys"
@@ -8841,10 +8865,21 @@ mod tests {
             entry.backoff = COMPOSER_OCCUPIED_REPROBE_MAX_BACKOFF;
             entry.next_probe_at = At::from_unix_millis(999_999);
         }
-        // A fresh zero-key hold for the same recipient resets the exhausted entry.
+        // A fresh zero-key hold (e.g. from a reprobe's own dispatch) must NOT reset an
+        // exhausted entry, or the 16-probe bound defeats itself.
         inner.schedule_composer_occupied_reprobe("held", &At::from_unix_millis(500_000));
         let entry = lock(&inner.composer_occupied_reprobes)["held"].clone();
-        assert_eq!(entry.probes_run, 0, "fresh hold must reset exhausted entry");
+        assert_eq!(
+            entry.probes_run, COMPOSER_OCCUPIED_MAX_REPROBES,
+            "fresh hold must not reset exhausted entry"
+        );
+        // Only an explicit reset (new message / read / ack) re-arms it.
+        inner.reset_composer_occupied_reprobe("held", &At::from_unix_millis(500_000));
+        let entry = lock(&inner.composer_occupied_reprobes)["held"].clone();
+        assert_eq!(
+            entry.probes_run, 0,
+            "explicit reset must re-arm exhausted entry"
+        );
         assert_eq!(entry.backoff, COMPOSER_OCCUPIED_REPROBE_INITIAL_BACKOFF);
         assert_eq!(entry.next_probe_at.unix_millis(), 510_000);
 

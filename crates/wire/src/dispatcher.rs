@@ -2538,6 +2538,12 @@ fn composer_occupied_by_non_wire_input_error() -> String {
     )
 }
 
+fn composer_occupied_after_pre_paste_flush_error() -> String {
+    format!(
+        "{COMPOSER_OCCUPIED_BY_NON_WIRE_INPUT_PREFIX} composer holds non-wire input after pre-paste flush Enter; holding delivery"
+    )
+}
+
 fn composer_occupied_after_paste_error() -> String {
     format!(
         "{COMPOSER_OCCUPIED_BY_NON_WIRE_INPUT_PREFIX} composer holds non-wire input after paste; aborting Enter retries"
@@ -3038,9 +3044,10 @@ fn execute_verified_paste_delivery(
     }
 
     if spec.verify_submission && !trimmed.is_empty() {
-        let prep = prepare_clean_composer_before_paste_for_route(
+        let prep = prepare_clean_composer_before_paste_impl(
             trimmed,
             &spec.route_keys,
+            spec.is_muse_route,
             &mut wait,
             &mut capture_rendered,
             || transcript.confirmed(trimmed),
@@ -3087,7 +3094,11 @@ fn execute_verified_paste_delivery(
                     break;
                 }
                 if composer_is_rendering_target_prefix(&contents, &d_target)
-                    || !composer_has_unsubmitted_content(&contents, cursor)
+                    || !composer_has_unsubmitted_content_for_route(
+                        &contents,
+                        cursor,
+                        spec.is_muse_route,
+                    )
                 {
                     continue;
                 }
@@ -3106,9 +3117,10 @@ fn execute_verified_paste_delivery(
     if !spec.verify_submission || trimmed.is_empty() {
         return Ok(());
     }
-    match confirm_paste_submission_with_raw(
+    match confirm_paste_submission_with_raw_for_route(
         trimmed,
         spec.raw_text,
+        spec.is_muse_route,
         &mut wait,
         &mut capture_screen,
         || transcript.confirmed(trimmed),
@@ -3826,9 +3838,31 @@ fn prepare_clean_composer_before_paste(
 /// sent. Only content proven to equal 1 or more ordered recorded unconfirmed FerroWire deliveries
 /// for `route_keys` ([`composer_equals_recorded_wire_deliveries`]) is flushed via
 /// [`run_bounded_enter_retry_loop`].
+#[cfg(test)]
 fn prepare_clean_composer_before_paste_for_route(
     trimmed: &str,
     route_keys: &[String],
+    wait: impl FnMut(Duration),
+    capture_rendered_only: impl FnMut() -> Option<(String, Option<CursorState>)>,
+    transcript_confirmed: impl FnMut() -> bool,
+    send_enter: impl FnMut() -> Result<(), String>,
+) -> Result<PrePasteOutcome, String> {
+    prepare_clean_composer_before_paste_impl(
+        trimmed,
+        route_keys,
+        true,
+        wait,
+        capture_rendered_only,
+        transcript_confirmed,
+        send_enter,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_clean_composer_before_paste_impl(
+    trimmed: &str,
+    route_keys: &[String],
+    is_muse_route: bool,
     mut wait: impl FnMut(Duration),
     mut capture_rendered_only: impl FnMut() -> Option<(String, Option<CursorState>)>,
     mut transcript_confirmed: impl FnMut() -> bool,
@@ -3840,10 +3874,13 @@ fn prepare_clean_composer_before_paste_for_route(
     let Some((contents1, cursor1)) = capture_rendered_only() else {
         return Ok(PrePasteOutcome::CleanProceedToPaste);
     };
+    if !contents1.trim().is_empty() && !composer_region_located(&contents1) {
+        return Err(composer_occupied_by_non_wire_input_error());
+    }
     if screen_has_dialog_or_menu_markers_with_context(&contents1, None, None, route_keys) {
         return Err(composer_occupied_by_non_wire_input_error());
     }
-    if !composer_has_unsubmitted_content(&contents1, cursor1) {
+    if !composer_has_unsubmitted_content_for_route(&contents1, cursor1, is_muse_route) {
         clear_unconfirmed_wire_deliveries(route_keys);
         return Ok(PrePasteOutcome::CleanProceedToPaste);
     }
@@ -3866,10 +3903,13 @@ fn prepare_clean_composer_before_paste_for_route(
              composer still holds earlier unsubmitted content (rendered capture unavailable)"
             .to_string());
     };
+    if !contents2.trim().is_empty() && !composer_region_located(&contents2) {
+        return Err(composer_occupied_by_non_wire_input_error());
+    }
     if screen_has_dialog_or_menu_markers_with_context(&contents2, None, None, route_keys) {
         return Err(composer_occupied_by_non_wire_input_error());
     }
-    if !composer_has_unsubmitted_content(&contents2, cursor2) {
+    if !composer_has_unsubmitted_content_for_route(&contents2, cursor2, is_muse_route) {
         clear_unconfirmed_wire_deliveries(route_keys);
         return Ok(PrePasteOutcome::CleanProceedToPaste);
     }
@@ -3897,12 +3937,17 @@ fn prepare_clean_composer_before_paste_for_route(
             let Some((contents, cursor)) = capture_rendered_only() else {
                 return RetryPollDecision::CaptureUnavailable;
             };
-            if screen_has_dialog_or_menu_markers_with_context(&contents, None, None, route_keys) {
-                return RetryPollDecision::Abort(composer_occupied_by_non_wire_input_error());
+            if !contents.trim().is_empty() && !composer_region_located(&contents) {
+                return RetryPollDecision::Abort(composer_occupied_after_pre_paste_flush_error());
             }
-            if composer_has_unsubmitted_content(&contents, cursor) {
+            if screen_has_dialog_or_menu_markers_with_context(&contents, None, None, route_keys) {
+                return RetryPollDecision::Abort(composer_occupied_after_pre_paste_flush_error());
+            }
+            if composer_has_unsubmitted_content_for_route(&contents, cursor, is_muse_route) {
                 if !composer_equals_recorded_wire_deliveries(&contents, route_keys) {
-                    return RetryPollDecision::Abort(composer_occupied_by_non_wire_input_error());
+                    return RetryPollDecision::Abort(
+                        composer_occupied_after_pre_paste_flush_error(),
+                    );
                 }
                 preexisting_matches_target.set(
                     preexisting_matches_target.get()
@@ -3960,9 +4005,31 @@ fn confirm_paste_submission(
     .map(|_| ())
 }
 
+#[cfg(test)]
 fn confirm_paste_submission_with_raw(
     trimmed: &str,
     raw_text: Option<&str>,
+    wait: impl FnMut(Duration),
+    capture_screen: impl FnMut() -> Option<ScreenCapture>,
+    transcript_confirmed: impl FnMut() -> bool,
+    send_enter: impl FnMut() -> Result<(), String>,
+) -> Result<PostPasteOutcome, String> {
+    confirm_paste_submission_with_raw_for_route(
+        trimmed,
+        raw_text,
+        true,
+        wait,
+        capture_screen,
+        transcript_confirmed,
+        send_enter,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn confirm_paste_submission_with_raw_for_route(
+    trimmed: &str,
+    raw_text: Option<&str>,
+    is_muse_route: bool,
     wait: impl FnMut(Duration),
     mut capture_screen: impl FnMut() -> Option<ScreenCapture>,
     mut transcript_confirmed: impl FnMut() -> bool,
@@ -4022,7 +4089,8 @@ fn confirm_paste_submission_with_raw(
                             exhausted_detail: "composer still rendering pasted payload",
                         };
                     }
-                    if composer_has_unsubmitted_content(&contents, cursor) {
+                    if composer_has_unsubmitted_content_for_route(&contents, cursor, is_muse_route)
+                    {
                         return RetryPollDecision::Abort(composer_occupied_after_paste_error());
                     }
                     last_poll_rendered_empty.set(true);
@@ -4444,7 +4512,11 @@ fn is_known_static_ghost_placeholder(ghost_text: &str) -> bool {
     ) || ghost_text.starts_with("Try \"")
         || ghost_text.starts_with("Press ")
         || ghost_text.starts_with("? for shortcuts")
-        || is_muse_placeholder_hint(ghost_text)
+}
+
+fn is_known_static_ghost_placeholder_for_route(ghost_text: &str, is_muse_route: bool) -> bool {
+    is_known_static_ghost_placeholder(ghost_text)
+        || (is_muse_route && is_muse_placeholder_hint(ghost_text))
 }
 
 /// Muse rotates grey hint texts in an empty composer (for example
@@ -4460,23 +4532,9 @@ fn is_muse_placeholder_hint(ghost_text: &str) -> bool {
         "/model switches the model",
         "/clear clears the conversation",
     ];
-    if MUSE_HINTS.contains(&ghost_text) {
-        return true;
-    }
-    let mut words = ghost_text.split_whitespace();
-    let Some(command) = words.next() else {
-        return false;
-    };
-    if !command.starts_with('/')
-        || command.len() < 2
-        || !command[1..]
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-')
-    {
-        return false;
-    }
-    // `/command` plus at least two descriptive words reads as a hint sentence, not input.
-    words.count() >= 2
+    // Exact list only, Muse routes only (see `is_known_static_ghost_placeholder_for_route`):
+    // a typed `/review the open PR please` is real input, not a hint.
+    MUSE_HINTS.contains(&ghost_text)
 }
 
 /// `true` when `raw_ansi` applies ANSI dim/faint/gray SGR styling (`\x1b[2m`, `\x1b[90m`,
@@ -4628,7 +4686,22 @@ fn ansi_stream_styles_ghost_text(raw_ansi: &str, ghost_text: &str) -> bool {
 /// `[Pasted Content` placeholder, ignoring ghost prompt suggestions ONLY when the cursor sits
 /// immediately after the prompt prefix AND the text is ghost-styled (`\x1b[2m` / gray SGR) or a
 /// known static vendor placeholder.
+#[cfg(test)]
 fn composer_has_unsubmitted_content(screen: &str, cursor: Option<CursorState>) -> bool {
+    composer_has_unsubmitted_content_for_route(screen, cursor, true)
+}
+
+fn composer_region_located(screen: &str) -> bool {
+    let cleaned = normalize_terminal_screen(screen);
+    let lines: Vec<&str> = cleaned.lines().collect();
+    composer_region_lines(&lines).is_some()
+}
+
+fn composer_has_unsubmitted_content_for_route(
+    screen: &str,
+    cursor: Option<CursorState>,
+    is_muse_route: bool,
+) -> bool {
     if composer_shows_pasted_placeholder(screen) {
         return true;
     }
@@ -4666,7 +4739,7 @@ fn composer_has_unsubmitted_content(screen: &str, cursor: Option<CursorState>) -
                 });
             let ghost_text = strip_composer_prompt_prefix(line).trim();
             let proven_ghost = cs.ghost_styled
-                || is_known_static_ghost_placeholder(ghost_text)
+                || is_known_static_ghost_placeholder_for_route(ghost_text, is_muse_route)
                 || ansi_stream_styles_ghost_text(screen, ghost_text);
             if (exact_row || soft_wrapped_scrollback_row) && proven_ghost {
                 return false;
@@ -5672,10 +5745,17 @@ pub(crate) fn probe_route_composer_ready(route: &VendorRoute) -> Option<bool> {
         let route_keys = vec![format!("tmux:{exact}"), format!("target:{target}")];
         (contents, cursor, route_keys)
     };
+    // Fail closed: no located composer, no ready verdict. A slash menu, tall footer or
+    // ruleless draft makes `composer_region_lines` return `None`; that must never read clean.
+    // A wholly empty capture holds nothing at all, so it is clean rather than unlocated.
+    if !contents.trim().is_empty() && !composer_region_located(&contents) {
+        return None;
+    }
     if screen_has_dialog_or_menu_markers_with_context(&contents, None, None, &route_keys) {
         return Some(false);
     }
-    if !composer_has_unsubmitted_content(&contents, cursor)
+    let is_muse_route = matches!(route, VendorRoute::Muse { .. });
+    if !composer_has_unsubmitted_content_for_route(&contents, cursor, is_muse_route)
         || composer_equals_recorded_wire_deliveries(&contents, &route_keys)
     {
         Some(true)
@@ -6043,8 +6123,15 @@ fn dispatch_message_selected_with_status<S: MessageStore>(
             continue;
         };
         attempted = true;
+        // Keys may have been sent by either dispatch call; a later zero-key hold must not
+        // erase that (duplicate-delivery risk), so track it across the re-route retry.
+        let mut may_have_sent_keys = false;
         let slot = report.record_call_started(&entry);
         let mut pushed = dispatch(&entry.route, Some(rcpt.recipient_name.as_str()), msg);
+        if let Err(ref e) = pushed {
+            may_have_sent_keys = matches!(e, PushError::Failed(_))
+                && !is_composer_occupied_zero_keys_error(e.as_str());
+        }
         report.record_call_finished(
             slot,
             if pushed.is_ok() {
@@ -6076,6 +6163,11 @@ fn dispatch_message_selected_with_status<S: MessageStore>(
                 {
                     let slot = report.record_call_started(&fresh);
                     pushed = dispatch(&fresh.route, Some(rcpt.recipient_name.as_str()), msg);
+                    if let Err(ref e) = pushed {
+                        may_have_sent_keys = may_have_sent_keys
+                            || (matches!(e, PushError::Failed(_))
+                                && !is_composer_occupied_zero_keys_error(e.as_str()));
+                    }
                     report.record_call_finished(
                         slot,
                         if pushed.is_ok() {
@@ -6109,7 +6201,7 @@ fn dispatch_message_selected_with_status<S: MessageStore>(
             Ok(status) => (status, true),
             Err(ref err) => (
                 DeliveryStatus::Pending,
-                !is_composer_occupied_zero_keys_error(err.as_str()),
+                may_have_sent_keys || !is_composer_occupied_zero_keys_error(err.as_str()),
             ),
         };
         match store.update_wire_receipt(
@@ -17966,6 +18058,66 @@ exit 1"#,
     }
 
     #[test]
+    fn unlocated_composer_fails_closed_and_typed_slash_input_is_not_a_muse_hint() {
+        let rule = "─".repeat(40);
+        // Slash menu: 5 entries below the bottom rule -> composer cannot be located.
+        let slash_menu = format!(
+            "◆ Ready.\n{rule}\n❯ /re\n{rule}\n  /review\n  /resume\n  /help\n  /model\n  /clear"
+        );
+        // Tall footer: draft between rules, 5 lines below the bottom rule.
+        let tall_footer = format!(
+            "◆ Ready.\n{rule}\n❯ owner draft\n{rule}\n  line1\n  line2\n  line3\n  line4\n  line5"
+        );
+        // Ruleless draft.
+        let ruleless = "❯ owner draft without rules".to_string();
+        for screen in [&slash_menu, &tall_footer, &ruleless] {
+            assert!(!composer_region_located(screen), "screen: {screen}");
+            let mut enters = 0u32;
+            let err = prepare_clean_composer_before_paste(
+                "next wire payload",
+                |_| {},
+                || Some((screen.clone(), Some(CursorState::new(2, 4)))),
+                || false,
+                || {
+                    enters += 1;
+                    Ok(())
+                },
+            )
+            .expect_err("unlocated composer must fail closed without paste");
+            assert!(is_composer_occupied_zero_keys_error(&err), "got: {err}");
+            assert_eq!(enters, 0);
+        }
+        // Hint: generic `/word + >=2 words` is gone; typed input at prompt-start is input.
+        assert!(!is_muse_placeholder_hint("/review the open PR please"));
+        assert!(is_muse_placeholder_hint(
+            "/resume reopens a past session (--last for the latest)"
+        ));
+        let typed = format!("◆ Ready.\n{rule}\n❯ /review the open PR please\n{rule}\n  footer");
+        assert!(
+            composer_has_unsubmitted_content(&typed, Some(CursorState::new(2, 2))),
+            "typed /review at prompt-start must read as input"
+        );
+        // Exact Muse hint is a hint only on Muse routes.
+        let hint = format!(
+            "◆ Ready.\n{rule}\n❯ /resume reopens a past session (--last for the latest)\n{rule}\n  footer"
+        );
+        assert!(!composer_has_unsubmitted_content_for_route(
+            &hint,
+            Some(CursorState::new(2, 2)),
+            true
+        ));
+        assert!(composer_has_unsubmitted_content_for_route(
+            &hint,
+            Some(CursorState::new(2, 2)),
+            false
+        ));
+        // After a pre-paste flush Enter, occupied errors must not claim zero keys.
+        assert!(!is_composer_occupied_zero_keys_error(
+            &composer_occupied_after_pre_paste_flush_error()
+        ));
+    }
+
+    #[test]
     fn zero_key_composer_occupied_leaves_receipt_attempts_at_zero_while_post_paste_increments() {
         let store = MemStore::default();
         let tmp = tempfile::tempdir().unwrap();
@@ -18042,6 +18194,80 @@ exit 1"#,
         assert_eq!(
             updated_post[0].attempts, 1,
             "post-paste composer_occupied abort must increment receipt attempts because keys were sent"
+        );
+    }
+
+    #[test]
+    fn transport_error_then_rerouted_zero_key_hold_still_increments_attempts() {
+        let store = MemStore::default();
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let sessions = home.join(".claude").join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        let write_session = |pid: u32| {
+            fs::write(
+                sessions.join(format!("{pid}.json")),
+                serde_json::json!({
+                    "name": "Kacey",
+                    "nameSource": "user",
+                    "sessionId": format!("sess-{pid}"),
+                    "messagingSocketPath": home.join(format!("{pid}.sock")),
+                })
+                .to_string(),
+            )
+            .unwrap();
+        };
+        write_session(111);
+        let routes_path = tmp.path().join("routes.json");
+        let mut routes = RouteTable::load(Some(&routes_path));
+        routes.discover_routes(Some(&home), At::from_unix_millis(10));
+        assert!(routes.get("kacey").is_some());
+        let (msg, _) = store
+            .send_wire(SendWireArgs {
+                id: None,
+                sender_id: None,
+                sender_name: "felix".into(),
+                sender_host: None,
+                to: WireAddress::AgentName("kacey".into()),
+                kind: MessageKind::Mail,
+                urgency: MessageUrgency::Normal,
+                durable: true,
+                subject: "reroute".into(),
+                body: "may have been pasted".into(),
+                reply_to: None,
+                thread_id: None,
+                deadline_at: None,
+                at: At::from_unix_millis(20),
+            })
+            .unwrap();
+        let calls = std::cell::Cell::new(0u32);
+        let mut report = DispatchReport::default();
+        let (updated, _) = dispatch_message_for_recipient_with_test_dispatch(
+            &store,
+            &mut routes,
+            Some(&home),
+            &msg,
+            At::from_unix_millis(30),
+            "kacey",
+            &mut report,
+            |_, _| {
+                let n = calls.get() + 1;
+                calls.set(n);
+                if n == 1 {
+                    // Route changes so the retry runs, and the first call may have sent keys.
+                    fs::remove_file(sessions.join("111.json")).unwrap();
+                    write_session(222);
+                    Err("transport error after paste".to_string())
+                } else {
+                    Err(composer_occupied_by_non_wire_input_error())
+                }
+            },
+        );
+        assert_eq!(calls.get(), 2, "re-routed retry must run");
+        assert_eq!(updated.len(), 1);
+        assert_eq!(
+            updated[0].attempts, 1,
+            "may-have-sent-keys from the first call must survive a later zero-key hold"
         );
     }
 }

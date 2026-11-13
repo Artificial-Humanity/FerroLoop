@@ -6840,4 +6840,114 @@ pub(crate) mod tests {
             std::env::remove_var("FL_HOSTED_ID");
         }
     }
+
+    #[test]
+    fn claude_plugin_hook_with_nonempty_hosted_store_registers_muse_route() {
+        use std::io::Write;
+
+        let _guard = hook_env_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("store.redb");
+        let routes = tmp.path().join("routes.json");
+        let fake_home = tmp.path().join("home");
+        let muse_sid = "20261110_150000_00000000-0000-0000-0000-000000000471";
+        let muse_session_dir = fake_home
+            .join(".local/share/muse/sessions/2026/11/10")
+            .join(muse_sid);
+        std::fs::create_dir_all(&muse_session_dir).unwrap();
+        let muse_tp = muse_session_dir.join("session.jsonl");
+        {
+            let mut f = std::fs::File::create(&muse_tp).unwrap();
+            f.write_all(
+                b"{\"payload_type\":\"runtime.user_intent.accepted\",\"payload\":{\"model_messages\":[{\"role\":\"user\",\"content\":\"You are Kacey, the Muse agent.\"}]}}\n",
+            )
+            .unwrap();
+        }
+        let cfg = Config::default();
+        let env = StateEnv {
+            explicit_db: Some(&db),
+            default_store: tmp.path(),
+            cfg: &cfg,
+            cwd: tmp.path(),
+        };
+        // Non-empty store: a live hosted Muse session for kacey.
+        let store = env.open_for_scope(Some(&StateScope::Workspace)).unwrap();
+        let rec = fl_hub::lifecycle::HostedSessionRecord {
+            session_id: "muse:kacey".into(),
+            persona: "kacey".into(),
+            project: "ferroloop".into(),
+            role: "assistant".into(),
+            vendor: "muse".into(),
+            model: None,
+            thinking_level: None,
+            node_id: "local".into(),
+            hosted: true,
+            status: fl_hub::lifecycle::STATUS_RUNNING.into(),
+            stop_reason: None,
+            restart_policy: "on-failure".into(),
+            restart_count: 0,
+            tmux_target: Some("Kacey:muse".into()),
+            host_session_id: Some("Kacey.muse".into()),
+            cwd: None,
+            context_window: None,
+            posture: fl_core::permissions::Posture::Auto,
+            hydration_dispatched: true,
+            hydration_status: fl_hub::lifecycle::HydrationStatus::Confirmed,
+            hydration_generation: None,
+            runtime_spawned: true,
+            tombstone_ids: Vec::new(),
+            vendor_session_id: Some(muse_sid.into()),
+            pid: None,
+            runtime_leader_pid: None,
+            pid_start_time: None,
+            created_at_ms: 2,
+            updated_at_ms: 2,
+            decommission_prepared_at_ms: None,
+        };
+        fl_hub::lifecycle::persist_hosted_session(&store, &rec, "owner").unwrap();
+        drop(store);
+        assert!(
+            !fl_hub::lifecycle::list_hosted_sessions(
+                &env.open_for_scope(Some(&StateScope::Workspace)).unwrap()
+            )
+            .unwrap()
+            .is_empty(),
+            "hosted store must be non-empty for this fixture"
+        );
+
+        let prev_home = std::env::var_os("HOME");
+        unsafe {
+            std::env::set_var("HOME", &fake_home);
+            std::env::set_var("FL_WIRE_ROUTES", &routes);
+            std::env::set_var("FL_WIRE_DISABLE_HOST_DISCOVERY", "1");
+            std::env::set_var("FL_HOSTED_ID", "muse:kacey");
+            std::env::remove_var("AGENT_PERSONA");
+            std::env::remove_var("AGENT_NAME");
+        }
+        let payload = serde_json::json!({
+            "hook_event_name": "UserPromptSubmit",
+            "session_id": muse_sid,
+            "cwd": tmp.path().to_string_lossy(),
+        });
+        vendor_hook_response(&env, Some("claude"), &payload.to_string()).unwrap();
+        let table = RouteTable::load(Some(&routes));
+        let entry = table
+            .get("kacey")
+            .expect(".claude-plugin hook must go through the Muse hosted check and register");
+        assert!(matches!(
+            &entry.route,
+            VendorRoute::Muse { session_id, .. } if session_id == muse_sid
+        ));
+        assert_eq!(entry.hosted_id.as_deref(), Some("muse:kacey"));
+        unsafe {
+            if let Some(h) = prev_home {
+                std::env::set_var("HOME", h);
+            } else {
+                std::env::remove_var("HOME");
+            }
+            std::env::remove_var("FL_WIRE_ROUTES");
+            std::env::remove_var("FL_WIRE_DISABLE_HOST_DISCOVERY");
+            std::env::remove_var("FL_HOSTED_ID");
+        }
+    }
 }
