@@ -1942,7 +1942,28 @@ pub fn resume_restore(
         continuation_limits(&j, lease, filesystem, &lock)?;
         return Ok(RestoreOutcome::OriginalAbsenceRestored { journal: j });
     }
-    inspect_phase_layout(&j, filesystem.reconciliation_limits())?;
+    // Reject unavailable or corrupt selected evidence before spending a resume
+    // attempt. A reversed generation needs only its preserved journal evidence.
+    let precheck = continuation_limits(&j, lease, filesystem, &lock)?;
+    let (dest, candidate, original) = inspect_layout(&j, &precheck)?;
+    let forward_candidate = if dest == binding_identity(&j.original)
+        && candidate == Some(j.candidate_identity)
+        && original.is_none()
+    {
+        Some(j.staging.join("candidate.fls"))
+    } else if dest == Some(j.candidate_identity)
+        && ((candidate == binding_identity(&j.original)
+            && original.is_none()
+            && candidate.is_some())
+            || (candidate.is_none() && original == binding_identity(&j.original)))
+    {
+        Some(j.destination.clone())
+    } else {
+        None
+    };
+    if let Some(path) = forward_candidate {
+        verify_candidate_at(&j, &path, lease, filesystem, &lock, &precheck)?;
+    }
     let (l, control) = attempt(&mut j, lease, filesystem, false)?;
     let (dest, candidate, original) = inspect_layout(&j, &l)?;
     let parent = Dir::open(j.destination.parent().ok_or_else(|| l.verification())?, &l)?;
@@ -1951,21 +1972,12 @@ pub fn resume_restore(
         && candidate == Some(j.candidate_identity)
         && original.is_none()
     {
-        verify_candidate_at(
-            &j,
-            &staging.path.join("candidate.fls"),
-            lease,
-            filesystem,
-            &lock,
-            &l,
-        )?;
         install(&mut j, lease, &control, &l)?;
     } else if dest == Some(j.candidate_identity)
         && candidate == binding_identity(&j.original)
         && original.is_none()
         && candidate.is_some()
     {
-        verify_candidate_at(&j, &j.destination, lease, filesystem, &lock, &l)?;
         sync_both(&parent, &staging, &*control.io, &l)?;
         j.phase = RestorePhase::RelocateIntent;
         journal_append(&mut j, &control, &l)?;
@@ -1989,7 +2001,6 @@ pub fn resume_restore(
         && candidate.is_none()
         && original == binding_identity(&j.original)
     {
-        verify_candidate_at(&j, &j.destination, lease, filesystem, &lock, &l)?;
         sync_both(&parent, &staging, &*control.io, &l)?;
         j.phase = RestorePhase::Installed;
         journal_append(&mut j, &control, &l)?;
@@ -2034,7 +2045,9 @@ pub fn rollback_restore(
     )?;
     if !matches!(
         j.phase,
-        RestorePhase::Installed
+        RestorePhase::ExchangeIntent
+            | RestorePhase::RelocateIntent
+            | RestorePhase::Installed
             | RestorePhase::ReverseIntent
             | RestorePhase::RolledBack
             | RestorePhase::OriginalAbsenceRestored
@@ -2052,6 +2065,12 @@ pub fn rollback_restore(
         ));
     }
     let (dest, candidate, original) = inspect_layout(&j, &precheck)?;
+    if j.phase == RestorePhase::ExchangeIntent && dest != Some(j.candidate_identity) {
+        return Err(fs::refused(
+            &precheck,
+            "rollback requires the completed forward exchange",
+        ));
+    }
     let candidate_path = if dest == Some(j.candidate_identity) {
         j.destination.clone()
     } else if candidate == Some(j.candidate_identity) {
@@ -2121,6 +2140,34 @@ pub fn rollback_restore(
         journal_append(&mut j, &control, &l)?;
         return Ok(RestoreOutcome::RolledBack { journal: j });
     }
+    if dest == Some(j.candidate_identity)
+        && candidate == Some(original_identity)
+        && original.is_none()
+    {
+        // ExchangeIntent cannot describe the normalized layout. Persist the
+        // relocation intent first so either side of the rename remains loadable.
+        // Together with the attempt, reverse intent and terminal this uses the
+        // existing four-frame rollback schedule.
+        if j.phase == RestorePhase::ExchangeIntent {
+            j.phase = RestorePhase::RelocateIntent;
+            journal_append(&mut j, &control, &l)?;
+        }
+        staging.rename_checked(
+            "candidate.fls",
+            &staging,
+            "original.fls",
+            &*control.io,
+            RecoveryEvent::RestoreRelocate,
+            &l,
+            || {
+                matches_binding(&staging.path.join("candidate.fls"), &j.original, &l)?;
+                lease_time_remaining(lease.request.expires_at_unix_ms, &*control.io, &l)?;
+                Ok(())
+            },
+        )?;
+        sync_both(&parent, &staging, &*control.io, &l)?;
+    }
+    let (dest, candidate, original) = inspect_layout(&j, &l)?;
     if dest != Some(j.candidate_identity)
         || candidate.is_some()
         || original != Some(original_identity)

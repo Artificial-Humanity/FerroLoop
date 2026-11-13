@@ -7505,3 +7505,348 @@ fn restore_pin_temp_cleanup_rechecks_identity_and_both_names_after_sync_hooks() 
         }
     }
 }
+
+#[derive(Clone, Copy, Debug)]
+enum BundlelessLayout {
+    BeforeExchange,
+    Exchanged,
+    Relocating,
+    Relocated,
+    AbsentExchanged,
+}
+struct BundlelessInstallCut {
+    layout: BundlelessLayout,
+    installed: AtomicBool,
+    relocated: AtomicBool,
+    fired: AtomicBool,
+}
+impl RecoveryIo for BundlelessInstallCut {
+    fn before(&self, event: RecoveryEvent) -> std::io::Result<()> {
+        let cut = match self.layout {
+            BundlelessLayout::BeforeExchange => event == RecoveryEvent::RestoreInstall,
+            BundlelessLayout::Exchanged | BundlelessLayout::AbsentExchanged => {
+                self.installed.load(Ordering::Acquire)
+                    && event == RecoveryEvent::Sync(Directory::RestoreDestinationParent)
+            }
+            BundlelessLayout::Relocating => event == RecoveryEvent::RestoreRelocate,
+            BundlelessLayout::Relocated => {
+                self.relocated.load(Ordering::Acquire)
+                    && event == RecoveryEvent::Sync(Directory::RestoreDestinationParent)
+            }
+        };
+        if event == RecoveryEvent::RestoreInstall {
+            self.installed.store(true, Ordering::Release);
+        }
+        if event == RecoveryEvent::RestoreRelocate {
+            self.relocated.store(true, Ordering::Release);
+        }
+        if cut && !self.fired.swap(true, Ordering::AcqRel) {
+            return Err(std::io::Error::from_raw_os_error(libc::EIO));
+        }
+        Ok(())
+    }
+}
+fn bundleless_fixture(layout: BundlelessLayout) -> (Fixture, RestoreJournal, OfflineLease) {
+    bundleless_fixture_with_bundle(layout, true)
+}
+fn bundleless_fixture_with_bundle(
+    layout: BundlelessLayout,
+    remove_bundle: bool,
+) -> (Fixture, RestoreJournal, OfflineLease) {
+    let f = Fixture::new();
+    let absent = matches!(layout, BundlelessLayout::AbsentExchanged);
+    if absent {
+        // A genuine large live value supplies the unchanged strict-2L baseline.
+        let writer = FerroStore::open(&f.source).unwrap();
+        writer
+            .put_doc(
+                "fixture_unknown",
+                "one",
+                &serde_json::json!({"body":"x".repeat(20 << 20)}),
+            )
+            .unwrap();
+        drop(writer);
+    }
+    let destination = if absent {
+        f.root.path().join("absent.fls")
+    } else {
+        f.source.clone()
+    };
+    let (request, lease) = prepare_restore(&f, &destination);
+    let hook = Arc::new(BundlelessInstallCut {
+        layout,
+        installed: AtomicBool::new(false),
+        relocated: AtomicBool::new(false),
+        fired: AtomicBool::new(false),
+    });
+    let filesystem = CutFs {
+        f: &f,
+        io: hook.clone(),
+        limits: limits(),
+    };
+    let outcome = restore_offline(&request, &lease, &filesystem);
+    assert!(
+        outcome.is_err() || matches!(outcome, Ok(RestoreOutcome::OutcomeUnknown { .. })),
+        "{layout:?}: {outcome:?}"
+    );
+    assert!(hook.fired.load(Ordering::Acquire));
+    let guard: serde_json::Value =
+        serde_json::from_slice(&fs::read(destination.with_extension("fls.restore-guard")).unwrap())
+            .unwrap();
+    let j = load_restore_journal(
+        std::path::Path::new(guard["journal"].as_str().unwrap()),
+        &lease,
+        &f.filesystem(),
+    )
+    .unwrap();
+    assert_eq!(
+        j.phase,
+        if matches!(
+            layout,
+            BundlelessLayout::Relocating | BundlelessLayout::Relocated
+        ) {
+            RestorePhase::RelocateIntent
+        } else {
+            RestorePhase::ExchangeIntent
+        }
+    );
+    if remove_bundle {
+        fs::remove_dir_all(request.selected_bundle.path()).unwrap();
+    }
+    (f, j, lease)
+}
+fn assert_bundleless_rolled_back(_f: &Fixture, before: &RestoreJournal, after: &RestoreJournal) {
+    assert_eq!(after.rollback_attempts, before.rollback_attempts + 1);
+    let candidate_path = if matches!(before.original, FileBinding::Absent) {
+        assert_eq!(after.phase, RestorePhase::OriginalAbsenceRestored);
+        assert!(!after.destination.exists());
+        after.staging.join("candidate.fls")
+    } else {
+        assert_eq!(after.phase, RestorePhase::RolledBack);
+        assert_eq!(
+            inspect_file_binding(&after.destination, &limits()).unwrap(),
+            before.original
+        );
+        after.staging.join("original.fls")
+    };
+    let metadata = fs::metadata(&candidate_path).unwrap();
+    assert_eq!((metadata.dev(), metadata.ino()), before.candidate_identity);
+    assert_eq!(
+        format!(
+            "{:x}",
+            sha2::Sha256::digest(fs::read(candidate_path).unwrap())
+        ),
+        before.candidate_sha256
+    );
+}
+#[test]
+fn restore_bundleless_post_exchange_rollback_preserves_both_generations() {
+    for layout in [
+        BundlelessLayout::Exchanged,
+        BundlelessLayout::Relocating,
+        BundlelessLayout::Relocated,
+        BundlelessLayout::AbsentExchanged,
+    ] {
+        let (f, j, lease) = bundleless_fixture(layout);
+        let frames = journal_frame_ranges(&fs::read(j.staging.join("journal.bin")).unwrap()).len();
+        let outcome = rollback_restore(&j, &lease, &f.filesystem())
+            .unwrap_or_else(|e| panic!("{layout:?}: {e:?}"));
+        let next = match outcome {
+            RestoreOutcome::RolledBack { journal }
+            | RestoreOutcome::OriginalAbsenceRestored { journal } => journal,
+            other => panic!("{other:?}"),
+        };
+        assert_bundleless_rolled_back(&f, &j, &next);
+        let expected = if matches!(layout, BundlelessLayout::Exchanged) {
+            4
+        } else {
+            3
+        };
+        assert_eq!(
+            journal_frame_ranges(&fs::read(next.staging.join("journal.bin")).unwrap()).len()
+                - frames,
+            expected,
+            "{layout:?}"
+        );
+        let loaded =
+            load_restore_journal(&next.staging.join("journal.bin"), &lease, &f.filesystem())
+                .unwrap();
+        assert_eq!(loaded.phase, next.phase);
+        eprintln!("bundleless_rollback layout={layout:?} frames={expected}");
+    }
+}
+#[test]
+fn restore_bundleless_resume_refusals_do_not_spend_attempts() {
+    for layout in [
+        BundlelessLayout::BeforeExchange,
+        BundlelessLayout::Exchanged,
+        BundlelessLayout::Relocating,
+        BundlelessLayout::Relocated,
+        BundlelessLayout::AbsentExchanged,
+    ] {
+        let (f, j, lease) = bundleless_fixture(layout);
+        let path = j.staging.join("journal.bin");
+        let before = fs::read(&path).unwrap();
+        for retry in 0..14 {
+            assert!(
+                resume_restore(&j, &lease, &f.filesystem()).is_err(),
+                "{layout:?} retry={retry}"
+            );
+            assert!(
+                fs::read(&path).unwrap() == before,
+                "{layout:?} retry={retry} charged a refusal"
+            );
+        }
+        let loaded = load_restore_journal(&path, &lease, &f.filesystem()).unwrap();
+        assert_eq!(
+            (
+                loaded.current_attempt,
+                loaded.resume_finalize_attempts,
+                loaded.rollback_attempts,
+                loaded.forensic_handling_required
+            ),
+            (
+                j.current_attempt,
+                j.resume_finalize_attempts,
+                j.rollback_attempts,
+                j.forensic_handling_required
+            )
+        );
+    }
+}
+#[test]
+fn restore_bundleless_pre_exchange_rollback_refuses_without_attempt() {
+    let (f, j, lease) = bundleless_fixture(BundlelessLayout::BeforeExchange);
+    let path = j.staging.join("journal.bin");
+    let bytes = fs::read(&path).unwrap();
+    let layout = restore_expiry_layout(&j.destination, &j.staging);
+    assert!(rollback_restore(&j, &lease, &f.filesystem()).is_err());
+    assert_eq!(fs::read(path).unwrap(), bytes);
+    assert_eq!(restore_expiry_layout(&j.destination, &j.staging), layout);
+}
+#[test]
+fn restore_bundleless_normalization_cuts_reload_and_rollback() {
+    let (f, j, lease) = bundleless_fixture(BundlelessLayout::Exchanged);
+    let hook = Arc::new(CutIo::new(usize::MAX, libc::EIO));
+    let filesystem = CutFs {
+        f: &f,
+        io: hook.clone(),
+        limits: limits(),
+    };
+    rollback_restore(&j, &lease, &filesystem).unwrap();
+    let events = hook.events.lock().unwrap().clone();
+    assert!(events.contains(&RecoveryEvent::RestoreRelocate));
+    for (cut, event) in events.iter().enumerate() {
+        let (f, j, lease) = bundleless_fixture(BundlelessLayout::Exchanged);
+        let hook = Arc::new(CutIo::new(cut, libc::EIO));
+        let filesystem = CutFs {
+            f: &f,
+            io: hook.clone(),
+            limits: limits(),
+        };
+        assert!(
+            rollback_restore(&j, &lease, &filesystem).is_err(),
+            "cut {cut}: {event:?}"
+        );
+        assert!(hook.count.load(Ordering::Acquire) > cut);
+        let loaded = load_restore_journal(&j.staging.join("journal.bin"), &lease, &f.filesystem())
+            .unwrap_or_else(|e| panic!("cut {cut} {event:?}: {e:?}"));
+        let frames = journal_frame_ranges(&fs::read(j.staging.join("journal.bin")).unwrap()).len();
+        let RestoreOutcome::RolledBack { journal: next } =
+            rollback_restore(&loaded, &lease, &f.filesystem()).unwrap()
+        else {
+            panic!("cut {cut}: not rolled back")
+        };
+        assert_bundleless_rolled_back(&f, &loaded, &next);
+        assert!(
+            journal_frame_ranges(&fs::read(next.staging.join("journal.bin")).unwrap()).len()
+                - frames
+                <= 4,
+            "cut {cut}: frame schedule widened"
+        );
+        eprintln!("bundleless_normalization_cut index={cut} event={event:?} recovered=true");
+    }
+}
+#[test]
+fn restore_bundleless_fourth_rollback_attempt_can_finish_normalization() {
+    let (f, j, lease) = bundleless_fixture(BundlelessLayout::Exchanged);
+    for expected in 1..=3 {
+        let hook = Arc::new(TerminalCutIo::new(RecoveryEvent::RestoreRelocate));
+        let filesystem = CutFs {
+            f: &f,
+            io: hook,
+            limits: limits(),
+        };
+        assert!(rollback_restore(&j, &lease, &filesystem).is_err());
+        let loaded =
+            load_restore_journal(&j.staging.join("journal.bin"), &lease, &f.filesystem()).unwrap();
+        assert_eq!(loaded.rollback_attempts, expected);
+        assert_eq!(loaded.phase, RestorePhase::RelocateIntent);
+    }
+    let loaded =
+        load_restore_journal(&j.staging.join("journal.bin"), &lease, &f.filesystem()).unwrap();
+    let frames = journal_frame_ranges(&fs::read(j.staging.join("journal.bin")).unwrap()).len();
+    let RestoreOutcome::RolledBack { journal: next } =
+        rollback_restore(&loaded, &lease, &f.filesystem()).unwrap()
+    else {
+        panic!("fourth attempt failed")
+    };
+    assert_eq!(next.rollback_attempts, 4);
+    assert!(next.forensic_handling_required);
+    assert_bundleless_rolled_back(&f, &loaded, &next);
+    assert_eq!(
+        journal_frame_ranges(&fs::read(next.staging.join("journal.bin")).unwrap()).len() - frames,
+        3
+    );
+}
+
+#[test]
+fn restore_bundleless_normalization_expiry_preserves_namespace() {
+    for cut in [RestoreExpiryCut::BeforeDigest, RestoreExpiryCut::FinalRead] {
+        let (f, j, lease) = bundleless_fixture(BundlelessLayout::Exchanged);
+        let hook = restore_expiry_io(&j.destination, &lease, RecoveryEvent::RestoreRelocate, cut);
+        let filesystem = CutFs {
+            f: &f,
+            io: hook.clone(),
+            limits: limits(),
+        };
+        let error = rollback_restore(&j, &lease, &filesystem).unwrap_err();
+        assert!(
+            matches!(error, fl_store::recovery::RecoveryError::Deadline { .. }),
+            "{error:?}"
+        );
+        assert_restore_expiry_layout(&f, &j.destination, &hook);
+        let loaded =
+            load_restore_journal(&j.staging.join("journal.bin"), &lease, &f.filesystem()).unwrap();
+        assert_eq!(loaded.phase, RestorePhase::RelocateIntent);
+        let RestoreOutcome::RolledBack { journal: next } =
+            rollback_restore(&loaded, &lease, &f.filesystem()).unwrap()
+        else {
+            panic!("expiry retry failed")
+        };
+        assert_bundleless_rolled_back(&f, &loaded, &next);
+    }
+}
+#[test]
+fn restore_bundleless_corrupt_bundle_resume_refuses_without_attempt() {
+    for layout in [
+        BundlelessLayout::BeforeExchange,
+        BundlelessLayout::Relocating,
+    ] {
+        let (f, j, lease) = bundleless_fixture_with_bundle(layout, false);
+        let bundle = request_bundle_path(&f, j.selected_bundle_operation);
+        fs::write(bundle.join("manifest.json"), b"{corrupt").unwrap();
+        let path = j.staging.join("journal.bin");
+        let before = fs::read(&path).unwrap();
+        for retry in 0..14 {
+            assert!(
+                resume_restore(&j, &lease, &f.filesystem()).is_err(),
+                "{layout:?} retry={retry}"
+            );
+            assert!(
+                fs::read(&path).unwrap() == before,
+                "{layout:?} retry={retry} charged corrupt-bundle refusal"
+            );
+        }
+    }
+}
