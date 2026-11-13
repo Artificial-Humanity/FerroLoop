@@ -11,3 +11,5 @@ pub mod peer;
 pub mod scanner;
 pub mod vendor_adapter;
 pub mod ws;
+
+pub use dispatcher::is_composer_occupied_zero_keys_error;
