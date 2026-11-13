@@ -16,6 +16,7 @@ import {
   type PromptAttachment,
   type PromptRequest,
   type ProjectSummary,
+  type AreaRecord,
   type PromptResponse,
   type QueuedOperatorPrompt,
   type QuotaWindowUsage,
@@ -1116,6 +1117,8 @@ export interface ChatPaneProps {
   agentDisplayName?: string | null;
   agentRole?: string | null;
   agentProject?: string | null;
+  agentExtraAreas?: string[];
+  areas?: readonly AreaRecord[];
   adapter?: string | null;
   model?: string | null;
   thinkingLevel?: string | null;
@@ -1212,6 +1215,8 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
   agentDisplayName,
   agentRole = null,
   agentProject = null,
+  agentExtraAreas,
+  areas,
   adapter,
   model = null,
   thinkingLevel = null,
@@ -4833,6 +4838,8 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
         agentDisplayName={agentDisplayName}
         agentRole={agentRole}
         agentProject={agentProject}
+        agentExtraAreas={agentExtraAreas}
+        areas={areas}
         adapter={adapter}
         sessionId={sessionId}
         selectedModel={selectedModel}

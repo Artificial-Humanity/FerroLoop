@@ -1,4 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
+import { AreaBadge, areaInfo, CoverageChips, coversArea, extraAreaKeys } from "./AreaCoverage";
 import {
   HubApiClient,
   HubApiError,
@@ -608,6 +609,7 @@ import {
   type RoleRecord,
   type RoleReviewPolicy,
   type AgentRecord,
+  type AreaRecord,
   type BulkSessionAction,
   type BulkSessionActionResponse,
   type CloudAdaptersConfig,
@@ -678,6 +680,7 @@ export interface SettingsModalProps {
   initialProjectSubTab?: ProjectSettingsSubTabId;
   initialAgentsSubTab?: AgentsSubTabId;
   agents?: AgentRecord[];
+  areas?: readonly AreaRecord[];
   authority?: HubAuthority | null;
   wsConnected?: boolean;
   onlineNodesCount?: number;
@@ -1290,6 +1293,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   initialProjectSubTab,
   initialAgentsSubTab,
   agents: propAgents,
+  areas: propAreas,
   authority,
   wsConnected = false,
   onlineNodesCount = 0,
@@ -1520,6 +1524,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     useState<string | null>(null);
 
   // Agents Fleet & Re-Cast state
+  const [loadedAreas, setLoadedAreas] = useState<AreaRecord[]>([]);
   const [loadedAgents, setLoadedAgents] = useState<AgentRecord[]>(
     propAgents ?? [],
   );
@@ -1717,6 +1722,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
       .then((res) => {
         if (!cancelled && Array.isArray(res?.agents)) {
           setLoadedAgents(res.agents);
+          if (Array.isArray(res.areas)) setLoadedAreas(res.areas);
         }
       })
       .catch(() => {
@@ -1896,6 +1902,8 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     return out;
   }, [propAgents, loadedAgents]);
 
+  const areaRecords = propAreas ?? loadedAreas;
+
   const projectOptions = useMemo<string[]>(() => {
     const out: string[] = projectOptionLabels(effectiveProjects);
     const addProjectOption = (raw?: string | null) => {
@@ -1903,7 +1911,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
       if (!trimmed || trimmed.toLowerCase() === "all") return;
       // An agent's project is a slug; list it under the project's display name.
       const known = findProject(effectiveProjects, trimmed);
-      const label = known ? projectLabel(known) : trimmed;
+      const label = known ? projectLabel(known) : areaInfo(trimmed, areaRecords, effectiveProjects).label;
       const lower = label.toLowerCase();
       if (!out.some((opt) => opt.toLowerCase() === lower)) {
         out.push(label);
@@ -1911,6 +1919,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     };
     for (const ag of effectiveAgents) {
       addProjectOption(ag.project || "Workspace");
+      extraAreaKeys(ag).forEach(addProjectOption);
     }
     addProjectOption(initialProject);
     addProjectOption(selectedProjectFilter);
@@ -1918,6 +1927,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   }, [
     effectiveProjects,
     effectiveAgents,
+    areaRecords,
     initialProject,
     selectedProjectFilter,
   ]);
@@ -1969,13 +1979,15 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     }
   }, [effectiveProjects, selectedProjectFilter]);
 
-  const filteredAgents = useMemo<AgentRecord[]>(() => {
+  const projectScopedAgents = useMemo<AgentRecord[]>(() => {
     if (!resolvedProjectFilter || resolvedProjectFilter === "all") {
       return effectiveAgents;
     }
     // Agents carry the project slug; the filter holds the display name.
     const known = findProject(effectiveProjects, resolvedProjectFilter);
     const targets = new Set<string>([resolvedProjectFilter.toLowerCase()]);
+    const matchedArea = areaRecords.find((a) => a.name.trim().toLowerCase() === resolvedProjectFilter.trim().toLowerCase() || a.area_key.trim().toLowerCase() === resolvedProjectFilter.trim().toLowerCase());
+    if (matchedArea) targets.add(matchedArea.area_key.trim().toLowerCase());
     if (known) {
       targets.add(known.slug.trim().toLowerCase());
       targets.add(projectLabel(known).toLowerCase());
@@ -1983,22 +1995,36 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     return effectiveAgents.filter((ag) =>
       targets.has((ag.project || "Workspace").toLowerCase()),
     );
-  }, [effectiveAgents, resolvedProjectFilter, effectiveProjects]);
+  }, [effectiveAgents, resolvedProjectFilter, effectiveProjects, areaRecords]);
+
+  const filteredAgents = useMemo<AgentRecord[]>(() => {
+    if (!resolvedProjectFilter || resolvedProjectFilter === "all") return effectiveAgents;
+    const known = findProject(effectiveProjects, resolvedProjectFilter);
+    const area = areaRecords.find((a) => a.name.trim().toLowerCase() === resolvedProjectFilter.trim().toLowerCase() || a.area_key.trim().toLowerCase() === resolvedProjectFilter.trim().toLowerCase());
+    const target = known?.slug ?? area?.area_key ?? resolvedProjectFilter;
+    return effectiveAgents.filter((agent) => coversArea(agent, target) || projectScopedAgents.includes(agent));
+  }, [effectiveAgents, resolvedProjectFilter, effectiveProjects, areaRecords, projectScopedAgents]);
+
+  // Coverage-only rows stay visible, but bulk operations belong to primary projects.
+  const selectableAgents = useMemo(
+    () => filteredAgents.filter(agent => projectScopedAgents.includes(agent)),
+    [filteredAgents, projectScopedAgents],
+  );
 
   const allFilteredSelected = useMemo(() => {
-    if (filteredAgents.length === 0) return false;
-    return filteredAgents.every((ag) =>
+    if (selectableAgents.length === 0) return false;
+    return selectableAgents.every((ag) =>
       selectedAgentKeys.has(ag.name_key.toLowerCase()),
     );
-  }, [filteredAgents, selectedAgentKeys]);
+  }, [selectableAgents, selectedAgentKeys]);
 
   const projectSummaryLead = useMemo(() => {
     if (!resolvedProjectFilter || resolvedProjectFilter === "all") return null;
-    const lead = filteredAgents.find(
+    const lead = projectScopedAgents.find(
       (ag) => ag.role === "lead" || ag.role === "lab_manager",
     );
     return lead ? lead.display_name : "Unassigned";
-  }, [filteredAgents, resolvedProjectFilter]);
+  }, [projectScopedAgents, resolvedProjectFilter]);
 
   const authorityText = useMemo(() => {
     if (!authority) return "Unauthenticated";
@@ -2669,15 +2695,21 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
       ? resolvedProjectFilter
       : initialProject || null;
 
+  const bulkSelectedKeys = Array.from(selectedAgentKeys).filter(key =>
+    !isProjectScoped || projectScopedAgents.some(agent => agent.name_key.toLowerCase() === key),
+  );
+
   const handleConfirmBulkAction = async () => {
     if (!armedAction || submitting) return;
     setSubmitting(true);
     setError(null);
     const selectedKeys =
       selectedAgentKeys.size > 0
-        ? Array.from(selectedAgentKeys)
+        // An explicit selection that no longer belongs to this project stays empty;
+        // it must never fall back to the whole project or fleet.
+        ? bulkSelectedKeys
         : isProjectScoped
-          ? filteredAgents.map((a) => a.name_key.toLowerCase())
+          ? projectScopedAgents.map((a) => a.name_key.toLowerCase())
           : undefined;
     try {
       let res: BulkSessionActionResponse;
@@ -2691,7 +2723,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
           client,
           armedAction,
           selectedKeys,
-          filteredAgents.map((a) => a.name_key.toLowerCase()),
+          projectScopedAgents.map((a) => a.name_key.toLowerCase()),
         );
       }
       setLastResult(res);
@@ -3645,6 +3677,8 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                   value={resolvedProjectFilter}
                   onChange={(e) => {
                     setSelectedProjectFilter(e.target.value);
+                    setSelectedAgentKeys(new Set());
+                    setArmedAction(null);
                     setProjectArtifactsDirStatus(null);
                   }}
                 >
@@ -3672,15 +3706,16 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                   data-testid="settings-agents-select-all-btn"
                   className="fd-btn"
                   style={{ fontSize: "11px", padding: "3px 8px" }}
+                  disabled={selectableAgents.length === 0}
                   onClick={() => {
                     setSelectedAgentKeys((prev) => {
                       const next = new Set(prev);
                       if (allFilteredSelected) {
-                        for (const ag of filteredAgents) {
+                        for (const ag of selectableAgents) {
                           next.delete(ag.name_key.toLowerCase());
                         }
                       } else {
-                        for (const ag of filteredAgents) {
+                        for (const ag of selectableAgents) {
                           next.add(ag.name_key.toLowerCase());
                         }
                       }
@@ -3690,7 +3725,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 >
                   {allFilteredSelected
                     ? "Clear Selection"
-                    : `Select All (${filteredAgents.length})`}
+                    : `Select All (${selectableAgents.length})`}
                 </button>
               </div>
             </div>
@@ -3746,6 +3781,8 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                           type="checkbox"
                           data-testid={`agent-select-checkbox-${key}`}
                           aria-label={`Select ${ag.display_name}`}
+                          disabled={!projectScopedAgents.includes(ag)}
+                          title={!projectScopedAgents.includes(ag) ? "Bulk actions are limited to agents whose primary area is this project" : undefined}
                           checked={selectedAgentKeys.has(key)}
                           onChange={(e) => {
                             const checked = e.target.checked;
@@ -3763,12 +3800,8 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                         <strong style={{ fontSize: "12.5px" }}>
                           {ag.display_name}
                         </strong>
-                        <span
-                          className="fd-badge fd-mono"
-                          style={{ fontSize: "10.5px" }}
-                        >
-                          {ag.project}
-                        </span>
+                        <AreaBadge slug={ag.project || "Workspace"} areas={areaRecords} projects={effectiveProjects} />
+                        <CoverageChips agent={ag} areas={areaRecords} projects={effectiveProjects} />
                         <span
                           className="fd-badge fd-mono"
                           style={{ fontSize: "10.5px" }}
@@ -3935,7 +3968,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 }}
               >
                 {isProjectScoped
-                  ? `Project Bulk Session Operations — ${scopedProjectName} (${filteredAgents.length} ${filteredAgents.length === 1 ? "Agent" : "Agents"})`
+                  ? `Project Bulk Session Operations — ${scopedProjectName} (${projectScopedAgents.length} ${projectScopedAgents.length === 1 ? "Agent" : "Agents"})`
                   : "Fleet Bulk Session Operations"}
               </h3>
               <p
@@ -3947,7 +3980,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 }}
               >
                 {isProjectScoped
-                  ? `Project-scoped session context operations apply only to active agents in ${scopedProjectName} (${filteredAgents.length} ${filteredAgents.length === 1 ? "agent" : "agents"}) and require explicit two-step confirmation.`
+                  ? `Project-scoped session context operations apply only to active agents in ${scopedProjectName} (${projectScopedAgents.length} ${projectScopedAgents.length === 1 ? "agent" : "agents"}) and require explicit two-step confirmation.`
                   : "Fleet-wide session context operations are isolated here and require explicit two-step confirmation before executing across all active agent sessions."}
               </p>
             </div>
@@ -3960,7 +3993,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 disabled={
                   submitting ||
                   (isProjectScoped &&
-                    filteredAgents.length === 0 &&
+                    projectScopedAgents.length === 0 &&
                     selectedAgentKeys.size === 0)
                 }
                 onClick={() => {
@@ -3973,7 +4006,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                   "compact",
                   selectedAgentKeys.size,
                   isProjectScoped ? scopedProjectName : null,
-                  filteredAgents.length,
+                  projectScopedAgents.length,
                 )}
               </button>
               <button
@@ -3983,7 +4016,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 disabled={
                   submitting ||
                   (isProjectScoped &&
-                    filteredAgents.length === 0 &&
+                    projectScopedAgents.length === 0 &&
                     selectedAgentKeys.size === 0)
                 }
                 onClick={() => {
@@ -3996,7 +4029,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                   "clear",
                   selectedAgentKeys.size,
                   isProjectScoped ? scopedProjectName : null,
-                  filteredAgents.length,
+                  projectScopedAgents.length,
                 )}
               </button>
               <button
@@ -4006,7 +4039,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 disabled={
                   submitting ||
                   (isProjectScoped &&
-                    filteredAgents.length === 0 &&
+                    projectScopedAgents.length === 0 &&
                     selectedAgentKeys.size === 0)
                 }
                 onClick={() => {
@@ -4019,7 +4052,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                   "reforge",
                   selectedAgentKeys.size,
                   isProjectScoped ? scopedProjectName : null,
-                  filteredAgents.length,
+                  projectScopedAgents.length,
                 )}
               </button>
               <button
@@ -4029,7 +4062,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 disabled={
                   submitting ||
                   (isProjectScoped &&
-                    filteredAgents.length === 0 &&
+                    projectScopedAgents.length === 0 &&
                     selectedAgentKeys.size === 0)
                 }
                 onClick={() => {
@@ -4042,7 +4075,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                   "prepare",
                   selectedAgentKeys.size,
                   isProjectScoped ? scopedProjectName : null,
-                  filteredAgents.length,
+                  projectScopedAgents.length,
                 )}
               </button>
               <button
@@ -4052,7 +4085,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 disabled={
                   submitting ||
                   (isProjectScoped &&
-                    filteredAgents.length === 0 &&
+                    projectScopedAgents.length === 0 &&
                     selectedAgentKeys.size === 0)
                 }
                 onClick={() => {
@@ -4065,7 +4098,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                   "teardown",
                   selectedAgentKeys.size,
                   isProjectScoped ? scopedProjectName : null,
-                  filteredAgents.length,
+                  projectScopedAgents.length,
                 )}
               </button>
             </div>
@@ -4087,16 +4120,16 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                     Confirm{" "}
                     {getBulkActionLabel(
                       armedAction,
-                      selectedAgentKeys.size,
+                      bulkSelectedKeys.length,
                       isProjectScoped ? scopedProjectName : null,
-                      filteredAgents.length,
+                      projectScopedAgents.length,
                     )}
                     :
                   </strong>{" "}
                   {selectedAgentKeys.size > 0
-                    ? `Execute ${armedAction} across the ${selectedAgentKeys.size} selected agent session${selectedAgentKeys.size === 1 ? "" : "s"} (${Array.from(selectedAgentKeys).join(", ")}).`
+                    ? `Execute ${armedAction} across the ${bulkSelectedKeys.length} selected agent session${bulkSelectedKeys.length === 1 ? "" : "s"} (${bulkSelectedKeys.join(", ")}).`
                     : isProjectScoped
-                      ? `Execute ${armedAction} across the ${filteredAgents.length} ${scopedProjectName} project agent session${filteredAgents.length === 1 ? "" : "s"} (${filteredAgents.map((a) => a.name_key.toLowerCase()).join(", ")}).`
+                      ? `Execute ${armedAction} across the ${projectScopedAgents.length} ${scopedProjectName} project agent session${projectScopedAgents.length === 1 ? "" : "s"} (${projectScopedAgents.map((a) => a.name_key.toLowerCase()).join(", ")}).`
                       : ACTION_DESCRIPTIONS[armedAction]}
                 </div>
                 <div
@@ -4131,9 +4164,9 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                       ? "Running..."
                       : `Confirm ${getBulkActionLabel(
                           armedAction,
-                          selectedAgentKeys.size,
+                          bulkSelectedKeys.length,
                           isProjectScoped ? scopedProjectName : null,
-                          filteredAgents.length,
+                          projectScopedAgents.length,
                         )}`}
                   </button>
                 </div>
