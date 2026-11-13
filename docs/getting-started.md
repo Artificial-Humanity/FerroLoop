@@ -826,6 +826,26 @@ root = "/home/you/code/app"
 store = "/home/you/.local/share/fl/app.redb"
 ```
 
+For a hosted agent, a project binding may opt into starting at its exact registered root:
+
+    [[project]]
+    name = "competition"
+    root = "/home/you/workspace/Kaggle/Competition"
+    store = "/home/you/.local/share/fl/competition.redb"
+    cwd = "exact"
+    # cwd = "workspace"  # alternative: use the default behavior
+
+When `cwd` is absent or set to `"workspace"`, the existing workspace umbrella behavior applies;
+`"exact"` selects the registered root. Both settings preserve canonical symlink resolution,
+including roots outside the workspace. When a launch needs to resolve its directory, an invalid,
+unavailable, or ambiguous binding now refuses it; previously it launched with no cwd selected.
+An unparseable configuration now also refuses instead of falling back to the catalog or a
+workspace directory. A restart with a persisted cwd, or a launch with an explicit cwd, uses it without this resolution.
+Add this field to a live configuration only after every running FerroLoop process accepts it,
+and remove it before rolling back to an older build. Older `fl host` commands silently fall
+back to the default store when they cannot parse this field; that may be a different store
+from the one named by `[state].store`.
+
 A full IRI on the command line (rather than a handle such as `3`) selects the store that
 holds it, searching the bound store and every store any project is bound to. `--db` and
 `$FL_DB` stop that search: they confine the command to the one store they name, and an IRI

@@ -1524,6 +1524,7 @@ mod tests {
                 ledger: None,
             }),
             state: None,
+            cwd: None,
         };
         Config {
             projects: vec![

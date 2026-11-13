@@ -286,3 +286,31 @@ async fn older_daemon_is_refused_without_unknown_capture_request() {
     );
     server.await.unwrap();
 }
+
+#[test]
+fn invalid_config_warns_once_then_host_capture_uses_default_store() {
+    let f = Fixture::new();
+    let config_dir = f.root.path().join("config/fl");
+    let data_dir = f.root.path().join("data");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::create_dir_all(&data_dir).unwrap();
+    let config = config_dir.join("config.toml");
+    std::fs::write(&config, "not valid [toml").unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_fl"))
+        .args(["host", "capture", "claude:missing"])
+        .env("FL_HOST_SOCK", f.endpoint.socket_path())
+        .env("XDG_CONFIG_HOME", f.root.path().join("config"))
+        .env("XDG_DATA_HOME", &data_dir)
+        .env_remove("FL_DB")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        stderr.matches("warning: failed to load").count(),
+        1,
+        "{stderr}"
+    );
+    assert!(stderr.contains(config.to_str().unwrap()), "{stderr}");
+    assert!(stderr.contains("TOML parse error"), "{stderr}");
+    assert!(stderr.contains("no fl-host session matching"), "{stderr}");
+}
