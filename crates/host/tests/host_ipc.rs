@@ -21,6 +21,28 @@ fn host_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_fl-host"))
 }
 
+/// How long a connect helper waits for a (re)started daemon to accept.
+/// The daemon binds in `Host::open` before serving, so there is no separate
+/// ready signal to wait on; polling the connect is the ready wait. 15 s
+/// covers a loaded CI runner where 3 s proved too short (#522).
+const DAEMON_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+
+fn capture_stderr(child: &mut Child) -> (Arc<Mutex<String>>, Option<JoinHandle<()>>) {
+    let stderr = Arc::new(Mutex::new(String::new()));
+    let thread = child.stderr.take().map(|pipe| {
+        let slot = Arc::clone(&stderr);
+        thread::spawn(move || {
+            let mut reader = std::io::BufReader::new(pipe);
+            let mut line = String::new();
+            while std::io::BufRead::read_line(&mut reader, &mut line).unwrap_or(0) > 0 {
+                slot.lock().expect("stderr").push_str(&line);
+                line.clear();
+            }
+        })
+    });
+    (stderr, thread)
+}
+
 struct Paths {
     /// Owns the endpoint directory. Taken out when a second daemon reuses it.
     root: Option<tempfile::TempDir>,
@@ -98,24 +120,21 @@ impl Daemon {
             cmd.process_group(0);
         }
         let mut child = cmd.spawn().expect("daemon");
-        let stderr = Arc::new(Mutex::new(String::new()));
-        let stderr_thread = child.stderr.take().map(|pipe| {
-            let slot = Arc::clone(&stderr);
-            thread::spawn(move || {
-                let mut reader = std::io::BufReader::new(pipe);
-                let mut line = String::new();
-                while std::io::BufRead::read_line(&mut reader, &mut line).unwrap_or(0) > 0 {
-                    slot.lock().expect("stderr").push_str(&line);
-                    line.clear();
-                }
-            })
-        });
+        let (stderr, stderr_thread) = capture_stderr(&mut child);
         Self {
             child,
             paths,
             stderr,
             stderr_thread,
         }
+    }
+
+    fn stderr_snapshot(&self) -> String {
+        self.stderr.lock().expect("stderr").clone()
+    }
+
+    fn rpc(&self) -> Rpc {
+        Rpc::connect_with_stderr(&self.paths.endpoint, Some(&self.stderr))
     }
 
     fn stop(&mut self) {
@@ -145,7 +164,7 @@ impl Drop for Daemon {
         if let Some(thread) = self.stderr_thread.take() {
             let _ = thread.join();
         }
-        let err = self.stderr.lock().expect("stderr").clone();
+        let err = self.stderr_snapshot();
         if !err.is_empty() {
             eprintln!("daemon stderr: {err}");
         }
@@ -159,7 +178,11 @@ struct Rpc {
 
 impl Rpc {
     fn connect(endpoint: &HostEndpoint) -> Self {
-        let deadline = Instant::now() + Duration::from_secs(3);
+        Self::connect_with_stderr(endpoint, None)
+    }
+
+    fn connect_with_stderr(endpoint: &HostEndpoint, stderr: Option<&Arc<Mutex<String>>>) -> Self {
+        let deadline = Instant::now() + DAEMON_CONNECT_TIMEOUT;
         let mut last = String::new();
         while Instant::now() < deadline {
             match BlockingHostClient::connect(endpoint) {
@@ -170,7 +193,17 @@ impl Rpc {
             }
             thread::sleep(Duration::from_millis(20));
         }
-        panic!("daemon did not accept connections: {last}");
+        let stderr = stderr
+            .map(|slot| slot.lock().expect("stderr").clone())
+            .unwrap_or_else(|| "<not captured>".to_owned());
+        let stderr = if stderr.trim().is_empty() {
+            "<empty>".to_owned()
+        } else {
+            stderr
+        };
+        panic!(
+            "daemon did not accept connections within {DAEMON_CONNECT_TIMEOUT:?}: {last}; daemon stderr: {stderr}"
+        );
     }
 
     fn call(
@@ -386,7 +419,7 @@ impl EventLog {
                 .expect("runtime");
             let mut stream = None;
             let mut last_err = None;
-            let deadline = Instant::now() + Duration::from_secs(3);
+            let deadline = Instant::now() + DAEMON_CONNECT_TIMEOUT;
             while stream.is_none() && Instant::now() < deadline {
                 match runtime.block_on(fl_host_proto::events(&endpoint, session_filter.clone())) {
                     Ok(s) => stream = Some(s),
@@ -601,7 +634,7 @@ fn serves_spawn_list_lease_send_echo_events_kill_and_exit() {
 #[test]
 fn duplicate_session_is_refused() {
     let daemon = Daemon::start(DaemonOpts { chunk: None });
-    let mut rpc = Rpc::connect(&daemon.paths.endpoint);
+    let mut rpc = daemon.rpc();
     rpc.spawn("same", &["stall"]);
     let spec = spec("same", &["stall"]);
     let reason = failed_reason(
@@ -615,7 +648,7 @@ fn duplicate_session_is_refused() {
 #[test]
 fn second_daemon_is_refused() {
     let daemon = Daemon::start(DaemonOpts { chunk: None });
-    let _ = Rpc::connect(&daemon.paths.endpoint);
+    let _ = daemon.rpc();
     let mut cmd = Command::new(host_bin());
     cmd.arg("--socket")
         .arg(daemon.paths.endpoint.socket_path())
@@ -639,14 +672,14 @@ fn second_daemon_is_refused() {
 #[test]
 fn reclaim_lease_refuses_stale_send() {
     let daemon = Daemon::start(DaemonOpts { chunk: None });
-    let mut owner = Rpc::connect(&daemon.paths.endpoint);
+    let mut owner = daemon.rpc();
     let child = owner.spawn(
         "rec",
         &["record", daemon.paths.transcript.to_str().unwrap()],
     );
     let epoch = epoch_of(&child);
     let first = owner.claim("rec", epoch).expect("lease");
-    let mut next = Rpc::connect(&daemon.paths.endpoint);
+    let mut next = daemon.rpc();
     let second = next.claim("rec", epoch).expect("reclaim");
     assert!(second.0 > first.0);
     let outcome = owner.send("rec", epoch, first, "STALE");
@@ -660,13 +693,13 @@ fn reclaim_lease_refuses_stale_send() {
 fn reclaim_lease_fences_already_queued_write() {
     let daemon = Daemon::start(DaemonOpts { chunk: None });
     arm(&daemon.paths.barrier, "before-first");
-    let mut owner = Rpc::connect(&daemon.paths.endpoint);
+    let mut owner = daemon.rpc();
     let child = owner.spawn("q", &["record", daemon.paths.transcript.to_str().unwrap()]);
     let epoch = epoch_of(&child);
     let lease = owner.claim("q", epoch).expect("lease");
     let queued = thread::spawn(move || owner.send("q", epoch, lease, "QUEUED"));
     wait_at(&daemon.paths.barrier, "before-first");
-    let mut next = Rpc::connect(&daemon.paths.endpoint);
+    let mut next = daemon.rpc();
     let renewed = next.claim("q", epoch).expect("reclaim");
     assert!(renewed.0 > lease.0);
     release(&daemon.paths.barrier, "before-first");
@@ -680,7 +713,7 @@ fn reclaim_lease_fences_already_queued_write() {
 #[test]
 fn stale_epoch_cannot_write_to_respawn() {
     let daemon = Daemon::start(DaemonOpts { chunk: None });
-    let mut rpc = Rpc::connect(&daemon.paths.endpoint);
+    let mut rpc = daemon.rpc();
     let path = daemon.paths.transcript.clone();
     let child = rpc.spawn("again", &["record", path.to_str().unwrap()]);
     let old_epoch = epoch_of(&child);
@@ -743,19 +776,21 @@ fn daemon_restart_never_reuses_session_epoch() {
     assert!(registry.high_water >= old_epoch);
     drop(rpc);
     daemon.stop();
+    let mut restarted_child = {
+        let mut cmd = Command::new(host_bin());
+        cmd.arg("--socket")
+            .arg(endpoint.socket_path())
+            .env("FL_HOST_WRITER_BARRIER", root.join("barrier"))
+            .env("FL_HOST_SUBSCRIBER_HOLD", root.join("subscriber"))
+            .env("FL_HOST_BACKLOG_STATUS", root.join("backlog"))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+        cmd.spawn().expect("restart")
+    };
+    let (restarted_stderr, restarted_stderr_thread) = capture_stderr(&mut restarted_child);
     let restarted = Daemon {
-        child: {
-            let mut cmd = Command::new(host_bin());
-            cmd.arg("--socket")
-                .arg(endpoint.socket_path())
-                .env("FL_HOST_WRITER_BARRIER", root.join("barrier"))
-                .env("FL_HOST_SUBSCRIBER_HOLD", root.join("subscriber"))
-                .env("FL_HOST_BACKLOG_STATUS", root.join("backlog"))
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null());
-            cmd.spawn().expect("restart")
-        },
+        child: restarted_child,
         paths: Paths {
             endpoint: endpoint.clone(),
             barrier: root.join("barrier"),
@@ -764,12 +799,12 @@ fn daemon_restart_never_reuses_session_epoch() {
             transcript: root.join("stdin.bin"),
             root: daemon.paths.root.take(),
         },
-        stderr: Arc::new(Mutex::new(String::new())),
-        stderr_thread: None,
+        stderr: restarted_stderr,
+        stderr_thread: restarted_stderr_thread,
     };
     // The first daemon is stopped and no longer owns the directory. Drop must
     // not delete the endpoint the replacement is serving.
-    let mut rpc = Rpc::connect(&restarted.paths.endpoint);
+    let mut rpc = restarted.rpc();
     let path = restarted.paths.transcript.clone();
     let spawned = rpc.spawn("persist", &["record", path.to_str().unwrap()]);
     let new_epoch = epoch_of(&spawned);
@@ -785,7 +820,7 @@ fn daemon_restart_never_reuses_session_epoch() {
 fn stdout_fragments_preserve_large_binary_stream_and_keep_child_alive() {
     let daemon = Daemon::start(DaemonOpts { chunk: None });
     let log = EventLog::subscribe(&daemon.paths.endpoint, Some("big"));
-    let mut rpc = Rpc::connect(&daemon.paths.endpoint);
+    let mut rpc = daemon.rpc();
     let done = daemon.paths.transcript.with_extension("done");
     rpc.spawn("big", &["stdout-fragments", "tail", done.to_str().unwrap()]);
     let mut expected = vec![b'z'; 513 * 4096];
@@ -828,7 +863,7 @@ fn stdout_fragments_preserve_large_binary_stream_and_keep_child_alive() {
 fn stdin_queue_refuses_over_capacity() {
     let daemon = Daemon::start(DaemonOpts { chunk: None });
     arm(&daemon.paths.barrier, "before-first");
-    let mut rpc = Rpc::connect(&daemon.paths.endpoint);
+    let mut rpc = daemon.rpc();
     let path = daemon.paths.transcript.clone();
     let child = rpc.spawn("cap", &["record", path.to_str().unwrap()]);
     let epoch = epoch_of(&child);
@@ -936,7 +971,7 @@ fn stdin_queue_refuses_over_capacity() {
 fn stdin_progress_timeout_is_bounded() {
     let daemon = Daemon::start(DaemonOpts { chunk: Some(1) });
     arm(&daemon.paths.barrier, "after-chunk");
-    let mut owner = Rpc::connect(&daemon.paths.endpoint);
+    let mut owner = daemon.rpc();
     let child = owner.spawn("slow", &["stall"]);
     let epoch = epoch_of(&child);
     let lease = owner.claim("slow", epoch).expect("lease");
@@ -966,7 +1001,7 @@ fn stdin_progress_timeout_is_bounded() {
             reason: SendBlock::Timeout
         }
     ));
-    let mut rpc = Rpc::connect(&daemon.paths.endpoint);
+    let mut rpc = daemon.rpc();
     let listed = rpc.list();
     assert_eq!(
         record(&find(&listed, "slow").state).input,
@@ -979,7 +1014,7 @@ fn stdin_progress_timeout_is_bounded() {
 fn stderr_flood_does_not_stall_stdout() {
     let daemon = Daemon::start(DaemonOpts { chunk: None });
     let log = EventLog::subscribe(&daemon.paths.endpoint, Some("mix"));
-    let mut rpc = Rpc::connect(&daemon.paths.endpoint);
+    let mut rpc = daemon.rpc();
     let started = Instant::now();
     rpc.spawn("mix", &["stderr-and-stdout"]);
     log.wait_until(Duration::from_secs(2), |events| {
@@ -994,7 +1029,7 @@ fn stderr_flood_does_not_stall_stdout() {
 fn maximum_line_is_fragmented_losslessly() {
     let daemon = Daemon::start(DaemonOpts { chunk: None });
     let log = EventLog::subscribe(&daemon.paths.endpoint, Some("max"));
-    let mut rpc = Rpc::connect(&daemon.paths.endpoint);
+    let mut rpc = daemon.rpc();
     rpc.spawn("max", &["maxline"]);
     let lines = log.wait_until(Duration::from_secs(5), |events| {
         line_bytes(events, "max")
@@ -1011,7 +1046,7 @@ fn maximum_line_is_fragmented_losslessly() {
 #[test]
 fn no_consumer_sets_stalled_without_unbounded_growth() {
     let daemon = Daemon::start(DaemonOpts { chunk: None });
-    let mut rpc = Rpc::connect(&daemon.paths.endpoint);
+    let mut rpc = daemon.rpc();
     rpc.spawn("empty", &["flood-empty"]);
     let deadline = Instant::now() + Duration::from_secs(5);
     let mut saw = false;
@@ -1443,9 +1478,9 @@ fn subscriber_count_queue_and_terminal_slot_are_bounded() {
 #[test]
 fn events_connection_is_stream_only() {
     let daemon = Daemon::start(DaemonOpts { chunk: None });
-    let mut rpc = Rpc::connect(&daemon.paths.endpoint);
+    let mut rpc = daemon.rpc();
     rpc.spawn("stream", &["stall"]);
-    let mut events = Rpc::connect(&daemon.paths.endpoint);
+    let mut events = daemon.rpc();
     let subscribed = events
         .call(|id| HostRequest::Events {
             id,
@@ -1486,7 +1521,7 @@ fn pending_output_survives_last_subscriber_drop() {
 fn partial_write_then_takeover_fences_and_refuses_new_lease() {
     let daemon = Daemon::start(DaemonOpts { chunk: Some(4) });
     arm(&daemon.paths.barrier, "after-chunk");
-    let mut owner = Rpc::connect(&daemon.paths.endpoint);
+    let mut owner = daemon.rpc();
     let path = daemon.paths.transcript.clone();
     let child = owner.spawn("part", &["record", path.to_str().unwrap()]);
     let epoch = epoch_of(&child);
@@ -1494,7 +1529,7 @@ fn partial_write_then_takeover_fences_and_refuses_new_lease() {
     let send = thread::spawn(move || owner.send("part", epoch, lease, "HELLO-WORLD"));
     wait_at(&daemon.paths.barrier, "after-chunk");
     let _ = wait_file(&path, |bytes| bytes.starts_with(b"HELL"));
-    let mut next = Rpc::connect(&daemon.paths.endpoint);
+    let mut next = daemon.rpc();
     let renewed = next.claim("part", epoch).expect("new lease");
     assert!(renewed.0 > lease.0);
     let outcome = send.join().expect("join");
@@ -1519,7 +1554,7 @@ fn partial_write_then_takeover_fences_and_refuses_new_lease() {
 fn fenced_session_allows_epoch_guarded_signal_and_kill() {
     let daemon = Daemon::start(DaemonOpts { chunk: Some(4) });
     arm(&daemon.paths.barrier, "after-chunk");
-    let mut owner = Rpc::connect(&daemon.paths.endpoint);
+    let mut owner = daemon.rpc();
     let eof = daemon.paths.barrier.join("record-eof");
     let child = owner.spawn(
         "fence",
@@ -1533,7 +1568,7 @@ fn fenced_session_allows_epoch_guarded_signal_and_kill() {
     let lease = owner.claim("fence", epoch).expect("lease");
     let send = thread::spawn(move || owner.send("fence", epoch, lease, "HELLO-WORLD"));
     wait_at(&daemon.paths.barrier, "after-chunk");
-    let mut next = Rpc::connect(&daemon.paths.endpoint);
+    let mut next = daemon.rpc();
     let renewed = next.claim("fence", epoch).expect("lease");
     let _ = send.join();
     wait_file(&eof, |bytes| bytes == b"eof");
@@ -1557,7 +1592,7 @@ fn fenced_session_allows_epoch_guarded_signal_and_kill() {
 fn claim_ack_is_boundary_for_pending_os_write() {
     let daemon = Daemon::start(DaemonOpts { chunk: None });
     arm(&daemon.paths.barrier, "pending");
-    let mut owner = Rpc::connect(&daemon.paths.endpoint);
+    let mut owner = daemon.rpc();
     let path = daemon.paths.transcript.clone();
     let child = owner.spawn("ack", &["record", path.to_str().unwrap()]);
     let epoch = epoch_of(&child);
@@ -1619,7 +1654,7 @@ fn claim_ack_is_boundary_for_pending_os_write() {
 fn claim_deadline_cannot_be_extended_by_input_progress() {
     let daemon = Daemon::start(DaemonOpts { chunk: Some(1) });
     arm(&daemon.paths.barrier, "pending");
-    let mut owner = Rpc::connect(&daemon.paths.endpoint);
+    let mut owner = daemon.rpc();
     let child = owner.spawn("deadline", &["stall"]);
     let epoch = epoch_of(&child);
     let lease = owner.claim("deadline", epoch).expect("lease");
@@ -1651,7 +1686,7 @@ fn claim_deadline_cannot_be_extended_by_input_progress() {
     assert!(result.is_err(), "{result:?}");
     let outcome = send.join().expect("join");
     assert!(matches!(outcome, SendOutcome::Ambiguous { .. }));
-    let mut rpc = Rpc::connect(&daemon.paths.endpoint);
+    let mut rpc = daemon.rpc();
     let listed = rpc.list();
     assert_eq!(
         record(&find(&listed, "deadline").state).input,
@@ -1750,7 +1785,7 @@ fn caller_cancellation_does_not_drop_writer() {
 fn control_disconnect_revokes_queued_input() {
     let daemon = Daemon::start(DaemonOpts { chunk: None });
     arm(&daemon.paths.barrier, "before-first");
-    let mut rpc = Rpc::connect(&daemon.paths.endpoint);
+    let mut rpc = daemon.rpc();
     let path = daemon.paths.transcript.clone();
     let child = rpc.spawn("drop", &["record", path.to_str().unwrap()]);
     let epoch = epoch_of(&child);
@@ -1804,7 +1839,7 @@ fn control_disconnect_revokes_queued_input() {
         thread::sleep(Duration::from_millis(5));
     }
     release(&daemon.paths.barrier, "before-first");
-    let mut rpc = Rpc::connect(&daemon.paths.endpoint);
+    let mut rpc = daemon.rpc();
     let renewed = rpc.claim("drop", epoch).expect("lease");
     assert_eq!(
         rpc.send("drop", epoch, renewed, "FRESH"),
@@ -1819,12 +1854,12 @@ fn control_disconnect_revokes_queued_input() {
 #[test]
 fn send_reports_not_written_vs_ambiguous() {
     let daemon = Daemon::start(DaemonOpts { chunk: None });
-    let mut owner = Rpc::connect(&daemon.paths.endpoint);
+    let mut owner = daemon.rpc();
     let path = daemon.paths.transcript.clone();
     let child = owner.spawn("kind", &["record", path.to_str().unwrap()]);
     let epoch = epoch_of(&child);
     let lease = owner.claim("kind", epoch).expect("lease");
-    let mut other = Rpc::connect(&daemon.paths.endpoint);
+    let mut other = daemon.rpc();
     let _ = other.claim("kind", epoch).expect("reclaim");
     let outcome = owner.send("kind", epoch, lease, "ZERO");
     assert_eq!(not_written(&outcome), &SendBlock::StaleLease);
@@ -1849,7 +1884,7 @@ fn send_reports_not_written_vs_ambiguous() {
 fn send_reply_waits_for_newline_write_result() {
     let daemon = Daemon::start(DaemonOpts { chunk: Some(3) });
     arm(&daemon.paths.barrier, "after-chunk");
-    let mut owner = Rpc::connect(&daemon.paths.endpoint);
+    let mut owner = daemon.rpc();
     let path = daemon.paths.transcript.clone();
     let child = owner.spawn("nl", &["record", path.to_str().unwrap()]);
     let epoch = epoch_of(&child);
@@ -1870,13 +1905,13 @@ fn send_reply_waits_for_newline_write_result() {
 #[test]
 fn lease_is_bound_to_session_epoch_and_control_connection() {
     let daemon = Daemon::start(DaemonOpts { chunk: None });
-    let mut owner = Rpc::connect(&daemon.paths.endpoint);
+    let mut owner = daemon.rpc();
     let path = daemon.paths.transcript.clone();
     let child = owner.spawn("bound", &["record", path.to_str().unwrap()]);
     let epoch = epoch_of(&child);
     owner.spawn("other", &["stall"]);
     let lease = owner.claim("bound", epoch).expect("lease");
-    let mut stranger = Rpc::connect(&daemon.paths.endpoint);
+    let mut stranger = daemon.rpc();
     let wrong_conn = stranger.send("bound", epoch, lease, "CONN");
     assert_eq!(not_written(&wrong_conn), &SendBlock::WrongConnection);
     let wrong_epoch = owner.send("bound", epoch + 9, lease, "EPOCH");
@@ -1898,7 +1933,7 @@ fn lease_is_bound_to_session_epoch_and_control_connection() {
 fn concurrent_claims_are_ordered() {
     let daemon = Daemon::start(DaemonOpts { chunk: None });
     arm(&daemon.paths.barrier, "before-claim");
-    let mut rpc = Rpc::connect(&daemon.paths.endpoint);
+    let mut rpc = daemon.rpc();
     let child = rpc.spawn("race", &["stall"]);
     let epoch = epoch_of(&child);
     let endpoint = daemon.paths.endpoint.clone();
@@ -1936,7 +1971,7 @@ fn concurrent_claims_are_ordered() {
 #[test]
 fn stale_epoch_kill_refused() {
     let daemon = Daemon::start(DaemonOpts { chunk: None });
-    let mut rpc = Rpc::connect(&daemon.paths.endpoint);
+    let mut rpc = daemon.rpc();
     let child = rpc.spawn("live", &["stall"]);
     let epoch = epoch_of(&child);
     let err = rpc.kill("live", epoch + 3, None).expect_err("stale kill");
@@ -1952,7 +1987,7 @@ fn stale_epoch_kill_refused() {
 #[test]
 fn stale_lease_signal_refused() {
     let daemon = Daemon::start(DaemonOpts { chunk: None });
-    let mut rpc = Rpc::connect(&daemon.paths.endpoint);
+    let mut rpc = daemon.rpc();
     let child = rpc.spawn("sig", &["stall"]);
     let epoch = epoch_of(&child);
     let lease = rpc.claim("sig", epoch).expect("lease");
@@ -1975,7 +2010,7 @@ fn stale_lease_signal_refused() {
 fn epoch_guard_serializes_signal_kill_and_respawn() {
     let daemon = Daemon::start(DaemonOpts { chunk: None });
     arm(&daemon.paths.barrier, "before-signal");
-    let mut rpc = Rpc::connect(&daemon.paths.endpoint);
+    let mut rpc = daemon.rpc();
     let child = rpc.spawn("guard", &["stall"]);
     let epoch = epoch_of(&child);
     let lease = rpc.claim("guard", epoch).expect("lease");
@@ -2003,7 +2038,7 @@ fn epoch_guard_serializes_signal_kill_and_respawn() {
     queued_rx
         .recv_timeout(Duration::from_secs(3))
         .expect("kill was not admitted behind the signal");
-    let mut rpc = Rpc::connect(&daemon.paths.endpoint);
+    let mut rpc = daemon.rpc();
     let spec = spec("guard", &["stall"]);
     let reason = failed_reason(
         rpc.call(|id| HostRequest::Spawn { id, spec })
@@ -2046,7 +2081,7 @@ fn epoch_guard_serializes_signal_kill_and_respawn() {
 #[test]
 fn terminate_signal_reaches_child_from_real_daemon() {
     let daemon = Daemon::start(DaemonOpts { chunk: None });
-    let mut rpc = Rpc::connect(&daemon.paths.endpoint);
+    let mut rpc = daemon.rpc();
     let child = rpc.spawn("term", &["stall"]);
     let epoch = epoch_of(&child);
     let lease = rpc.claim("term", epoch).expect("lease");
@@ -2069,7 +2104,7 @@ fn terminate_signal_reaches_child_from_real_daemon() {
 #[test]
 fn respawned_session_allows_bounded_daemon_shutdown() {
     let mut daemon = Daemon::start(DaemonOpts { chunk: None });
-    let mut rpc = Rpc::connect(&daemon.paths.endpoint);
+    let mut rpc = daemon.rpc();
     let child = rpc.spawn("respawn-shutdown", &["stall"]);
     let epoch = epoch_of(&child);
     rpc.kill("respawn-shutdown", epoch, None).expect("kill");
@@ -2186,7 +2221,7 @@ impl Drop for SignalFixturePin {
 fn signal_waits_for_sole_reaper_and_expired_command_cannot_signal() {
     let daemon = Daemon::start(DaemonOpts { chunk: None });
     let log = EventLog::subscribe(&daemon.paths.endpoint, Some("serialized"));
-    let mut rpc = Rpc::connect(&daemon.paths.endpoint);
+    let mut rpc = daemon.rpc();
     let child = rpc.spawn("serialized", &["stall"]);
     let epoch = epoch_of(&child);
     let lease = rpc.claim("serialized", epoch).expect("lease");
@@ -2256,7 +2291,7 @@ fn signal_waits_for_sole_reaper_and_expired_command_cannot_signal() {
 fn signalled_windows_handle_preserves_exit_259_in_event_inventory_and_registry() {
     let daemon = Daemon::start(DaemonOpts { chunk: None });
     let log = EventLog::subscribe(&daemon.paths.endpoint, Some("exit259"));
-    let mut rpc = Rpc::connect(&daemon.paths.endpoint);
+    let mut rpc = daemon.rpc();
     let child = rpc.spawn("exit259", &["exit-with-survivor", "259"]);
     log.wait_until(Duration::from_secs(3), |events| {
         controls(events).iter().any(|event| {
@@ -2299,7 +2334,7 @@ fn signalled_windows_handle_preserves_exit_259_in_event_inventory_and_registry()
 fn unsupported_windows_signals_refuse_without_mutation() {
     let daemon = Daemon::start(DaemonOpts { chunk: None });
     let log = EventLog::subscribe(&daemon.paths.endpoint, Some("unsupported"));
-    let mut rpc = Rpc::connect(&daemon.paths.endpoint);
+    let mut rpc = daemon.rpc();
     let child = rpc.spawn("unsupported", &["echo"]);
     let epoch = epoch_of(&child);
     let lease = rpc.claim("unsupported", epoch).expect("lease");
@@ -2342,7 +2377,7 @@ fn unsupported_windows_signals_refuse_without_mutation() {
 fn supervisor_disconnect_never_reports_signal_success() {
     let daemon = Daemon::start(DaemonOpts { chunk: None });
     let log = EventLog::subscribe(&daemon.paths.endpoint, Some("disconnect"));
-    let mut rpc = Rpc::connect(&daemon.paths.endpoint);
+    let mut rpc = daemon.rpc();
     let child = rpc.spawn("disconnect", &["stall"]);
     let epoch = epoch_of(&child);
     let lease = rpc.claim("disconnect", epoch).expect("lease");
@@ -2391,7 +2426,7 @@ fn supervisor_disconnect_never_reports_signal_success() {
 fn signal_with_unreported_leader_exit_is_serialized_with_reaping() {
     let daemon = Daemon::start(DaemonOpts { chunk: None });
     let log = EventLog::subscribe(&daemon.paths.endpoint, Some("exit-race"));
-    let mut rpc = Rpc::connect(&daemon.paths.endpoint);
+    let mut rpc = daemon.rpc();
     let child = rpc.spawn("exit-race", &["stall"]);
     let epoch = epoch_of(&child);
     let lease = rpc.claim("exit-race", epoch).expect("lease");
@@ -2522,7 +2557,7 @@ fn unread_previous_epoch_survives_respawn() {
 #[test]
 fn unread_epochs_refuse_admission_at_retained_capacity() {
     let daemon = Daemon::start(DaemonOpts { chunk: None });
-    let mut rpc = Rpc::connect(&daemon.paths.endpoint);
+    let mut rpc = daemon.rpc();
     for index in 0..fl_host_proto::DEFAULT_MAX_SESSIONS {
         let name = format!("retained-{index}");
         let epoch = epoch_of(&rpc.spawn(&name, &["stall"]));
@@ -2681,7 +2716,7 @@ fn ack(rpc: &mut Rpc, stream: &StreamId, lease: ControllerLease, seq: u64) -> XR
 #[test]
 fn second_authoritative_subscribe_is_busy() {
     let daemon = Daemon::start(DaemonOpts { chunk: None });
-    let mut rpc = Rpc::connect(&daemon.paths.endpoint);
+    let mut rpc = daemon.rpc();
     let stream = reliable_spawn(&mut rpc, "one-stream", &["echo"]);
     let lease = controller(&mut rpc, &stream);
     let t = ticket(&mut rpc, &stream, lease, 0);
@@ -2717,12 +2752,12 @@ fn second_authoritative_subscribe_is_busy() {
 #[test]
 fn ticket_bound_to_live_rpc_lease_and_consumed_once() {
     let daemon = Daemon::start(DaemonOpts { chunk: None });
-    let mut rpc = Rpc::connect(&daemon.paths.endpoint);
+    let mut rpc = daemon.rpc();
     let stream = reliable_spawn(&mut rpc, "ticket", &["echo"]);
     let lease = controller(&mut rpc, &stream);
     let old = ticket(&mut rpc, &stream, lease, 0);
     let new = ticket(&mut rpc, &stream, lease, 0);
-    let mut event = Rpc::connect(&daemon.paths.endpoint);
+    let mut event = daemon.rpc();
     assert_eq!(
         extended(&mut event, XReq::OpenStream { ticket: old }),
         XResp::Refused {
@@ -2736,7 +2771,7 @@ fn ticket_bound_to_live_rpc_lease_and_consumed_once() {
             code: Refuse::TicketInvalid
         }
     );
-    let mut other = Rpc::connect(&daemon.paths.endpoint);
+    let mut other = daemon.rpc();
     let lease2 = controller(&mut other, &stream);
     let pending = settled_ticket(&mut other, &stream, lease2, 0);
     drop(other);
@@ -2751,7 +2786,7 @@ fn ticket_bound_to_live_rpc_lease_and_consumed_once() {
 #[test]
 fn ack_lost_reply_is_idempotent() {
     let daemon = Daemon::start(DaemonOpts { chunk: None });
-    let mut rpc = Rpc::connect(&daemon.paths.endpoint);
+    let mut rpc = daemon.rpc();
     let stream = reliable_spawn(&mut rpc, "ack-retry", &["echo"]);
     let lease = controller(&mut rpc, &stream);
     let t = ticket(&mut rpc, &stream, lease, 0);
@@ -2769,7 +2804,7 @@ fn ack_lost_reply_is_idempotent() {
         },
     });
     wait_at(&daemon.paths.subscriber, "reliable-ack-reply");
-    let mut recovered = Rpc::connect(&daemon.paths.endpoint);
+    let mut recovered = daemon.rpc();
     assert!(
         matches!(extended(&mut recovered,XReq::ListSessions),XResp::Sessions{records} if records[0].acked==1)
     );
@@ -2795,7 +2830,7 @@ fn ack_lost_reply_is_idempotent() {
 #[test]
 fn legacy_cannot_access_reliable_epoch() {
     let daemon = Daemon::start(DaemonOpts { chunk: None });
-    let mut rpc = Rpc::connect(&daemon.paths.endpoint);
+    let mut rpc = daemon.rpc();
     let stream = reliable_spawn(&mut rpc, "private-mode", &["echo"]);
     let lease = controller(&mut rpc, &stream);
     assert!(rpc.list().is_empty());
@@ -2816,7 +2851,7 @@ fn legacy_cannot_access_reliable_epoch() {
 #[test]
 fn observer_cannot_advance_ack_ceiling() {
     let daemon = Daemon::start(DaemonOpts { chunk: None });
-    let mut rpc = Rpc::connect(&daemon.paths.endpoint);
+    let mut rpc = daemon.rpc();
     let stream = reliable_spawn(&mut rpc, "observer", &["echo"]);
     let lease = controller(&mut rpc, &stream);
     let t = match extended(
@@ -2841,13 +2876,13 @@ fn observer_cannot_advance_ack_ceiling() {
 #[test]
 fn takeover_revokes_old_stream_ceiling() {
     let daemon = Daemon::start(DaemonOpts { chunk: None });
-    let mut old = Rpc::connect(&daemon.paths.endpoint);
+    let mut old = daemon.rpc();
     let stream = reliable_spawn(&mut old, "takeover", &["echo"]);
     let lease = controller(&mut old, &stream);
     let t = ticket(&mut old, &stream, lease, 0);
     let (rt, mut events) = event_socket(&daemon.paths.endpoint, t);
     assert_eq!(event_seq(&rt, &mut events, 0), 1);
-    let mut new = Rpc::connect(&daemon.paths.endpoint);
+    let mut new = daemon.rpc();
     let fresh = controller(&mut new, &stream);
     assert_ne!(fresh, lease);
     assert_eq!(
@@ -2871,7 +2906,7 @@ fn takeover_revokes_old_stream_ceiling() {
 #[test]
 fn historical_epoch_ack_survives_writer_retirement() {
     let daemon = Daemon::start(DaemonOpts { chunk: None });
-    let mut rpc = Rpc::connect(&daemon.paths.endpoint);
+    let mut rpc = daemon.rpc();
     let old = reliable_spawn(&mut rpc, "history", &["exit", "0"]);
     let cleanup_lease = controller(&mut rpc, &old);
     assert_eq!(
@@ -2923,7 +2958,7 @@ fn historical_epoch_ack_survives_writer_retirement() {
 #[test]
 fn stale_claim_continuation_cannot_publish_owner() {
     let daemon = Daemon::start(DaemonOpts { chunk: Some(1) });
-    let mut owner = Rpc::connect(&daemon.paths.endpoint);
+    let mut owner = daemon.rpc();
     let eof = daemon.paths.barrier.join("reliable-eof");
     let stream = reliable_spawn(
         &mut owner,
@@ -2947,7 +2982,7 @@ fn stale_claim_continuation_cannot_publish_owner() {
     wait_at(&daemon.paths.barrier, "after-chunk"); // first OS byte was written, completion is held.
     let _ = wait_file(&daemon.paths.transcript, |b| b.starts_with(b"A"));
     arm(&daemon.paths.barrier, "before-claim");
-    let mut claimant = Rpc::connect(&daemon.paths.endpoint);
+    let mut claimant = daemon.rpc();
     claimant.push(|id| HostRequest::Extended {
         id,
         request: XReq::ClaimController {
@@ -2988,7 +3023,7 @@ fn stale_claim_continuation_cannot_publish_owner() {
 #[test]
 fn partial_event_cannot_advance_emitted_ceiling() {
     let daemon = Daemon::start(DaemonOpts { chunk: None });
-    let mut rpc = Rpc::connect(&daemon.paths.endpoint);
+    let mut rpc = daemon.rpc();
     let stream = reliable_spawn(&mut rpc, "partial", &["echo"]);
     let lease = controller(&mut rpc, &stream);
     let t = ticket(&mut rpc, &stream, lease, 0);
@@ -3061,7 +3096,7 @@ fn partial_event_cannot_advance_emitted_ceiling() {
 #[test]
 fn closed_stream_replacement_waits_for_authority_settlement() {
     let daemon = Daemon::start(DaemonOpts { chunk: None });
-    let mut rpc = Rpc::connect(&daemon.paths.endpoint);
+    let mut rpc = daemon.rpc();
     let stream = reliable_spawn(&mut rpc, "settlement", &["echo"]);
     let lease = controller(&mut rpc, &stream);
     let t = ticket(&mut rpc, &stream, lease, 0);
@@ -3115,13 +3150,13 @@ fn closed_stream_replacement_waits_for_authority_settlement() {
 fn cancelled_ticket_keeps_real_refs() {
     // Pending tickets own their cursors/slots until actual revocation; 16 is shared with legacy.
     let daemon = Daemon::start(DaemonOpts { chunk: None });
-    let mut rpc = Rpc::connect(&daemon.paths.endpoint);
+    let mut rpc = daemon.rpc();
     let stream = reliable_spawn(&mut rpc, "capacity", &["echo"]);
     let lease = controller(&mut rpc, &stream);
     let pending = ticket(&mut rpc, &stream, lease, 0);
     let mut observers = Vec::new();
     for _ in 0..15 {
-        let mut observer = Rpc::connect(&daemon.paths.endpoint);
+        let mut observer = daemon.rpc();
         assert!(matches!(
             extended(
                 &mut observer,
@@ -3134,7 +3169,7 @@ fn cancelled_ticket_keeps_real_refs() {
         ));
         observers.push(observer);
     }
-    let mut legacy = Rpc::connect(&daemon.paths.endpoint);
+    let mut legacy = daemon.rpc();
     assert!(matches!(
         legacy.call(|id| HostRequest::Events { id, session: None }),
         Ok(HostResponse::Failed { .. })
@@ -3194,7 +3229,7 @@ fn cancelled_ticket_keeps_real_refs() {
 #[test]
 fn reliable_client_yields_complete_events_without_automatic_ack() {
     let daemon = Daemon::start(DaemonOpts { chunk: None });
-    let mut rpc = Rpc::connect(&daemon.paths.endpoint);
+    let mut rpc = daemon.rpc();
     let stream = reliable_spawn(&mut rpc, "typed-client", &["echo"]);
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async {
@@ -3211,10 +3246,10 @@ fn reliable_client_yields_complete_events_without_automatic_ack() {
 #[test]
 fn reliable_scope_recovery_and_expiry_refusals() {
     let daemon = Daemon::start(DaemonOpts { chunk: None });
-    let mut rpc = Rpc::connect(&daemon.paths.endpoint);
+    let mut rpc = daemon.rpc();
     let stream = reliable_spawn(&mut rpc, "scope", &["echo"]);
     let lease = controller(&mut rpc, &stream);
-    let mut other = Rpc::connect(&daemon.paths.endpoint);
+    let mut other = daemon.rpc();
     assert_eq!(
         ack(&mut other, &stream, lease, 0),
         XResp::Refused {
@@ -3313,7 +3348,7 @@ fn reliable_scope_recovery_and_expiry_refusals() {
 #[test]
 fn reliable_minor_zero_has_no_extension_fallback() {
     let daemon = Daemon::start(DaemonOpts { chunk: None });
-    let mut rpc = Rpc::connect(&daemon.paths.endpoint);
+    let mut rpc = daemon.rpc();
     let _stream = reliable_spawn(&mut rpc, "minor", &["echo"]);
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async {
@@ -3327,7 +3362,7 @@ fn reliable_minor_zero_has_no_extension_fallback() {
 #[test]
 fn reliable_raw_minor_zero_request_is_rejected_before_spawn() {
     let daemon = Daemon::start(DaemonOpts { chunk: None });
-    let mut rpc = Rpc::connect(&daemon.paths.endpoint);
+    let mut rpc = daemon.rpc();
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async {
         let old = AsyncHostClient::connect_with(
@@ -3373,7 +3408,7 @@ fn reliable_raw_minor_zero_request_is_rejected_before_spawn() {
 #[test]
 fn reliable_observer_lag_is_explicit_after_controller_retirement() {
     let daemon = Daemon::start(DaemonOpts { chunk: None });
-    let mut rpc = Rpc::connect(&daemon.paths.endpoint);
+    let mut rpc = daemon.rpc();
     let stream = reliable_spawn(&mut rpc, "lag", &["echo"]);
     let lease = controller(&mut rpc, &stream);
     arm(&daemon.paths.subscriber, "reliable-before-part");
@@ -3418,7 +3453,7 @@ fn reliable_observer_lag_is_explicit_after_controller_retirement() {
 #[test]
 fn reliable_pending_operations_and_responses_have_finite_admission() {
     let daemon = Daemon::start(DaemonOpts { chunk: None });
-    let mut rpc = Rpc::connect(&daemon.paths.endpoint);
+    let mut rpc = daemon.rpc();
     arm(&daemon.paths.subscriber, "reliable-operation");
     for _ in 0..64 {
         rpc.push(|id| HostRequest::Extended {
@@ -3467,7 +3502,7 @@ fn reliable_pending_operations_and_responses_have_finite_admission() {
 #[test]
 fn rpc_stream_legacy_conversion_revokes_pending_reliable_ticket() {
     let daemon = Daemon::start(DaemonOpts { chunk: None });
-    let mut owner = Rpc::connect(&daemon.paths.endpoint);
+    let mut owner = daemon.rpc();
     let stream = reliable_spawn(&mut owner, "legacy-conversion", &["echo"]);
     let lease = controller(&mut owner, &stream);
     let pending = ticket(&mut owner, &stream, lease, 0);
@@ -3477,7 +3512,7 @@ fn rpc_stream_legacy_conversion_revokes_pending_reliable_ticket() {
             .unwrap(),
         HostResponse::Subscribed { .. }
     ));
-    let mut event = Rpc::connect(&daemon.paths.endpoint);
+    let mut event = daemon.rpc();
     assert_eq!(
         extended(&mut event, XReq::OpenStream { ticket: pending }),
         XResp::Refused {
@@ -3503,11 +3538,11 @@ fn rpc_stream_legacy_conversion_revokes_pending_reliable_ticket() {
 #[test]
 fn rpc_stream_extension_conversion_revokes_previous_rpc_ownership() {
     let daemon = Daemon::start(DaemonOpts { chunk: None });
-    let mut owner = Rpc::connect(&daemon.paths.endpoint);
+    let mut owner = daemon.rpc();
     let first = reliable_spawn(&mut owner, "first-controller", &["echo"]);
     let lease = controller(&mut owner, &first);
     let first_ticket = ticket(&mut owner, &first, lease, 0);
-    let mut converting = Rpc::connect(&daemon.paths.endpoint);
+    let mut converting = daemon.rpc();
     let second = reliable_spawn(&mut converting, "second-controller", &["echo"]);
     let second_lease = controller(&mut converting, &second);
     let second_ticket = ticket(&mut converting, &second, second_lease, 0);
@@ -3520,7 +3555,7 @@ fn rpc_stream_extension_conversion_revokes_previous_rpc_ownership() {
         ),
         XResp::Opened
     );
-    let mut event = Rpc::connect(&daemon.paths.endpoint);
+    let mut event = daemon.rpc();
     assert_eq!(
         extended(
             &mut event,
@@ -3551,7 +3586,7 @@ fn rpc_stream_extension_conversion_revokes_previous_rpc_ownership() {
 #[test]
 fn rpc_stream_own_ticket_requires_separate_live_rpc() {
     let daemon = Daemon::start(DaemonOpts { chunk: None });
-    let mut owner = Rpc::connect(&daemon.paths.endpoint);
+    let mut owner = daemon.rpc();
     let stream = reliable_spawn(&mut owner, "own-ticket", &["echo"]);
     let lease = controller(&mut owner, &stream);
     let pending = ticket(&mut owner, &stream, lease, 0);
@@ -3573,9 +3608,9 @@ fn rpc_stream_own_ticket_requires_separate_live_rpc() {
 #[test]
 fn rpc_stream_conversion_refuses_outstanding_claim_response() {
     let daemon = Daemon::start(DaemonOpts { chunk: None });
-    let mut owner = Rpc::connect(&daemon.paths.endpoint);
+    let mut owner = daemon.rpc();
     let stream = reliable_spawn(&mut owner, "pending-conversion", &["echo"]);
-    let mut separate = Rpc::connect(&daemon.paths.endpoint);
+    let mut separate = daemon.rpc();
     let other = reliable_spawn(&mut separate, "pending-other", &["echo"]);
     let other_lease = controller(&mut separate, &other);
     let pending_ticket = ticket(&mut separate, &other, other_lease, 0);
@@ -3618,7 +3653,7 @@ fn rpc_stream_conversion_refuses_outstanding_claim_response() {
 #[test]
 fn pre_enqueue_stale_claim_cannot_change_current_writer() {
     let daemon = Daemon::start(DaemonOpts { chunk: None });
-    let mut older = Rpc::connect(&daemon.paths.endpoint);
+    let mut older = daemon.rpc();
     let eof = daemon.paths.barrier.join("record-eof");
     let stream = reliable_spawn(
         &mut older,
@@ -3637,7 +3672,7 @@ fn pre_enqueue_stale_claim_cannot_change_current_writer() {
         },
     });
     wait_at(&daemon.paths.subscriber, "reliable-pre-enqueue");
-    let mut newer = Rpc::connect(&daemon.paths.endpoint);
+    let mut newer = daemon.rpc();
     let lease = controller(&mut newer, &stream);
     assert_eq!(
         extended(
@@ -3693,7 +3728,7 @@ fn pre_enqueue_stale_claim_cannot_change_current_writer() {
 #[test]
 fn legacy_lookup_replacement_cannot_select_reliable_writer() {
     let daemon = Daemon::start(DaemonOpts { chunk: None });
-    let mut legacy = Rpc::connect(&daemon.paths.endpoint);
+    let mut legacy = daemon.rpc();
     let old = legacy.spawn("lookup-race", &["exit", "0"]);
     let old_epoch = epoch_of(&old);
     legacy
@@ -3718,7 +3753,7 @@ fn legacy_lookup_replacement_cannot_select_reliable_writer() {
         lease: None,
     });
     wait_at(&daemon.paths.subscriber, "legacy-writer-lookup");
-    let mut owner = Rpc::connect(&daemon.paths.endpoint);
+    let mut owner = daemon.rpc();
     let stream = reliable_spawn(&mut owner, "lookup-race", &["echo"]);
     assert_eq!(stream.epoch.0, old_epoch + 1);
     let lease = controller(&mut owner, &stream);
@@ -3755,7 +3790,7 @@ fn legacy_lookup_replacement_cannot_select_reliable_writer() {
 #[test]
 fn pty_reliable_session_supports_capture_output_and_write_raw() {
     let daemon = Daemon::start(DaemonOpts { chunk: None });
-    let mut client = Rpc::connect(&daemon.paths.endpoint).inner;
+    let mut client = daemon.rpc().inner;
     let mut env = std::collections::BTreeMap::new();
     env.insert("FL_HOST_PTY".into(), "1".into());
     let mut env_allow = std::collections::BTreeSet::new();
@@ -3814,7 +3849,7 @@ fn pty_reliable_session_supports_capture_output_and_write_raw() {
 fn non_reliable_eof_preserves_exact_unterminated_tail() {
     let daemon = Daemon::start(DaemonOpts { chunk: None });
     let log = EventLog::subscribe(&daemon.paths.endpoint, Some("eof-tail"));
-    let mut rpc = Rpc::connect(&daemon.paths.endpoint);
+    let mut rpc = daemon.rpc();
     let done = daemon.paths.transcript.with_extension("done");
     rpc.spawn(
         "eof-tail",
@@ -3853,7 +3888,7 @@ fn non_reliable_eof_preserves_exact_unterminated_tail() {
 #[test]
 fn host_build_identity_is_opt_in() {
     let daemon = Daemon::start(DaemonOpts { chunk: None });
-    let mut rpc = Rpc::connect(&daemon.paths.endpoint);
+    let mut rpc = daemon.rpc();
     // A strict old reader only knows these variants/fields. Advertising a bit is
     // compatible; adding build fields to either old response would fail here.
     #[derive(serde::Deserialize, serde::Serialize)]
@@ -3907,7 +3942,7 @@ fn host_build_identity_is_opt_in() {
 fn pipe_modes_report_current_device_truth() {
     use fl_host_proto::SessionMode;
     let daemon = Daemon::start(DaemonOpts { chunk: None });
-    let mut client = Rpc::connect(&daemon.paths.endpoint).inner;
+    let mut client = daemon.rpc().inner;
     for mode in [SessionMode::LegacyPipe, SessionMode::ReliablePipe] {
         for env_pty in [false, true] {
             let name = format!("device-{mode:?}-{env_pty}");
@@ -4069,7 +4104,7 @@ fn wait_safety_stall(rpc: &mut Rpc) {
 #[test]
 fn safety_flood_legacy_unattended_recovers_and_captures_final_tail() {
     let daemon = Daemon::start(DaemonOpts { chunk: None });
-    let mut rpc = Rpc::connect(&daemon.paths.endpoint);
+    let mut rpc = daemon.rpc();
     let gate = daemon.paths.barrier.join("produce");
     let done = daemon.paths.barrier.join("flushed");
     let fragment_gate = daemon.paths.barrier.join("finish-fragment");
@@ -4167,7 +4202,7 @@ fn safety_flood_legacy_unattended_recovers_and_captures_final_tail() {
 #[test]
 fn safety_flood_legacy_held_subscriber_preserves_control_and_cleanup() {
     let daemon = Daemon::start(DaemonOpts { chunk: None });
-    let mut rpc = Rpc::connect(&daemon.paths.endpoint);
+    let mut rpc = daemon.rpc();
     arm(&daemon.paths.subscriber, "before-send-1");
     let events = EventLog::subscribe(&daemon.paths.endpoint, Some("safety-flood"));
     wait_file(&daemon.paths.subscriber.join("subscribed-1"), |b| b == b"1");
@@ -4242,7 +4277,7 @@ fn rendered_spawn(rpc: &mut Rpc, name: &str) -> StreamId {
 #[test]
 fn default_pty_capacity_supports_sixteen_live_gated_children() {
     let daemon = Daemon::start(DaemonOpts { chunk: None });
-    let mut rpc = Rpc::connect(&daemon.paths.endpoint);
+    let mut rpc = daemon.rpc();
     let gate = daemon.paths.barrier.join("capacity-go");
     let mut streams = Vec::new();
     for index in 0..16 {
@@ -4309,7 +4344,7 @@ fn default_pty_capacity_supports_sixteen_live_gated_children() {
 #[test]
 fn rendered_capture_resize_identity_and_kernel_geometry() {
     let daemon = Daemon::start(DaemonOpts { chunk: None });
-    let mut rpc = Rpc::connect(&daemon.paths.endpoint);
+    let mut rpc = daemon.rpc();
     let stream = rendered_spawn(&mut rpc, "rendered");
     let lease = controller(&mut rpc, &stream);
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -4373,7 +4408,7 @@ fn rendered_capture_resize_identity_and_kernel_geometry() {
         );
         thread::yield_now();
     }
-    let mut rpc = Rpc::connect(&daemon.paths.endpoint);
+    let mut rpc = daemon.rpc();
     let mut wrong = stream.clone();
     wrong.host = fl_host_proto::HostInstance::new([99; 16]);
     assert_eq!(
@@ -4458,7 +4493,7 @@ fn rendered_ready(rpc: &mut Rpc, stream: &StreamId) -> fl_host_proto::RenderedSc
 #[test]
 fn rendered_resize_takeover_before_claim_enqueue_refuses_without_mutation() {
     let daemon = Daemon::start(DaemonOpts { chunk: None });
-    let mut owner = Rpc::connect(&daemon.paths.endpoint);
+    let mut owner = daemon.rpc();
     let stream = rendered_spawn(&mut owner, "resize-takeover");
     let lease = controller(&mut owner, &stream);
     let before = rendered_ready(&mut owner, &stream);
@@ -4474,7 +4509,7 @@ fn rendered_resize_takeover_before_claim_enqueue_refuses_without_mutation() {
     });
     wait_at(&daemon.paths.barrier, "before-resize");
     arm(&daemon.paths.subscriber, "reliable-pre-enqueue");
-    let mut claimant = Rpc::connect(&daemon.paths.endpoint);
+    let mut claimant = daemon.rpc();
     claimant.push(|id| HostRequest::Extended {
         id,
         request: XReq::ClaimController {
@@ -4492,7 +4527,7 @@ fn rendered_resize_takeover_before_claim_enqueue_refuses_without_mutation() {
             ..
         }
     ));
-    let mut observer = Rpc::connect(&daemon.paths.endpoint);
+    let mut observer = daemon.rpc();
     assert_eq!(rendered_screen(&mut observer, &stream), before);
     release(&daemon.paths.subscriber, "reliable-pre-enqueue");
     assert!(matches!(
@@ -4509,7 +4544,7 @@ fn rendered_resize_takeover_before_claim_enqueue_refuses_without_mutation() {
 #[test]
 fn rendered_resize_disconnect_refuses_without_mutation() {
     let daemon = Daemon::start(DaemonOpts { chunk: None });
-    let mut owner = Rpc::connect(&daemon.paths.endpoint);
+    let mut owner = daemon.rpc();
     let stream = rendered_spawn(&mut owner, "resize-disconnect");
     let lease = controller(&mut owner, &stream);
     let before = rendered_ready(&mut owner, &stream);
@@ -4527,7 +4562,7 @@ fn rendered_resize_disconnect_refuses_without_mutation() {
     drop(owner);
     wait_file(&daemon.paths.barrier.join("revoked"), |b| !b.is_empty());
     release(&daemon.paths.barrier, "before-resize");
-    let mut observer = Rpc::connect(&daemon.paths.endpoint);
+    let mut observer = daemon.rpc();
     let fresh = controller(&mut observer, &stream); // worker passed the old job before this fence completes
     assert_eq!(rendered_screen(&mut observer, &stream), before);
     assert!(matches!(
@@ -4558,7 +4593,7 @@ fn rendered_resize_disconnect_refuses_without_mutation() {
 #[test]
 fn rendered_old_epoch_never_selects_respawned_session() {
     let daemon = Daemon::start(DaemonOpts { chunk: None });
-    let mut rpc = Rpc::connect(&daemon.paths.endpoint);
+    let mut rpc = daemon.rpc();
     let old = rendered_spawn(&mut rpc, "rendered-respawn");
     let lease = controller(&mut rpc, &old);
     let before = rendered_ready(&mut rpc, &old);
@@ -4633,7 +4668,7 @@ fn rendered_old_epoch_never_selects_respawned_session() {
 #[test]
 fn rendered_resize_held_past_deadline_refuses_without_mutation() {
     let daemon = Daemon::start(DaemonOpts { chunk: None });
-    let mut rpc = Rpc::connect(&daemon.paths.endpoint);
+    let mut rpc = daemon.rpc();
     let stream = rendered_spawn(&mut rpc, "resize-deadline");
     let lease = controller(&mut rpc, &stream);
     let before = rendered_ready(&mut rpc, &stream);
@@ -4664,7 +4699,7 @@ fn rendered_resize_held_past_deadline_refuses_without_mutation() {
 #[test]
 fn rendered_resize_queue_preserves_geometry_and_generation_order() {
     let daemon = Daemon::start(DaemonOpts { chunk: None });
-    let mut rpc = Rpc::connect(&daemon.paths.endpoint);
+    let mut rpc = daemon.rpc();
     let stream = rendered_spawn(&mut rpc, "resize-order");
     let lease = controller(&mut rpc, &stream);
     let before = rendered_ready(&mut rpc, &stream);
@@ -4722,7 +4757,7 @@ fn rendered_resize_queue_preserves_geometry_and_generation_order() {
 #[test]
 fn rendered_capture_and_resize_are_unsupported_without_unix_backend() {
     let daemon = Daemon::start(DaemonOpts { chunk: None });
-    let mut rpc = Rpc::connect(&daemon.paths.endpoint);
+    let mut rpc = daemon.rpc();
     let XResp::Capabilities { features, .. } = extended(&mut rpc, XReq::Capabilities) else {
         panic!("capabilities")
     };
@@ -4884,7 +4919,7 @@ fn rendered_tui_retains_early_state_after_eviction_with_unread_and_stalled_consu
 
     let daemon = Daemon::start(DaemonOpts { chunk: None });
     let root = tempfile::tempdir().unwrap();
-    let mut rpc = Rpc::connect(&daemon.paths.endpoint);
+    let mut rpc = daemon.rpc();
     let stream = rendered_fixture_spawn(&mut rpc, "rendered-tui", "rendered-tui", root.path());
     let lease = rpc.inner.claim_controller(stream.clone()).unwrap().lease;
     let initial_bytes = wait_rendered_fixture(&root.path().join("ready"));
@@ -4894,7 +4929,7 @@ fn rendered_tui_retains_early_state_after_eviction_with_unread_and_stalled_consu
 
     // One ticket stays unopened. A second consumer pins a record before its
     // first write, without depending on socket-buffer capacity or scheduling.
-    let mut unread = Rpc::connect(&daemon.paths.endpoint);
+    let mut unread = daemon.rpc();
     let unread_ticket = match extended(
         &mut unread,
         XReq::Observe {
@@ -5017,7 +5052,7 @@ fn rendered_tui_retains_early_state_after_eviction_with_unread_and_stalled_consu
 fn rendered_child_winsize_matches_ordered_resize_generation_and_output() {
     let daemon = Daemon::start(DaemonOpts { chunk: None });
     let root = tempfile::tempdir().unwrap();
-    let mut rpc = Rpc::connect(&daemon.paths.endpoint);
+    let mut rpc = daemon.rpc();
     let stream = rendered_fixture_spawn(
         &mut rpc,
         "rendered-resize-child",
@@ -5061,7 +5096,7 @@ fn rendered_child_winsize_matches_ordered_resize_generation_and_output() {
 #[test]
 fn unattended_pty_retention_survives_more_than_sixty_four_epochs() {
     let daemon = Daemon::start(DaemonOpts { chunk: None });
-    let mut rpc = Rpc::connect(&daemon.paths.endpoint);
+    let mut rpc = daemon.rpc();
     let baseline = rpc.inner.pty_retention_status().unwrap().unwrap();
     assert_eq!(baseline.projection_reserved_bytes, 0);
     let mut streams = Vec::new();
@@ -5190,8 +5225,8 @@ fn unattended_pty_retention_survives_more_than_sixty_four_epochs() {
 #[test]
 fn attached_completed_pty_reader_receives_session_fenced_notice_on_compaction() {
     let daemon = Daemon::start(DaemonOpts { chunk: None });
-    let mut rpc = Rpc::connect(&daemon.paths.endpoint);
-    let mut old_rpc = Rpc::connect(&daemon.paths.endpoint);
+    let mut rpc = daemon.rpc();
+    let mut old_rpc = daemon.rpc();
 
     let mut child = spec("fenced-reader", &["hold"]);
     child.kind = SpawnKind::Pty;
@@ -5314,9 +5349,9 @@ fn attached_completed_pty_reader_receives_session_fenced_notice_on_compaction() 
 #[test]
 fn pipes_survive_completed_pty_compaction_and_sixty_four_slot_pressure() {
     let daemon = Daemon::start(DaemonOpts { chunk: None });
-    let mut rel_rpc = Rpc::connect(&daemon.paths.endpoint);
-    let mut leg_rpc = Rpc::connect(&daemon.paths.endpoint);
-    let mut pty_rpc = Rpc::connect(&daemon.paths.endpoint);
+    let mut rel_rpc = daemon.rpc();
+    let mut leg_rpc = daemon.rpc();
+    let mut pty_rpc = daemon.rpc();
 
     // 1. Spawn a ReliablePipe and verify initial replay + partial Ack.
     let rel_stream = reliable_spawn(&mut rel_rpc, "keep-reliable", &["echo"]);
@@ -5482,7 +5517,7 @@ fn pipes_survive_completed_pty_compaction_and_sixty_four_slot_pressure() {
 #[test]
 fn hosted_owner_pty_and_reliable_pipe_auto_cleanup_after_leader_exit() {
     let daemon = Daemon::start(DaemonOpts { chunk: None });
-    let mut rpc = Rpc::connect(&daemon.paths.endpoint);
+    let mut rpc = daemon.rpc();
     let baseline = rpc.inner.pty_retention_status().unwrap().unwrap();
     assert_eq!(baseline.projection_reserved_bytes, 0);
 

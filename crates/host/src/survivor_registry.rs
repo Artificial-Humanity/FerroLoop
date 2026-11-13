@@ -10,7 +10,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[cfg(unix)]
@@ -410,6 +410,13 @@ fn unix_euid() -> u32 {
     unsafe { libc::geteuid() }
 }
 
+/// Publication temp name. The time component keeps a new daemon from
+/// colliding with a `.flh-` leftover of a killed daemon whose pid it reused:
+/// `CREATE_NEW`/`O_EXCL` would otherwise refuse with `EndpointStateDenied`.
+fn temp_name_text(pid: u32, seq: u64, nanos: u128) -> String {
+    format!(".flh-{pid}-{seq}-{nanos}")
+}
+
 #[cfg(unix)]
 fn temp_name() -> Result<std::ffi::CString, HostError> {
     let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
@@ -417,7 +424,7 @@ fn temp_name() -> Result<std::ffi::CString, HostError> {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    let name = format!(".flh-{}-{}-{}", std::process::id(), seq, nanos);
+    let name = temp_name_text(std::process::id(), seq, nanos);
     std::ffi::CString::new(name).map_err(|_| HostError::Protocol("temp name".into()))
 }
 
@@ -460,10 +467,14 @@ fn replace_atomic(path: &Path, bytes: &[u8], crash: Option<CrashPoint>) -> Resul
         lpSecurityDescriptor: raw_sd,
         bInheritHandle: 0,
     };
-    let temp = path.with_file_name(format!(
-        ".flh-{}-{}",
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let temp = path.with_file_name(temp_name_text(
         unsafe { GetCurrentProcessId() },
-        TEMP_SEQ.fetch_add(1, Ordering::Relaxed)
+        TEMP_SEQ.fetch_add(1, Ordering::Relaxed),
+        nanos,
     ));
     let temp_w = wide_os(temp.as_os_str());
     // SAFETY: CREATE_NEW refuses an existing name. The DACL is applied at creation and the
@@ -1037,6 +1048,19 @@ impl OwnedSid {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn registry_temp_names_survive_pid_reuse() {
+        // A daemon killed mid-publish leaves its `.flh-` temp in the shared
+        // host directory. A later daemon reusing that pid restarts the
+        // sequence at 1, so pid+seq alone would collide and `CREATE_NEW`
+        // would refuse the daemon's own publish with EndpointStateDenied.
+        assert_eq!(temp_name_text(4242, 1, 1_000), ".flh-4242-1-1000");
+        assert_ne!(
+            temp_name_text(4242, 1, 1_000),
+            temp_name_text(4242, 1, 2_000)
+        );
+    }
 
     #[test]
     fn temp_names_are_not_cleanup_authority() {

@@ -25,12 +25,17 @@ struct Rpc {
 }
 impl Rpc {
     fn connect(endpoint: &HostEndpoint) -> Self {
-        let deadline = Instant::now() + Duration::from_secs(5);
+        // Same daemon-start wait as host_ipc (#522): 15 s for loaded runners.
+        // This fixture inherits daemon stderr, so it is visible above on failure.
+        let deadline = Instant::now() + Duration::from_secs(15);
         loop {
-            if let Ok(client) = BlockingHostClient::connect(endpoint) {
-                return Self { client, next: 1 };
+            match BlockingHostClient::connect(endpoint) {
+                Ok(client) => return Self { client, next: 1 },
+                Err(err) => assert!(
+                    Instant::now() < deadline,
+                    "host did not become ready within 15s: {err}"
+                ),
             }
-            assert!(Instant::now() < deadline, "host did not become ready");
             thread::sleep(Duration::from_millis(5));
         }
     }

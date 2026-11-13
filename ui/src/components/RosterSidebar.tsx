@@ -3,6 +3,7 @@ import {
   resolveLivenessState,
   type AgentLivenessItem,
   type AgentRecord,
+  type AreaRecord,
   type DiscoveredSessionSummary,
   type SessionContextUsage,
   type SessionQuotaUsage,
@@ -11,6 +12,7 @@ import {
   type ProjectSummary,
   type WireMessage,
 } from "../types/api";
+import { AreaBadge, areaInfo, CoverageChips, extraAreaKeys } from "./AreaCoverage";
 import { roleLabel } from "../hooks/useRoles";
 import type { RoleRecord } from "../types/api";
 import { projectLabel } from "../hooks/useProjects";
@@ -337,6 +339,7 @@ export function hasTrailingIncompleteWork(turns: TranscriptTurn[]): boolean {
 export interface RosterSidebarProps {
   roles?: readonly RoleRecord[];
   agents: AgentRecord[];
+  areas?: readonly AreaRecord[];
   routes: DiscoveredSessionSummary[];
   sessions?: DiscoveredSessionSummary[];
   liveness: AgentLivenessItem[];
@@ -667,6 +670,7 @@ export const RosterSidebar: React.FC<RosterSidebarProps> = ({
   onTouchResizeStart,
   embedded = false,
   projects = [],
+  areas = [],
   showEmptyProjects = false,
   loading = false,
   signedOut = false,
@@ -917,6 +921,7 @@ export const RosterSidebar: React.FC<RosterSidebarProps> = ({
         record.name_key.toLowerCase().includes(query) ||
         record.display_name.toLowerCase().includes(query) ||
         record.project.toLowerCase().includes(query) ||
+        extraAreaKeys(record).some(area => area.toLowerCase().includes(query) || areaInfo(area, areas, projects).label.toLowerCase().includes(query)) ||
         record.role.toLowerCase().includes(query) ||
         formatRoleLabel(record.role, roles).toLowerCase().includes(query) ||
         (adapter && adapter.toLowerCase().includes(query))
@@ -935,15 +940,12 @@ export const RosterSidebar: React.FC<RosterSidebarProps> = ({
     const listOrder = new Map(Array.from(groups.keys()).map((k, i) => [k, i]));
 
     for (const item of filtered) {
-      const rawProj = (item.record.project || "Workspace").trim();
-      const lower = rawProj.toLowerCase();
-      const key = groups.has(lower) ? lower : (slugByName.get(lower) ?? lower);
-      const group = groups.get(key);
-      if (group) {
-        group.list.push(item);
-      } else {
-        // A project the list does not know still gets its own group.
-        groups.set(key, { label: rawProj, list: [item] });
+      for (const rawProj of [item.record.project || "Workspace", ...extraAreaKeys(item.record)]) {
+        const lower = rawProj.trim().toLowerCase();
+        const groupKey = groups.has(lower) ? lower : (slugByName.get(lower) ?? lower);
+        const group = groups.get(groupKey);
+        if (group) group.list.push(item);
+        else groups.set(groupKey, { label: areaInfo(rawProj, areas, projects).label, list: [item] });
       }
     }
 
@@ -983,6 +985,7 @@ export const RosterSidebar: React.FC<RosterSidebarProps> = ({
     projects,
     showEmptyProjects,
     roles,
+    areas,
   ]);
 
   const selectedKey = (selectedAgentName ?? "").trim().toLowerCase();
@@ -1288,6 +1291,7 @@ export const RosterSidebar: React.FC<RosterSidebarProps> = ({
                     >
                       {project}
                     </span>
+                    {areaInfo(project, areas, projects).virtual && <span className="fd-badge" style={{ borderStyle: "dashed" }}>virtual</span>}
                   </button>
 
                   <div style={{ display: "flex", alignItems: "center", gap: "4px", flexShrink: 0 }}>
@@ -1697,6 +1701,9 @@ export const RosterSidebar: React.FC<RosterSidebarProps> = ({
                               <span className="fd-badge" data-testid={`role-badge-${key}`}>
                                 {formatRoleLabel(record.role, roles)}
                               </span>
+                              {record.project.toLowerCase() !== project.toLowerCase() && areaInfo(record.project, areas, projects).label.toLowerCase() !== project.toLowerCase() && <span className="fd-badge">also covers</span>}
+                              <AreaBadge slug={record.project || "Workspace"} areas={areas} projects={projects} primary />
+                              <CoverageChips agent={record} areas={areas} projects={projects} />
                               {adapter && (
                                 <span
                                   data-testid={`adapter-pill-${key}`}

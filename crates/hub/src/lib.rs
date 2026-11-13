@@ -1530,6 +1530,47 @@ pub(crate) static SECRET_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(
 #[cfg(test)]
 pub(crate) static TMUX_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+// Libtest runs dependency code without propagating cfg(test). Turn on the
+// dependency's host guard before any test starts, even if this binary is renamed.
+// No production hub or other executable links this test-only constructor.
+#[cfg(all(
+    test,
+    not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_vendor = "apple",
+        windows
+    ))
+))]
+compile_error!("fl-hub tests require a pre-main host isolation constructor on this platform");
+
+#[cfg(all(
+    test,
+    any(
+        target_os = "linux",
+        target_os = "android",
+        target_vendor = "apple",
+        windows
+    )
+))]
+mod isolate_host_before_tests {
+    extern "C" fn enable() {
+        fl_host_proto::enable_hub_test_isolation();
+    }
+
+    #[used]
+    #[cfg_attr(
+        target_vendor = "apple",
+        unsafe(link_section = "__DATA,__mod_init_func")
+    )]
+    #[cfg_attr(
+        all(unix, not(target_vendor = "apple")),
+        unsafe(link_section = ".init_array")
+    )]
+    #[cfg_attr(windows, unsafe(link_section = ".CRT$XCU"))]
+    static INITIALIZE: extern "C" fn() = enable;
+}
+
 #[cfg(test)]
 mod attachment_policy_tests;
 
@@ -1547,6 +1588,78 @@ mod tests {
     use std::collections::BTreeMap;
     use std::fs;
     use tempfile::TempDir;
+
+    // Subprocesses exercise the real dependency configuration without mutating the
+    // environment shared by unrelated parallel tests.
+    #[cfg(unix)]
+    #[test]
+    fn hub_test_binary_allows_only_registered_host_fixtures() {
+        const CHILD: &str = "FL_HUB_TEST_ISOLATION_CHILD";
+        if let Ok(mode) = std::env::var(CHILD) {
+            if mode == "fixture" || mode == "symlink" {
+                let path = std::path::PathBuf::from(std::env::var_os("FL_HOST_SOCK").unwrap());
+                let guard = fl_host_proto::register_hub_test_host_fixture(&path).unwrap();
+                assert_eq!(
+                    fl_host_proto::HostEndpoint::discover().is_ok(),
+                    mode == "fixture"
+                );
+                drop(guard);
+                assert!(fl_host_proto::HostEndpoint::discover().is_err());
+            } else {
+                assert!(fl_host_proto::HostEndpoint::discover().is_err());
+            }
+            return;
+        }
+        let tmp = TempDir::new().unwrap();
+        let fixture = tmp.path().join("fixture.sock");
+        let symlink = tmp.path().join("escape.sock");
+        std::os::unix::fs::symlink("/run/user/1000/ferroloop/fl-host.sock", &symlink).unwrap();
+        let renamed_dir =
+            TempDir::new_in(std::env::current_exe().unwrap().parent().unwrap()).unwrap();
+        let renamed = renamed_dir.path().join("renamed-hub-test");
+        fs::hard_link(std::env::current_exe().unwrap(), &renamed).unwrap();
+        for mode in [
+            "implicit",
+            "renamed",
+            "live",
+            "unregistered",
+            "fixture",
+            "symlink",
+        ] {
+            let executable = if mode == "renamed" {
+                renamed.clone()
+            } else {
+                std::env::current_exe().unwrap()
+            };
+            let mut child = std::process::Command::new(executable);
+            child
+                .args([
+                    "--exact",
+                    "tests::hub_test_binary_allows_only_registered_host_fixtures",
+                ])
+                .env(CHILD, mode)
+                .env("TMPDIR", "/run/user/1000/ferroloop")
+                .env_remove("FL_HOST_SOCK");
+            match mode {
+                "live" => {
+                    child.env("FL_HOST_SOCK", "/run/user/1000/ferroloop/fl-host.sock");
+                }
+                "unregistered" | "fixture" => {
+                    child.env("FL_HOST_SOCK", &fixture);
+                }
+                "symlink" => {
+                    child.env("FL_HOST_SOCK", &symlink);
+                }
+                _ => {}
+            }
+            let output = child.output().unwrap();
+            assert!(
+                output.status.success(),
+                "{mode}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
 
     #[test]
     fn failed_queued_send_retains_prompt_in_original_order() {
@@ -3626,6 +3739,269 @@ mod tests {
                 .with_header("Authorization", "Bearer owner-tok-secret"),
         );
         assert_eq!(del_secret_resp.status, 200);
+    }
+
+    #[test]
+    fn queued_prompt_mutation_and_send_now_require_owner_or_queuing_peer() {
+        let _queued_delivery = crate::api::stub_queued_delivery_success();
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        let conv_id = "conv-ferris-1";
+        let logs_dir = tmp
+            .path()
+            .join(".gemini")
+            .join("antigravity-cli")
+            .join("brain")
+            .join(conv_id)
+            .join(".system_generated")
+            .join("logs");
+        fs::create_dir_all(&logs_dir).unwrap();
+        let turn0 = json!({
+            "step_index": 0,
+            "type": "USER_INPUT",
+            "content": "You will take the name of Ferris. Run cargo test.",
+            "created_at": "2026-10-27T16:00:00Z"
+        })
+        .to_string();
+        fs::write(logs_dir.join("transcript.jsonl"), format!("{turn0}\n")).unwrap();
+
+        fn queue_prompt(
+            state: &HubState,
+            token: &str,
+            agent: Option<&str>,
+            prompt: &str,
+        ) -> String {
+            let mut req = HttpRequest::new("POST", "/api/v1/sessions/ferris/prompt")
+                .with_header("Authorization", format!("Bearer {token}"))
+                .with_json_body(&json!({ "prompt": prompt, "send_now": false }));
+            if let Some(agent) = agent {
+                req = req.with_header("X-Fl-Agent", agent);
+            }
+            let resp = handle_http_request(state, &req);
+            assert_eq!(resp.status, 200, "queue resp: {:?}", resp.body);
+            let value = resp.json_value().unwrap();
+            assert_eq!(value["status"], "queued", "expected busy queue: {value}");
+            value["queued_prompt"]["id"].as_str().unwrap().to_string()
+        }
+        fn call(
+            state: &HubState,
+            method: &str,
+            path: String,
+            token: &str,
+            agent: Option<&str>,
+            body: Option<serde_json::Value>,
+        ) -> crate::api::HttpResponse {
+            let mut req = HttpRequest::new(method, path)
+                .with_header("Authorization", format!("Bearer {token}"));
+            if let Some(agent) = agent {
+                req = req.with_header("X-Fl-Agent", agent);
+            }
+            if let Some(body) = body {
+                req = req.with_json_body(&body);
+            }
+            handle_http_request(state, &req)
+        }
+        fn queued_prompt_text(state: &HubState, prompt_id: &str) -> Option<String> {
+            let resp = call(
+                state,
+                "GET",
+                "/api/v1/sessions/ferris/queue".to_string(),
+                "owner-tok-secret",
+                None,
+                None,
+            );
+            assert_eq!(resp.status, 200);
+            resp.json_value().unwrap()["queue"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|item| item["id"] == prompt_id)
+                .map(|item| item["prompt"].as_str().unwrap().to_string())
+        }
+
+        // Owner-queued item: a non-queuing peer is refused on every verb, changing nothing.
+        let owner_item = queue_prompt(&state, "owner-tok-secret", None, "Owner queued prompt");
+        let peer_patch = call(
+            &state,
+            "PATCH",
+            format!("/api/v1/sessions/ferris/queue/{owner_item}"),
+            "peer-tok-secret",
+            Some("mallory"),
+            Some(json!({ "prompt": "peer edit" })),
+        );
+        assert_eq!(peer_patch.status, 403, "peer PATCH owner item");
+        assert_eq!(
+            queued_prompt_text(&state, &owner_item).as_deref(),
+            Some("Owner queued prompt")
+        );
+        // Authorization precedes body validation: an unauthorized empty PATCH is 403, not 400.
+        let peer_empty_patch = call(
+            &state,
+            "PATCH",
+            format!("/api/v1/sessions/ferris/queue/{owner_item}"),
+            "peer-tok-secret",
+            Some("mallory"),
+            Some(json!({ "prompt": "" })),
+        );
+        assert_eq!(peer_empty_patch.status, 403, "peer empty PATCH owner item");
+        assert_eq!(
+            queued_prompt_text(&state, &owner_item).as_deref(),
+            Some("Owner queued prompt")
+        );
+        let peer_delete = call(
+            &state,
+            "DELETE",
+            format!("/api/v1/sessions/ferris/queue/{owner_item}"),
+            "peer-tok-secret",
+            Some("mallory"),
+            None,
+        );
+        assert_eq!(peer_delete.status, 403, "peer DELETE owner item");
+        assert!(queued_prompt_text(&state, &owner_item).is_some());
+        crate::api::reset_queued_delivery_calls();
+        let peer_send = call(
+            &state,
+            "POST",
+            format!("/api/v1/sessions/ferris/queue/{owner_item}/send-now"),
+            "peer-tok-secret",
+            Some("mallory"),
+            None,
+        );
+        assert_eq!(peer_send.status, 403, "peer send-now owner item");
+        assert_eq!(crate::api::queued_delivery_calls(), 0);
+        assert!(queued_prompt_text(&state, &owner_item).is_some());
+
+        // Owner PATCH and send-now still work on the owner's item.
+        let owner_patch = call(
+            &state,
+            "PATCH",
+            format!("/api/v1/sessions/ferris/queue/{owner_item}"),
+            "owner-tok-secret",
+            None,
+            Some(json!({ "prompt": "Owner queued prompt (edited)" })),
+        );
+        assert_eq!(
+            owner_patch.status, 200,
+            "owner PATCH: {:?}",
+            owner_patch.body
+        );
+        let owner_send = call(
+            &state,
+            "POST",
+            format!("/api/v1/sessions/ferris/queue/{owner_item}/send-now"),
+            "owner-tok-secret",
+            None,
+            None,
+        );
+        assert_eq!(
+            owner_send.status, 200,
+            "owner send-now: {:?}",
+            owner_send.body
+        );
+        assert!(queued_prompt_text(&state, &owner_item).is_none());
+
+        // Owner DELETE still works.
+        let owner_item2 = queue_prompt(&state, "owner-tok-secret", None, "Owner second prompt");
+        let owner_delete = call(
+            &state,
+            "DELETE",
+            format!("/api/v1/sessions/ferris/queue/{owner_item2}"),
+            "owner-tok-secret",
+            None,
+            None,
+        );
+        assert_eq!(owner_delete.status, 200);
+        assert!(queued_prompt_text(&state, &owner_item2).is_none());
+
+        // Peer-queued item: peers can queue; only that peer (and the owner) may act on it.
+        let peer_item = queue_prompt(
+            &state,
+            "peer-tok-secret",
+            Some("felicia"),
+            "Peer queued prompt",
+        );
+        let owner_patch_peer = call(
+            &state,
+            "PATCH",
+            format!("/api/v1/sessions/ferris/queue/{peer_item}"),
+            "owner-tok-secret",
+            None,
+            Some(json!({ "prompt": "Peer queued prompt (owner edit)" })),
+        );
+        assert_eq!(owner_patch_peer.status, 200, "owner PATCH peer item");
+        for (method, path, body) in [
+            (
+                "PATCH",
+                format!("/api/v1/sessions/ferris/queue/{peer_item}"),
+                Some(json!({ "prompt": "mallory edit" })),
+            ),
+            (
+                "DELETE",
+                format!("/api/v1/sessions/ferris/queue/{peer_item}"),
+                None,
+            ),
+            (
+                "POST",
+                format!("/api/v1/sessions/ferris/queue/{peer_item}/send-now"),
+                None,
+            ),
+        ] {
+            crate::api::reset_queued_delivery_calls();
+            let refused = call(
+                &state,
+                method,
+                path,
+                "peer-tok-secret",
+                Some("mallory"),
+                body,
+            );
+            assert_eq!(refused.status, 403, "non-queuing peer {method} peer item");
+            assert_eq!(crate::api::queued_delivery_calls(), 0);
+            assert_eq!(
+                queued_prompt_text(&state, &peer_item).as_deref(),
+                Some("Peer queued prompt (owner edit)")
+            );
+        }
+        let queuing_patch = call(
+            &state,
+            "PATCH",
+            format!("/api/v1/sessions/ferris/queue/{peer_item}"),
+            "peer-tok-secret",
+            Some("felicia"),
+            Some(json!({ "prompt": "Peer queued prompt (edited)" })),
+        );
+        assert_eq!(queuing_patch.status, 200, "queuing peer PATCH");
+        let queuing_send = call(
+            &state,
+            "POST",
+            format!("/api/v1/sessions/ferris/queue/{peer_item}/send-now"),
+            "peer-tok-secret",
+            Some("felicia"),
+            None,
+        );
+        assert_eq!(
+            queuing_send.status, 200,
+            "queuing peer send-now: {:?}",
+            queuing_send.body
+        );
+        assert!(queued_prompt_text(&state, &peer_item).is_none());
+
+        let peer_item2 = queue_prompt(
+            &state,
+            "peer-tok-secret",
+            Some("felicia"),
+            "Peer second prompt",
+        );
+        let queuing_delete = call(
+            &state,
+            "DELETE",
+            format!("/api/v1/sessions/ferris/queue/{peer_item2}"),
+            "peer-tok-secret",
+            Some("felicia"),
+            None,
+        );
+        assert_eq!(queuing_delete.status, 200, "queuing peer DELETE");
+        assert!(queued_prompt_text(&state, &peer_item2).is_none());
     }
 
     #[test]
@@ -6844,15 +7220,10 @@ mod tests {
             &json!({ "model": "gpt-6-sol" }),
         );
         assert_eq!(ok.status, 200, "{}", error_text(&ok));
-        assert_eq!(
-            state.session_model_override("ms-ada").unwrap().model,
-            "gpt-6-sol"
-        );
-        // The accepted `/model` command was typed into the route's own pane, exactly once.
-        let log = tmux.log();
-        assert_eq!(log.matches("paste-buffer").count(), 1, "{log}");
-        assert!(log.contains("paste-buffer -d -b"), "{log}");
-        assert!(log.contains("-t =muse:=ada"), "{log}");
+        assert!(state.session_model_override("ms-ada").is_none());
+        // Muse's route is deferred without a proven terminal-only switch.
+        assert_eq!(ok.json_value().unwrap()["live"]["status"], "deferred");
+        assert_eq!(tmux.log(), "");
     }
 
     #[test]
@@ -7113,12 +7484,11 @@ mod tests {
     }
 
     #[test]
-    fn model_endpoint_validates_overrides_the_summary_and_dispatches_the_command() {
+    fn model_endpoint_validates_and_defers_unproven_webhook_delivery() {
         let tmp = TempDir::new().unwrap();
         let state = test_hub_state(&tmp);
         let socket = tmp.path().join("felicia.sock");
         install_route(tmp.path(), "felicia", webhook_route(&socket));
-        let lines = collect_webhook_lines(socket, 2);
         let url = "/api/v1/sessions/felicia/model";
 
         let unauth = handle_http_request(
@@ -7173,17 +7543,17 @@ mod tests {
                 "vendor": "webhook",
                 "model": "claude-opus-5-5",
                 "thinking_level": "high",
-                "switched": true,
-                "method": "operator-prompt",
+                "switched": false,
+                "method": "override-only",
+                "persisted": false,
+                "record_id": null,
+                "restart_applies": false,
+                "live": {"status": "deferred", "mechanism": "override-only", "queued": false, "model_applied": false},
             })
         );
-        let frame = frames.try_recv().unwrap();
-        assert_eq!(
-            (frame.channel.as_str(), frame.event.as_str()),
-            ("sessions", "session.model_changed")
-        );
+        assert!(frames.try_recv().is_err(), "no change was applied or saved");
 
-        // The override shows in the session list.
+        // A deferred, recordless choice must not show as selected after a refresh.
         let listed = call(&state, "GET", "/api/v1/sessions", OWNER, &json!({}));
         let sessions = listed.json_value().unwrap()["sessions"]
             .as_array()
@@ -7193,8 +7563,9 @@ mod tests {
             .iter()
             .find(|s| s["id"] == "webhook-felicia")
             .unwrap();
-        assert_eq!(felicia["model"], "claude-opus-5-5");
-        assert_eq!(felicia["thinking_level"], "high");
+        assert_ne!(felicia["model"], "claude-opus-5-5");
+        assert_ne!(felicia["thinking_level"], "high");
+        assert!(state.session_model_override("webhook-felicia").is_none());
 
         // No thinking level is `null`, and the earlier level is not carried over. A Peer can
         // still read the list.
@@ -7210,20 +7581,405 @@ mod tests {
             .iter()
             .find(|s| s["id"] == "webhook-felicia")
             .unwrap();
-        assert_eq!(felicia["model"], "gpt-6-sol");
+        assert_ne!(felicia["model"], "gpt-6-sol");
+    }
 
-        // The CLI got `/model <id>` once per accepted call (the trimmed id, not the raw one).
-        let delivered = lines.join().unwrap();
-        let bodies: Vec<String> = delivered
+    #[test]
+    fn model_store_open_failure_has_no_override_or_delivery() {
+        let tmp = TempDir::new().unwrap();
+        let mut state = test_hub_state(&tmp);
+        install_route(
+            tmp.path(),
+            "ada",
+            webhook_route(&tmp.path().join("ada.sock")),
+        );
+        let bad_store = tmp.path().join("store-is-a-directory");
+        fs::create_dir_all(&bad_store).unwrap();
+        state.config.store_path = bad_store;
+        let result = call(
+            &state,
+            "POST",
+            "/api/v1/sessions/ada/model",
+            OWNER,
+            &json!({"model":"new"}),
+        );
+        assert_eq!(result.status, 500);
+        assert!(state.session_model_override("webhook-ada").is_none());
+        assert!(state.session_model_override("ada").is_none());
+    }
+
+    #[test]
+    fn model_write_failure_after_read_has_no_override_or_delivery() {
+        use fl_wire::identity::VendorRoute;
+        use std::os::unix::net::UnixListener;
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        assert_eq!(spin_up(&state, &spin_up_body("ada")).status, 200);
+        let socket = tmp.path().join("claude.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        install_route(
+            tmp.path(),
+            "ada",
+            VendorRoute::Claude {
+                pid: 0,
+                session_id: "cs-ada".into(),
+                socket_path: socket,
+                key_path: Some(tmp.path().join("missing")),
+            },
+        );
+        let mut events = state.subscribe();
+        let req = HttpRequest::new("POST", "/api/v1/sessions/ada/model")
+            .with_json_body(&json!({"model":"new"}));
+        let authority = auth::HubAuthority::Owner {
+            login: "owner".into(),
+        };
+        let response = crate::api::handle_post_session_model_with(
+            &state,
+            &authority,
+            "ada",
+            &req,
+            |store, keys, _, _, _| {
+                assert!(
+                    lifecycle::find_hosted_session(store, keys)
+                        .unwrap()
+                        .is_some()
+                );
+                Err(lifecycle::LifecycleError::Store(
+                    "injected write failure".into(),
+                ))
+            },
+            |_, _| panic!("must not dispatch after write failure"),
+        );
+        assert_eq!(response.status, 500);
+        assert!(error_text(&response).contains("injected write failure"));
+        assert!(state.session_model_override("ada").is_none());
+        assert!(state.session_model_override("cs-ada").is_none());
+        assert!(events.try_recv().is_err());
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        let list = call(&state, "GET", "/api/v1/hosted-sessions", OWNER, &json!({}));
+        assert!(list.json_value().unwrap()["sessions"][0]["model"].is_null());
+    }
+
+    #[test]
+    fn recordless_partial_model_delivery_does_not_claim_effort() {
+        use fl_wire::identity::VendorRoute;
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        install_route(
+            tmp.path(),
+            "ada",
+            VendorRoute::Claude {
+                pid: 0,
+                session_id: "cs-ada".into(),
+                socket_path: tmp.path().join("missing"),
+                key_path: Some(tmp.path().join("missing")),
+            },
+        );
+        let req = HttpRequest::new("POST", "/api/v1/sessions/ada/model")
+            .with_json_body(&json!({"model":"sonnet", "thinking_level":"high"}));
+        let authority = auth::HubAuthority::Owner {
+            login: "owner".into(),
+        };
+        let mut commands = Vec::new();
+        let response = crate::api::handle_post_session_model_with(
+            &state,
+            &authority,
+            "ada",
+            &req,
+            lifecycle::set_hosted_session_model,
+            |_, command| {
+                commands.push(command.to_string());
+                if commands.len() == 1 {
+                    Ok(())
+                } else {
+                    Err("composer_occupied_by_non_wire_input: without sending keys".into())
+                }
+            },
+        );
+        assert_eq!(response.status, 200);
+        let result = response.json_value().unwrap();
+        assert_eq!(result["persisted"], false);
+        assert_eq!(result["live"]["status"], "held");
+        assert_eq!(result["live"]["queued"], false);
+        assert_eq!(result["live"]["model_applied"], true);
+        assert_eq!(commands, ["/model sonnet", "/effort high"]);
+        let selected = state.session_model_override("cs-ada").unwrap();
+        assert_eq!(selected.model, "sonnet");
+        assert_eq!(selected.thinking_level, None);
+        let listed = call(&state, "GET", "/api/v1/sessions", OWNER, &json!({}));
+        let sessions = listed.json_value().unwrap()["sessions"]
+            .as_array()
+            .unwrap()
+            .clone();
+        let ada = sessions
             .iter()
-            .map(|l| {
-                serde_json::from_str::<Value>(l).unwrap()["body"]
-                    .as_str()
-                    .unwrap()
-                    .to_string()
-            })
-            .collect();
-        assert_eq!(bodies, vec!["/model claude-opus-5-5", "/model gpt-6-sol"]);
+            .find(|session| session["id"] == "cs-ada")
+            .unwrap();
+        assert_eq!(ada["model"], "sonnet");
+        assert_ne!(ada["thinking_level"], "high");
+    }
+
+    #[test]
+    fn model_switch_by_codex_thread_id_persists_against_persona_without_dispatch() {
+        use fl_wire::identity::VendorRoute;
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        let mut body = spin_up_body("ada");
+        body["vendor"] = json!("codex");
+        assert_eq!(spin_up(&state, &body).status, 200);
+        install_route(
+            tmp.path(),
+            "ada",
+            VendorRoute::Codex {
+                thread_id: "thread-uuid-1".into(),
+                cwd: None,
+            },
+        );
+        let resp = call(
+            &state,
+            "POST",
+            "/api/v1/sessions/thread-uuid-1/model",
+            OWNER,
+            &json!({"model": "gpt-6-sol", "thinking_level": "high"}),
+        );
+        assert_eq!(resp.status, 200, "{}", error_text(&resp));
+        let result = resp.json_value().unwrap();
+        assert_eq!(result["persisted"], true);
+        assert_eq!(result["record_id"], "codex:ada");
+        assert_eq!(result["restart_applies"], true);
+        assert_eq!(result["live"]["status"], "deferred");
+        let list = call(&state, "GET", "/api/v1/hosted-sessions", OWNER, &json!({}));
+        let rec = &list.json_value().unwrap()["sessions"][0];
+        assert_eq!(rec["model"], "gpt-6-sol");
+        assert_eq!(rec["thinking_level"], "high");
+    }
+
+    #[test]
+    fn model_route_vendor_cannot_write_another_vendors_hosted_record() {
+        use fl_wire::identity::VendorRoute;
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        let persona = "test-536-crossvendor";
+        assert_eq!(spin_up(&state, &spin_up_body(persona)).status, 200);
+        install_route(
+            tmp.path(),
+            persona,
+            VendorRoute::Codex {
+                thread_id: "6a145d3a-3bee-4e26-a77e-3aceb7cdbd8c".into(),
+                cwd: None,
+            },
+        );
+        let mut events = state.subscribe();
+        let resp = call(
+            &state,
+            "POST",
+            "/api/v1/sessions/6a145d3a-3bee-4e26-a77e-3aceb7cdbd8c/model",
+            OWNER,
+            &json!({"model":"gpt-6-sol", "thinking_level":"high"}),
+        );
+        assert_eq!(resp.status, 200, "{}", error_text(&resp));
+        let result = resp.json_value().unwrap();
+        assert_eq!(result["vendor"], "codex");
+        assert_eq!(result["persisted"], false);
+        assert_eq!(result["restart_applies"], false);
+        assert!(events.try_recv().is_err());
+        let list = call(&state, "GET", "/api/v1/hosted-sessions", OWNER, &json!({}));
+        assert!(list.json_value().unwrap()["sessions"][0]["model"].is_null());
+    }
+
+    #[test]
+    fn claude_host_cli_route_saves_to_claude_record_but_defers_delivery() {
+        use fl_wire::identity::VendorRoute;
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        let persona = "test-536-hostcli";
+        assert_eq!(spin_up(&state, &spin_up_body(persona)).status, 200);
+        install_route(
+            tmp.path(),
+            persona,
+            VendorRoute::HostCli {
+                vendor: "claude".into(),
+                session_id: "fixture-536-hostcli".into(),
+                cwd: None,
+                tmux_target: None,
+                tmux_pane: None,
+            },
+        );
+        let resp = call(
+            &state,
+            "POST",
+            &format!("/api/v1/sessions/{persona}/model"),
+            OWNER,
+            &json!({"model":"sonnet", "thinking_level":"high"}),
+        );
+        assert_eq!(resp.status, 200, "{}", error_text(&resp));
+        let result = resp.json_value().unwrap();
+        assert_eq!(result["vendor"], "claude");
+        assert_eq!(result["record_id"], format!("claude:{persona}"));
+        assert_eq!(result["persisted"], true);
+        assert_eq!(result["live"]["status"], "deferred");
+    }
+
+    #[test]
+    fn model_decommissioned_record_does_not_promise_restart() {
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        let persona = "test-536-decommissioned";
+        assert_eq!(spin_up(&state, &spin_up_body(persona)).status, 200);
+        let id = format!("claude:{persona}");
+        let teardown = call(
+            &state,
+            "POST",
+            &format!("/api/v1/sessions/{id}/decommission"),
+            OWNER,
+            &json!({"mode":"teardown"}),
+        );
+        assert_eq!(teardown.status, 200, "{}", error_text(&teardown));
+        let resp = call(
+            &state,
+            "POST",
+            &format!("/api/v1/sessions/{id}/model"),
+            OWNER,
+            &json!({"model":"sonnet"}),
+        );
+        assert_eq!(resp.status, 200, "{}", error_text(&resp));
+        assert_eq!(resp.json_value().unwrap()["restart_applies"], false);
+    }
+
+    #[test]
+    fn busy_claude_endpoint_holds_before_any_delivery() {
+        use fl_wire::identity::VendorRoute;
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        let persona = "test-536-busy";
+        let id = "933a9966-68e0-4be5-9816-a648c1924e26";
+        install_route(
+            tmp.path(),
+            persona,
+            VendorRoute::Claude {
+                pid: 0,
+                session_id: id.into(),
+                socket_path: tmp.path().join("missing.sock"),
+                key_path: Some(tmp.path().join("missing.key")),
+            },
+        );
+        state.mark_session_in_flight_from_turns(id, &[]);
+        let req = HttpRequest::new("POST", format!("/api/v1/sessions/{persona}/model"))
+            .with_json_body(&json!({"model":"sonnet"}));
+        let authority = auth::HubAuthority::Owner {
+            login: "owner".into(),
+        };
+        let result = crate::api::handle_post_session_model_with(
+            &state,
+            &authority,
+            persona,
+            &req,
+            lifecycle::set_hosted_session_model,
+            |_, _| panic!("busy endpoint sent a command"),
+        );
+        assert_eq!(result.json_value().unwrap()["live"]["status"], "held");
+    }
+
+    #[test]
+    fn busy_claude_record_holds_without_touching_host_or_terminal() {
+        use fl_wire::identity::VendorRoute;
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        let persona = "test-536-record-busy";
+        fs::write(
+            tmp.path().join("0.json"),
+            json!({"status":"busy"}).to_string(),
+        )
+        .unwrap();
+        // An empty native ID forbids host lookup even if the idle guard regresses;
+        // an explicit key without a pane likewise cannot fall back to a live terminal.
+        fs::write(tmp.path().join("missing.key"), "{}").unwrap();
+        install_route(
+            tmp.path(),
+            persona,
+            VendorRoute::Claude {
+                pid: 0,
+                session_id: String::new(),
+                socket_path: tmp.path().join("missing.sock"),
+                key_path: Some(tmp.path().join("missing.key")),
+            },
+        );
+        let result = call(
+            &state,
+            "POST",
+            &format!("/api/v1/sessions/{persona}/model"),
+            OWNER,
+            &json!({"model":"sonnet"}),
+        );
+        assert_eq!(result.status, 200);
+        assert_eq!(result.json_value().unwrap()["live"]["status"], "held");
+    }
+
+    #[test]
+    fn other_vendor_hosted_choices_never_promise_restart() {
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        for (vendor, persona) in [
+            ("antigravity", "test-536-agy"),
+            ("grok", "test-536-grok"),
+            ("muse", "test-536-muse"),
+        ] {
+            let mut body = spin_up_body(persona);
+            body["vendor"] = json!(vendor);
+            assert_eq!(spin_up(&state, &body).status, 200, "{vendor}");
+            let resp = call(
+                &state,
+                "POST",
+                &format!("/api/v1/sessions/{vendor}:{persona}/model"),
+                OWNER,
+                &json!({"model":"gemini-4-argon", "thinking_level":"high"}),
+            );
+            assert_eq!(resp.status, 200, "{vendor}: {}", error_text(&resp));
+            let result = resp.json_value().unwrap();
+            assert_eq!(result["persisted"], true, "{vendor}");
+            assert_eq!(result["restart_applies"], false, "{vendor}");
+        }
+    }
+
+    #[test]
+    fn model_save_survives_failed_claude_terminal_delivery() {
+        use fl_wire::identity::VendorRoute;
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        assert_eq!(spin_up(&state, &spin_up_body("ada")).status, 200);
+        install_route(
+            tmp.path(),
+            "ada",
+            VendorRoute::Claude {
+                pid: 0,
+                session_id: "cs-ada".into(),
+                socket_path: tmp.path().join("does-not-exist"),
+                key_path: Some(tmp.path().join("missing")),
+            },
+        );
+        let req = HttpRequest::new("POST", "/api/v1/sessions/ada/model")
+            .with_json_body(&json!({"model":"sonnet"}));
+        let authority = auth::HubAuthority::Owner {
+            login: "owner".into(),
+        };
+        let resp = crate::api::handle_post_session_model_with(
+            &state,
+            &authority,
+            "ada",
+            &req,
+            lifecycle::set_hosted_session_model,
+            |_, _| Err("fixture terminal delivery failure".into()),
+        );
+        assert_eq!(resp.status, 200, "{}", error_text(&resp));
+        let result = resp.json_value().unwrap();
+        assert_eq!(result["persisted"], true);
+        assert_eq!(result["live"]["status"], "failed");
+        let list = call(&state, "GET", "/api/v1/hosted-sessions", OWNER, &json!({}));
+        assert_eq!(list.json_value().unwrap()["sessions"][0]["model"], "sonnet");
     }
 
     fn set_model(state: &HubState, target: &str, model: &str) {
@@ -7256,15 +8012,10 @@ mod tests {
             webhook_route(&tmp.path().join("felicia.sock")),
         );
 
-        // `Felicia` is not the discovered persona, so the request matches no summary, but it
-        // does find the route. The override is keyed by the lowercased persona and still shows.
+        // A recordless deferred request must not create an override, even by persona.
         set_model(&state, "Felicia", "model-a");
-        assert_eq!(
-            state.session_model_override("felicia").unwrap().model,
-            "model-a"
-        );
-        assert!(state.session_model_override("Felicia").is_none());
-        assert_eq!(listed_model(&state, "webhook-felicia"), "model-a");
+        assert!(state.session_model_override("felicia").is_none());
+        assert_ne!(listed_model(&state, "webhook-felicia"), "model-a");
 
         // A hosted session with no route yet: the override waits under its persona, and shows
         // as soon as discovery lists the session.
@@ -7414,7 +8165,14 @@ mod tests {
         // No metadata record yet: Muse shows its default.
         assert_eq!(listed()["model"], "muse-wonder-full-1.0");
         let id = listed()["id"].as_str().unwrap().to_string();
+        // A recordless Muse change is deferred and does not create an override. Seed an
+        // existing override to test whether discovery treats default metadata as evidence.
         set_model(&state, &id, "muse-spark-1.3");
+        assert!(state.session_model_override(&id).is_none());
+        state.set_session_model_override(
+            &id,
+            session_actions::ModelOverride::new("muse-spark-1.3".into(), None),
+        );
         // The default is no report: the choice shows and stays.
         assert_eq!(listed()["model"], "muse-spark-1.3");
         assert!(state.session_model_override(&id).is_some());
@@ -7501,14 +8259,10 @@ mod tests {
             ("ada", "claude-sonnet-5-5", "low"),
             ("bea", "claude-haiku-4-5", "high"),
         ] {
-            let resp = call(
-                &state,
-                "POST",
-                &format!("/api/v1/sessions/{persona}/model"),
-                OWNER,
-                &json!({ "model": model, "thinking_level": effort }),
+            state.set_session_model_override(
+                &format!("cs-{persona}"),
+                session_actions::ModelOverride::new(model.into(), Some(effort.into())),
             );
-            assert_eq!(resp.status, 200, "{persona}: {}", error_text(&resp));
         }
         // The transcripts are newer than settings.json: each session's own report is the
         // baseline, and the choices show.
@@ -7554,9 +8308,12 @@ mod tests {
         // Clear: the override of the discovered session id goes.
         let socket = tmp.path().join("felicia.sock");
         install_route(tmp.path(), "felicia", webhook_route(&socket));
-        // The webhook takes `/model model-a`, then `/clear`.
-        let lines = collect_webhook_lines(socket, 2);
-        set_model(&state, "felicia", "model-a");
+        // Only `/clear` is dispatched to the webhook.
+        let lines = collect_webhook_lines(socket, 1);
+        state.set_session_model_override(
+            "webhook-felicia",
+            session_actions::ModelOverride::new("model-a".into(), None),
+        );
         assert!(state.session_model_override("webhook-felicia").is_some());
         let cleared = call(
             &state,
@@ -7632,11 +8389,10 @@ mod tests {
             assert_eq!(body["method"], "override-only", "{target}");
             assert_eq!(body["session_id"], session);
             assert_eq!(body["vendor"], vendor);
-            assert_eq!(body["switched"], true);
-            assert_eq!(
-                state.session_model_override(session).unwrap().model,
-                "gemini-4-argon"
-            );
+            assert_eq!(body["switched"], false);
+            assert_eq!(body["live"]["status"], "deferred");
+            assert_eq!(body["persisted"], false);
+            assert!(state.session_model_override(session).is_none());
         }
 
         // A hosted session with no live route: the record takes the model.
@@ -8775,12 +9531,14 @@ mod tests {
                 .remove_queued_prompt("codex-thread-fixture", &item.id)
                 .is_some()
         );
+        // The queuing peer's authenticated name (no `X-Fl-Agent` in this helper): only it
+        // or the Owner may send this item now, and as Ordinary intent, never steering.
         let (peer_item, _) = state.enqueue_session_prompt(
             "codex-thread-fixture",
             Some("freya".into()),
             "peer queued".into(),
             "peer queued".into(),
-            "owner".into(),
+            "peer".into(),
             vec![],
         );
         let peer_queued = call(

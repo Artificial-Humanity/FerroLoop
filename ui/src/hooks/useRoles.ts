@@ -11,6 +11,7 @@ export interface RoleOption {
  * Catalog labels remain authoritative whenever supplied by the hub. */
 const RUNTIME_ROLE_LABELS: Readonly<Record<string, string>> = {
   assistant: "Software Engineer",
+  director: "Project Director",
   lead: "Project Lead",
   "lab-manager": "Lab Manager",
   "ui-developer": "UI & Full-Stack Application Developer",

@@ -1,4 +1,4 @@
-import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import React from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import App from "../App";
@@ -283,6 +283,8 @@ describe("Track 1 FerroDeck+ Operator Controls UI (Records 47, 48, 44, 30)", () 
         thinking_level: "xhigh",
         switched: true,
         method: "slash_model",
+        persisted: true, record_id: "hosted-felix", restart_applies: true,
+        live: { status: "applied", mechanism: "slash_model" },
       });
 
       const { rerender } = render(
@@ -348,6 +350,188 @@ describe("Track 1 FerroDeck+ Operator Controls UI (Records 47, 48, 44, 30)", () 
       });
     });
 
+    it.each([
+      [true, "applied", true, /model: claude-sonnet-5-5/i, "claude-sonnet-5-5"],
+      [true, "deferred", true, /applies on next restart/i, "claude-sonnet-5-5"],
+      [true, "deferred", false, /saved.*deferred/i, "claude-sonnet-5-5"],
+      [true, "held", true, /saved.*held/i, "claude-sonnet-5-5"],
+      [true, "failed", true, /saved.*failed/i, "claude-sonnet-5-5"],
+      [false, "deferred", false, /not applied.*not saved/i, "claude-opus-5-5"],
+      [false, "failed", false, /not.*saved/i, "claude-opus-5-5"],
+    ])("reports callback result persisted=%s live=%s restart=%s", async (persisted, status, restartApplies, message, expectedModel) => {
+      const onSetSessionModel = vi.fn().mockResolvedValue({
+        session_id: "sess-ada-01", vendor: "claude", model: "claude-sonnet-5-5",
+        persisted, record_id: persisted ? "hosted-ada" : null,
+        live: { status, mechanism: "terminal_paste" }, restart_applies: restartApplies,
+      });
+      render(<ChatPane agentName="ada" adapter="claude" model="claude-opus-5-5"
+        thinkingLevel="high" sessionId="sess-ada-01" turns={[]} agentSettingsOpen
+        onSetSessionModel={onSetSessionModel} />);
+      const select = screen.getByTestId("session-model-select") as HTMLSelectElement;
+      fireEvent.change(select, { target: { value: "claude-sonnet-5-5" } });
+      await waitFor(() => expect(screen.getByTestId("compact-feedback")).toHaveTextContent(message));
+      expect(select.value).toBe(expectedModel);
+      if (!persisted || !restartApplies || status !== "deferred") {
+        expect(screen.getByTestId("compact-feedback")).not.toHaveTextContent(/applies on next restart/i);
+      }
+    });
+
+    it("reports an unsaved Codex choice as not applied", async () => {
+      const onSetSessionModel = vi.fn().mockResolvedValue({
+        persisted: false, record_id: null, restart_applies: false,
+        live: { status: "deferred", mechanism: "override-only", model_applied: false },
+      });
+      render(<ChatPane agentName="fixture-only" adapter="codex" model="gpt-6-sol"
+        sessionId="fixture-only-thread" turns={[]} agentSettingsOpen
+        onSetSessionModel={onSetSessionModel} />);
+      const select = screen.getByTestId("session-model-select") as HTMLSelectElement;
+      fireEvent.change(select, { target: { value: "gpt-6-astra" } });
+      await waitFor(() => expect(screen.getByTestId("compact-feedback")).toHaveTextContent(
+        "Model change was not applied; the choice was not saved.",
+      ));
+      expect(select.value).toBe("gpt-6-sol");
+      expect(screen.getByTestId("compact-feedback")).not.toHaveTextContent(/deferred|restart/i);
+    });
+
+    it.each([undefined, null, {}, { persisted: true }, { persisted: true, live: {} }, { persisted: true, live: { status: "unknown" } }])("restores the previous choice when outcome fields are missing (%s)", async (response) => {
+      const onSetSessionModel = vi.fn().mockResolvedValue(response);
+      render(<ChatPane agentName="ada" adapter="claude" model="claude-opus-5-5"
+        thinkingLevel="high" sessionId="sess-ada-01" turns={[]} agentSettingsOpen
+        onSetSessionModel={onSetSessionModel} />);
+      const select = screen.getByTestId("session-model-select") as HTMLSelectElement;
+      fireEvent.change(select, { target: { value: "claude-sonnet-5-5" } });
+      await waitFor(() => expect(screen.getByTestId("compact-feedback")).toHaveTextContent(/status unavailable/i));
+      expect(select.value).toBe("claude-opus-5-5");
+    });
+
+    it.each(["held", "failed"])("reports partial model delivery when the effort is %s", async (status) => {
+      const onSetSessionModel = vi.fn().mockResolvedValue({
+        persisted: false, record_id: null, restart_applies: false,
+        live: { status, mechanism: "terminal_paste", queued: false, model_applied: true },
+      });
+      render(<ChatPane agentName="ada" adapter="claude" model="claude-opus-5-5"
+        thinkingLevel="high" sessionId="sess-ada-01" turns={[]} agentSettingsOpen
+        onSetSessionModel={onSetSessionModel} />);
+      const model = screen.getByTestId("session-model-select") as HTMLSelectElement;
+      fireEvent.change(model, { target: { value: "claude-sonnet-5-5" } });
+      await waitFor(() => expect(screen.getByTestId("compact-feedback")).toHaveTextContent(/model.*applied.*effort/i));
+      expect(screen.getByTestId("compact-feedback")).toHaveTextContent(/not saved/i);
+      expect(model.value).toBe("claude-sonnet-5-5");
+    });
+
+    it("says a held live delivery was not queued and must be retried", async () => {
+      const onSetSessionModel = vi.fn().mockResolvedValue({
+        persisted: true, record_id: "hosted-ada", restart_applies: true,
+        live: { status: "held", mechanism: "terminal_paste", queued: false, model_applied: false },
+      });
+      render(<ChatPane agentName="ada" adapter="claude" model="claude-opus-5-5"
+        thinkingLevel="high" sessionId="sess-ada-01" turns={[]} agentSettingsOpen
+        onSetSessionModel={onSetSessionModel} />);
+      fireEvent.change(screen.getByTestId("session-model-select"), { target: { value: "claude-sonnet-5-5" } });
+      await waitFor(() => expect(screen.getByTestId("compact-feedback")).toHaveTextContent(/not queued.*retry/i));
+    });
+
+    it("restores the previous choice when persistence fails", async () => {
+      const onSetSessionModel = vi.fn().mockRejectedValue(new Error("Save failed"));
+      render(<ChatPane agentName="ada" adapter="claude" model="claude-opus-5-5"
+        thinkingLevel="high" sessionId="sess-ada-01" turns={[]} agentSettingsOpen
+        onSetSessionModel={onSetSessionModel} />);
+      const select = screen.getByTestId("session-model-select") as HTMLSelectElement;
+      fireEvent.change(select, { target: { value: "claude-sonnet-5-5" } });
+      await waitFor(() => expect(screen.getByTestId("model-switch-feedback")).toHaveTextContent("Save failed"));
+      expect(select.value).toBe("claude-opus-5-5");
+    });
+
+    it("uses the direct client response and keeps a saved choice when live delivery fails", async () => {
+      const setSessionModel = vi.fn().mockResolvedValue({
+        session_id: "sess-ada-01", vendor: "claude", model: "claude-sonnet-5-5",
+        persisted: true, record_id: "hosted-ada", restart_applies: true,
+        live: { status: "failed", mechanism: "terminal_paste" },
+      });
+      render(<ChatPane agentName="ada" adapter="claude" model="claude-opus-5-5"
+        thinkingLevel="high" sessionId="sess-ada-01" turns={[]} agentSettingsOpen
+        apiClient={{ setSessionModel, getToken: () => null, listSlashCommands: async () => ({ commands: [] }) } as unknown as HubApiClient} />);
+      const select = screen.getByTestId("session-model-select") as HTMLSelectElement;
+      fireEvent.change(select, { target: { value: "claude-sonnet-5-5" } });
+      await waitFor(() => expect(screen.getByTestId("compact-feedback")).toHaveTextContent(/saved.*failed/i));
+      expect(select.value).toBe("claude-sonnet-5-5");
+    });
+
+    it("replaces stale model feedback with the Antigravity thinking validation in the dialog", async () => {
+      const onSetSessionModel = vi.fn().mockResolvedValue({ persisted: true, record_id: "hosted-felix", restart_applies: true,
+        live: { status: "deferred", mechanism: "override", model_applied: false, queued: false } });
+      const props = { agentName: "felix", adapter: "antigravity", model: "gemini-4-argon", sessionId: "sess-felix", turns: [], agentSettingsOpen: true, onSetSessionModel };
+      const { rerender } = render(<ChatPane {...props} thinkingLevel="high" />);
+      fireEvent.change(screen.getByTestId("session-model-select"), { target: { value: "gemini-3.8-flash" } });
+      await waitFor(() => expect(screen.getByTestId("model-switch-feedback")).toHaveTextContent(/applies on next restart/i));
+      rerender(<ChatPane {...props} thinkingLevel={null} />);
+      await waitFor(() => expect((screen.getByTestId("session-thinking-select") as HTMLSelectElement).value).toBe(""));
+      fireEvent.change(screen.getByTestId("session-model-select"), { target: { value: "gemini-4-argon" } });
+      expect(screen.getByTestId("model-switch-feedback")).toHaveTextContent(/choose a thinking level/i);
+      expect(screen.getByTestId("model-switch-feedback")).not.toHaveTextContent(/restart/i);
+      expect(onSetSessionModel).toHaveBeenCalledTimes(1);
+    });
+
+    it("announces the model result inside the open settings dialog", async () => {
+      const onSetSessionModel = vi.fn().mockResolvedValue({ persisted: true, record_id: "hosted-ada", restart_applies: true,
+        live: { status: "deferred", mechanism: "override", model_applied: false, queued: false } });
+      render(<ChatPane agentName="ada" adapter="claude" model="claude-opus-5-5" thinkingLevel="high"
+        sessionId="sess-ada" turns={[]} agentSettingsOpen onSetSessionModel={onSetSessionModel} />);
+      fireEvent.change(screen.getByTestId("session-model-select"), { target: { value: "claude-sonnet-5-5" } });
+      const dialog = screen.getByTestId("agent-settings-modal");
+      await waitFor(() => expect(within(dialog).getByRole("status")).toHaveTextContent(/applies on next restart/i));
+    });
+
+    it.each(["resolve", "reject"])("ignores model request %s after changing agents", async (outcome) => {
+      let finish!: (value: unknown) => void;
+      let fail!: (error: Error) => void;
+      const pending = new Promise((resolve, reject) => { finish = resolve; fail = reject; });
+      const onSetSessionModel = vi.fn().mockReturnValue(pending);
+      const { rerender } = render(<ChatPane agentName="ada" adapter="claude" model="claude-opus-5-5"
+        thinkingLevel="high" sessionId="sess-ada" turns={[]} agentSettingsOpen onSetSessionModel={onSetSessionModel} />);
+      fireEvent.change(screen.getByTestId("session-model-select"), { target: { value: "claude-sonnet-5-5" } });
+      rerender(<ChatPane agentName="bob" adapter="claude" model="claude-haiku-4-5" thinkingLevel="low"
+        sessionId="sess-bob" turns={[]} agentSettingsOpen onSetSessionModel={onSetSessionModel} />);
+      await act(async () => { if (outcome === "reject") fail(new Error("old target error")); else finish({ persisted: false, live: { status: "failed" } }); });
+      expect((screen.getByTestId("session-model-select") as HTMLSelectElement).value).toBe("claude-haiku-4-5");
+      expect(screen.getByTestId("session-model-select")).not.toBeDisabled();
+      expect(screen.queryByText("old target error")).toBeNull();
+      expect(screen.queryByText(/choice was not saved/i)).toBeNull();
+    });
+
+    it("keeps the previous model after App refreshes an unpersisted and unapplied change", async () => {
+      let sessionReads = 0;
+      const fetchImpl = vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        const json = (body: unknown) => new Response(JSON.stringify(body), {
+          status: 200, headers: { "Content-Type": "application/json" },
+        });
+        if (url.endsWith("/api/v1/auth/session")) return json({ authenticated: true, authority: { tier: "owner", login: "test" } });
+        if (url.endsWith("/api/v1/agents")) return json({ agents: [{ name_key: "ferris", display_name: "Ferris", project: "FerroLoop", role: "lead" }], routes: [] });
+        if (url.endsWith("/model")) return json({ session_id: "sess-ferris-live", vendor: "claude", model: "claude-sonnet-5-5", persisted: false, record_id: null, restart_applies: false, live: { status: "held", mechanism: "terminal_paste", queued: false, model_applied: false } });
+        if (url.endsWith("/api/v1/sessions")) {
+          sessionReads++;
+          return json({ sessions: [{ id: "sess-ferris-live", persona: "ferris", adapter: "claude", model: "claude-opus-5-5", thinking_level: "high", status: "running" }] });
+        }
+        return json({});
+      });
+      const apiClient = new HubApiClient({ fetchImpl: fetchImpl as unknown as typeof fetch });
+      const wsClient = {
+        setToken: vi.fn(), connect: vi.fn(), disconnect: vi.fn(),
+        onStatusChange: () => () => {}, subscribe: () => () => {},
+      } as unknown as HubWsClient;
+      render(<App apiClient={apiClient} wsClient={wsClient} />);
+      fireEvent.click(await screen.findByTestId("agent-settings-btn-ferris"));
+      const select = await screen.findByTestId("session-model-select") as HTMLSelectElement;
+      await waitFor(() => expect(select.value).toBe("claude-opus-5-5"));
+      const readsBefore = sessionReads;
+      fireEvent.change(select, { target: { value: "claude-sonnet-5-5" } });
+      await waitFor(() => expect(screen.getByTestId("compact-feedback")).toHaveTextContent(/not saved.*held/i));
+      await waitFor(() => expect(sessionReads).toBeGreaterThan(readsBefore));
+      expect(select.value).toBe("claude-opus-5-5");
+      expect(screen.getByTestId("chat-active-model-badge")).toHaveTextContent("claude-opus-5-5");
+    });
+
     it("does not fabricate high thinking level when unknown: omits thinking_level on Claude model-only change and blocks Antigravity model-only change until a level is chosen (#351)", async () => {
       const onSetSessionModel = vi.fn().mockResolvedValue({
         session_id: "sess-ada-01",
@@ -355,6 +539,8 @@ describe("Track 1 FerroDeck+ Operator Controls UI (Records 47, 48, 44, 30)", () 
         model: "claude-sonnet-5-5",
         switched: true,
         method: "operator-prompt",
+        persisted: true, record_id: "hosted-ada", restart_applies: true,
+        live: { status: "applied", mechanism: "terminal_paste" },
       });
 
       const { rerender } = render(

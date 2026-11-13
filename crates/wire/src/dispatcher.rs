@@ -3006,8 +3006,11 @@ enum ComposerStyle {
     /// Vendor draws a rule-delimited composer (Claude, Muse, Antigravity): fail closed
     /// when `composer_region_lines` cannot locate it.
     Ruled,
-    /// Vendor draws no rules (Codex, Grok, HostCli codex/grok, unknown): keep the
-    /// pre-r2 behaviour; the compact extraction still applies.
+    /// Codex draws no rules: locate the composer by its `› ` prompt line above the
+    /// footer (`codex_composer_state`, #520) and fail closed when it cannot be located.
+    CodexPrompt,
+    /// Vendor draws no rules and has no prompt locator (Grok, HostCli grok, unknown):
+    /// keep the pre-r2 behaviour; the compact extraction still applies.
     Ruleless,
 }
 
@@ -3015,6 +3018,7 @@ impl ComposerStyle {
     fn for_vendor(vendor: &str) -> Self {
         match crate::identity::canonical_vendor_id(vendor) {
             "claude" | "muse" | "antigravity" => Self::Ruled,
+            "codex" => Self::CodexPrompt,
             _ => Self::Ruleless,
         }
     }
@@ -3028,6 +3032,9 @@ impl ComposerStyle {
             let v = crate::identity::canonical_vendor_id(token);
             if matches!(v, "claude" | "muse" | "antigravity") {
                 return Self::Ruled;
+            }
+            if v == "codex" {
+                return Self::CodexPrompt;
             }
         }
         Self::Ruleless
@@ -3142,10 +3149,11 @@ fn execute_verified_paste_delivery(
                     break;
                 }
                 if composer_is_rendering_target_prefix(&contents, &d_target)
-                    || !composer_has_unsubmitted_content_for_route(
+                    || !composer_has_unsubmitted_content_for_style(
                         &contents,
                         cursor,
                         spec.is_muse_route,
+                        spec.composer_style,
                     )
                 {
                     continue;
@@ -3558,11 +3566,27 @@ fn deliver_via_tmux_paste_with_opts(
     text: &str,
     opts: TmuxPasteOptions<'_>,
 ) -> Result<(), String> {
+    deliver_via_tmux_paste_with_resolved_host(target, text, opts, None)
+}
+
+fn deliver_via_tmux_paste_with_resolved_host(
+    target: &str,
+    text: &str,
+    opts: TmuxPasteOptions<'_>,
+    resolved: Option<(
+        fl_host_proto::BlockingHostClient,
+        fl_host_proto::StreamId,
+        bool,
+    )>,
+) -> Result<(), String> {
     let trimmed = text.trim();
     let raw_target = target;
-    if std::env::var_os("FL_WIRE_TMUX_BIN").is_none()
-        && let Some((client, stream, is_pty)) = resolve_live_host_session_with_mode(target)
-    {
+    if let Some((client, stream, is_pty)) = resolved.or_else(|| {
+        std::env::var_os("FL_WIRE_TMUX_BIN")
+            .is_none()
+            .then(|| resolve_live_host_session_with_mode(target))
+            .flatten()
+    }) {
         let client_cell = std::cell::RefCell::new(client);
         let grant = client_cell
             .borrow_mut()
@@ -3946,16 +3970,21 @@ fn prepare_clean_composer_before_paste_impl(
     let Some((contents1, cursor1)) = capture_rendered_only() else {
         return Ok(PrePasteOutcome::CleanProceedToPaste);
     };
-    if composer_style == ComposerStyle::Ruled
-        && !contents1.trim().is_empty()
-        && !composer_region_located(&contents1)
-    {
+    if !contents1.trim().is_empty() && !composer_located_for_style(&contents1, composer_style) {
+        if composer_style == ComposerStyle::CodexPrompt {
+            log_codex_unlocatable(&contents1);
+        }
         return Err(composer_occupied_by_non_wire_input_error());
     }
     if screen_has_dialog_or_menu_markers_with_context(&contents1, None, None, route_keys) {
         return Err(composer_occupied_by_non_wire_input_error());
     }
-    if !composer_has_unsubmitted_content_for_route(&contents1, cursor1, is_muse_route) {
+    if !composer_has_unsubmitted_content_for_style(
+        &contents1,
+        cursor1,
+        is_muse_route,
+        composer_style,
+    ) {
         clear_unconfirmed_wire_deliveries(route_keys);
         return Ok(PrePasteOutcome::CleanProceedToPaste);
     }
@@ -3978,16 +4007,21 @@ fn prepare_clean_composer_before_paste_impl(
              composer still holds earlier unsubmitted content (rendered capture unavailable)"
             .to_string());
     };
-    if composer_style == ComposerStyle::Ruled
-        && !contents2.trim().is_empty()
-        && !composer_region_located(&contents2)
-    {
+    if !contents2.trim().is_empty() && !composer_located_for_style(&contents2, composer_style) {
+        if composer_style == ComposerStyle::CodexPrompt {
+            log_codex_unlocatable(&contents2);
+        }
         return Err(composer_occupied_by_non_wire_input_error());
     }
     if screen_has_dialog_or_menu_markers_with_context(&contents2, None, None, route_keys) {
         return Err(composer_occupied_by_non_wire_input_error());
     }
-    if !composer_has_unsubmitted_content_for_route(&contents2, cursor2, is_muse_route) {
+    if !composer_has_unsubmitted_content_for_style(
+        &contents2,
+        cursor2,
+        is_muse_route,
+        composer_style,
+    ) {
         clear_unconfirmed_wire_deliveries(route_keys);
         return Ok(PrePasteOutcome::CleanProceedToPaste);
     }
@@ -4015,16 +4049,22 @@ fn prepare_clean_composer_before_paste_impl(
             let Some((contents, cursor)) = capture_rendered_only() else {
                 return RetryPollDecision::CaptureUnavailable;
             };
-            if composer_style == ComposerStyle::Ruled
-                && !contents.trim().is_empty()
-                && !composer_region_located(&contents)
+            if !contents.trim().is_empty() && !composer_located_for_style(&contents, composer_style)
             {
+                if composer_style == ComposerStyle::CodexPrompt {
+                    log_codex_unlocatable(&contents);
+                }
                 return RetryPollDecision::Abort(composer_occupied_after_pre_paste_flush_error());
             }
             if screen_has_dialog_or_menu_markers_with_context(&contents, None, None, route_keys) {
                 return RetryPollDecision::Abort(composer_occupied_after_pre_paste_flush_error());
             }
-            if composer_has_unsubmitted_content_for_route(&contents, cursor, is_muse_route) {
+            if composer_has_unsubmitted_content_for_style(
+                &contents,
+                cursor,
+                is_muse_route,
+                composer_style,
+            ) {
                 if !composer_equals_recorded_wire_deliveries(&contents, route_keys) {
                     return RetryPollDecision::Abort(
                         composer_occupied_after_pre_paste_flush_error(),
@@ -4847,6 +4887,38 @@ fn log_unlisted_muse_hint(candidate: &str) {
     eprintln!("fl-wire: warning: {line}");
 }
 
+fn codex_unlocatable_log_line(screen: &str) -> Option<String> {
+    if codex_composer_state(screen) != CodexComposerState::Unlocatable {
+        return None;
+    }
+    if screen_has_dialog_or_menu_markers_with_context(screen, None, None, &[]) {
+        return None;
+    }
+    let cleaned = normalize_terminal_screen(screen);
+    let lines: Vec<&str> = cleaned.lines().collect();
+    let footer_lines_seen = lines.iter().filter(|l| is_codex_footer_line(l)).count();
+    let has_prompt = lines
+        .iter()
+        .any(|l| l.trim_start().starts_with("› ") || l.trim_start() == "›");
+    let part = if has_prompt {
+        "footer not recognised"
+    } else {
+        "no prompt line"
+    };
+    Some(format!(
+        "codex composer could not be located: {part} (footer_lines_seen={footer_lines_seen})"
+    ))
+}
+
+fn log_codex_unlocatable(screen: &str) {
+    let Some(line) = codex_unlocatable_log_line(screen) else {
+        return;
+    };
+    #[cfg(test)]
+    CODEX_UNLOCATABLE_WARNINGS.with(|w| w.borrow_mut().push(line.clone()));
+    eprintln!("fl-wire: warning: {line}");
+}
+
 /// `true` when `raw_ansi` applies ANSI dim/faint/gray SGR styling (`\x1b[2m`, `\x1b[90m`,
 /// `\x1b[38;5;240..255m`, or muted `\x1b[38;2;...m`) to `ghost_text` at its last occurrence.
 fn ansi_stream_styles_ghost_text(raw_ansi: &str, ghost_text: &str) -> bool {
@@ -5005,6 +5077,89 @@ fn composer_region_located(screen: &str) -> bool {
     let cleaned = normalize_terminal_screen(screen);
     let lines: Vec<&str> = cleaned.lines().collect();
     composer_region_lines(&lines).is_some()
+}
+
+/// Ghost placeholder Codex prints in an empty composer (capture, 2026-11-13).
+const CODEX_GHOST_PLACEHOLDER: &str = "Ask Codex to do anything";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CodexComposerState {
+    Empty,
+    Occupied,
+    Unlocatable,
+}
+
+/// Footer lines in real Codex captures are two-space indented and carry a ` · `
+/// separator (model line and shortcuts line).
+fn is_codex_footer_line(line: &str) -> bool {
+    line.starts_with("  ") && line.contains('·')
+}
+
+/// Locate a ruleless Codex composer (#520): the last `› ` prompt line above the
+/// footer. Everything between the prompt line and the footer (continuation lines,
+/// slash-menu lines) is composer content; only the ghost placeholder is empty.
+/// No prompt line, or an unrecognisable footer, is `Unlocatable` (fail closed).
+fn codex_composer_state(screen: &str) -> CodexComposerState {
+    let cleaned = normalize_terminal_screen(screen);
+    let lines: Vec<&str> = cleaned.lines().collect();
+    let Some(prompt_idx) = lines
+        .iter()
+        .rposition(|l| l.trim_start().starts_with("› ") || l.trim_start() == "›")
+    else {
+        return CodexComposerState::Unlocatable;
+    };
+    let Some(last) = lines.iter().rposition(|l| !l.trim().is_empty()) else {
+        return CodexComposerState::Unlocatable;
+    };
+    if last <= prompt_idx {
+        return CodexComposerState::Unlocatable;
+    }
+    let mut footer_start = last;
+    while footer_start > 0 && !lines[footer_start - 1].trim().is_empty() {
+        footer_start -= 1;
+    }
+    if footer_start <= prompt_idx || !(footer_start..=last).all(|i| is_codex_footer_line(lines[i]))
+    {
+        return CodexComposerState::Unlocatable;
+    }
+    if lines[prompt_idx + 1..footer_start]
+        .iter()
+        .any(|l| !l.trim().is_empty())
+    {
+        return CodexComposerState::Occupied;
+    }
+    let first = strip_composer_prompt_prefix(lines[prompt_idx]).trim();
+    if first.is_empty() || first == CODEX_GHOST_PLACEHOLDER {
+        CodexComposerState::Empty
+    } else {
+        CodexComposerState::Occupied
+    }
+}
+
+fn composer_located_for_style(screen: &str, style: ComposerStyle) -> bool {
+    match style {
+        ComposerStyle::Ruled => composer_region_located(screen),
+        ComposerStyle::CodexPrompt => {
+            codex_composer_state(screen) != CodexComposerState::Unlocatable
+        }
+        ComposerStyle::Ruleless => true,
+    }
+}
+
+fn composer_has_unsubmitted_content_for_style(
+    screen: &str,
+    cursor: Option<CursorState>,
+    is_muse_route: bool,
+    style: ComposerStyle,
+) -> bool {
+    if style == ComposerStyle::CodexPrompt {
+        if composer_shows_pasted_placeholder(screen) {
+            return true;
+        }
+        // Unlocatable fails closed: treated as occupied so callers hold.
+        return codex_composer_state(screen) != CodexComposerState::Empty;
+    }
+    composer_has_unsubmitted_content_for_route(screen, cursor, is_muse_route)
 }
 
 fn composer_has_unsubmitted_content_for_route(
@@ -6076,16 +6231,13 @@ fn probe_composer_ready_from_screen(
     composer_style: ComposerStyle,
     is_muse_route: bool,
 ) -> Option<bool> {
-    if composer_style == ComposerStyle::Ruled
-        && !contents.trim().is_empty()
-        && !composer_region_located(contents)
-    {
+    if !contents.trim().is_empty() && !composer_located_for_style(contents, composer_style) {
         return None;
     }
     if screen_has_dialog_or_menu_markers_with_context(contents, None, None, route_keys) {
         return Some(false);
     }
-    if !composer_has_unsubmitted_content_for_route(contents, cursor, is_muse_route)
+    if !composer_has_unsubmitted_content_for_style(contents, cursor, is_muse_route, composer_style)
         || composer_equals_recorded_wire_deliveries(contents, route_keys)
     {
         Some(true)
@@ -6097,6 +6249,94 @@ fn probe_composer_ready_from_screen(
         }
         Some(false)
     }
+}
+
+// /proc is a Linux interface. On other platforms let the terminal locator verify the route.
+fn claude_pid_may_be_alive(pid: u32) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        pid == 0 || Path::new(&format!("/proc/{pid}")).exists()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pid;
+        true
+    }
+}
+
+/// A host lookup for Claude must be vendor-qualified. A bare persona otherwise also
+/// matches the same persona's Codex or other vendor session.
+pub(crate) fn claude_host_target(raw: &str) -> Option<String> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let raw = raw.strip_prefix("claude:").unwrap_or(raw);
+    let persona = if let Some((persona, vendor)) = raw.rsplit_once('.') {
+        if !vendor.eq_ignore_ascii_case("claude") {
+            return None;
+        }
+        persona
+    } else {
+        raw
+    };
+    if persona.is_empty() || persona.contains(':') || persona.contains('.') {
+        return None;
+    }
+    Some(format!("claude:{persona}"))
+}
+
+/// Deliver a Claude slash command to its terminal only. Never fall back to the peer socket.
+pub fn deliver_to_live_claude_pane(route: &VendorRoute, text: &str) -> Result<(), String> {
+    let VendorRoute::Claude {
+        pid,
+        session_id,
+        socket_path,
+        key_path,
+    } = route
+    else {
+        return Err("not a claude route".into());
+    };
+    if !claude_pid_may_be_alive(*pid) {
+        return Err(format!("claude pid {pid} is no longer running"));
+    }
+    let key = read_claude_key(*pid, socket_path, key_path.as_deref())
+        .ok()
+        .map(|(_, key)| key);
+    let record = read_claude_session_record(*pid, key_path.as_deref());
+    if !claude_session_idle(record.as_ref()) {
+        return Err("composer_occupied_by_non_wire_input: Claude session is not idle; holding delivery without sending keys".into());
+    }
+    let discovered = claude_live_pane(*pid, record.as_ref(), || key);
+    let opts = TmuxPasteOptions {
+        bracketed: true,
+        verify_submission: true,
+        session_id: Some(session_id.as_str()).filter(|s| !s.trim().is_empty()),
+        is_muse_route: false,
+        composer_style: ComposerStyle::Ruled,
+    };
+    // Tmux pane IDs are verified by process-tree discovery. A host target must be
+    // resolved as Claude and the exact stream carried through the paste itself.
+    if let Some(pane) = discovered.as_deref().filter(|pane| pane.starts_with('%')) {
+        return deliver_via_tmux_paste_with_opts(pane, &sanitize_for_paste(text), opts);
+    }
+    let target = claude_host_target(discovered.as_deref().unwrap_or(session_id))
+        .ok_or_else(|| "the claude route has no live terminal".to_string())?;
+    let resolved = resolve_live_host_session_with_mode(&target)
+        .filter(|(_, stream, _)| {
+            stream
+                .session
+                .as_str()
+                .rsplit_once('.')
+                .is_some_and(|(_, vendor)| vendor.eq_ignore_ascii_case("claude"))
+        })
+        .ok_or_else(|| "the claude route has no live terminal".to_string())?;
+    deliver_via_tmux_paste_with_resolved_host(
+        &target,
+        &sanitize_for_paste(text),
+        opts,
+        Some(resolved),
+    )
 }
 
 pub fn dispatch_operator_prompt_to_route(
@@ -6562,6 +6802,8 @@ fn dispatch_message_selected_with_status<S: MessageStore>(
 thread_local! {
     pub(crate) static UNLISTED_MUSE_HINT_WARNINGS: std::cell::RefCell<Vec<String>> =
         const { std::cell::RefCell::new(Vec::new()) };
+    pub(crate) static CODEX_UNLOCATABLE_WARNINGS: std::cell::RefCell<Vec<String>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// `FL_WIRE_TMUX_BIN` is process-global. Tests that point it at a fake tmux (or that rely on it
@@ -6579,6 +6821,164 @@ mod tests {
     use std::os::unix::net::UnixListener;
     use std::sync::Mutex;
     use tempfile::TempDir;
+
+    #[test]
+    fn claude_model_paste_pins_the_claude_stream_and_refuses_codex_only() {
+        use fl_host_proto::{
+            ChildRecord, ChildState, ControllerLease, ExtensionLimits, ExtensionRequest,
+            ExtensionResponse, HostConfig, HostEndpoint, HostInstance, HostListener, HostRequest,
+            HostResponse, InputState, RENDERED_PTY_FEATURE, RenderedScreen, SendOutcome,
+            SessionEpoch, SessionId, SessionMode, SessionSummary, SpawnKind, StreamId,
+        };
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::Arc;
+        let _lock = TMUX_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = TempDir::new().unwrap();
+        fs::set_permissions(tmp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let socket = tmp.path().join("fixture-host.sock");
+        let endpoint = HostEndpoint::unix(&socket).unwrap();
+        let make_summary = |name: &str| {
+            let session = SessionId::new(name).unwrap();
+            SessionSummary {
+                stream: StreamId {
+                    host: HostInstance::new([5; 16]),
+                    session: session.clone(),
+                    epoch: SessionEpoch(3),
+                },
+                mode: SessionMode::Pty,
+                input: InputState::Writable,
+                state: ChildState::Running(ChildRecord {
+                    session,
+                    session_epoch: SessionEpoch(3),
+                    kind: SpawnKind::Pty,
+                    pid: 42,
+                    input: InputState::Writable,
+                    started_at_ms: 0,
+                    exit: None,
+                    consumer_stalled: false,
+                }),
+                acked: 0,
+                latest: 0,
+            }
+        };
+        let codex = make_summary("fixture-536.codex");
+        let claude = make_summary("fixture-536.claude");
+        let claude_stream = claude.stream.clone();
+        let sessions = Arc::new(Mutex::new(vec![codex.clone(), claude]));
+        let writes = Arc::new(Mutex::new(Vec::<(StreamId, Vec<u8>)>::new()));
+        let claims = Arc::new(Mutex::new(Vec::<StreamId>::new()));
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let sessions_server = Arc::clone(&sessions);
+        let writes_server = Arc::clone(&writes);
+        let claims_server = Arc::clone(&claims);
+        let server = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async move {
+                let mut config = HostConfig::new(endpoint);
+                config.minor = 1;
+                let mut listener = HostListener::bind(config).await.unwrap();
+                ready_tx.send(()).unwrap();
+                loop {
+                    let mut conn = tokio::select! {
+                        _ = &mut stop_rx => break,
+                        conn = listener.accept() => conn.unwrap(),
+                    };
+                    let sessions = Arc::clone(&sessions_server);
+                    let writes = Arc::clone(&writes_server);
+                    let claims = Arc::clone(&claims_server);
+                    tokio::spawn(async move {
+                        while let Ok(HostRequest::Extended { id, request }) = conn.recv().await {
+                            let response = match request {
+                                ExtensionRequest::ListSessions => ExtensionResponse::Sessions {
+                                    records: sessions.lock().unwrap().clone(),
+                                },
+                                ExtensionRequest::Capabilities => ExtensionResponse::Capabilities {
+                                    host: HostInstance::new([5; 16]),
+                                    features: RENDERED_PTY_FEATURE,
+                                    limits: ExtensionLimits::default(),
+                                },
+                                ExtensionRequest::ClaimController { stream } => {
+                                    claims.lock().unwrap().push(stream);
+                                    ExtensionResponse::Controller {
+                                        lease: ControllerLease(7),
+                                        acked: 0,
+                                        latest: 0,
+                                    }
+                                }
+                                ExtensionRequest::CaptureRendered { stream } => {
+                                    ExtensionResponse::RenderedCapture {
+                                        screen: RenderedScreen {
+                                            schema: 1,
+                                            stream,
+                                            contents: String::new(),
+                                            cursor_row: 0,
+                                            cursor_col: 0,
+                                            rows: 24,
+                                            cols: 80,
+                                            generation: 1,
+                                            output_seq: 0,
+                                            output_bytes: 0,
+                                        },
+                                    }
+                                }
+                                ExtensionRequest::Write { stream, bytes, .. } => {
+                                    writes.lock().unwrap().push((stream, bytes.into_vec()));
+                                    ExtensionResponse::Input {
+                                        outcome: SendOutcome::Written,
+                                    }
+                                }
+                                ExtensionRequest::CaptureOutput { .. } => {
+                                    ExtensionResponse::CapturedOutput {
+                                        text: String::new(),
+                                    }
+                                }
+                                _ => break,
+                            };
+                            if conn
+                                .respond(&HostResponse::Extended { id, response })
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                    });
+                }
+            });
+        });
+        ready_rx.recv().unwrap();
+        let _no_tmux = EnvGuard::remove("FL_WIRE_TMUX_BIN");
+        let _sock = EnvGuard::set("FL_HOST_SOCK", &socket);
+        let key = tmp.path().join("fixture.key");
+        fs::write(&key, "{}").unwrap();
+        fs::write(tmp.path().join("0.json"), r#"{"status":"idle"}"#).unwrap();
+        let route = VendorRoute::Claude {
+            pid: 0,
+            session_id: "fixture-536".into(),
+            socket_path: tmp.path().join("unused.sock"),
+            key_path: Some(key),
+        };
+        deliver_to_live_claude_pane(&route, "/model sonnet").unwrap();
+        let actual = writes.lock().unwrap().clone();
+        assert!(actual.iter().all(|(stream, _)| stream == &claude_stream));
+        assert!(actual.iter().any(|(_, bytes)| {
+            bytes
+                .windows(b"/model sonnet".len())
+                .any(|w| w == b"/model sonnet")
+        }));
+        assert!(actual.iter().any(|(_, bytes)| bytes == b"\r"));
+        assert_eq!(*claims.lock().unwrap(), vec![claude_stream]);
+        *sessions.lock().unwrap() = vec![codex];
+        assert!(deliver_to_live_claude_pane(&route, "/model sonnet").is_err());
+        assert_eq!(writes.lock().unwrap().len(), actual.len());
+        assert_eq!(claims.lock().unwrap().len(), 1);
+        let _ = stop_tx.send(());
+        server.join().unwrap();
+    }
 
     /// Antigravity reset reads `FL_WIRE_AGY_BIN`, `ANTIGRAVITY_LS_ADDRESS`, and
     /// `ANTIGRAVITY_CSRF_TOKEN`. Tests that change those variables hold this lock
@@ -8154,6 +8554,37 @@ mod tests {
             socket_frames(&listener).is_none(),
             "the peer socket must receive nothing"
         );
+    }
+
+    #[test]
+    fn claude_model_pid_check_is_platform_appropriate() {
+        assert!(claude_pid_may_be_alive(0));
+        assert!(claude_pid_may_be_alive(std::process::id()));
+        #[cfg(target_os = "linux")]
+        assert!(!claude_pid_may_be_alive(u32::MAX));
+        #[cfg(not(target_os = "linux"))]
+        assert!(claude_pid_may_be_alive(u32::MAX));
+    }
+
+    #[test]
+    fn model_switch_claude_terminal_only_never_uses_peer_socket() {
+        let _tmux_lock = TMUX_ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let tmp = TempDir::new().unwrap();
+        let (tmux_bin, _tmux_out, tmux_stdin) = write_fake_tmux(tmp.path(), true);
+        let _env = EnvGuard::set("FL_WIRE_TMUX_BIN", &tmux_bin);
+        let (route, listener) = claude_route_with_mock_socket(tmp.path(), Some("Felicity:@12.%12"));
+        fs::write(tmp.path().join("0.json"), r#"{"status":"idle"}"#).unwrap();
+        deliver_to_live_claude_pane(&route, "/model sonnet").unwrap();
+        assert_eq!(
+            fs::read_to_string(tmux_stdin).unwrap().trim(),
+            "/model sonnet"
+        );
+        assert!(socket_frames(&listener).is_none());
+        drop(listener);
+        let _ = fs::remove_file(tmp.path().join("claude-tmux.sock"));
+        let (route, listener) = claude_route_with_mock_socket(tmp.path(), None);
+        assert!(deliver_to_live_claude_pane(&route, "/model sonnet").is_err());
+        assert!(socket_frames(&listener).is_none());
     }
 
     #[test]
@@ -18517,12 +18948,12 @@ exit 1"#,
 
     #[test]
     fn nb1_ruleless_vendors_proceed_and_ruled_vendors_fail_closed() {
-        let codex_idle = "› Ask Codex to do anything\n  footer one\n  footer two";
+        let codex_idle = "› Ask Codex to do anything\n\n  GPT-6.1-Sol medium · ~/x\n  ← for agents · ? for shortcuts";
         // Idle Codex: pre-paste proceeds (ruleless), through the verified-delivery path
         // `host_write_text_then_enter` builds (style derived from the host session id).
         assert_eq!(
             ComposerStyle::for_host_session("Fiona.codex"),
-            ComposerStyle::Ruleless
+            ComposerStyle::CodexPrompt
         );
         assert_eq!(
             ComposerStyle::for_host_session("Ada.claude"),
@@ -18556,7 +18987,7 @@ exit 1"#,
         // Same screen with typed text after `›`: today (and kept) it also proceeds clean —
         // `composer_has_unsubmitted_content_for_route` returns false with no located region,
         // so the paste appends after the typed text. Asserted to keep that behaviour visible.
-        let codex_typed = "› fix the failing test\n  footer one\n  footer two";
+        let codex_typed = "› fix the failing test\n\n  GPT-6.1-Sol medium · ~/x";
         let out = prepare_clean_composer_before_paste_impl(
             "hello codex",
             &[],
@@ -18637,6 +19068,183 @@ exit 1"#,
         )
         .expect_err("dialog screen must fail closed on ruled vendor");
         assert!(is_composer_occupied_zero_keys_error(&err), "got: {err}");
+    }
+
+    // Fixtures below are trimmed from real captures (2026-11-13): idle from
+    // `tmux capture-pane -p` of a running Codex screen shape, typed/slash/multi-line
+    // from a throwaway `codex` tmux session under scratch/ferroloop/520-captures/
+    // launched with `env -u AGENT_PERSONA -u AGENT_NAME -u FL_HOSTED_ID
+    // -u AGENT_HYDRATION_GENERATION`. Footer: model line + shortcuts line.
+    #[test]
+    fn codex_prompt_locator_holds_drafts_and_fails_closed() {
+        let footer = "  GPT-6.1-Sol medium · ~/Projects/x\n  ← for agents · ? for shortcuts";
+        let idle = format!("› Ask Codex to do anything\n\n{footer}");
+        let typed = format!("› fix the failing test please\n\n{footer}");
+        let slash = format!(
+            "› /model         choose what model and reasoning effort to use\n  /fast          2x speed, increased usage\n\n› /\n\n{footer}"
+        );
+        let multiline = format!("› line one of draft\n  line two of draft\n\n{footer}");
+        let no_prompt = format!("some output without a composer\n\n{footer}");
+        let dialog = "Do you want to proceed?\n  1. Yes\n  2. No".to_string();
+        assert_eq!(codex_composer_state(&idle), CodexComposerState::Empty);
+        assert_eq!(codex_composer_state(&typed), CodexComposerState::Occupied);
+        assert_eq!(codex_composer_state(&slash), CodexComposerState::Occupied);
+        assert_eq!(
+            codex_composer_state(&multiline),
+            CodexComposerState::Occupied
+        );
+        assert_eq!(
+            codex_composer_state(&no_prompt),
+            CodexComposerState::Unlocatable
+        );
+        assert_eq!(
+            codex_composer_state(&dialog),
+            CodexComposerState::Unlocatable
+        );
+        // Grok/Ruleless keep the old behaviour on the same typed screen.
+        assert!(!composer_has_unsubmitted_content_for_style(
+            &typed,
+            None,
+            false,
+            ComposerStyle::Ruleless
+        ));
+        for (screen, ready) in [
+            (&idle, Some(true)),
+            (&typed, Some(false)),
+            (&slash, Some(false)),
+            (&multiline, Some(false)),
+            (&no_prompt, None),
+            (&dialog, None),
+        ] {
+            assert_eq!(
+                probe_composer_ready_from_screen(
+                    screen,
+                    None,
+                    &[],
+                    ComposerStyle::CodexPrompt,
+                    false
+                ),
+                ready,
+                "probe for {screen:?}"
+            );
+        }
+        // Idle proceeds; every occupied/unlocatable screen holds with zero keys.
+        let mut enters = 0u32;
+        let out = prepare_clean_composer_before_paste_impl(
+            "hello codex",
+            &[],
+            false,
+            ComposerStyle::CodexPrompt,
+            |_| {},
+            || Some((idle.clone(), None)),
+            || false,
+            || {
+                enters += 1;
+                Ok(())
+            },
+        )
+        .expect("idle Codex placeholder must proceed");
+        assert_eq!(out, PrePasteOutcome::CleanProceedToPaste);
+        assert_eq!(enters, 0);
+        for screen in [&typed, &slash, &multiline, &no_prompt, &dialog] {
+            let mut e = 0u32;
+            let err = prepare_clean_composer_before_paste_impl(
+                "hello codex",
+                &[],
+                false,
+                ComposerStyle::CodexPrompt,
+                |_| {},
+                || Some((screen.clone(), None)),
+                || false,
+                || {
+                    e += 1;
+                    Ok(())
+                },
+            )
+            .expect_err("occupied/unlocatable Codex composer must hold");
+            assert!(is_composer_occupied_zero_keys_error(&err), "got: {err}");
+            assert_eq!(e, 0);
+        }
+    }
+
+    #[test]
+    fn codex_unlocatable_logs_distinct_line_only_on_unlocatable_refusal() {
+        let footer = "  GPT-6.1-Sol medium · ~/Projects/x\n  ← for agents · ? for shortcuts";
+        let idle = format!("› Ask Codex to do anything\n\n{footer}");
+        let typed = format!("› fix the failing test please\n\n{footer}");
+        let dialog = "Do you want to proceed?\n  1. Yes\n  2. No".to_string();
+        let no_prompt = format!("some output without a composer\n\n{footer}");
+        let unrecognised_footer = "› Ask Codex to do anything\n\n  GPT-6.1-Sol medium ~/Projects/x\n  left for agents ? for shortcuts".to_string();
+        assert_eq!(
+            codex_composer_state(&unrecognised_footer),
+            CodexComposerState::Unlocatable
+        );
+        // Pure helper: reason + footer count, no screen text.
+        let no_prompt_line = codex_unlocatable_log_line(&no_prompt).expect("no_prompt line");
+        assert!(
+            no_prompt_line.contains("codex composer could not be located"),
+            "{no_prompt_line}"
+        );
+        assert!(
+            no_prompt_line.contains("no prompt line"),
+            "{no_prompt_line}"
+        );
+        assert!(
+            no_prompt_line.contains("footer_lines_seen=2"),
+            "{no_prompt_line}"
+        );
+        assert!(!no_prompt_line.contains("some output"), "{no_prompt_line}");
+        let footer_line = codex_unlocatable_log_line(&unrecognised_footer).expect("footer line");
+        assert!(
+            footer_line.contains("footer not recognised"),
+            "{footer_line}"
+        );
+        assert!(footer_line.contains("footer_lines_seen=0"), "{footer_line}");
+        assert!(!footer_line.contains("GPT-6.1"), "{footer_line}");
+        for screen in [&idle, &typed, &dialog] {
+            assert_eq!(codex_unlocatable_log_line(screen), None, "{screen:?}");
+        }
+        // Refusal path calls it exactly once per refusal.
+        for (screen, needle) in [
+            (&no_prompt, "no prompt line"),
+            (&unrecognised_footer, "footer not recognised"),
+        ] {
+            CODEX_UNLOCATABLE_WARNINGS.with(|w| w.borrow_mut().clear());
+            let err = prepare_clean_composer_before_paste_impl(
+                "hello codex",
+                &[],
+                false,
+                ComposerStyle::CodexPrompt,
+                |_| {},
+                || Some((screen.clone(), None)),
+                || false,
+                || Ok(()),
+            )
+            .expect_err("unlocatable Codex composer must hold");
+            assert!(is_composer_occupied_zero_keys_error(&err), "got: {err}");
+            let warnings =
+                CODEX_UNLOCATABLE_WARNINGS.with(|w| std::mem::take(&mut *w.borrow_mut()));
+            assert_eq!(warnings.len(), 1, "warnings: {warnings:?}");
+            assert!(warnings[0].contains(needle), "{warnings:?}");
+            assert!(!warnings[0].contains("GPT-6.1"), "{warnings:?}");
+        }
+        for screen in [&idle, &typed, &dialog] {
+            CODEX_UNLOCATABLE_WARNINGS.with(|w| w.borrow_mut().clear());
+            let _ = prepare_clean_composer_before_paste_impl(
+                "hello codex",
+                &[],
+                false,
+                ComposerStyle::CodexPrompt,
+                |_| {},
+                || Some((screen.clone(), None)),
+                || false,
+                || Ok(()),
+            );
+            assert!(
+                CODEX_UNLOCATABLE_WARNINGS.with(|w| w.borrow().is_empty()),
+                "no line for {screen:?}"
+            );
+        }
     }
 
     #[test]

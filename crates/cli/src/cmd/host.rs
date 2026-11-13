@@ -246,12 +246,22 @@ fn load_registry_agents(db: Option<&Path>) -> Result<Vec<fl_core::AgentRecord>> 
         Some(p) => Some(p),
         None => {
             let default = crate::default_state_store_path().ok();
-            match crate::config::load(crate::config::path().as_deref()) {
+            let config_path = crate::config::path();
+            match crate::config::load(config_path.as_deref()) {
                 Ok(cfg) => match default {
                     Some(d) => Some(cfg.workspace_state_store(&d)),
                     None => cfg.state.as_ref().and_then(|s| s.store.clone()),
                 },
-                Err(_) => default,
+                Err(error) => {
+                    eprintln!(
+                        "warning: failed to load {}: {error:#}; using default store",
+                        config_path.as_deref().map_or_else(
+                            || "<unavailable config path>".into(),
+                            |p| p.display().to_string()
+                        )
+                    );
+                    default
+                }
             }
         }
     };

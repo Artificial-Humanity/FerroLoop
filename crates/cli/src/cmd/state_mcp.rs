@@ -1769,6 +1769,7 @@ mod tests {
             store: store.to_path_buf(),
             tracker: None,
             state: None,
+            cwd: None,
         }
     }
 

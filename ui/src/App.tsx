@@ -86,6 +86,7 @@ import {
   normalizeHydrationWarnings,
   type AgentLivenessItem,
   type AgentRecord,
+  type AreaRecord,
   type AuthSessionResponse,
   type ArchitectureResponse,
   type BulkSessionAction,
@@ -1196,6 +1197,7 @@ export const App: React.FC<AppProps> = ({
 
   // Data State
   const [agents, setAgents] = useState<AgentRecord[]>([]);
+  const [areas, setAreas] = useState<AreaRecord[]>([]);
   const [routes, setRoutes] = useState<DiscoveredSessionSummary[]>([]);
   const [liveness, setLiveness] = useState<AgentLivenessItem[]>([]);
   const [sessions, setSessions] = useState<DiscoveredSessionSummary[]>([]);
@@ -1641,6 +1643,7 @@ export const App: React.FC<AppProps> = ({
       ]);
       if (!mountedRef.current || loggedOutRef.current) return;
       if (agentsRes) {
+        if (Array.isArray(agentsRes.areas)) setAreas(agentsRes.areas);
         if (Array.isArray(agentsRes.agents)) {
           setAgents(agentsRes.agents);
         }
@@ -1668,6 +1671,7 @@ export const App: React.FC<AppProps> = ({
       ]);
       if (!mountedRef.current || loggedOutRef.current) return;
       if (agentsRes) {
+        if (Array.isArray(agentsRes.areas)) setAreas(agentsRes.areas);
         if (Array.isArray(agentsRes.agents)) {
           setAgents(agentsRes.agents);
         }
@@ -1888,6 +1892,7 @@ export const App: React.FC<AppProps> = ({
         setAuthRequired(true);
         setPairingOpen(true);
         setAgents([]);
+        setAreas([]);
         setRoutes([]);
         setLiveness([]);
         setSessions([]);
@@ -1902,6 +1907,7 @@ export const App: React.FC<AppProps> = ({
       }
 
       if (agentsRes) {
+        if (Array.isArray(agentsRes.areas)) setAreas(agentsRes.areas);
         if (Array.isArray(agentsRes.agents)) {
           setAgents(agentsRes.agents);
         }
@@ -2721,6 +2727,7 @@ export const App: React.FC<AppProps> = ({
     setSessionContextUsage(null);
     setSessionQuotaUsage(null);
     setAgents([]);
+    setAreas([]);
     setSessions([]);
     setRoutes([]);
     setLiveness([]);
@@ -3068,33 +3075,41 @@ export const App: React.FC<AppProps> = ({
     const updatedModel = res.model || model;
     const updatedThinking =
       res.thinking_level !== undefined ? res.thinking_level : thinkingLevel;
-    setSessions((prev) =>
-      prev.map((sess) =>
-        matchesTarget(sess)
-          ? {
-              ...sess,
-              model: updatedModel,
-              ...(updatedThinking !== undefined
-                ? { thinking_level: updatedThinking }
-                : {}),
-            }
-          : sess,
-      ),
-    );
-    setRoutes((prev) =>
-      prev.map((sess) =>
-        matchesTarget(sess)
-          ? {
-              ...sess,
-              model: updatedModel,
-              ...(updatedThinking !== undefined
-                ? { thinking_level: updatedThinking }
-                : {}),
-            }
-          : sess,
-      ),
-    );
-    await refreshSessionsAndTranscript(targetId);
+    const updateThinking = res.persisted || res.live?.status === "applied";
+    if (updateThinking || res.live?.model_applied) {
+      setSessions((prev) =>
+        prev.map((sess) =>
+          matchesTarget(sess)
+            ? {
+                ...sess,
+                model: updatedModel,
+                ...(updateThinking && updatedThinking !== undefined
+                  ? { thinking_level: updatedThinking }
+                  : {}),
+              }
+            : sess,
+        ),
+      );
+      setRoutes((prev) =>
+        prev.map((sess) =>
+          matchesTarget(sess)
+            ? {
+                ...sess,
+                model: updatedModel,
+                ...(updateThinking && updatedThinking !== undefined
+                  ? { thinking_level: updatedThinking }
+                  : {}),
+              }
+            : sess,
+        ),
+      );
+    }
+    // A refresh failure cannot undo the already-saved model choice.
+    try {
+      await refreshSessionsAndTranscript(targetId);
+    } catch {
+      // The next normal refresh will reconcile the session view.
+    }
     return res;
   };
 
@@ -3670,6 +3685,8 @@ export const App: React.FC<AppProps> = ({
       agentDisplayName={selectedAgent?.display_name ?? null}
       agentRole={selectedAgent?.role ?? null}
       agentProject={selectedAgent?.project || null}
+      agentExtraAreas={selectedAgent?.extra_areas}
+      areas={areas}
       adapter={activeAdapter}
       model={activeModel}
       thinkingLevel={activeSession?.thinking_level ?? null}
@@ -3746,6 +3763,7 @@ export const App: React.FC<AppProps> = ({
     <RosterSidebar
           roles={rosterRoles}
       projects={projects}
+      areas={areas}
       showEmptyProjects={projectsFromHub}
       loading={loading}
       signedOut={!authority && (pairingOpen || authRequired)}
@@ -4066,6 +4084,7 @@ export const App: React.FC<AppProps> = ({
         initialProjectSubTab={settingsInitialProjectSubTab}
         initialAgentsSubTab={settingsInitialAgentsSubTab}
         agents={agents}
+        areas={areas}
         authority={authority}
         wsConnected={wsConnected}
         onlineNodesCount={onlineNodesCount}

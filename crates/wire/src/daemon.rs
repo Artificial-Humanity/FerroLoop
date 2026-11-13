@@ -8636,6 +8636,21 @@ mod tests {
      {
         let tmp = TempDir::new().unwrap();
         let store = Arc::new(RedbStore::open(&tmp.path().join("queue.redb")).unwrap());
+        // Delivery can reach the webhook before the daemon removes the durable marker.
+        // Wait for the actual store condition instead of racing the dispatch worker.
+        let wait_for_marker_clear = || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                if store.list_wire_awaiting_daemon().unwrap().is_empty() {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "daemon did not clear awaiting markers"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        };
         let sock = tmp.path().join("daemon.sock");
         let routes_file = tmp.path().join("routes.json");
         RouteTable::default().save(Some(&routes_file)).unwrap();
@@ -8763,7 +8778,7 @@ mod tests {
             }
         }
         assert_eq!(received_subjects, vec!["queued-pre".to_string()]);
-        assert!(store.list_wire_awaiting_daemon().unwrap().is_empty());
+        wait_for_marker_clear();
         let amb_rcpts = store.list_wire_receipts(&ambiguous_msg.id).unwrap();
         assert_eq!(amb_rcpts[0].status, DeliveryStatus::Pending);
         assert_eq!(amb_rcpts[0].attempts, 0);
@@ -8806,7 +8821,7 @@ mod tests {
             received_subjects,
             vec!["queued-pre".to_string(), "queued-live".to_string()]
         );
-        assert!(store.list_wire_awaiting_daemon().unwrap().is_empty());
+        wait_for_marker_clear();
         handle.stop();
 
         // 4. Crash/restart between store write and daemon pickup -> delivered once across restarts.
@@ -8864,7 +8879,7 @@ mod tests {
                 "queued-restart".to_string(),
             ]
         );
-        assert!(store.list_wire_awaiting_daemon().unwrap().is_empty());
+        wait_for_marker_clear();
         handle_1.stop();
 
         // Starting a second daemon on the same store and routes must NOT re-deliver anything.
