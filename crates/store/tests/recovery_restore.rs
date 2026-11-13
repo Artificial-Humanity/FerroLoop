@@ -9191,7 +9191,16 @@ fn unverified_original_relocation_fixture(
             .unwrap();
     let path = std::path::Path::new(guard["journal"].as_str().unwrap());
     let j = load_restore_journal(path, &lease, &f.filesystem()).unwrap();
-    assert_eq!(j.phase, RestorePhase::RelocateIntent);
+    assert_eq!(
+        j.phase,
+        if matches!(layout, BundlelessLayout::Exchanged) {
+            RestorePhase::ExchangeIntent
+        } else {
+            RestorePhase::RelocateIntent
+        }
+    );
+    assert_eq!(j.resume_finalize_attempts, 0);
+    assert_eq!(j.rollback_attempts, 0);
     assert!(j.original_verification.is_none());
     assert!(j.original_read_error.is_some());
     assert_eq!(matches!(j.original, FileBinding::Forensic { .. }), forensic);
@@ -9202,7 +9211,10 @@ fn unverified_original_relocation_fixture(
     let selected = request_bundle_path(&f, j.selected_bundle_operation);
     let candidate = fs::metadata(&j.destination).unwrap();
     assert_eq!((candidate.dev(), candidate.ino()), j.candidate_identity);
-    let (retained, absent) = if matches!(layout, BundlelessLayout::Relocating) {
+    let (retained, absent) = if matches!(
+        layout,
+        BundlelessLayout::Exchanged | BundlelessLayout::Relocating
+    ) {
         ("candidate.fls", "original.fls")
     } else {
         ("original.fls", "candidate.fls")
@@ -9215,10 +9227,24 @@ fn unverified_original_relocation_fixture(
     );
     assert!(!j.staging.join(absent).exists());
     fs::rename(&selected, selected.with_extension("unavailable-for-test")).unwrap();
+    assert!(!selected.exists());
     (f, j, lease, original)
 }
-fn assert_unverified_original_bundleless_resume(forensic: bool, layout: BundlelessLayout) {
+fn assert_unverified_original_bundleless_resume(
+    forensic: bool,
+    layout: BundlelessLayout,
+    renewed: bool,
+) {
     let (f, j, lease, original) = unverified_original_relocation_fixture(forensic, layout);
+    let lease = if renewed {
+        let mut request = fixture_lease_request(&lease);
+        request.expected_file = inspect_file_binding(&f.source, &limits()).unwrap();
+        fs::remove_file(lease.path()).unwrap();
+        create_offline_lease(&request, &f.filesystem(), &limits()).unwrap()
+    } else {
+        lease
+    };
+    let j = load_restore_journal(&j.staging.join("journal.bin"), &lease, &f.filesystem()).unwrap();
     let original_bytes = forensic_descriptor_digest(&original);
     let original_metadata = original.metadata().unwrap();
     let guard = fs::read(f.source.with_extension("fls.restore-guard")).unwrap();
@@ -9264,28 +9290,69 @@ fn assert_unverified_original_bundleless_resume(forensic: bool, layout: Bundlele
     .unwrap();
     assert_eq!(loaded.phase, RestorePhase::Installed);
     assert_eq!(loaded.candidate_sha256, j.candidate_sha256);
+    let RestoreOutcome::Finalized { .. } = fl_store::recovery::readiness::finalize_restore(
+        &loaded,
+        &lease,
+        &generation_evidence(&loaded, false),
+        &f.filesystem(),
+    )
+    .unwrap() else {
+        panic!("typed finalization did not finish")
+    };
+    let finalized =
+        load_restore_journal(&loaded.staging.join("journal.bin"), &lease, &f.filesystem()).unwrap();
+    assert_eq!(finalized.phase, RestorePhase::Finalized);
+    assert_eq!(
+        finalized.resume_finalize_attempts,
+        j.resume_finalize_attempts + 2
+    );
+    assert_eq!(finalized.rollback_attempts, j.rollback_attempts);
+    assert!(!f.source.with_extension("fls.restore-guard").exists());
+    let retained = fs::metadata(finalized.staging.join("original.fls")).unwrap();
+    assert_eq!(
+        (retained.dev(), retained.ino()),
+        (original_metadata.dev(), original_metadata.ino())
+    );
+    assert_eq!(retained.mode(), original_metadata.mode());
+    assert_eq!(forensic_descriptor_digest(&original), original_bytes);
+}
+#[test]
+fn restore_bundleless_unverified_forensic_exchange_intent_resume() {
+    for renewed in [false, true] {
+        assert_unverified_original_bundleless_resume(true, BundlelessLayout::Exchanged, renewed);
+    }
+}
+#[test]
+fn restore_bundleless_unverified_readable_exchange_intent_resume() {
+    for renewed in [false, true] {
+        assert_unverified_original_bundleless_resume(false, BundlelessLayout::Exchanged, renewed);
+    }
 }
 #[test]
 fn restore_bundleless_unverified_forensic_exchanged_resume() {
-    assert_unverified_original_bundleless_resume(true, BundlelessLayout::Relocating);
+    assert_unverified_original_bundleless_resume(true, BundlelessLayout::Relocating, false);
 }
 #[test]
 fn restore_bundleless_unverified_forensic_installed_resume() {
-    assert_unverified_original_bundleless_resume(true, BundlelessLayout::Relocated);
+    assert_unverified_original_bundleless_resume(true, BundlelessLayout::Relocated, false);
 }
 #[test]
 fn restore_bundleless_unverified_readable_exchanged_resume() {
-    assert_unverified_original_bundleless_resume(false, BundlelessLayout::Relocating);
+    assert_unverified_original_bundleless_resume(false, BundlelessLayout::Relocating, false);
 }
 #[test]
 fn restore_bundleless_unverified_readable_installed_resume() {
-    assert_unverified_original_bundleless_resume(false, BundlelessLayout::Relocated);
+    assert_unverified_original_bundleless_resume(false, BundlelessLayout::Relocated, false);
 }
 #[test]
 fn restore_bundleless_unverified_corrupt_candidate_refuses_without_attempt() {
     use std::os::unix::fs::FileExt;
     for forensic in [true, false] {
-        for layout in [BundlelessLayout::Relocating, BundlelessLayout::Relocated] {
+        for layout in [
+            BundlelessLayout::Exchanged,
+            BundlelessLayout::Relocating,
+            BundlelessLayout::Relocated,
+        ] {
             let (f, j, lease, original) = unverified_original_relocation_fixture(forensic, layout);
             let path = j.staging.join("journal.bin");
             let before = fs::read(&path).unwrap();
@@ -9303,19 +9370,44 @@ fn restore_bundleless_unverified_corrupt_candidate_refuses_without_attempt() {
             file.write_all_at(&byte, 0).unwrap();
             file.sync_all().unwrap();
             let candidate_bytes = fs::read(&j.destination).unwrap();
+            // Snapshot metadata without reopening the mode-000 original;
+            // its preserved descriptor supplies the byte-for-byte check below.
+            let artifact_metadata = || {
+                [
+                    j.destination.clone(),
+                    j.staging.join("candidate.fls"),
+                    j.staging.join("original.fls"),
+                    j.staging.join("journal.bin"),
+                    j.staging.join("journal.bin.lock"),
+                    guard_path.clone(),
+                    terminal_negative_pin(&f, &j),
+                ]
+                .map(|path| match fs::symlink_metadata(path) {
+                    Ok(m) => Some((m.dev(), m.ino(), m.mode(), m.len())),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                    Err(e) => panic!("snapshot: {e}"),
+                })
+            };
+            let artifacts = artifact_metadata();
+            let metadata_bytes = terminal_negative_metadata(&f, &j);
             assert!(resume_restore(&j, &lease, &f.filesystem()).is_err());
+            assert_eq!(artifact_metadata(), artifacts);
+            assert_eq!(terminal_negative_metadata(&f, &j), metadata_bytes);
             // Exact journal equality proves durable counters and phase unchanged.
             assert_eq!(fs::read(&path).unwrap(), before);
             assert_eq!(fs::read(&j.destination).unwrap(), candidate_bytes);
             assert_eq!(forensic_descriptor_digest(&original), original_bytes);
             assert_eq!(fs::read(&guard_path).unwrap(), guard);
-            let retained = j
-                .staging
-                .join(if matches!(layout, BundlelessLayout::Relocating) {
+            let retained = j.staging.join(
+                if matches!(
+                    layout,
+                    BundlelessLayout::Exchanged | BundlelessLayout::Relocating
+                ) {
                     "candidate.fls"
                 } else {
                     "original.fls"
-                });
+                },
+            );
             let metadata = fs::metadata(retained).unwrap();
             let original_metadata = original.metadata().unwrap();
             assert_eq!(

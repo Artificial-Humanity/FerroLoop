@@ -1981,7 +1981,10 @@ pub fn resume_restore(
         None
     };
     if let Some(path) = forward_candidate {
-        if j.phase == RestorePhase::RelocateIntent
+        if matches!(
+            j.phase,
+            RestorePhase::ExchangeIntent | RestorePhase::RelocateIntent
+        ) && !matches!(j.original, FileBinding::Absent)
             && j.original_verification.is_none()
             && path == j.destination
         {
