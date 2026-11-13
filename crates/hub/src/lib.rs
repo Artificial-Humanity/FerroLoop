@@ -7863,7 +7863,14 @@ mod tests {
         // No metadata record yet: Muse shows its default.
         assert_eq!(listed()["model"], "muse-wonder-full-1.0");
         let id = listed()["id"].as_str().unwrap().to_string();
+        // A recordless Muse change is deferred and does not create an override. Seed an
+        // existing override to test whether discovery treats default metadata as evidence.
         set_model(&state, &id, "muse-spark-1.3");
+        assert!(state.session_model_override(&id).is_none());
+        state.set_session_model_override(
+            &id,
+            session_actions::ModelOverride::new("muse-spark-1.3".into(), None),
+        );
         // The default is no report: the choice shows and stays.
         assert_eq!(listed()["model"], "muse-spark-1.3");
         assert!(state.session_model_override(&id).is_some());
