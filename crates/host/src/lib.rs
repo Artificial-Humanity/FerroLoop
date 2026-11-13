@@ -43,7 +43,7 @@ pub use child::SessionHandle;
 use identity::{RecordedPid, SignalHook, cleanup_recorded};
 pub use refusal::ContainmentRefusal;
 use session::{Session, SessionParts};
-use survivor_registry::{load_registry, publish, registry_path};
+use survivor_registry::{clean_stale_publish_temps, load_registry, publish, registry_path};
 
 pub use child::{CleanupReport, DescendantExit};
 pub use identity::{
@@ -348,6 +348,9 @@ impl Host {
         let endpoint = listener.endpoint().clone();
         let path = registry_path(&endpoint)?;
         let mut registry = load_registry(&endpoint)?;
+        if let Some(dir) = path.parent() {
+            clean_stale_publish_temps(dir);
+        }
         let deadline = Instant::now() + STARTUP_CLEANUP_DEADLINE;
         if let Err(err) = recover(
             &mut registry,
@@ -2385,6 +2388,64 @@ mod deadline_tests {
         assert!(!cleanup_deadline_expired(None, now));
         assert!(!cleanup_deadline_expired(Some(now), now));
         assert!(cleanup_deadline_expired(Some(running_since), now));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn host_open_cleans_stale_temp_and_tolerates_undeletable_one() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let endpoint = unresolved_endpoint(dir.path());
+        let stale = dir.path().join(format!(".flh-{}-1-1000", u32::MAX - 1));
+        let undeletable = dir.path().join(format!(".flh-{}-2-1000", u32::MAX - 1));
+        for file in [&stale, &undeletable] {
+            std::fs::write(file, b"x").expect("plant");
+            std::fs::set_permissions(file, std::fs::Permissions::from_mode(0o600)).expect("mode");
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(file)
+                .expect("open")
+                .set_modified(std::time::SystemTime::now() - Duration::from_secs(120))
+                .expect("age");
+        }
+        // A hard link makes the second temp undeletable by cleanup policy.
+        std::fs::hard_link(&undeletable, dir.path().join("alias")).expect("hardlink");
+        let host = Host::open(OpenOptions::new(HostConfig::new(endpoint))).expect("open");
+        assert!(!stale.exists(), "stale dead-pid temp cleaned at open");
+        assert!(
+            undeletable.exists(),
+            "undeletable temp kept, open stayed best-effort"
+        );
+        host.shutdown().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn host_open_loads_registry_before_cleaning_stale_temps() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let endpoint = unresolved_endpoint(dir.path());
+        let registry = crate::survivor_registry::registry_path(&endpoint).expect("registry path");
+        std::fs::write(&registry, b"{").expect("corrupt registry");
+        std::fs::set_permissions(&registry, std::fs::Permissions::from_mode(0o600))
+            .expect("registry mode");
+        let stale = dir.path().join(format!(".flh-{}-1-1000", u32::MAX - 1));
+        std::fs::write(&stale, b"x").expect("plant");
+        std::fs::set_permissions(&stale, std::fs::Permissions::from_mode(0o600)).expect("mode");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&stale)
+            .expect("open temp")
+            .set_modified(std::time::SystemTime::now() - Duration::from_secs(120))
+            .expect("age");
+        assert!(
+            Host::open(OpenOptions::new(HostConfig::new(endpoint))).is_err(),
+            "corrupt registry refuses open"
+        );
+        assert!(
+            stale.exists(),
+            "cleanup must not run before load_registry succeeds"
+        );
     }
 
     #[test]
