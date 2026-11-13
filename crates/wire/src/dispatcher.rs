@@ -2539,7 +2539,7 @@ fn is_composer_occupied_error(err: &str) -> bool {
     err.starts_with(COMPOSER_OCCUPIED_BY_NON_WIRE_INPUT_PREFIX)
 }
 
-pub(crate) fn is_composer_occupied_zero_keys_error(err: &str) -> bool {
+pub fn is_composer_occupied_zero_keys_error(err: &str) -> bool {
     is_composer_occupied_error(err) && err.contains("without sending keys")
 }
 
@@ -4410,8 +4410,14 @@ fn composer_shows_target_placeholder_with_raw(
     matches_target && is_placeholder
 }
 
+fn strip_dialog_box_prefix(line: &str) -> &str {
+    let t = line.trim_start();
+    let t = t.strip_prefix('│').map_or(t, str::trim_start);
+    t.strip_prefix('┃').map_or(t, str::trim_start)
+}
+
 fn starts_with_numbered_choice(line: &str, prefix: &str) -> bool {
-    let trimmed = line.trim_start();
+    let trimmed = strip_dialog_box_prefix(line);
     let after_selector = trimmed
         .strip_prefix('❯')
         .or_else(|| trimmed.strip_prefix('›'))
@@ -4420,17 +4426,26 @@ fn starts_with_numbered_choice(line: &str, prefix: &str) -> bool {
     after_selector.starts_with(prefix)
 }
 
+fn line_has_selector_numbered_choice(line: &str) -> bool {
+    let trimmed = strip_dialog_box_prefix(line);
+    let Some(rest) = trimmed
+        .strip_prefix('❯')
+        .or_else(|| trimmed.strip_prefix('›'))
+        .or_else(|| trimmed.strip_prefix('>'))
+    else {
+        return false;
+    };
+    let rest = rest.trim_start();
+    let digits_len = rest.bytes().take_while(|b| b.is_ascii_digit()).count();
+    digits_len > 0 && rest[digits_len..].starts_with('.')
+}
+
 fn lines_have_dialog_or_menu_markers(candidate_lines: &[&str]) -> bool {
     let mut saw_choice_1 = false;
     let mut saw_choice_2 = false;
     for &line in candidate_lines {
         let trimmed = line.trim_start();
-        if let Some(after_sel) = trimmed
-            .strip_prefix('❯')
-            .or_else(|| trimmed.strip_prefix('›'))
-            .or_else(|| trimmed.strip_prefix('>'))
-            && after_sel.trim_start().starts_with("1.")
-        {
+        if line_has_selector_numbered_choice(line) {
             return true;
         }
         if starts_with_numbered_choice(trimmed, "1. ") {
@@ -4452,6 +4467,103 @@ fn lines_have_dialog_or_menu_markers(candidate_lines: &[&str]) -> bool {
         }
     }
     saw_choice_1 && saw_choice_2
+}
+
+/// Strong dialog markers that cannot appear in ordinary assistant prose: a selector-prefixed
+/// numbered choice, an explicit cancel/allow affordance, or a `[y/n]` prompt. Weak markers
+/// (`"do you want"`, paired plain `1. `/`2. ` lines) only count inside the composer/dialog
+/// box, never in scrollback or an agent reply.
+fn lines_have_strong_dialog_markers(candidate_lines: &[&str]) -> bool {
+    for &line in candidate_lines {
+        let trimmed = line.trim_start();
+        if line_has_selector_numbered_choice(line) {
+            return true;
+        }
+        let lower = trimmed.to_ascii_lowercase();
+        if lower.contains("esc to cancel")
+            || lower.contains("allow once")
+            || lower.contains("allow always")
+            || lower.contains("allow for session")
+            || lower.contains("[y/n]")
+            || lower.contains("(y/n)")
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Dialog check for regions outside a located composer box (the single-rule footer and the
+/// ruleless tail below the last output marker). Once the region is restricted to below the
+/// last output marker or below the single rule, weak markers fail closed: a question plus
+/// paired `1. `/`2. ` choices is a dialog regardless of trailing lines (further choices or
+/// nav/confirm hints), and paired choices plus a nav/confirm hint is a dialog even without
+/// the question. Prose above a retained empty composer is handled separately and exempt.
+fn lines_have_dialog_markers_in_tail(candidate_lines: &[&str]) -> bool {
+    // Region is already restricted by the caller; inside it the full marker set counts:
+    // any strong marker, "do you want", or paired choices.
+    lines_have_dialog_or_menu_markers(candidate_lines)
+}
+
+/// Weak dialog above a retained empty composer: a question that precedes paired choices
+/// (dialog order), as opposed to reply prose that lists options and then asks a question.
+fn lines_have_weak_dialog_before_empty_prompt(candidate_lines: &[&str]) -> bool {
+    // Strong markers are never exempted above an empty prompt.
+    if lines_have_strong_dialog_markers(candidate_lines) {
+        return true;
+    }
+    let mut question_idx: Option<usize> = None;
+    let mut saw_choice_1_after = false;
+    let mut saw_choice_2_after = false;
+    let mut saw_nav_hint = false;
+    for (idx, &line) in candidate_lines.iter().enumerate() {
+        let trimmed = line.trim_start();
+        let lower = trimmed.to_ascii_lowercase();
+        if lower.contains("do you want") && question_idx.is_none() {
+            question_idx = Some(idx);
+        }
+        if lower.contains("to navigate") || lower.contains("to confirm") {
+            saw_nav_hint = true;
+        }
+        if question_idx.is_some_and(|q| idx > q) {
+            if starts_with_numbered_choice(trimmed, "1. ") {
+                saw_choice_1_after = true;
+            }
+            if starts_with_numbered_choice(trimmed, "2. ")
+                || starts_with_numbered_choice(trimmed, "3. ")
+            {
+                saw_choice_2_after = true;
+            }
+        }
+    }
+    (saw_choice_1_after && saw_choice_2_after)
+        || (saw_nav_hint && saw_choice_1_after && saw_choice_2_after)
+}
+
+/// Index of a trailing empty composer prompt (`❯`/`›`/`>` with nothing after it) at the
+/// bottom of `lines`, ignoring a short status footer. A dialog replaces the composer, so
+/// when an empty composer is present, prose above it cannot be an active dialog.
+fn empty_composer_prompt_index(lines: &[&str]) -> Option<usize> {
+    let mut seen_below = 0usize;
+    for (idx, line) in lines.iter().enumerate().rev() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        seen_below += 1;
+        if seen_below > 3 {
+            return None;
+        }
+        let after_prompt = trimmed
+            .strip_prefix('❯')
+            .or_else(|| trimmed.strip_prefix('›'))
+            .or_else(|| trimmed.strip_prefix('>'));
+        if let Some(rest) = after_prompt {
+            let rest = rest.trim();
+            return (rest.is_empty() || is_known_static_ghost_placeholder(rest)).then_some(idx);
+        }
+    }
+    None
 }
 
 fn between_has_delivery_header(between: &[&str]) -> bool {
@@ -4550,18 +4662,41 @@ fn screen_has_dialog_or_menu_markers_with_context(
     }
     if let [r0] = rule_indices.as_slice() {
         let after = &lines[r0 + 1..];
-        if after.iter().filter(|l| !l.trim().is_empty()).count() <= 12
-            && lines_have_dialog_or_menu_markers(after)
-        {
+        let held_below = if after.iter().filter(|l| !l.trim().is_empty()).count() <= 12 {
+            lines_have_dialog_or_menu_markers(after)
+        } else {
+            lines_have_dialog_markers_in_tail(&after[after.len().saturating_sub(12)..])
+        };
+        if held_below {
             return true;
         }
+        // A dialog can sit directly above the rule (footer-only below, no composer prompt
+        // below the rule): scan that block too. Reply prose above a live composer prompt
+        // below the rule is not scanned.
+        let below_has_prompt = empty_composer_prompt_index(after).is_some()
+            || after
+                .iter()
+                .any(|l| strip_dialog_box_prefix(l).starts_with(['❯', '›', '>']));
+        if !below_has_prompt && after.iter().filter(|l| !l.trim().is_empty()).count() <= 6 {
+            let above = &lines[..*r0];
+            if empty_composer_prompt_index(above).is_none() {
+                return lines_have_dialog_or_menu_markers(&above[above.len().saturating_sub(12)..]);
+            }
+        }
+        return false;
+    }
+    // No composer box could be located. An empty composer at the bottom exempts reply
+    // prose above it, but a dialog in dialog order (question before paired choices)
+    // above a retained empty prompt is still a live dialog and fails closed.
+    if let Some(prompt_idx) = empty_composer_prompt_index(&lines) {
+        return lines_have_weak_dialog_before_empty_prompt(&lines[..prompt_idx]);
     }
     let tail_start = lines
         .iter()
         .rposition(|l| line_starts_with_output_marker(l))
         .map_or(0, |idx| idx + 1);
     let sub = &lines[tail_start..];
-    lines_have_dialog_or_menu_markers(&sub[sub.len().saturating_sub(12)..])
+    lines_have_dialog_markers_in_tail(&sub[sub.len().saturating_sub(12)..])
 }
 
 /// `true` ONLY when `screen` has no dialog/menu markers and the ENTIRE composer content is
@@ -5869,7 +6004,7 @@ pub fn claude_route_live_pane(route: &VendorRoute) -> Option<String> {
 /// composer or only recorded unconfirmed FerroWire deliveries for `route`; `Some(false)` when the
 /// composer still holds non-wire input or an active dialog/menu; and `None` when the route does not
 /// use terminal composer verification or its rendered screen cannot be captured right now.
-pub(crate) fn probe_route_composer_ready(route: &VendorRoute) -> Option<bool> {
+pub fn probe_route_composer_ready(route: &VendorRoute) -> Option<bool> {
     let target = match route {
         VendorRoute::Muse {
             session_id,
@@ -14526,6 +14661,142 @@ exit 1"#,
             &wrapped_prompt_screen,
             Some(CursorState::with_dims_and_ghost(37, 2, 40, 120, true))
         ));
+    }
+
+    #[test]
+    fn agent_reply_ending_in_question_above_empty_composer_is_not_a_dialog() {
+        let rule = "─".repeat(120);
+        // Framed empty composer: reply prose above the top rule is never a dialog.
+        let framed = format!(
+            "⏺ I can fix this two ways:\n  1. Patch the parser\n  2. Rewrite the parser\nDo you want me to proceed with one of these?\n{rule}\n❯ \n{rule}\n  muse-wonder-full-1.0"
+        );
+        assert!(!screen_has_dialog_or_menu_markers(&framed));
+        // Ruleless screen: reply ending in a question above an empty composer prompt.
+        let ruleless = "⏺ I can fix this two ways:\n  1. Patch the parser\n  2. Rewrite the parser\nDo you want me to proceed with one of these?\n❯ ";
+        assert!(!screen_has_dialog_or_menu_markers(ruleless));
+        // Single rule below the composer: prose above the rule is still reply text.
+        let single_rule = format!(
+            "⏺ Do you want me to run the tests?\n  1. Unit tests\n  2. Full suite\n❯ \n{rule}\n  muse-wonder-full-1.0"
+        );
+        assert!(!screen_has_dialog_or_menu_markers(&single_rule));
+        // A real dialog in the dialog region still reads as a dialog, framed or not.
+        let framed_dialog =
+            format!("{rule}\nDo you want to proceed?\n❯ 1. Yes\n  2. No\n{rule}\n  Esc to cancel");
+        assert!(screen_has_dialog_or_menu_markers(&framed_dialog));
+        let ruleless_dialog =
+            "⏺ Tool call pending\nDo you want to allow always?\n› 1. Yes\n  2. No";
+        assert!(screen_has_dialog_or_menu_markers(ruleless_dialog));
+        // Weak 3-choice dialog with trailing nav hint and no strong markers fails closed.
+        let weak_three_choice = "⏺ Tool call pending\nDo you want to proceed?\n  1. Yes\n  2. No\n  3. Maybe later\n  ↑↓ to navigate • Enter to confirm";
+        assert!(
+            screen_has_dialog_or_menu_markers(weak_three_choice),
+            "weak 3-choice dialog with trailing hint must be a dialog:\n{weak_three_choice}"
+        );
+        // Same weak dialog above a retained empty prompt is not dismissed as prose.
+        let weak_above_prompt = "Do you want to proceed?\n  1. Yes\n  2. No\n  3. Maybe later\n  ↑↓ to navigate • Enter to confirm\n❯ ";
+        assert!(screen_has_dialog_or_menu_markers(weak_above_prompt));
+        // Single-rule footer variant with trailing hint.
+        let single_rule_weak = format!(
+            "⏺ Ready\n{rule}\nDo you want to proceed?\n  1. Yes\n  2. No\n  3. Maybe later\n  ↑↓ to navigate • Enter to confirm\n  footer line\n  another footer\n  more footer\n  still footer\n  footer five\n  footer six\n  footer seven\n  footer eight"
+        );
+        assert!(screen_has_dialog_or_menu_markers(&single_rule_weak));
+    }
+
+    #[test]
+    fn b3_ten_dialog_screens_must_hold_and_reply_must_not() {
+        let rule = "─".repeat(60);
+        let plan: String = (0..16)
+            .map(|i| format!("   - step {i}: do the thing number {i}\n"))
+            .collect();
+        let diff_out: String = (0..14).map(|i| format!("  output line {i}\n")).collect();
+        let screens: Vec<(&str, String)> = vec![
+            ("claude_plan_tall_single_rule_sel2", format!("⏺ Plan ready\n\n{rule}\n Ready to code?\n\n Here is Claude's plan:\n{plan}\n Would you like to proceed?\n\n   1. Yes, and auto-accept edits\n ❯ 2. Yes, and manually approve edits\n   3. No, keep planning\n")),
+            ("boxed_perm_no_rules_sel1", "⏺ Bash(rm -rf build)\n\n╭──────────────────────────────────────────╮\n│ Bash command                             │\n│                                          │\n│   rm -rf build                           │\n│                                          │\n│ Do you want to proceed?                  │\n│ ❯ 1. Yes                                 │\n│   2. No, and tell Claude what to do (esc)│\n╰──────────────────────────────────────────╯\n".into()),
+            ("codex_update_prompt_sel2", "  ✨ Update available! 0.167.0 -> 0.168.0\n\n  Release notes: https://example.invalid/releases\n\n  1. Update now (runs `npm install -g @openai/codex`)\n› 2. Skip\n  3. Skip until next version\n\n  Press enter to continue\n".into()),
+            ("codex_trust_onboarding_sel2", "  You are running Codex in /home/x/proj\n\n  Since this folder is version controlled, you may wish to allow Codex to work in this folder without asking for approval.\n\n  1. Yes, allow Codex to work in this folder without asking for approval\n› 2. No, ask me to approve edits and commands\n\n  Press enter to continue\n".into()),
+            ("codex_user_question_sel2", "• Asking a question\n\n  Question 1/1\n  Which approach should I take?\n\n  1. Patch the parser (Recommended)\n› 2. Rewrite the parser\n  3. None of the above\n\n  tab to add notes | enter to submit answer | esc to interrupt\n".into()),
+            ("generic_yn_then_empty_prompt", "Running migration tool\nThis will overwrite the existing database. Continue? [y/n]\n> \n".into()),
+            ("generic_allow_once_then_empty_prompt", "Tool wants to run: rm -rf build\nAllow once / Allow always / Deny (Esc to cancel)\n> \n".into()),
+            ("dialog_above_single_rule_sel1", format!("⏺ Tool call pending\nDo you want to proceed?\n❯ 1. Yes\n  2. No\n{rule}\n  some-footer-1.0\n")),
+            ("dialog_above_single_rule_sel2_esc_to_cancel", format!("⏺ Tool call pending\nDo you want to proceed?\n  1. Yes\n❯ 2. No\n  Esc to cancel\n{rule}\n  some-footer-1.0\n")),
+            ("ruleless_one_scrollback_rule_tall_dialog_sel2", format!("• Ran tool\n{rule}\n{diff_out}\n  Choose how to continue\n\n  1. Keep going\n› 2. Stop here\n  3. Start over\n\n  Press enter to continue\n")),
+        ];
+        for (name, screen) in &screens {
+            assert!(
+                screen_has_dialog_or_menu_markers(screen),
+                "{name} must hold"
+            );
+            assert_eq!(
+                probe_composer_ready_from_screen(screen, None, &[], ComposerStyle::Ruleless, false),
+                Some(false),
+                "{name} probe must hold"
+            );
+        }
+        // Must-not: reply list-then-question above ghost/empty composer (real idle Codex shape).
+        let reply = "• I can fix this two ways:\n  1. Patch the parser\n  2. Rewrite the parser\n  Do you want me to proceed with one of these?\n\n› Ask Codex to do anything\n\n  gpt-5.2-codex · 80% left · ~/proj\n";
+        assert!(!screen_has_dialog_or_menu_markers(reply));
+        assert_eq!(
+            probe_composer_ready_from_screen(reply, None, &[], ComposerStyle::Ruleless, false),
+            Some(true)
+        );
+        let idle =
+            "› Ask Codex to do anything\n\n  gpt-5.2-codex · 80% left · ~/proj\n  footer two\n";
+        assert!(!screen_has_dialog_or_menu_markers(idle));
+    }
+
+    #[test]
+    fn nb4_selector_on_any_numbered_choice_must_hold() {
+        let hold: Vec<(&str, &str)> = vec![
+            (
+                "would_you_like_sel2_then_empty_prompt",
+                "• Proposed plan ready.\n\nWould you like to proceed?\n\n  1. Yes\n❯ 2. No, keep planning\n\n› \n",
+            ),
+            (
+                "would_you_like_sel2_then_ghost_prompt",
+                "• Proposed plan ready.\n\nWould you like to proceed?\n\n  1. Yes\n› 2. No, keep planning\n\n› Ask Codex to do anything\n\n  GPT-6.1 · ~/proj\n",
+            ),
+            (
+                "question_sel3_notes_field",
+                "  Which option should I use?\n\n    1. Fast path\n    2. Safe path\n  › 3. Something else\n\n  › \n  tab to add notes | enter to submit answer\n",
+            ),
+            // Fail-closed case that must stay held (NB4 note).
+            (
+                "reply_do_you_want_then_list_ghost",
+                "• Do you want me to continue? Options:\n  1. Patch the test\n  2. Fix the code\n\n› Ask Codex to do anything\n\n  GPT-6.1 · ~/proj\n",
+            ),
+        ];
+        for (name, screen) in &hold {
+            assert!(
+                screen_has_dialog_or_menu_markers(screen),
+                "{name} must hold"
+            );
+            assert_eq!(
+                probe_composer_ready_from_screen(screen, None, &[], ComposerStyle::Ruleless, false),
+                Some(false),
+                "{name} probe must hold"
+            );
+        }
+        let proceed: Vec<(&str, &str)> = vec![
+            (
+                "plain_choices_no_selector_then_empty_prompt",
+                "Pick one:\n  1. Alpha\n  2. Beta\n\n> \n",
+            ),
+            (
+                "reply_list_then_question_empty_prompt",
+                "• I can do this two ways:\n  1. Patch the test\n  2. Fix the code\n  Which do you prefer?\n\n› \n",
+            ),
+        ];
+        for (name, screen) in &proceed {
+            assert!(
+                !screen_has_dialog_or_menu_markers(screen),
+                "{name} must proceed"
+            );
+            assert_eq!(
+                probe_composer_ready_from_screen(screen, None, &[], ComposerStyle::Ruleless, false),
+                Some(true),
+                "{name} probe must proceed"
+            );
+        }
     }
 
     #[test]
