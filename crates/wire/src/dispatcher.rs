@@ -4454,6 +4454,94 @@ fn lines_have_dialog_or_menu_markers(candidate_lines: &[&str]) -> bool {
     saw_choice_1 && saw_choice_2
 }
 
+/// Strong dialog markers that cannot appear in ordinary assistant prose: a selector-prefixed
+/// first choice, an explicit cancel/allow affordance, or a `[y/n]` prompt. Weak markers
+/// (`"do you want"`, paired plain `1. `/`2. ` lines) only count inside the composer/dialog
+/// box, never in scrollback or an agent reply.
+fn lines_have_strong_dialog_markers(candidate_lines: &[&str]) -> bool {
+    for &line in candidate_lines {
+        let trimmed = line.trim_start();
+        if let Some(after_sel) = trimmed
+            .strip_prefix('❯')
+            .or_else(|| trimmed.strip_prefix('›'))
+            .or_else(|| trimmed.strip_prefix('>'))
+            && after_sel.trim_start().starts_with("1.")
+        {
+            return true;
+        }
+        let lower = trimmed.to_ascii_lowercase();
+        if lower.contains("esc to cancel")
+            || lower.contains("allow once")
+            || lower.contains("allow always")
+            || lower.contains("allow for session")
+            || lower.contains("[y/n]")
+            || lower.contains("(y/n)")
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Dialog check for regions outside a located composer box (the single-rule footer and the
+/// ruleless tail below the last output marker). Weak markers count only when they form a
+/// dialog block at the very bottom of the region: a question plus paired choices whose last
+/// non-empty line is a choice, as a live menu renders. An agent reply that ends with a
+/// question, or lists options above an empty composer, is prose, not a dialog.
+fn lines_have_dialog_markers_in_tail(candidate_lines: &[&str]) -> bool {
+    if lines_have_strong_dialog_markers(candidate_lines) {
+        return true;
+    }
+    let mut saw_question = false;
+    let mut saw_choice_1 = false;
+    let mut saw_choice_2 = false;
+    for &line in candidate_lines {
+        let trimmed = line.trim_start();
+        if trimmed.to_ascii_lowercase().contains("do you want") {
+            saw_question = true;
+        }
+        if starts_with_numbered_choice(trimmed, "1. ") {
+            saw_choice_1 = true;
+        }
+        if starts_with_numbered_choice(trimmed, "2. ") {
+            saw_choice_2 = true;
+        }
+    }
+    if !(saw_question && saw_choice_1 && saw_choice_2) {
+        return false;
+    }
+    candidate_lines
+        .iter()
+        .rev()
+        .find(|l| !l.trim().is_empty())
+        .is_some_and(|last| starts_with_numbered_choice(last.trim_start(), "2. "))
+}
+
+/// Index of a trailing empty composer prompt (`❯`/`›`/`>` with nothing after it) at the
+/// bottom of `lines`, ignoring a short status footer. A dialog replaces the composer, so
+/// when an empty composer is present, prose above it cannot be an active dialog.
+fn empty_composer_prompt_index(lines: &[&str]) -> Option<usize> {
+    let mut seen_below = 0usize;
+    for (idx, line) in lines.iter().enumerate().rev() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        seen_below += 1;
+        if seen_below > 3 {
+            return None;
+        }
+        let after_prompt = trimmed
+            .strip_prefix('❯')
+            .or_else(|| trimmed.strip_prefix('›'))
+            .or_else(|| trimmed.strip_prefix('>'));
+        if let Some(rest) = after_prompt {
+            return rest.trim().is_empty().then_some(idx);
+        }
+    }
+    None
+}
+
 fn between_has_delivery_header(between: &[&str]) -> bool {
     if between.iter().any(|l| line_starts_with_output_marker(l)) {
         return false;
@@ -4549,19 +4637,25 @@ fn screen_has_dialog_or_menu_markers_with_context(
         return lines_have_dialog_or_menu_markers(&sub[sub.len().saturating_sub(12)..]);
     }
     if let [r0] = rule_indices.as_slice() {
+        // Only the region below the single rule (the composer/dialog footer) is an active
+        // dialog region; prose above the rule is the agent's reply and is never scanned.
         let after = &lines[r0 + 1..];
-        if after.iter().filter(|l| !l.trim().is_empty()).count() <= 12
-            && lines_have_dialog_or_menu_markers(after)
-        {
-            return true;
+        if after.iter().filter(|l| !l.trim().is_empty()).count() <= 12 {
+            return lines_have_dialog_or_menu_markers(after);
         }
+        return lines_have_dialog_markers_in_tail(&after[after.len().saturating_sub(12)..]);
+    }
+    // No composer box could be located. An empty composer at the bottom means no dialog
+    // is active: everything above it is reply prose, however it is phrased.
+    if let Some(prompt_idx) = empty_composer_prompt_index(&lines) {
+        return lines_have_dialog_markers_in_tail(&lines[prompt_idx..]);
     }
     let tail_start = lines
         .iter()
         .rposition(|l| line_starts_with_output_marker(l))
         .map_or(0, |idx| idx + 1);
     let sub = &lines[tail_start..];
-    lines_have_dialog_or_menu_markers(&sub[sub.len().saturating_sub(12)..])
+    lines_have_dialog_markers_in_tail(&sub[sub.len().saturating_sub(12)..])
 }
 
 /// `true` ONLY when `screen` has no dialog/menu markers and the ENTIRE composer content is
@@ -14526,6 +14620,31 @@ exit 1"#,
             &wrapped_prompt_screen,
             Some(CursorState::with_dims_and_ghost(37, 2, 40, 120, true))
         ));
+    }
+
+    #[test]
+    fn agent_reply_ending_in_question_above_empty_composer_is_not_a_dialog() {
+        let rule = "─".repeat(120);
+        // Framed empty composer: reply prose above the top rule is never a dialog.
+        let framed = format!(
+            "⏺ I can fix this two ways:\n  1. Patch the parser\n  2. Rewrite the parser\nDo you want me to proceed with one of these?\n{rule}\n❯ \n{rule}\n  muse-wonder-full-1.0"
+        );
+        assert!(!screen_has_dialog_or_menu_markers(&framed));
+        // Ruleless screen: reply ending in a question above an empty composer prompt.
+        let ruleless = "⏺ I can fix this two ways:\n  1. Patch the parser\n  2. Rewrite the parser\nDo you want me to proceed with one of these?\n❯ ";
+        assert!(!screen_has_dialog_or_menu_markers(ruleless));
+        // Single rule below the composer: prose above the rule is still reply text.
+        let single_rule = format!(
+            "⏺ Do you want me to run the tests?\n  1. Unit tests\n  2. Full suite\n❯ \n{rule}\n  muse-wonder-full-1.0"
+        );
+        assert!(!screen_has_dialog_or_menu_markers(&single_rule));
+        // A real dialog in the dialog region still reads as a dialog, framed or not.
+        let framed_dialog = format!(
+            "{rule}\nDo you want to proceed?\n❯ 1. Yes\n  2. No\n{rule}\n  Esc to cancel"
+        );
+        assert!(screen_has_dialog_or_menu_markers(&framed_dialog));
+        let ruleless_dialog = "⏺ Tool call pending\nDo you want to allow always?\n› 1. Yes\n  2. No";
+        assert!(screen_has_dialog_or_menu_markers(ruleless_dialog));
     }
 
     #[test]
