@@ -1010,3 +1010,33 @@ fn hydration_register_live_process_shapes_confirm_and_write_routes_for_each_vend
         assert_eq!(table.get("ada").unwrap().route.canonical_vendor(), vendor);
     }
 }
+
+#[test]
+fn area_set_preserves_nested_competition_path() {
+    let env = Env::new();
+    env.fl()
+        .args([
+            "agent",
+            "area",
+            "set",
+            "competition",
+            "--path",
+            "Kaggle/Competition/",
+            "--purpose",
+            "test",
+            "--by",
+            "owner",
+        ])
+        .assert()
+        .success();
+    let mut cmd = env.fl();
+    cmd.args(["agent", "area", "list", "--json"]);
+    let areas = Env::json_of(cmd);
+    let area = areas
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["area_key"] == "competition")
+        .unwrap();
+    assert_eq!(area["path"], "Kaggle/Competition/");
+}

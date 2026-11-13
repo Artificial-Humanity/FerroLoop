@@ -4835,20 +4835,7 @@ pub fn parse_jsonl_transcript(text: &str) -> Vec<TranscriptTurn> {
         // Claude records prompts delivered during an active turn as queued-command
         // attachments rather than ordinary user messages. Only known prompt origins
         // are eligible; task notifications and unknown origins are harness traffic.
-        let queued_prompt = (obj.get("type").and_then(Value::as_str) == Some("attachment"))
-            .then(|| val.get("attachment"))
-            .flatten()
-            .filter(|attachment| {
-                attachment.get("type").and_then(Value::as_str) == Some("queued_command")
-                    && attachment.get("commandMode").and_then(Value::as_str) == Some("prompt")
-                    && attachment
-                        .get("prompt")
-                        .is_some_and(|p| p.is_string() || p.is_array())
-                    && matches!(
-                        attachment.pointer("/origin/kind").and_then(Value::as_str),
-                        Some("human" | "peer")
-                    )
-            });
+        let queued_prompt = fl_core::vendor_adapter::claude_queued_prompt(&val);
         if let Some(t) = obj.get("type").and_then(Value::as_str)
             && queued_prompt.is_none()
             && (t.starts_with("api-request")

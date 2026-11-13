@@ -778,6 +778,160 @@ fn send_now_unstable_post_read_keeps_queue_until_later_completion() {
     );
 }
 
+fn make_composer_held(state: &HubState) -> String {
+    let (item, _) = state.enqueue_session_prompt(
+        "conv-ferris-1",
+        Some("ferris".into()),
+        "held".into(),
+        "held".into(),
+        "owner".into(),
+        vec![],
+    );
+    let (_claimed, claim) = state
+        .claim_queued_for_dispatch("conv-ferris-1", "conv-ferris-1", &item.id, false)
+        .unwrap();
+    state.finish_queued_prompt(
+        "conv-ferris-1",
+        &item.id,
+        Err(fl_wire::dispatcher::PushError::Failed(
+            "composer_occupied_by_non_wire_input: composer holds non-wire input or active dialog; holding delivery without sending keys".into(),
+        )),
+    );
+    claim.finish();
+    assert!(state.is_composer_held_prompt("conv-ferris-1", &item.id));
+    item.id
+}
+
+#[test]
+fn drain_composer_hold_delivers_only_on_clean_probe_and_exhausts() {
+    // Clean probe: exactly one delivery, queue drained.
+    {
+        let _delivery = crate::api::stub_queued_delivery_success();
+        let _probes = crate::api::stub_composer_probes(vec![Some(true)]);
+        crate::api::reset_queued_delivery_calls();
+        let tmp = TempDir::new().unwrap();
+        let state = hub_with_ferris(&tmp, 3);
+        let _id = make_composer_held(&state);
+        crate::api::drain_ready_session_queues(&state);
+        assert_eq!(crate::api::composer_probe_calls(), 1);
+        assert_eq!(crate::api::queued_delivery_calls(), 1);
+        assert!(state.session_queue("conv-ferris-1").is_empty());
+    }
+    // Some(false) and None: zero deliveries, hold retained.
+    for ready in [Some(false), None] {
+        let _delivery = crate::api::stub_queued_delivery_success();
+        let _probes = crate::api::stub_composer_probes(vec![ready]);
+        crate::api::reset_queued_delivery_calls();
+        let tmp = TempDir::new().unwrap();
+        let state = hub_with_ferris(&tmp, 3);
+        let id = make_composer_held(&state);
+        crate::api::drain_ready_session_queues(&state);
+        assert_eq!(crate::api::composer_probe_calls(), 1);
+        assert_eq!(crate::api::queued_delivery_calls(), 0, "ready={ready:?}");
+        assert_eq!(state.session_queue("conv-ferris-1").len(), 1);
+        assert!(state.is_composer_held_prompt("conv-ferris-1", &id));
+    }
+    // Exhaustion: 16 probes, then no further probes or deliveries.
+    {
+        let _delivery = crate::api::stub_queued_delivery_success();
+        let _probes = crate::api::stub_composer_probes(vec![Some(false); 20]);
+        crate::api::reset_queued_delivery_calls();
+        let tmp = TempDir::new().unwrap();
+        let state = hub_with_ferris(&tmp, 3);
+        let id = make_composer_held(&state);
+        for _ in 0..16 {
+            {
+                let mut guard = state.prompt_queues.lock().unwrap();
+                if let Some(entry) = guard.composer_hold_probes.get_mut(&id) {
+                    entry.1 = 0;
+                }
+            }
+            crate::api::drain_ready_session_queues(&state);
+        }
+        assert_eq!(crate::api::composer_probe_calls(), 16);
+        assert_eq!(crate::api::queued_delivery_calls(), 0);
+        assert_eq!(state.session_queue("conv-ferris-1").len(), 1);
+        crate::api::drain_ready_session_queues(&state);
+        assert_eq!(
+            crate::api::composer_probe_calls(),
+            16,
+            "exhausted budget must not reprobe"
+        );
+    }
+}
+
+#[test]
+fn drain_zero_key_hold_via_real_failing_dispatch_does_not_mark_in_flight_s1() {
+    let _err = crate::api::stub_queued_delivery_error(
+        "composer_occupied_by_non_wire_input: composer holds non-wire input or active dialog; holding delivery without sending keys",
+    );
+    crate::api::reset_queued_delivery_calls();
+    let tmp = TempDir::new().unwrap();
+    let state = hub_with_ferris(&tmp, 3);
+    let (item, _) = state.enqueue_session_prompt(
+        "conv-ferris-1",
+        Some("ferris".into()),
+        "held".into(),
+        "held".into(),
+        "owner".into(),
+        vec![],
+    );
+    crate::api::drain_ready_session_queues(&state);
+    assert_eq!(
+        crate::api::queued_delivery_calls(),
+        1,
+        "drain must go through dispatch"
+    );
+    let q = state.session_queue("conv-ferris-1");
+    assert_eq!(q.len(), 1);
+    assert_eq!(q[0].id, item.id);
+    assert!(state.is_composer_held_prompt("conv-ferris-1", &item.id));
+    assert_eq!(
+        q[0].hold_reason.as_deref(),
+        Some("composer_occupied_zero_keys")
+    );
+    assert!(
+        !state.session_in_flight_unconfirmed("conv-ferris-1"),
+        "zero-key hold must not mark in-flight (S1)"
+    );
+    drop(_err);
+    // Clean probe + success delivers it.
+    let _delivery = crate::api::stub_queued_delivery_success();
+    let _probes = crate::api::stub_composer_probes(vec![Some(true)]);
+    crate::api::drain_ready_session_queues(&state);
+    assert!(state.session_queue("conv-ferris-1").is_empty());
+}
+
+#[test]
+fn post_paste_error_stays_unconfirmed_and_never_reprobed_b1() {
+    let _err = crate::api::stub_queued_delivery_error(
+        "composer_occupied_by_non_wire_input: composer holds non-wire input after paste; aborting Enter retries",
+    );
+    let tmp = TempDir::new().unwrap();
+    let state = hub_with_ferris(&tmp, 3);
+    let (item, _) = state.enqueue_session_prompt(
+        "conv-ferris-1",
+        Some("ferris".into()),
+        "x".into(),
+        "x".into(),
+        "owner".into(),
+        vec![],
+    );
+    crate::api::drain_ready_session_queues(&state);
+    let q = state.session_queue("conv-ferris-1");
+    assert_eq!(q[0].delivery_state, crate::QueuedDeliveryState::Unconfirmed);
+    assert!(!state.is_composer_held_prompt("conv-ferris-1", &item.id));
+    assert!(q[0].hold_reason.is_none());
+    drop(_err);
+    let _probes = crate::api::stub_composer_probes(vec![Some(true)]);
+    crate::api::drain_ready_session_queues(&state);
+    assert_eq!(
+        crate::api::composer_probe_calls(),
+        0,
+        "post-paste Unconfirmed must never be re-probed"
+    );
+}
+
 #[test]
 fn removed_route_alias_falls_back_to_original_queue_and_refuses_send_now() {
     let _delivery = crate::api::stub_queued_delivery_success();

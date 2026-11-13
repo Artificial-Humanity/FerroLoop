@@ -443,6 +443,12 @@ impl DiagnosticsState {
         }
     }
 
+    pub(crate) fn clear_recipient(&mut self, recipient: &str) {
+        self.snapshot
+            .records
+            .retain(|r| r.recipient.as_deref() != Some(recipient));
+    }
+
     /// Called with the diagnostics lock paired with the authoritative marker.
     /// Return only the first retained hold, for logging after all guards drop.
     pub(crate) fn retain(&mut self, row: FenceDiagnostic) -> Option<FenceDiagnostic> {

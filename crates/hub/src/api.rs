@@ -5644,10 +5644,10 @@ fn handle_dynamic_api_routes(
             return handle_post_queued_prompt_send_now(state, authority, &session_id, &prompt_id);
         }
         if segments.len() == 6 && (method == "PATCH" || method == "PUT") {
-            return handle_patch_queued_prompt(state, &session_id, &prompt_id, req);
+            return handle_patch_queued_prompt(state, authority, &session_id, &prompt_id, req);
         }
         if segments.len() == 6 && method == "DELETE" {
-            return handle_delete_queued_prompt(state, &session_id, &prompt_id);
+            return handle_delete_queued_prompt(state, authority, &session_id, &prompt_id);
         }
     }
 
@@ -6042,6 +6042,78 @@ pub(crate) fn stub_queued_delivery_success() -> StubQueuedDelivery {
     QUEUED_TEST_DELIVERY.with(|flag| flag.set(true));
     StubQueuedDelivery
 }
+#[cfg(test)]
+thread_local! {
+    static QUEUED_TEST_ERROR: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+#[cfg(test)]
+pub(crate) struct StubQueuedError;
+#[cfg(test)]
+impl Drop for StubQueuedError {
+    fn drop(&mut self) {
+        QUEUED_TEST_ERROR.with(|e| *e.borrow_mut() = None);
+    }
+}
+#[cfg(test)]
+pub(crate) fn stub_queued_delivery_error(msg: &str) -> StubQueuedError {
+    QUEUED_TEST_ERROR.with(|e| *e.borrow_mut() = Some(msg.to_string()));
+    StubQueuedError
+}
+
+#[cfg(test)]
+thread_local! {
+    static COMPOSER_PROBE_STUB: std::cell::RefCell<Option<std::collections::VecDeque<Option<bool>>>> =
+        const { std::cell::RefCell::new(None) };
+    static COMPOSER_PROBE_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static QUEUED_DELIVERY_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+#[cfg(test)]
+pub(crate) struct StubComposerProbes;
+#[cfg(test)]
+impl Drop for StubComposerProbes {
+    fn drop(&mut self) {
+        COMPOSER_PROBE_STUB.with(|s| *s.borrow_mut() = None);
+    }
+}
+#[cfg(test)]
+pub(crate) fn stub_composer_probes(results: Vec<Option<bool>>) -> StubComposerProbes {
+    COMPOSER_PROBE_STUB.with(|s| *s.borrow_mut() = Some(results.into_iter().collect()));
+    COMPOSER_PROBE_CALLS.with(|c| c.set(0));
+    StubComposerProbes
+}
+#[cfg(test)]
+pub(crate) fn composer_probe_calls() -> usize {
+    COMPOSER_PROBE_CALLS.with(|c| c.get())
+}
+#[cfg(test)]
+pub(crate) fn queued_delivery_calls() -> usize {
+    QUEUED_DELIVERY_CALLS.with(|c| c.get())
+}
+#[cfg(test)]
+pub(crate) fn reset_queued_delivery_calls() {
+    QUEUED_DELIVERY_CALLS.with(|c| c.set(0));
+}
+
+fn drain_composer_probe(
+    home: Option<&std::path::Path>,
+    item: &crate::QueuedOperatorPrompt,
+    canonical_id: &str,
+) -> Option<bool> {
+    #[cfg(test)]
+    {
+        let stubbed: Option<Option<bool>> =
+            COMPOSER_PROBE_STUB.with(|s| s.borrow_mut().as_mut().and_then(|q| q.pop_front()));
+        if let Some(ready) = stubbed {
+            COMPOSER_PROBE_CALLS.with(|c| c.set(c.get() + 1));
+            return ready;
+        }
+    }
+    crate::lifecycle::find_route(
+        home,
+        session_route_query(item.persona.as_deref(), canonical_id),
+    )
+    .and_then(|route| fl_wire::dispatcher::probe_route_composer_ready(&route))
+}
 
 #[cfg(test)]
 pub(crate) fn before_next_prompt_dispatch(f: impl FnOnce() + 'static) {
@@ -6111,6 +6183,7 @@ fn dispatch_operator_prompt_with_intent_for_session(
             }
             #[cfg(test)]
             if queued && QUEUED_TEST_DELIVERY.with(|flag| flag.get()) {
+                QUEUED_DELIVERY_CALLS.with(|c| c.set(c.get() + 1));
                 return Ok(OperatorPromptOutcome::TransportAccepted);
             }
             let delivery = if intent == OperatorPromptIntent::OwnerSendNow
@@ -6175,9 +6248,15 @@ fn dispatch_queued_operator_prompt_with_intent_for_session(
     intended_codex_thread_id: Option<&str>,
 ) -> Result<OperatorPromptOutcome, OperatorPromptError> {
     #[cfg(test)]
+    if let Some(err) = QUEUED_TEST_ERROR.with(|e| e.borrow().clone()) {
+        QUEUED_DELIVERY_CALLS.with(|c| c.set(c.get() + 1));
+        return Err(OperatorPromptError::Push(PushError::Failed(err)));
+    }
+    #[cfg(test)]
     if QUEUED_TEST_DELIVERY.with(|flag| flag.get())
         && matches!(state.prompt_queue_target(session_id), Ok(None))
     {
+        QUEUED_DELIVERY_CALLS.with(|c| c.set(c.get() + 1));
         AFTER_PROMPT_DISPATCH.with(|hook| {
             if let Some(f) = hook.borrow_mut().take() {
                 f();
@@ -6215,6 +6294,11 @@ fn with_operator_delivery(
             let stage = match error {
                 OperatorPromptError::Steer(CodexSteerError::Refused { .. }) => "refused",
                 OperatorPromptError::Push(PushError::NotConnected(_)) => "not_connected",
+                OperatorPromptError::Push(PushError::Failed(e))
+                    if fl_wire::is_composer_occupied_zero_keys_error(e) =>
+                {
+                    "held"
+                }
                 _ => "unconfirmed",
             };
             let mut fields = json!({"delivery_stage":stage, "delivered":false, "delivery_error":error.to_string()});
@@ -6318,6 +6402,37 @@ pub fn drain_ready_session_queues(state: &HubState) {
             .session_queue(&session_id)
             .first()
             .map(|item| item.id.clone());
+        // A composer-occupied hold is retried only when a passive, key-free probe
+        // positively observes a clean composer (`Some(true)`), on the bounded
+        // backoff schedule in `HubState` — never over non-wire input or a dialog.
+        if let Some(prompt_id) = &next
+            && state.is_composer_held_prompt(&session_id, prompt_id)
+        {
+            let now_ms = stamp::now().unix_millis() as i64;
+            if !state.composer_hold_probe_due(prompt_id, now_ms) {
+                continue;
+            }
+            let head = state.session_queue(&session_id).into_iter().next();
+            let ready = head
+                .as_ref()
+                .and_then(|item| drain_composer_probe(home, item, &canonical_id));
+            match state.note_composer_hold_probe(prompt_id, now_ms) {
+                Some(probes) => eprintln!(
+                    "hub: composer-held prompt {prompt_id} for {canonical_id}: reprobe {probes}/{} ready={ready:?}",
+                    crate::COMPOSER_HELD_MAX_PROBES
+                ),
+                None => {
+                    state.mark_hold_retries_exhausted(&session_id, prompt_id);
+                    eprintln!(
+                        "hub: composer-held prompt {prompt_id} for {canonical_id}: reprobes exhausted after {} probes; holding until owner action",
+                        crate::COMPOSER_HELD_MAX_PROBES
+                    );
+                }
+            }
+            if !state.release_composer_held_prompt(&session_id, prompt_id, ready) {
+                continue;
+            }
+        }
         if !state.is_session_busy_from_observation(&canonical_id, turns.as_deref())
             && let Some(prompt_id) = next
             && let Some((item, claim)) =
@@ -6339,7 +6454,8 @@ pub fn drain_ready_session_queues(state: &HubState) {
                     f();
                 }
             });
-            if !matches!(delivery_res, Err(PushError::NotConnected(_))) {
+            let zero_key_hold = state.is_composer_held_prompt(&session_id, &item.id);
+            if !zero_key_hold && !matches!(delivery_res, Err(PushError::NotConnected(_))) {
                 let after = transcript_observation_from_sessions(
                     &canonical_id,
                     &sessions,
@@ -6385,6 +6501,33 @@ pub fn drain_ready_session_queues(state: &HubState) {
     }
 }
 
+/// Refusal for a queued-prompt verb (send-now, PATCH, DELETE) when the caller neither owns
+/// the hub nor queued this item. Peers can queue operator prompts; the item's `by` records
+/// its sender, so a peer may act only when that is its own authenticated, non-owner name.
+/// `None` also when the item is absent: the caller's normal 404/409 path then applies.
+fn queued_prompt_refusal(
+    state: &HubState,
+    authority: &HubAuthority,
+    canonical_id: &str,
+    raw_session_id: &str,
+    prompt_id: &str,
+) -> Option<HttpResponse> {
+    let item = state
+        .session_queue(canonical_id)
+        .into_iter()
+        .chain(state.session_queue(raw_session_id))
+        .find(|item| item.id == prompt_id)?;
+    if authority.is_owner()
+        || (!fl_wire::dispatcher::is_owner_sender(&item.by) && authority.actor_name() == item.by)
+    {
+        return None;
+    }
+    Some(HttpResponse::json(
+        403,
+        json!({ "error": "only the owner or the peer that queued this prompt may change it" }),
+    ))
+}
+
 fn handle_post_queued_prompt_send_now(
     state: &HubState,
     authority: &HubAuthority,
@@ -6398,6 +6541,11 @@ fn handle_post_queued_prompt_send_now(
             return HttpResponse::json(409, json!({"error": "ambiguous queued session alias"}));
         }
     };
+    if let Some(refusal) =
+        queued_prompt_refusal(state, authority, &canonical_id, raw_session_id, prompt_id)
+    {
+        return refusal;
+    }
     let claimed = state.claim_queued_for_dispatch(&canonical_id, raw_session_id, prompt_id, false);
     let Some((item, claim)) = claimed else {
         let exists = state
@@ -6447,7 +6595,13 @@ fn handle_post_queued_prompt_send_now(
         });
         state.finish_queued_prompt(&queue_key, prompt_id, legacy)
     };
+    // Owner Send-now that lands on an occupied composer arms a new hold: reset its
+    // bounded re-probe budget instead of inheriting an exhausted one.
+    if !refused && state.is_composer_held_prompt(&queue_key, prompt_id) {
+        state.reset_composer_hold_probe(prompt_id, stamp::now().unix_millis() as i64);
+    }
     if !refused
+        && !state.is_composer_held_prompt(&queue_key, prompt_id)
         && !matches!(
             delivery_res,
             Err(OperatorPromptError::Push(PushError::NotConnected(_)))
@@ -6502,6 +6656,7 @@ fn handle_post_queued_prompt_send_now(
 
 fn handle_patch_queued_prompt(
     state: &HubState,
+    authority: &HubAuthority,
     raw_session_id: &str,
     prompt_id: &str,
     req: &HttpRequest,
@@ -6512,6 +6667,13 @@ fn handle_patch_queued_prompt(
         prompt: String,
     }
 
+    let (canonical_id, target_persona) = resolve_session_target(state, raw_session_id);
+    if let Some(refusal) =
+        queued_prompt_refusal(state, authority, &canonical_id, raw_session_id, prompt_id)
+    {
+        return refusal;
+    }
+
     let payload: PatchQueuedPromptPayload = match req.json() {
         Ok(p) => p,
         Err(e) => return HttpResponse::json(400, json!({ "error": e })),
@@ -6520,8 +6682,6 @@ fn handle_patch_queued_prompt(
     if trimmed.is_empty() {
         return HttpResponse::json(400, json!({ "error": "prompt must not be empty" }));
     }
-
-    let (canonical_id, target_persona) = resolve_session_target(state, raw_session_id);
     let updated = state
         .update_queued_prompt(&canonical_id, prompt_id, trimmed.clone())
         .or_else(|| state.update_queued_prompt(raw_session_id, prompt_id, trimmed));
@@ -6555,10 +6715,16 @@ fn handle_patch_queued_prompt(
 
 fn handle_delete_queued_prompt(
     state: &HubState,
+    authority: &HubAuthority,
     raw_session_id: &str,
     prompt_id: &str,
 ) -> HttpResponse {
     let (canonical_id, target_persona) = resolve_session_target(state, raw_session_id);
+    if let Some(refusal) =
+        queued_prompt_refusal(state, authority, &canonical_id, raw_session_id, prompt_id)
+    {
+        return refusal;
+    }
     let removed = state
         .remove_queued_prompt(&canonical_id, prompt_id)
         .or_else(|| state.remove_queued_prompt(raw_session_id, prompt_id));
@@ -8208,6 +8374,7 @@ fn contextual_reforge_prompt(state: &HubState, snapshot: ReforgePromptSnapshot) 
 
 pub(crate) fn reforge_role_label(role: &AgentRole) -> String {
     match role {
+        AgentRole::Director => "director".to_string(),
         AgentRole::Lead => "lead".to_string(),
         AgentRole::Assistant => "assistant".to_string(),
         AgentRole::LabManager => "lab_manager".to_string(),
@@ -9441,8 +9608,12 @@ mod tests {
         let (status, list) = roles_call(&state, "GET", "/api/v1/roles", owner, None);
         assert_eq!(status, 200);
         let list = list.as_array().unwrap();
-        assert_eq!(list.len(), 12);
-        assert_eq!(list.iter().filter(|r| r["builtin"] == true).count(), 11);
+        assert_eq!(list.len(), 13);
+        assert_eq!(list.iter().filter(|r| r["builtin"] == true).count(), 12);
+        assert!(
+            list.iter()
+                .any(|r| r["slug"] == "director" && r["label"] == "Project Director")
+        );
 
         // Custom create -> 201, builtin=false; then listed.
         let (status, saved) = roles_call(
@@ -9456,7 +9627,7 @@ mod tests {
         assert_eq!(saved["slug"], "reviewer");
         assert_eq!(saved["builtin"], false);
         let (_, list) = roles_call(&state, "GET", "/api/v1/roles", owner, None);
-        assert_eq!(list.as_array().unwrap().len(), 13);
+        assert_eq!(list.as_array().unwrap().len(), 14);
         assert!(
             list.as_array()
                 .unwrap()

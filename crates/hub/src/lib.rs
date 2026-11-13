@@ -130,6 +130,10 @@ pub struct QueuedOperatorPrompt {
     pub delivery_state: QueuedDeliveryState,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delivery_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hold_reason: Option<String>,
+    #[serde(default)]
+    pub retries_exhausted: bool,
 }
 
 /// Sending and unconfirmed items stay visible and cannot be drained automatically.
@@ -193,6 +197,17 @@ impl PromptQueueTarget {
     }
 }
 
+/// Bounded re-probe budget for a prompt held by an occupied composer: first probe is
+/// immediate, then 10s doubling to 120s (10, 20, 40, 80, 120, ...), at most 16 probes.
+pub(crate) const COMPOSER_HELD_MAX_PROBES: u32 = 16;
+pub(crate) const COMPOSER_HELD_INITIAL_BACKOFF_MS: i64 = 10_000;
+pub(crate) const COMPOSER_HELD_MAX_BACKOFF_MS: i64 = 120_000;
+
+fn is_composer_occupied_error(error: &str) -> bool {
+    // Only the zero-keys wire error may auto-retry; every other Failed stays Unconfirmed.
+    fl_wire::is_composer_occupied_zero_keys_error(error)
+}
+
 #[derive(Debug, Default)]
 struct PromptQueueState {
     queues: BTreeMap<String, Vec<QueuedOperatorPrompt>>,
@@ -200,6 +215,8 @@ struct PromptQueueState {
     active_queue_sends: std::collections::BTreeSet<String>,
     next_seq: u64,
     targets: BTreeMap<String, PromptQueueTarget>,
+    /// Per-prompt `(probes_run, next_probe_at_ms)` for composer-occupied holds.
+    composer_hold_probes: BTreeMap<String, (u32, i64)>,
 }
 
 /// A logical dispatch claim, held across I/O without holding the queue mutex.
@@ -271,7 +288,7 @@ pub(crate) struct DirectPromptInput {
 
 pub(crate) enum DirectPromptDecision<'a> {
     Dispatch(SessionDispatchGuard<'a>),
-    Queued(QueuedOperatorPrompt, Vec<QueuedOperatorPrompt>),
+    Queued(Box<QueuedOperatorPrompt>, Vec<QueuedOperatorPrompt>),
     DispatchBusy,
     FencedAlias(String),
 }
@@ -306,6 +323,8 @@ impl PromptQueueState {
             created_at: now.to_string(),
             delivery_state: QueuedDeliveryState::Pending,
             delivery_error: None,
+            hold_reason: None,
+            retries_exhausted: false,
         };
         let queue = self.queues.entry(session_key.to_string()).or_default();
         queue.push(item.clone());
@@ -886,7 +905,7 @@ impl HubState {
                 || guard.queues.get(raw).is_some_and(|q| !q.is_empty()))
         {
             let (item, queue) = guard.enqueue(canonical, input);
-            return DirectPromptDecision::Queued(item, queue);
+            return DirectPromptDecision::Queued(Box::new(item), queue);
         }
         guard.remember_target(input.queue_target);
         guard.active_queue_sends.insert(canonical.into());
@@ -937,6 +956,7 @@ impl HubState {
         let Some(queue) = guard.queues.get_mut(session_key) else {
             return Vec::new();
         };
+        let mut finished_ok = false;
         if let Some(pos) = queue
             .iter()
             .position(|q| q.id == prompt_id && q.delivery_state == QueuedDeliveryState::Sending)
@@ -944,18 +964,152 @@ impl HubState {
             match result {
                 Ok(()) => {
                     queue.remove(pos);
+                    finished_ok = true;
                 }
                 Err(fl_wire::dispatcher::PushError::NotConnected(error)) => {
                     queue[pos].delivery_state = QueuedDeliveryState::Pending;
                     queue[pos].delivery_error = Some(error);
                 }
                 Err(fl_wire::dispatcher::PushError::Failed(error)) => {
-                    queue[pos].delivery_state = QueuedDeliveryState::Unconfirmed;
-                    queue[pos].delivery_error = Some(error);
+                    if is_composer_occupied_error(&error) {
+                        queue[pos].delivery_state = QueuedDeliveryState::Pending;
+                        queue[pos].delivery_error = Some(error);
+                        queue[pos].hold_reason = Some("composer_occupied_zero_keys".to_string());
+                        queue[pos].retries_exhausted = false;
+                    } else {
+                        queue[pos].delivery_state = QueuedDeliveryState::Unconfirmed;
+                        queue[pos].delivery_error = Some(error);
+                        queue[pos].hold_reason = None;
+                    }
                 }
             }
         }
-        queue.clone()
+        let composer_held = queue.iter().any(|q| {
+            q.id == prompt_id
+                && q.delivery_state == QueuedDeliveryState::Pending
+                && q.delivery_error
+                    .as_deref()
+                    .is_some_and(is_composer_occupied_error)
+        });
+        let out = queue.clone();
+        if finished_ok {
+            guard.composer_hold_probes.remove(prompt_id);
+        }
+        if composer_held {
+            guard
+                .composer_hold_probes
+                .entry(prompt_id.to_string())
+                .or_insert((0, stamp::now().unix_millis() as i64));
+        }
+        out
+    }
+
+    /// Reset the bounded re-probe budget for a composer-held prompt; used when an
+    /// owner action (Send-now) arms a new hold, mirroring wire's
+    /// `reset_composer_occupied_reprobe`.
+    pub(crate) fn reset_composer_hold_probe(&self, prompt_id: &str, now_ms: i64) {
+        let mut guard = self.prompt_queues.lock().unwrap_or_else(|e| e.into_inner());
+        guard
+            .composer_hold_probes
+            .insert(prompt_id.to_string(), (0, now_ms));
+        for q in guard.queues.values_mut() {
+            for i in q.iter_mut().filter(|i| i.id == prompt_id) {
+                i.retries_exhausted = false;
+            }
+        }
+    }
+
+    pub(crate) fn mark_hold_retries_exhausted(&self, session_key: &str, prompt_id: &str) {
+        let mut guard = self.prompt_queues.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(q) = guard.queues.get_mut(session_key) {
+            for i in q.iter_mut().filter(|i| i.id == prompt_id) {
+                i.retries_exhausted = true;
+            }
+        }
+    }
+
+    /// Whether `prompt_id` in `session_key`'s queue is a retryable composer-occupied hold.
+    pub(crate) fn is_composer_held_prompt(&self, session_key: &str, prompt_id: &str) -> bool {
+        let guard = self.prompt_queues.lock().unwrap_or_else(|e| e.into_inner());
+        guard.queues.get(session_key).is_some_and(|q| {
+            q.iter().any(|item| {
+                item.id == prompt_id
+                    && item.delivery_state == QueuedDeliveryState::Pending
+                    && item
+                        .delivery_error
+                        .as_deref()
+                        .is_some_and(is_composer_occupied_error)
+            })
+        })
+    }
+
+    /// Whether the bounded re-probe for a composer-held prompt is due at `now_ms`.
+    pub(crate) fn composer_hold_probe_due(&self, prompt_id: &str, now_ms: i64) -> bool {
+        let guard = self.prompt_queues.lock().unwrap_or_else(|e| e.into_inner());
+        match guard.composer_hold_probes.get(prompt_id) {
+            Some((probes, _)) if *probes >= COMPOSER_HELD_MAX_PROBES => false,
+            Some((_, next_at)) => now_ms >= *next_at,
+            None => true,
+        }
+    }
+
+    /// Record one re-probe of a composer-held prompt; returns the probe count, or `None`
+    /// when the bounded budget is exhausted and the prompt stays held.
+    pub(crate) fn note_composer_hold_probe(&self, prompt_id: &str, now_ms: i64) -> Option<u32> {
+        let mut guard = self.prompt_queues.lock().unwrap_or_else(|e| e.into_inner());
+        if !guard.composer_hold_probes.contains_key(prompt_id)
+            && !guard
+                .queues
+                .values()
+                .any(|q| q.iter().any(|i| i.id == prompt_id))
+        {
+            return None; // prompt deleted during probe: do not re-create entry
+        }
+        let entry = guard
+            .composer_hold_probes
+            .entry(prompt_id.to_string())
+            .or_insert((0, now_ms));
+        if entry.0 >= COMPOSER_HELD_MAX_PROBES {
+            return None;
+        }
+        entry.0 += 1;
+        let backoff = (COMPOSER_HELD_INITIAL_BACKOFF_MS << (entry.0 - 1).min(4))
+            .min(COMPOSER_HELD_MAX_BACKOFF_MS);
+        entry.1 = now_ms.saturating_add(backoff);
+        Some(entry.0)
+    }
+
+    /// Release a composer-held prompt for redelivery only when a passive probe positively
+    /// observed a clean composer (`Some(true)`). `Some(false)` (non-wire input or a dialog
+    /// still present) and `None` (composer not observable) keep the hold; no keys are ever
+    /// sent by the probe itself.
+    pub(crate) fn release_composer_held_prompt(
+        &self,
+        session_key: &str,
+        prompt_id: &str,
+        ready: Option<bool>,
+    ) -> bool {
+        if ready != Some(true) {
+            return false;
+        }
+        let mut guard = self.prompt_queues.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(queue) = guard.queues.get_mut(session_key) else {
+            return false;
+        };
+        let Some(item) = queue.iter_mut().find(|q| {
+            q.id == prompt_id
+                && q.delivery_state == QueuedDeliveryState::Pending
+                && q.delivery_error
+                    .as_deref()
+                    .is_some_and(is_composer_occupied_error)
+        }) else {
+            return false;
+        };
+        item.delivery_error = None;
+        item.hold_reason = None;
+        item.retries_exhausted = false;
+        guard.composer_hold_probes.remove(prompt_id);
+        true
     }
 
     /// Hold a known refusal without allowing a later automatic drain to change its intent.
@@ -983,7 +1137,15 @@ impl HubState {
     pub fn clear_session_prompt_queue(&self, session_key: &str) {
         let mut guard = self.prompt_queues.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(queue) = guard.queues.get_mut(session_key) {
+            let dropped: Vec<String> = queue
+                .iter()
+                .filter(|q| q.delivery_state == QueuedDeliveryState::Pending)
+                .map(|q| q.id.clone())
+                .collect();
             queue.retain(|q| q.delivery_state != QueuedDeliveryState::Pending);
+            for id in dropped {
+                guard.composer_hold_probes.remove(&id);
+            }
         }
         guard.in_flight.remove(session_key);
     }
@@ -1004,6 +1166,7 @@ impl HubState {
         })?;
         let item = queue.remove(pos);
         let remaining = queue.clone();
+        guard.composer_hold_probes.remove(prompt_id);
         if item.delivery_state == QueuedDeliveryState::Unconfirmed {
             // Only unwind-owned fences carry queue aliases. Do not clear a later direct
             // dispatch's unrelated unknown fence, or another alias's unresolved item.
@@ -1591,6 +1754,96 @@ mod tests {
         assert!(state.session_in_flight_unconfirmed("canonical"));
         state.remove_queued_prompt("raw", &item.id).unwrap();
         assert!(!state.session_in_flight_unconfirmed("canonical"));
+    }
+
+    #[test]
+    fn composer_occupied_hold_retries_only_on_clean_probe() {
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        let (item, _) = state.enqueue_session_prompt(
+            "ada",
+            None,
+            "hello".into(),
+            "hello".into(),
+            "owner".into(),
+            vec![],
+        );
+        let (_claimed, claim) = state
+            .claim_queued_for_dispatch("ada", "ada", &item.id, false)
+            .unwrap();
+        let queue = state.finish_queued_prompt(
+            "ada",
+            &item.id,
+            Err(fl_wire::dispatcher::PushError::Failed(
+                "composer_occupied_by_non_wire_input: composer holds non-wire input or active dialog; holding delivery without sending keys".into(),
+            )),
+        );
+        claim.finish();
+        // Zero-key hold stays retryable, not fenced as Unconfirmed.
+        assert_eq!(queue[0].delivery_state, QueuedDeliveryState::Pending);
+        assert!(state.is_composer_held_prompt("ada", &item.id));
+        // Probe that is not positively clean keeps the hold.
+        assert!(!state.release_composer_held_prompt("ada", &item.id, Some(false)));
+        assert!(!state.release_composer_held_prompt("ada", &item.id, None));
+        assert!(state.is_composer_held_prompt("ada", &item.id));
+        // Bounded probe budget.
+        let now_ms = stamp::now().unix_millis() as i64;
+        assert!(state.composer_hold_probe_due(&item.id, now_ms));
+        for _ in 0..COMPOSER_HELD_MAX_PROBES {
+            assert!(state.note_composer_hold_probe(&item.id, now_ms).is_some());
+        }
+        assert!(state.note_composer_hold_probe(&item.id, now_ms).is_none());
+        assert!(!state.composer_hold_probe_due(&item.id, now_ms + 1_000_000));
+        // A clean probe releases it for the normal drain dispatch path.
+        assert!(state.release_composer_held_prompt("ada", &item.id, Some(true)));
+        assert!(!state.is_composer_held_prompt("ada", &item.id));
+        let (claimed, claim2) = state
+            .claim_queued_for_dispatch("ada", "ada", &item.id, true)
+            .unwrap();
+        assert_eq!(claimed.id, item.id);
+        let queue = state.finish_queued_prompt("ada", &item.id, Ok(()));
+        claim2.finish();
+        assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn composer_hold_probes_cleaned_on_remove_and_reset_on_owner_rearm() {
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        let (item, _) = state.enqueue_session_prompt(
+            "ada",
+            None,
+            "hello".into(),
+            "hello".into(),
+            "owner".into(),
+            vec![],
+        );
+        let (_c, claim) = state
+            .claim_queued_for_dispatch("ada", "ada", &item.id, false)
+            .unwrap();
+        state.finish_queued_prompt(
+            "ada",
+            &item.id,
+            Err(fl_wire::dispatcher::PushError::Failed(
+                "composer_occupied_by_non_wire_input: composer holds non-wire input or active dialog; holding delivery without sending keys".into(),
+            )),
+        );
+        claim.finish();
+        let now_ms = stamp::now().unix_millis() as i64;
+        for _ in 0..COMPOSER_HELD_MAX_PROBES {
+            assert!(state.note_composer_hold_probe(&item.id, now_ms).is_some());
+        }
+        assert!(state.note_composer_hold_probe(&item.id, now_ms).is_none());
+        // Owner re-arm resets the exhausted budget.
+        state.reset_composer_hold_probe(&item.id, now_ms);
+        assert!(state.composer_hold_probe_due(&item.id, now_ms));
+        assert!(state.note_composer_hold_probe(&item.id, now_ms).is_some());
+        // Removing the prompt drops its probe entry (due again as a fresh prompt).
+        state.remove_queued_prompt("ada", &item.id).unwrap();
+        {
+            let guard = state.prompt_queues.lock().unwrap();
+            assert!(!guard.composer_hold_probes.contains_key(&item.id));
+        }
     }
 
     #[test]
@@ -3373,6 +3626,269 @@ mod tests {
                 .with_header("Authorization", "Bearer owner-tok-secret"),
         );
         assert_eq!(del_secret_resp.status, 200);
+    }
+
+    #[test]
+    fn queued_prompt_mutation_and_send_now_require_owner_or_queuing_peer() {
+        let _queued_delivery = crate::api::stub_queued_delivery_success();
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        let conv_id = "conv-ferris-1";
+        let logs_dir = tmp
+            .path()
+            .join(".gemini")
+            .join("antigravity-cli")
+            .join("brain")
+            .join(conv_id)
+            .join(".system_generated")
+            .join("logs");
+        fs::create_dir_all(&logs_dir).unwrap();
+        let turn0 = json!({
+            "step_index": 0,
+            "type": "USER_INPUT",
+            "content": "You will take the name of Ferris. Run cargo test.",
+            "created_at": "2026-10-27T16:00:00Z"
+        })
+        .to_string();
+        fs::write(logs_dir.join("transcript.jsonl"), format!("{turn0}\n")).unwrap();
+
+        fn queue_prompt(
+            state: &HubState,
+            token: &str,
+            agent: Option<&str>,
+            prompt: &str,
+        ) -> String {
+            let mut req = HttpRequest::new("POST", "/api/v1/sessions/ferris/prompt")
+                .with_header("Authorization", format!("Bearer {token}"))
+                .with_json_body(&json!({ "prompt": prompt, "send_now": false }));
+            if let Some(agent) = agent {
+                req = req.with_header("X-Fl-Agent", agent);
+            }
+            let resp = handle_http_request(state, &req);
+            assert_eq!(resp.status, 200, "queue resp: {:?}", resp.body);
+            let value = resp.json_value().unwrap();
+            assert_eq!(value["status"], "queued", "expected busy queue: {value}");
+            value["queued_prompt"]["id"].as_str().unwrap().to_string()
+        }
+        fn call(
+            state: &HubState,
+            method: &str,
+            path: String,
+            token: &str,
+            agent: Option<&str>,
+            body: Option<serde_json::Value>,
+        ) -> crate::api::HttpResponse {
+            let mut req = HttpRequest::new(method, path)
+                .with_header("Authorization", format!("Bearer {token}"));
+            if let Some(agent) = agent {
+                req = req.with_header("X-Fl-Agent", agent);
+            }
+            if let Some(body) = body {
+                req = req.with_json_body(&body);
+            }
+            handle_http_request(state, &req)
+        }
+        fn queued_prompt_text(state: &HubState, prompt_id: &str) -> Option<String> {
+            let resp = call(
+                state,
+                "GET",
+                "/api/v1/sessions/ferris/queue".to_string(),
+                "owner-tok-secret",
+                None,
+                None,
+            );
+            assert_eq!(resp.status, 200);
+            resp.json_value().unwrap()["queue"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|item| item["id"] == prompt_id)
+                .map(|item| item["prompt"].as_str().unwrap().to_string())
+        }
+
+        // Owner-queued item: a non-queuing peer is refused on every verb, changing nothing.
+        let owner_item = queue_prompt(&state, "owner-tok-secret", None, "Owner queued prompt");
+        let peer_patch = call(
+            &state,
+            "PATCH",
+            format!("/api/v1/sessions/ferris/queue/{owner_item}"),
+            "peer-tok-secret",
+            Some("mallory"),
+            Some(json!({ "prompt": "peer edit" })),
+        );
+        assert_eq!(peer_patch.status, 403, "peer PATCH owner item");
+        assert_eq!(
+            queued_prompt_text(&state, &owner_item).as_deref(),
+            Some("Owner queued prompt")
+        );
+        // Authorization precedes body validation: an unauthorized empty PATCH is 403, not 400.
+        let peer_empty_patch = call(
+            &state,
+            "PATCH",
+            format!("/api/v1/sessions/ferris/queue/{owner_item}"),
+            "peer-tok-secret",
+            Some("mallory"),
+            Some(json!({ "prompt": "" })),
+        );
+        assert_eq!(peer_empty_patch.status, 403, "peer empty PATCH owner item");
+        assert_eq!(
+            queued_prompt_text(&state, &owner_item).as_deref(),
+            Some("Owner queued prompt")
+        );
+        let peer_delete = call(
+            &state,
+            "DELETE",
+            format!("/api/v1/sessions/ferris/queue/{owner_item}"),
+            "peer-tok-secret",
+            Some("mallory"),
+            None,
+        );
+        assert_eq!(peer_delete.status, 403, "peer DELETE owner item");
+        assert!(queued_prompt_text(&state, &owner_item).is_some());
+        crate::api::reset_queued_delivery_calls();
+        let peer_send = call(
+            &state,
+            "POST",
+            format!("/api/v1/sessions/ferris/queue/{owner_item}/send-now"),
+            "peer-tok-secret",
+            Some("mallory"),
+            None,
+        );
+        assert_eq!(peer_send.status, 403, "peer send-now owner item");
+        assert_eq!(crate::api::queued_delivery_calls(), 0);
+        assert!(queued_prompt_text(&state, &owner_item).is_some());
+
+        // Owner PATCH and send-now still work on the owner's item.
+        let owner_patch = call(
+            &state,
+            "PATCH",
+            format!("/api/v1/sessions/ferris/queue/{owner_item}"),
+            "owner-tok-secret",
+            None,
+            Some(json!({ "prompt": "Owner queued prompt (edited)" })),
+        );
+        assert_eq!(
+            owner_patch.status, 200,
+            "owner PATCH: {:?}",
+            owner_patch.body
+        );
+        let owner_send = call(
+            &state,
+            "POST",
+            format!("/api/v1/sessions/ferris/queue/{owner_item}/send-now"),
+            "owner-tok-secret",
+            None,
+            None,
+        );
+        assert_eq!(
+            owner_send.status, 200,
+            "owner send-now: {:?}",
+            owner_send.body
+        );
+        assert!(queued_prompt_text(&state, &owner_item).is_none());
+
+        // Owner DELETE still works.
+        let owner_item2 = queue_prompt(&state, "owner-tok-secret", None, "Owner second prompt");
+        let owner_delete = call(
+            &state,
+            "DELETE",
+            format!("/api/v1/sessions/ferris/queue/{owner_item2}"),
+            "owner-tok-secret",
+            None,
+            None,
+        );
+        assert_eq!(owner_delete.status, 200);
+        assert!(queued_prompt_text(&state, &owner_item2).is_none());
+
+        // Peer-queued item: peers can queue; only that peer (and the owner) may act on it.
+        let peer_item = queue_prompt(
+            &state,
+            "peer-tok-secret",
+            Some("felicia"),
+            "Peer queued prompt",
+        );
+        let owner_patch_peer = call(
+            &state,
+            "PATCH",
+            format!("/api/v1/sessions/ferris/queue/{peer_item}"),
+            "owner-tok-secret",
+            None,
+            Some(json!({ "prompt": "Peer queued prompt (owner edit)" })),
+        );
+        assert_eq!(owner_patch_peer.status, 200, "owner PATCH peer item");
+        for (method, path, body) in [
+            (
+                "PATCH",
+                format!("/api/v1/sessions/ferris/queue/{peer_item}"),
+                Some(json!({ "prompt": "mallory edit" })),
+            ),
+            (
+                "DELETE",
+                format!("/api/v1/sessions/ferris/queue/{peer_item}"),
+                None,
+            ),
+            (
+                "POST",
+                format!("/api/v1/sessions/ferris/queue/{peer_item}/send-now"),
+                None,
+            ),
+        ] {
+            crate::api::reset_queued_delivery_calls();
+            let refused = call(
+                &state,
+                method,
+                path,
+                "peer-tok-secret",
+                Some("mallory"),
+                body,
+            );
+            assert_eq!(refused.status, 403, "non-queuing peer {method} peer item");
+            assert_eq!(crate::api::queued_delivery_calls(), 0);
+            assert_eq!(
+                queued_prompt_text(&state, &peer_item).as_deref(),
+                Some("Peer queued prompt (owner edit)")
+            );
+        }
+        let queuing_patch = call(
+            &state,
+            "PATCH",
+            format!("/api/v1/sessions/ferris/queue/{peer_item}"),
+            "peer-tok-secret",
+            Some("felicia"),
+            Some(json!({ "prompt": "Peer queued prompt (edited)" })),
+        );
+        assert_eq!(queuing_patch.status, 200, "queuing peer PATCH");
+        let queuing_send = call(
+            &state,
+            "POST",
+            format!("/api/v1/sessions/ferris/queue/{peer_item}/send-now"),
+            "peer-tok-secret",
+            Some("felicia"),
+            None,
+        );
+        assert_eq!(
+            queuing_send.status, 200,
+            "queuing peer send-now: {:?}",
+            queuing_send.body
+        );
+        assert!(queued_prompt_text(&state, &peer_item).is_none());
+
+        let peer_item2 = queue_prompt(
+            &state,
+            "peer-tok-secret",
+            Some("felicia"),
+            "Peer second prompt",
+        );
+        let queuing_delete = call(
+            &state,
+            "DELETE",
+            format!("/api/v1/sessions/ferris/queue/{peer_item2}"),
+            "peer-tok-secret",
+            Some("felicia"),
+            None,
+        );
+        assert_eq!(queuing_delete.status, 200, "queuing peer DELETE");
+        assert!(queued_prompt_text(&state, &peer_item2).is_none());
     }
 
     #[test]
@@ -8522,12 +9038,14 @@ mod tests {
                 .remove_queued_prompt("codex-thread-fixture", &item.id)
                 .is_some()
         );
+        // The queuing peer's authenticated name (no `X-Fl-Agent` in this helper): only it
+        // or the Owner may send this item now, and as Ordinary intent, never steering.
         let (peer_item, _) = state.enqueue_session_prompt(
             "codex-thread-fixture",
             Some("freya".into()),
             "peer queued".into(),
             "peer queued".into(),
-            "owner".into(),
+            "peer".into(),
             vec![],
         );
         let peer_queued = call(

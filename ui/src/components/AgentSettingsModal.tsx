@@ -1,7 +1,8 @@
+import { AreaBadge, CoverageChips } from "./AreaCoverage";
 import React, { useEffect, useRef, useState } from "react";
 import { HubApiClient, HubApiError } from "../api/client";
 import { roleLabel, roleOptions, selectedRoleOptions, useRoles } from "../hooks/useRoles";
-import type { HubAuthority, ProjectSummary, SessionQuotaUsage } from "../types/api";
+import type { AreaRecord, HubAuthority, ProjectSummary, SessionQuotaUsage } from "../types/api";
 import { projectChoices } from "../hooks/useProjects";
 import {
   isLiveSessionStatus,
@@ -345,6 +346,8 @@ export interface AgentSettingsModalProps {
   agentDisplayName?: string | null;
   agentRole?: string | null;
   agentProject?: string | null;
+  agentExtraAreas?: string[];
+  areas?: readonly AreaRecord[];
   adapter?: string | null;
   sessionId?: string | null;
   selectedModel: string;
@@ -487,6 +490,8 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
   agentDisplayName,
   agentRole,
   agentProject,
+  agentExtraAreas,
+  areas = [],
   adapter,
   sessionId,
   selectedModel,
@@ -1327,7 +1332,8 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
                   <div style={{ fontSize: "10px", color: "var(--text-muted)", textTransform: "uppercase" }}>
                     Project
                   </div>
-                  <div style={{ fontWeight: 600 }}>{agentProject}</div>
+                  <div style={{ fontWeight: 600 }}><AreaBadge slug={agentProject} areas={areas} projects={projects} /></div>
+                  <CoverageChips agent={{ id: "", name_key: "", display_name: "", project: agentProject, role: "", status: "", extra_areas: agentExtraAreas }} areas={areas} projects={projects} />
                 </div>
               )}
               {agentRole && (
