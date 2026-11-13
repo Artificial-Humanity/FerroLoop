@@ -2184,3 +2184,397 @@ fn purge_resume_resyncs_existing_audit_file_and_catalog_before_unlink() {
     );
     assert_eq!(fs::read(&intent).unwrap(), audit_before);
 }
+
+// A completed set retains its member even after that member's receipt is quarantined.
+fn review13_batch_fixture(dependency: bool) -> (Fixture, uuid::Uuid, OfflineLease, uuid::Uuid) {
+    use fl_store::recovery::{backup::*, catalog::PublicationReceiptV1, control::*, profiles::*};
+    let f = empty_fixture();
+    let (target, lease) = quarantined(&f);
+    let mut request = f.backup_request();
+    if dependency {
+        request.profile.dependencies.push(ReferenceDependency {
+            reference_sha256: "e".repeat(64),
+            catalog_identity: target.to_string(),
+            required_sequence: None,
+            policy: DependencyPolicy::ReconcileBeforeAdmission,
+        });
+    }
+    let owner = fl_store::FerroStore::open(&f.source).unwrap();
+    let PublicationOutcome::Durable(bundle) = backup(
+        &owner,
+        &request,
+        &f.filesystem(),
+        &fl_store::recovery::CancelToken::new(),
+    )
+    .unwrap() else {
+        panic!("not durable")
+    };
+    drop(owner);
+    let manifest: BundleManifestV1 =
+        serde_json::from_slice(&fs::read(bundle.path().join("manifest.json")).unwrap()).unwrap();
+    let other = uuid::Uuid::parse_str(&manifest.operation_id).unwrap();
+    let receipt: PublicationReceiptV1 = serde_json::from_slice(
+        &fs::read(f.backups.join(".catalog").join(format!("{other}.json"))).unwrap(),
+    )
+    .unwrap();
+    let batch = uuid::Uuid::now_v7();
+    let record = DurableBatchV1 {
+        version: 1,
+        batch_id: batch,
+        members: vec![DurableBatchMember {
+            operation_id: other,
+            catalog_identity: manifest.catalog_store_identity,
+            sequence: manifest.published_sequence,
+            manifest_sha256: receipt.manifest_sha256,
+            shared_config: manifest.shared_config,
+        }],
+    };
+    let path = f.backups.join(format!(".batch-{batch}.json"));
+    fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+    (f, target, lease, other)
+}
+fn review13_quarantine_other(f: &Fixture, other: uuid::Uuid) -> std::path::PathBuf {
+    let path = f.backups.join(".quarantine").join(other.to_string());
+    fs::create_dir(&path).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::rename(
+        f.backups.join(".catalog").join(format!("{other}.json")),
+        path.join("receipt.json"),
+    )
+    .unwrap();
+    path
+}
+#[test]
+fn purge_review13_completed_batch_accepts_exclusive_receipt_locations() {
+    // Start with the regression: the old reader cannot find this valid receipt.
+    for location in ["quarantine", "live-absent", "live-empty"] {
+        let (f, target, lease, other) = review13_batch_fixture(false);
+        let quarantine = f.backups.join(".quarantine").join(other.to_string());
+        if location == "quarantine" {
+            review13_quarantine_other(&f, other);
+        } else if location == "live-empty" {
+            fs::create_dir(&quarantine).unwrap();
+            fs::set_permissions(&quarantine, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let before = if location == "quarantine" {
+            pin_lifecycle_members(&f, other)
+        } else {
+            let mut files = std::collections::BTreeMap::new();
+            use sha2::{Digest, Sha256};
+            use std::os::unix::fs::MetadataExt;
+            for entry in fs::read_dir(f.backups.join(other.to_string())).unwrap() {
+                let path = entry.unwrap().path();
+                let m = fs::metadata(&path).unwrap();
+                files.insert(
+                    path.clone(),
+                    (
+                        m.dev(),
+                        m.ino(),
+                        m.len(),
+                        format!("{:x}", Sha256::digest(fs::read(path).unwrap())),
+                    ),
+                );
+            }
+            let path = f.backups.join(".catalog").join(format!("{other}.json"));
+            let m = fs::metadata(&path).unwrap();
+            files.insert(
+                path.clone(),
+                (
+                    m.dev(),
+                    m.ino(),
+                    m.len(),
+                    format!("{:x}", Sha256::digest(fs::read(path).unwrap())),
+                ),
+            );
+            files
+        };
+        let report = purge_quarantined(&inspection(target), &lease, &f.filesystem(), &limits())
+            .unwrap_or_else(|e| panic!("valid completed batch receipt at {location}: {e:?}"));
+        let done =
+            purge_quarantined(&confirmation(&report), &lease, &f.filesystem(), &limits()).unwrap();
+        assert!(
+            done.complete
+                && done
+                    .members
+                    .iter()
+                    .all(|m| m.state == PurgeMemberState::Removed)
+        );
+        use sha2::{Digest, Sha256};
+        use std::os::unix::fs::MetadataExt;
+        for (path, expected) in before {
+            let m = fs::metadata(&path).unwrap();
+            assert_eq!(
+                (
+                    m.dev(),
+                    m.ino(),
+                    m.len(),
+                    format!("{:x}", Sha256::digest(fs::read(path).unwrap()))
+                ),
+                expected
+            );
+        }
+        eprintln!("review13 location={location} purge_complete=true other_retained=true");
+    }
+}
+
+fn review13_refuses_without_target_unlink(
+    f: &Fixture,
+    target: uuid::Uuid,
+    lease: &OfflineLease,
+    report: &PurgeReport,
+    io: Arc<dyn RecoveryIo>,
+) {
+    let before = pin_lifecycle_members(f, target);
+    let filesystem = HookFs {
+        f,
+        io,
+        limits: limits(),
+    };
+    for request in [inspection(target), confirmation(report)] {
+        let result = purge_quarantined(&request, lease, &filesystem, &limits());
+        assert!(
+            result.is_err(),
+            "invalid completed-batch receipt accepted: {result:?}"
+        );
+        assert_eq!(pin_lifecycle_members(f, target), before);
+        assert!(
+            !f.backups
+                .join(".catalog")
+                .join(format!("purge-{target}.complete.json"))
+                .exists()
+        );
+    }
+}
+#[test]
+fn purge_review13_completed_batch_refuses_ambiguous_or_invalid_receipts() {
+    for change in [
+        "neither",
+        "both",
+        "bad-json",
+        "mismatch",
+        "stray",
+        "symlink-receipt",
+        "symlink-directory",
+        "regular-directory",
+        "live-stray",
+        "live-nonregular",
+    ] {
+        let (f, target, lease, other) = review13_batch_fixture(false);
+        let quarantine = review13_quarantine_other(&f, other);
+        let receipt = quarantine.join("receipt.json");
+        let live = f.backups.join(".catalog").join(format!("{other}.json"));
+        let report =
+            purge_quarantined(&inspection(target), &lease, &f.filesystem(), &limits()).unwrap();
+        match change {
+            "neither" => fs::remove_file(&receipt).unwrap(),
+            "both" => {
+                fs::copy(&receipt, &live).unwrap();
+            }
+            "bad-json" => fs::write(&receipt, b"{torn").unwrap(),
+            "mismatch" => {
+                let mut value: serde_json::Value =
+                    serde_json::from_slice(&fs::read(&receipt).unwrap()).unwrap();
+                value["manifest_sha256"] = serde_json::json!("0".repeat(64));
+                fs::write(&receipt, serde_json::to_vec(&value).unwrap()).unwrap();
+            }
+            "stray" => fs::write(quarantine.join("stray"), b"retain").unwrap(),
+            "symlink-receipt" => {
+                let saved = f.root.path().join("saved-receipt");
+                fs::rename(&receipt, &saved).unwrap();
+                std::os::unix::fs::symlink(&saved, &receipt).unwrap();
+            }
+            "symlink-directory" => {
+                let saved = f.root.path().join("saved-directory");
+                fs::rename(&quarantine, &saved).unwrap();
+                std::os::unix::fs::symlink(&saved, &quarantine).unwrap();
+            }
+            "regular-directory" => {
+                fs::rename(&quarantine, f.root.path().join("saved-directory")).unwrap();
+                fs::write(&quarantine, b"not a directory").unwrap();
+                fs::set_permissions(&quarantine, fs::Permissions::from_mode(0o600)).unwrap();
+            }
+            "live-stray" => {
+                fs::rename(&receipt, &live).unwrap();
+                fs::write(quarantine.join("stray"), b"retain").unwrap();
+            }
+            "live-nonregular" => {
+                fs::rename(&receipt, &live).unwrap();
+                fs::remove_file(&live).unwrap();
+                fs::create_dir(&live).unwrap();
+                fs::set_permissions(&live, fs::Permissions::from_mode(0o700)).unwrap();
+            }
+            _ => unreachable!(),
+        }
+        let hook = Arc::new(PurgeReplayCut {
+            stop: usize::MAX,
+            seen: std::sync::atomic::AtomicUsize::new(0),
+        });
+        review13_refuses_without_target_unlink(&f, target, &lease, &report, hook.clone());
+        assert_eq!(hook.seen.load(Ordering::Acquire), 0, "{change}");
+        eprintln!("review13 invalid={change} zero_unlinks=true");
+    }
+}
+struct Review13ReceiptRace {
+    receipt: std::path::PathBuf,
+    quarantine: std::path::PathBuf,
+    live: std::path::PathBuf,
+    change: u8,
+    batch_seen: AtomicBool,
+    fired: AtomicBool,
+    unlinks: std::sync::atomic::AtomicUsize,
+}
+impl RecoveryIo for Review13ReceiptRace {
+    fn before(&self, event: RecoveryEvent) -> std::io::Result<()> {
+        if event == RecoveryEvent::PurgeUnlink {
+            self.unlinks.fetch_add(1, Ordering::AcqRel);
+        }
+        Ok(())
+    }
+    fn read_exact_at(&self, file: &fs::File, bytes: &mut [u8], offset: u64) -> std::io::Result<()> {
+        use std::os::{fd::AsRawFd, unix::fs::FileExt};
+        file.read_exact_at(bytes, offset)?;
+        let path = fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd()))?;
+        if path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with(".batch-"))
+        {
+            self.batch_seen.store(true, Ordering::Release);
+        }
+        if path == self.receipt
+            && self.batch_seen.load(Ordering::Acquire)
+            && !self.fired.swap(true, Ordering::AcqRel)
+        {
+            match self.change {
+                0 => {
+                    let data = fs::read(&self.receipt)?;
+                    fs::rename(&self.receipt, self.receipt.with_extension("saved"))?;
+                    fs::write(&self.receipt, data)?;
+                    fs::set_permissions(&self.receipt, fs::Permissions::from_mode(0o600))?;
+                }
+                1 => {
+                    fs::rename(&self.quarantine, self.quarantine.with_extension("saved"))?;
+                    fs::create_dir(&self.quarantine)?;
+                    fs::set_permissions(&self.quarantine, fs::Permissions::from_mode(0o700))?;
+                    fs::copy(
+                        self.quarantine.with_extension("saved").join("receipt.json"),
+                        self.quarantine.join("receipt.json"),
+                    )?;
+                }
+                2 => {
+                    let parent = self.quarantine.parent().unwrap();
+                    fs::rename(parent, parent.with_extension("saved"))?;
+                    fs::create_dir(parent)?;
+                    fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
+                    // The target's quarantine must also survive, by the same inode.
+                    for entry in fs::read_dir(parent.with_extension("saved"))? {
+                        let entry = entry?;
+                        fs::rename(entry.path(), parent.join(entry.file_name()))?;
+                    }
+                }
+                3 => {
+                    fs::copy(&self.receipt, &self.live)?;
+                }
+                4 => {
+                    fs::write(self.quarantine.join("stray"), b"late stray")?;
+                }
+                5 => {
+                    fs::create_dir(&self.quarantine)?;
+                    fs::set_permissions(&self.quarantine, fs::Permissions::from_mode(0o700))?;
+                }
+                6 => {
+                    fs::rename(&self.quarantine, self.quarantine.with_extension("saved"))?;
+                    fs::create_dir(&self.quarantine)?;
+                    fs::set_permissions(&self.quarantine, fs::Permissions::from_mode(0o700))?;
+                }
+                _ => unreachable!(),
+            }
+        }
+        Ok(())
+    }
+}
+#[test]
+fn purge_review13_completed_batch_rechecks_receipt_locations_after_reads() {
+    for change in 0..7 {
+        let (f, target, lease, other) = review13_batch_fixture(false);
+        let quarantine = f.backups.join(".quarantine").join(other.to_string());
+        let live = f.backups.join(".catalog").join(format!("{other}.json"));
+        let receipt = if change < 5 {
+            review13_quarantine_other(&f, other).join("receipt.json")
+        } else {
+            live.clone()
+        };
+        if change == 6 {
+            fs::create_dir(&quarantine).unwrap();
+            fs::set_permissions(&quarantine, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let report =
+            purge_quarantined(&inspection(target), &lease, &f.filesystem(), &limits()).unwrap();
+        let hook = Arc::new(Review13ReceiptRace {
+            receipt,
+            quarantine,
+            live,
+            change,
+            batch_seen: AtomicBool::new(false),
+            fired: AtomicBool::new(false),
+            unlinks: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let before = pin_lifecycle_members(&f, target);
+        let filesystem = HookFs {
+            f: &f,
+            io: hook.clone(),
+            limits: limits(),
+        };
+        let request = confirmation(&report);
+        let result = purge_quarantined(&request, &lease, &filesystem, &limits());
+        assert!(
+            result.is_err(),
+            "read race accepted change={change}: {result:?}"
+        );
+        assert_eq!(pin_lifecycle_members(&f, target), before);
+        assert!(
+            !f.backups
+                .join(".catalog")
+                .join(format!("purge-{target}.complete.json"))
+                .exists()
+        );
+        assert!(
+            hook.fired.load(Ordering::Acquire),
+            "change={change} hook not reached"
+        );
+        assert_eq!(hook.unlinks.load(Ordering::Acquire), 0, "change={change}");
+        eprintln!("review13 race={change} reached=true zero_unlinks=true");
+    }
+}
+#[test]
+fn purge_review13_completed_batch_quarantined_dependency_still_refuses() {
+    let (f, target, lease, other) = review13_batch_fixture(true);
+    review13_quarantine_other(&f, other);
+    let before = pin_lifecycle_members(&f, target);
+    let hook = Arc::new(PurgeReplayCut {
+        stop: usize::MAX,
+        seen: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let filesystem = HookFs {
+        f: &f,
+        io: hook.clone(),
+        limits: limits(),
+    };
+    let error = purge_quarantined(&inspection(target), &lease, &filesystem, &limits()).unwrap_err();
+    assert!(
+        matches!(
+            error,
+            fl_store::recovery::RecoveryError::Verification { .. }
+        ),
+        "{error:?}"
+    );
+    assert_eq!(hook.seen.load(Ordering::Acquire), 0);
+    assert_eq!(pin_lifecycle_members(&f, target), before);
+    assert!(
+        !f.backups
+            .join(".catalog")
+            .join(format!("purge-{target}.complete.json"))
+            .exists()
+    );
+}

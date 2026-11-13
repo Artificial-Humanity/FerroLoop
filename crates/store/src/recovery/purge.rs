@@ -358,6 +358,73 @@ fn checked_memory(
 ) -> Result<u64, RecoveryError> {
     checked.memory_bytes(l)
 }
+// A completed set may outlive withdrawal of a member's receipt. Exactly one
+// publication location is authority; retain its directory/receipt handles until
+// all injectable receipt reads have finished, then recheck both locations.
+fn check_batch_receipt(
+    root: &Dir,
+    catalog: &Dir,
+    operation: &str,
+    checked: &catalog::CheckedBundle,
+    l: &OperationLimits,
+) -> Result<(), RecoveryError> {
+    // Covers the additional owned paths/descriptor bookkeeping and streaming
+    // directory iteration, alongside the already-retained bundle/batch models.
+    let l = l.with_retained_memory(6 * CLOSURE_ENTRY_MEMORY + 65536)?;
+    canonical_op(operation, &l)?;
+    let quarantine_root = Dir::open(&root.path.join(".quarantine"), &l)?;
+    let quarantine = if quarantine_root.exists(operation, &l)? {
+        Some(Dir::open(&quarantine_root.path.join(operation), &l)?)
+    } else {
+        None
+    };
+    let name = format!("{operation}.json");
+    let live = catalog.exists(&name, &l)?;
+    let quarantined = match &quarantine {
+        Some(dir) => dir.exists("receipt.json", &l)?,
+        None => false,
+    };
+    if live == quarantined {
+        return Err(l.verification());
+    }
+    let validate_locations = || {
+        root.same_name(&l)?;
+        catalog.same_name(&l)?;
+        quarantine_root.same_name(&l)?;
+        if catalog.exists(&name, &l)? != live
+            || quarantine_root.exists(operation, &l)? != quarantine.is_some()
+        {
+            return Err(l.verification());
+        }
+        if let Some(dir) = &quarantine {
+            let mut count = 0;
+            dir.visit_names(&l, |entry| {
+                if live || entry != "receipt.json" {
+                    return Err(l.verification());
+                }
+                count += 1;
+                Ok(())
+            })?;
+            if count != usize::from(!live) {
+                return Err(l.verification());
+            }
+        }
+        Ok(())
+    };
+    validate_locations()?;
+    let receipt = if live {
+        catalog::checked_receipt(catalog, &name, checked, &l)?
+    } else {
+        catalog::checked_receipt(
+            quarantine.as_ref().ok_or_else(|| l.verification())?,
+            "receipt.json",
+            checked,
+            &l,
+        )?
+    };
+    validate_locations()?;
+    receipt.unchanged(&l)
+}
 fn closure(
     root: &Dir,
     op: uuid::Uuid,
@@ -462,12 +529,6 @@ fn closure(
             let checked = catalog::check_bundle(&dir, &text, &member_limits)?;
             let receipt_limits =
                 member_limits.with_retained_memory(checked_memory(&checked, &member_limits)?)?;
-            let receipt = catalog::checked_receipt(
-                &catalog,
-                &format!("{text}.json"),
-                &checked,
-                &receipt_limits,
-            )?;
             if checked.manifest_sha256 != m.manifest_sha256
                 || checked.manifest.catalog_store_identity != m.catalog_identity
                 || checked.manifest.published_sequence != m.sequence
@@ -476,7 +537,7 @@ fn closure(
             {
                 return Err(l.verification());
             }
-            receipt.unchanged(&receipt_limits)?;
+            check_batch_receipt(root, &catalog, &text, &checked, &receipt_limits)?;
         }
         drop(seen);
         drop(batch);
