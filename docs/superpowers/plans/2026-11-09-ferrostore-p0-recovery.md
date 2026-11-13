@@ -235,10 +235,12 @@ Only isolated local fixture tests are in scope.**
   file under its locks; it does not authorize broad cleanup. Existing guard,
   phase/generation, forensic retention and strict restore `2L` constraints remain.
 - Read-only restore status exposes `accepted_reconciliation` and
-  `accepted_absence_reconciliation`. These let an operator recover a lost request
-  from journal-accepted evidence for an intent retry. Status does not change
-  acceptance, consume attempts or mutate artifacts; retries still require the
-  already accepted evidence rather than replacement evidence.
+  `accepted_absence_reconciliation`. The former lets an operator recover a lost
+  selected/original request for an INTENT retry, which requires byte-identical
+  stored reconciliation. The latter reports journal-accepted absence evidence;
+  absence finalization has no separate INTENT phase. Already-terminal cleanup
+  uses persisted evidence and ignores caller replacement evidence for both paths.
+  Status does not change acceptance, consume attempts or mutate artifacts.
 
 **Purge limitation:** current inspection and confirmed purge both require full
 bundle verification **and a matching receipt**. Consequently they cannot purge
