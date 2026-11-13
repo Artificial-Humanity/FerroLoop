@@ -5687,10 +5687,8 @@ where
         )
         .map_err(LifecycleError::Invalid)?;
     }
-    let project_cwd =
-        resolve_project_cwd(store, &v.project, env.workspace_root, env.home_override)?;
     if v.cwd.is_none() {
-        v.cwd = project_cwd;
+        v.cwd = resolve_project_cwd(store, &v.project, env.workspace_root, env.home_override)?;
     }
     // Before any side effect: an API vendor whose key is missing would register an agent that
     // can never run.
@@ -7746,14 +7744,13 @@ where
         record.project = agent.project;
         record.role = role_label_of(&agent.role);
     }
-    let project_cwd = resolve_project_cwd(
-        store,
-        &record.project,
-        env.workspace_root,
-        env.home_override,
-    )?;
     if record.cwd.is_none() {
-        record.cwd = project_cwd;
+        record.cwd = resolve_project_cwd(
+            store,
+            &record.project,
+            env.workspace_root,
+            env.home_override,
+        )?;
     }
     let config_home = preflight_vendor_launch(env, &record.vendor, record.hosted, &mut record.cwd)?;
     if record.hosted && vendor_has_runtime(&record.vendor) && env.spawn_runtime {
@@ -9009,7 +9006,6 @@ fn plan_remodel<S: AgentRegistry + StateStore + Catalog>(
     let from_model = old.and_then(|r| r.model.clone());
     let from_thinking_level = old.and_then(|r| r.thinking_level.clone());
     let from_posture = old.map_or(fl_core::permissions::Posture::Auto, |r| r.posture);
-    let project_cwd = resolve_project_cwd(store, &project, env.workspace_root, env.home_override)?;
     let resolved_cwd = if trimmed_opt(&req.cwd).is_some() {
         req.cwd.clone()
     } else {
@@ -9018,7 +9014,8 @@ fn plan_remodel<S: AgentRegistry + StateStore + Catalog>(
             _ => false,
         };
         if old_cwd.is_none() || old_is_ws_root {
-            project_cwd.or_else(|| old_cwd.clone())
+            resolve_project_cwd(store, &project, env.workspace_root, env.home_override)?
+                .or_else(|| old_cwd.clone())
         } else {
             old_cwd.clone()
         }
@@ -11440,6 +11437,128 @@ mod tests {
             fake.spawn_cwds.borrow().last().unwrap().as_deref(),
             root.to_str()
         );
+    }
+
+    #[test]
+    fn broken_config_is_checked_only_when_launch_needs_a_directory() {
+        for broken in ["invalid-toml", "missing-root", "conflict"] {
+            for operation in ["restart", "respawn", "remodel", "spin-up"] {
+                for has_cwd in [true, false] {
+                    let home = TempDir::new().unwrap();
+                    let workspace = home.path().join("workspace");
+                    let root = workspace.join("Kaggle/Competition");
+                    std::fs::create_dir_all(&root).unwrap();
+                    write_project_bindings(home.path(), std::slice::from_ref(&root));
+                    let store = MemStore::default();
+                    let fake = FakeRuntime::default();
+                    let mut e = fake.env(home.path());
+                    e.workspace_root = Some(&workspace);
+                    let mut request = req("ada", "assistant", "claude");
+                    request.project = "audio-suite".into();
+                    request.cwd = Some(root.display().to_string());
+                    if operation != "spin-up" {
+                        spin_up(&store, &e, &request, "owner", Caller::Owner).unwrap();
+                        let mut record = find_hosted_session(&store, &["claude:ada"])
+                            .unwrap()
+                            .unwrap();
+                        if !has_cwd {
+                            record.cwd = None;
+                        }
+                        if operation == "respawn" {
+                            record.status = STATUS_STOPPED.into();
+                            record.stop_reason = Some(STOP_REASON_RUNTIME_GONE.into());
+                        }
+                        persist_hosted_session(&store, &record, "owner").unwrap();
+                        fake.live.borrow_mut().clear();
+                        fake.launches.borrow_mut().clear();
+                        fake.spawn_cwds.borrow_mut().clear();
+                    }
+                    let config = home.path().join(".config/fl/config.toml");
+                    let text = match broken {
+                        "invalid-toml" => "broken = [".to_string(),
+                        "missing-root" => "[[project]]\nname='audio-suite'\n".to_string(),
+                        _ => format!(
+                            "[[project]]\nname='audio-suite'\nroot={:?}\ncwd='exact'\n[[project]]\nname='audio-suite'\nroot={:?}\ncwd='workspace'\n",
+                            root.to_str().unwrap(),
+                            root.to_str().unwrap()
+                        ),
+                    };
+                    std::fs::write(config, text).unwrap();
+                    let succeeded = match operation {
+                        "restart" => {
+                            restart_hosted_session(&store, &e, "claude:ada", "owner").is_ok()
+                        }
+                        "respawn" => !reconcile_and_respawn_hosted_sessions(&store, &e)
+                            .unwrap()
+                            .is_empty(),
+                        "remodel" => {
+                            let target =
+                                SessionTarget::resolve(&store, "claude:ada", None).unwrap();
+                            remodel_session(
+                                &store,
+                                &e,
+                                &target,
+                                &RemodelRequest {
+                                    vendor: "muse".into(),
+                                    ..Default::default()
+                                },
+                                "owner",
+                                Caller::Owner,
+                                |_| {},
+                            )
+                            .is_ok()
+                        }
+                        _ => {
+                            if !has_cwd {
+                                request.cwd = None;
+                            }
+                            spin_up(&store, &e, &request, "owner", Caller::Owner).is_ok()
+                        }
+                    };
+                    assert_eq!(succeeded, has_cwd, "{broken} {operation} cwd={has_cwd}");
+                    if has_cwd {
+                        assert_eq!(
+                            fake.spawn_cwds.borrow().last().unwrap().as_deref(),
+                            root.to_str(),
+                            "{broken} {operation}"
+                        );
+                    } else {
+                        assert!(fake.launches.borrow().is_empty(), "{broken} {operation}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn explicit_remodel_cwd_survives_broken_config() {
+        let home = TempDir::new().unwrap();
+        let root = home.path().join("repo");
+        std::fs::create_dir(&root).unwrap();
+        let store = MemStore::default();
+        let fake = FakeRuntime::default();
+        let e = fake.env(home.path());
+        let mut request = req("ada", "assistant", "claude");
+        request.cwd = Some(root.display().to_string());
+        spin_up(&store, &e, &request, "owner", Caller::Owner).unwrap();
+        let config = home.path().join(".config/fl/config.toml");
+        std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+        std::fs::write(config, "bad = [").unwrap();
+        let target = SessionTarget::resolve(&store, "claude:ada", None).unwrap();
+        let result = remodel_session(
+            &store,
+            &e,
+            &target,
+            &RemodelRequest {
+                vendor: "muse".into(),
+                cwd: Some(root.display().to_string()),
+                ..Default::default()
+            },
+            "owner",
+            Caller::Owner,
+            |_| {},
+        );
+        assert!(result.is_ok(), "{result:?}");
     }
 
     #[cfg(unix)]

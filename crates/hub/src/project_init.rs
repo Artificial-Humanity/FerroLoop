@@ -362,6 +362,9 @@ pub(crate) fn resolve_bound_project(
         .filter(|e| e.slug().is_some_and(|slug| slug.eq_ignore_ascii_case(name)))
     {
         let exact = entry.exact_cwd()?;
+        if entry.root.is_empty() {
+            return Err(format!("registered project root unavailable for {name}"));
+        }
         let path = Path::new(&entry.root);
         let root = path
             .is_absolute()
@@ -425,7 +428,7 @@ pub(crate) fn binding_config_entries(
             {
                 entries.push(ConfigEntry {
                     name: Some(name.to_owned()),
-                    root: String::new(),
+                    root: String::new(), // Invalid sentinel; never use as a path.
                     store: None,
                     tracker: None,
                     cwd: table.get("cwd").cloned(),
