@@ -9,6 +9,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
+use sha2::{Digest, Sha256};
+
 use fl_core::at::At;
 use fl_core::ferrowire::{DeliveryReceipt, DeliveryStatus, WireMessage};
 use fl_core::store::MessageStore;
@@ -4604,16 +4606,110 @@ fn is_known_static_ghost_placeholder_for_route(ghost_text: &str, is_muse_route: 
 /// leading-slash hint pattern: a `/command` followed by a descriptive sentence. This is only
 /// consulted inside the ghost gate in `composer_has_unsubmitted_content`, where the cursor
 /// sits immediately after the prompt prefix — real typed input has the cursor past the text.
+// Complete composer placeholder hint set extracted from the installed Muse build
+// Muse Code 1.4.18 (1.4.18-R8587.1), binary `~/.local/bin/muse-bin-1.4.18-R8587.1`
+// (strings table adjacent to `/resume reopens a past session (--last for the latest)`).
+const MUSE_HINTS: &[&str] = &[
+    "Type @ to search and insert workspace file paths",
+    "Start a message with ! to run a shell command yourself",
+    "Paste an image with Ctrl+V \u{2014} file paths and URLs work too",
+    "Press Alt+V to dictate instead of typing",
+    "Tab queues or steers while a run is active",
+    "Press ? on an empty composer to see keyboard shortcuts",
+    "Press Ctrl+O to expand collapsed tool output",
+    "/side asks a quick question without touching this thread",
+    "/fork branches the conversation from the latest point",
+    "/goal pins a session objective with a progress bar",
+    "/resume reopens a past session (--last for the latest)",
+    "Ask to 'use a workflow' to fan out parallel agents on big tasks",
+    "Say 'use a workflow' to fan out agents on big tasks",
+    "Ask to monitor a running build or log and get pinged on changes",
+    "/agent opens the subagent command center",
+    "/tasks shows workflows, subagents and terminals in one place",
+    "/loop 10m <prompt> schedules a recurring prompt",
+    "Ctrl+B sends the selected task to the background queue",
+    "/skills browses ready-made skills for repeatable procedures",
+    "/plugins marketplace installs new commands and skills",
+    "/effort adjusts reasoning depth vs speed",
+    "/usage shows this session's token usage",
+    "/export saves the conversation to a text file",
+];
+
 fn is_muse_placeholder_hint(ghost_text: &str) -> bool {
-    const MUSE_HINTS: &[&str] = &[
-        "/resume reopens a past session (--last for the latest)",
-        "/help lists available commands",
-        "/model switches the model",
-        "/clear clears the conversation",
-    ];
     // Exact list only, Muse routes only (see `is_known_static_ghost_placeholder_for_route`):
     // a typed `/review the open PR please` is real input, not a hint.
     MUSE_HINTS.contains(&ghost_text)
+}
+
+/// Prompt-start candidate on a Muse route that is not a known ghost/hint, if any.
+/// Mirrors the single-line ghost gate in `composer_has_unsubmitted_content_for_route`.
+fn unlisted_muse_prompt_start_candidate(
+    screen: &str,
+    cursor: Option<CursorState>,
+) -> Option<String> {
+    if composer_shows_pasted_placeholder(screen) {
+        return None;
+    }
+    let cleaned = normalize_terminal_screen(screen);
+    let lines: Vec<&str> = cleaned.lines().collect();
+    let (composer_lines, top_rule) = composer_region_lines(&lines)?;
+    let non_empty: Vec<(usize, &str)> = composer_lines
+        .iter()
+        .copied()
+        .enumerate()
+        .filter(|(_, line)| !strip_composer_prompt_prefix(line).trim().is_empty())
+        .collect();
+    let [(rel_idx, line)] = non_empty.as_slice() else {
+        return None;
+    };
+    if !line_starts_with_prompt(line) {
+        return None;
+    }
+    let cs = cursor?;
+    let leading_ws = line.chars().take_while(|c| c.is_whitespace()).count();
+    if usize::from(cs.col) > leading_ws + 2
+        || !cs
+            .dims
+            .is_none_or(|(_, cols)| cols == 0 || line.chars().count() < usize::from(cols))
+    {
+        return None;
+    }
+    let prompt_idx = top_rule + 1 + rel_idx;
+    let lines_below = lines.len().saturating_sub(1 + prompt_idx);
+    let exact_row = usize::from(cs.row) == prompt_idx;
+    let soft_wrapped = composer_lines.len() == rel_idx + 1
+        && cs.dims.is_some_and(|(rows, _)| {
+            usize::from(cs.row) >= prompt_idx
+                && usize::from(cs.row).saturating_add(lines_below) < usize::from(rows)
+        });
+    if !exact_row && !soft_wrapped {
+        return None;
+    }
+    let ghost_text = strip_composer_prompt_prefix(line).trim();
+    if ghost_text.is_empty()
+        || cs.ghost_styled
+        || is_known_static_ghost_placeholder_for_route(ghost_text, true)
+        || ansi_stream_styles_ghost_text(screen, ghost_text)
+    {
+        return None;
+    }
+    Some(ghost_text.to_string())
+}
+
+fn unlisted_muse_hint_log_line(candidate: &str) -> String {
+    let digest = format!("{:x}", Sha256::digest(candidate.as_bytes()));
+    format!(
+        "muse composer held: unlisted prompt-start candidate len={} sha256={}",
+        candidate.len(),
+        &digest[..12]
+    )
+}
+
+fn log_unlisted_muse_hint(candidate: &str) {
+    let line = unlisted_muse_hint_log_line(candidate);
+    #[cfg(test)]
+    UNLISTED_MUSE_HINT_WARNINGS.with(|w| w.borrow_mut().push(line.clone()));
+    eprintln!("fl-wire: warning: {line}");
 }
 
 /// `true` when `raw_ansi` applies ANSI dim/faint/gray SGR styling (`\x1b[2m`, `\x1b[90m`,
@@ -5859,6 +5955,11 @@ fn probe_composer_ready_from_screen(
     {
         Some(true)
     } else {
+        if is_muse_route
+            && let Some(candidate) = unlisted_muse_prompt_start_candidate(contents, cursor)
+        {
+            log_unlisted_muse_hint(&candidate);
+        }
         Some(false)
     }
 }
@@ -6320,6 +6421,12 @@ fn dispatch_message_selected_with_status<S: MessageStore>(
         }
     }
     (updated, Some(attempted))
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static UNLISTED_MUSE_HINT_WARNINGS: std::cell::RefCell<Vec<String>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// `FL_WIRE_TMUX_BIN` is process-global. Tests that point it at a fake tmux (or that rely on it
@@ -18344,6 +18451,120 @@ exit 1"#,
         assert!(!is_composer_occupied_zero_keys_error(
             &composer_occupied_after_pre_paste_flush_error()
         ));
+    }
+
+    #[test]
+    fn muse_hints_complete_list_route_and_cursor_gating() {
+        let rule = "─".repeat(40);
+        let screen_for = |text: &str| format!("◆ Ready.\n{rule}\n❯ {text}\n{rule}\n  footer");
+        // Every listed hint: empty at prompt start on Muse, input on non-Muse.
+        // `Press …` hints are also generic static ghosts for every vendor, so they
+        // stay empty on non-Muse routes by that pre-existing rule.
+        for hint in MUSE_HINTS {
+            let screen = screen_for(hint);
+            assert!(
+                !composer_has_unsubmitted_content_for_route(
+                    &screen,
+                    Some(CursorState::new(2, 2)),
+                    true
+                ),
+                "Muse hint must read empty: {hint}"
+            );
+            if hint.starts_with("Press ") {
+                assert!(!composer_has_unsubmitted_content_for_route(
+                    &screen,
+                    Some(CursorState::new(2, 2)),
+                    false
+                ));
+            } else {
+                assert!(
+                    composer_has_unsubmitted_content_for_route(
+                        &screen,
+                        Some(CursorState::new(2, 2)),
+                        false
+                    ),
+                    "Muse hint must read as input on non-Muse route: {hint}"
+                );
+            }
+            // Listed hint with cursor NOT at prompt start reads as input.
+            assert!(
+                composer_has_unsubmitted_content_for_route(
+                    &screen,
+                    Some(CursorState::new(2, 20)),
+                    true
+                ),
+                "hint away from prompt start must read as input: {hint}"
+            );
+        }
+        // Named regressions from NB2.
+        for hint in [
+            "Ask to monitor a running build or log and get pinged on changes",
+            "/goal pins a session objective with a progress bar",
+        ] {
+            assert!(is_muse_placeholder_hint(hint));
+            assert!(!composer_has_unsubmitted_content_for_route(
+                &screen_for(hint),
+                Some(CursorState::new(2, 2)),
+                true
+            ));
+            assert_eq!(
+                probe_composer_ready_from_screen(
+                    &screen_for(hint),
+                    Some(CursorState::new(2, 2)),
+                    &[],
+                    ComposerStyle::Ruled,
+                    true
+                ),
+                Some(true)
+            );
+        }
+        assert!(!is_muse_placeholder_hint("/review the open PR please"));
+        assert!(composer_has_unsubmitted_content_for_route(
+            &screen_for("/review the open PR please"),
+            Some(CursorState::new(2, 2)),
+            true
+        ));
+    }
+
+    #[test]
+    fn unlisted_muse_prompt_start_candidate_is_held_and_logged_redacted() {
+        let rule = "─".repeat(40);
+        let candidate = "Totally unlisted draft text xyz";
+        let screen = format!("◆ Ready.\n{rule}\n❯ {candidate}\n{rule}\n  footer");
+        UNLISTED_MUSE_HINT_WARNINGS.with(|w| w.borrow_mut().clear());
+        assert_eq!(
+            probe_composer_ready_from_screen(
+                &screen,
+                Some(CursorState::new(2, 2)),
+                &[],
+                ComposerStyle::Ruled,
+                true
+            ),
+            Some(false)
+        );
+        let warnings = UNLISTED_MUSE_HINT_WARNINGS.with(|w| std::mem::take(&mut *w.borrow_mut()));
+        assert_eq!(warnings.len(), 1, "warnings: {warnings:?}");
+        let line = &warnings[0];
+        let digest = format!("{:x}", Sha256::digest(candidate.as_bytes()));
+        assert!(line.contains(&format!("len={}", candidate.len())), "{line}");
+        assert!(
+            line.contains(&format!("sha256={}", &digest[..12])),
+            "{line}"
+        );
+        assert!(!line.contains(candidate), "must not log text: {line}");
+        // Non-Muse route: held as input but no unlisted-hint line.
+        UNLISTED_MUSE_HINT_WARNINGS.with(|w| w.borrow_mut().clear());
+        assert_eq!(
+            probe_composer_ready_from_screen(
+                &screen,
+                Some(CursorState::new(2, 2)),
+                &[],
+                ComposerStyle::Ruled,
+                false
+            ),
+            Some(false)
+        );
+        assert!(UNLISTED_MUSE_HINT_WARNINGS.with(|w| w.borrow().is_empty()));
     }
 
     #[test]
