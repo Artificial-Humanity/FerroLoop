@@ -549,7 +549,7 @@ fn bounded_output(mut command: std::process::Command) -> std::process::Output {
                 String::from_utf8_lossy(&output.stderr)
             );
         }
-        std::thread::yield_now();
+        std::thread::sleep(Duration::from_millis(5));
     }
     child.wait_with_output().unwrap()
 }
@@ -712,9 +712,109 @@ impl RecoveryFs for CutFs<'_> {
         &self.limits
     }
 }
+// The default schedule samples repeated I/O; exhaustive mode preserves every cut.
+fn restore_cut_schedule(events: &[RecoveryEvent], exhaustive: bool) -> Vec<usize> {
+    if exhaustive {
+        return (0..events.len()).collect();
+    }
+    let mut cuts = std::collections::BTreeSet::new();
+    for (index, event) in events.iter().enumerate() {
+        // Keep both ends of each repeated I/O kind: admission and completion
+        // have different recovery obligations even when the hook is identical.
+        if !events[..index].contains(event) || !events[index + 1..].contains(event) {
+            cuts.insert(index);
+        }
+        // Exercise the intent immediately before and durability immediately
+        // after each namespace/authority action, including intermediate ones.
+        if matches!(
+            event,
+            RecoveryEvent::Exchange
+                | RecoveryEvent::RestoreInstall
+                | RecoveryEvent::RestoreRelocate
+                | RecoveryEvent::RestoreReverseExchange
+                | RecoveryEvent::RestoreGuardRemove
+                | RecoveryEvent::RestorePinRemove
+                | RecoveryEvent::RestoreOperationLock
+                | RecoveryEvent::RenameEntry
+                | RecoveryEvent::Publish
+        ) {
+            cuts.extend(index.saturating_sub(1)..=(index + 1).min(events.len() - 1));
+        }
+    }
+    // Preserve the old cut-index errno mapping, including all three errors
+    // whenever the full lane contains them.
+    for residue in 0..events.len().min(3) {
+        if !cuts.iter().any(|cut| cut % 3 == residue) {
+            cuts.insert(residue);
+        }
+    }
+    cuts.into_iter().collect()
+}
+
+#[test]
+fn restore_cut_schedule_preserves_actions_durability_and_errno_coverage() {
+    // Repeated journal writes separate intent/action/durability neighborhoods.
+    let mut events = vec![RecoveryEvent::Write(Member::RestoreJournal); 60];
+    events[10] = RecoveryEvent::Flush(Member::RestoreJournal);
+    events[11] = RecoveryEvent::Exchange;
+    events[12] = RecoveryEvent::Sync(Directory::RestoreDestinationParent);
+    events[28] = RecoveryEvent::Flush(Member::RestoreJournal);
+    events[29] = RecoveryEvent::RestoreRelocate;
+    events[30] = RecoveryEvent::Sync(Directory::RestoreStagingParent);
+    events[43] = RecoveryEvent::RestoreReverseExchange;
+    events[50] = RecoveryEvent::RestoreGuardRemove;
+    events[55] = RecoveryEvent::RestorePinRemove;
+    let cuts = restore_cut_schedule(&events, false);
+    assert!(
+        cuts.len() < events.len() / 2,
+        "default must sample repeated I/O"
+    );
+    for required in [
+        0, 10, 11, 12, 28, 29, 30, 42, 43, 44, 49, 50, 51, 54, 55, 56, 59,
+    ] {
+        assert!(
+            cuts.contains(&required),
+            "missing action/durability cut {required}"
+        );
+    }
+    for event in &events {
+        assert!(
+            cuts.iter().any(|&cut| events[cut] == *event),
+            "missing {event:?}"
+        );
+    }
+    assert!(cuts.windows(2).all(|pair| pair[0] < pair[1]));
+    for residue in 0..3 {
+        assert!(
+            cuts.iter().any(|cut| cut % 3 == residue),
+            "missing errno {residue}"
+        );
+    }
+    for len in 0..10 {
+        let repeated = vec![RecoveryEvent::Write(Member::RestoreJournal); len];
+        let cuts = restore_cut_schedule(&repeated, false);
+        for residue in 0..len.min(3) {
+            assert!(cuts.iter().any(|cut| cut % 3 == residue));
+        }
+        assert!(cuts.windows(2).all(|pair| pair[0] < pair[1]));
+        assert!(cuts.iter().all(|&cut| cut < len));
+    }
+}
+
+#[test]
+fn restore_cut_schedule_exhaustive_keeps_repeated_events_and_every_index() {
+    for len in [0, 1, 2, 3, 17, 120] {
+        let events = vec![RecoveryEvent::Flush(Member::RestoreJournal); len];
+        assert_eq!(
+            restore_cut_schedule(&events, true),
+            (0..len).collect::<Vec<_>>()
+        );
+    }
+}
+
 #[test]
 fn restore_exchange_and_reverse_exchange_recover_every_cut() {
-    let trace = Fixture::new();
+    let trace = journal_fixture();
     let (request, lease) = prepare_restore(&trace, &trace.source);
     let hooks = Arc::new(CutIo::new(usize::MAX, libc::EIO));
     let filesystem = CutFs {
@@ -742,8 +842,16 @@ fn restore_exchange_and_reverse_exchange_recover_every_cut() {
     let reverse = hooks.events.lock().unwrap().clone();
     assert!(reverse.contains(&RecoveryEvent::RestoreReverseExchange));
     for (reverse_mode, events) in [(false, install), (true, reverse)] {
-        for (cut, event) in events.iter().enumerate() {
-            let f = Fixture::new();
+        let exhaustive = std::env::var("FL_RECOVERY_EXHAUSTIVE").as_deref() == Ok("1");
+        let cuts = restore_cut_schedule(&events, exhaustive);
+        eprintln!(
+            "restore_cut_schedule reverse={reverse_mode} exhaustive={exhaustive} selected={} full={} indices={cuts:?}",
+            cuts.len(),
+            events.len()
+        );
+        for cut in cuts {
+            let event = &events[cut];
+            let f = journal_fixture();
             let (request, lease) = prepare_restore(&f, &f.source);
             let old = fs::metadata(&f.source).unwrap().ino();
             let before = fs::read(&f.source).unwrap();
@@ -805,7 +913,13 @@ fn restore_exchange_and_reverse_exchange_recover_every_cut() {
                     let admitted =
                         load_restore_journal(std::path::Path::new(path), &renewed, &clock)
                             .expect("renewed lease must admit exact before/after intent layout");
-                    let result = resume_restore(&admitted, &renewed, &clock);
+                    // Durable reverse intent must be continued by typed rollback;
+                    // generic resume is not authority to cancel that decision.
+                    let result = if admitted.phase == RestorePhase::ReverseIntent {
+                        rollback_restore(&admitted, &renewed, &clock)
+                    } else {
+                        resume_restore(&admitted, &renewed, &clock)
+                    };
                     assert!(
                         matches!(
                             result,
@@ -1685,7 +1799,7 @@ fn generation_evidence(
 fn exercise_finalization_cuts(all: bool) {
     use fl_store::recovery::readiness::{finalize_restore, finalize_rollback};
     for original in [false, true] {
-        let trace = Fixture::new();
+        let trace = journal_fixture();
         let (request, lease) = prepare_restore(&trace, &trace.source);
         let RestoreOutcome::Installed { mut journal } =
             restore_offline(&request, &lease, &trace.filesystem()).unwrap()
@@ -1716,17 +1830,31 @@ fn exercise_finalization_cuts(all: bool) {
         let events = io.events.lock().unwrap().clone();
         assert!(events.contains(&RecoveryEvent::RestoreGuardRemove));
         assert!(events.contains(&RecoveryEvent::Sync(Directory::RestoreGuardParent)));
-        for (cut, event) in events.iter().enumerate() {
-            if !all
-                && !matches!(
-                    event,
-                    RecoveryEvent::RestoreGuardRemove
-                        | RecoveryEvent::Sync(Directory::RestoreGuardParent)
-                )
-            {
-                continue;
-            }
-            let f = Fixture::new();
+        let exhaustive = std::env::var("FL_RECOVERY_EXHAUSTIVE").as_deref() == Ok("1");
+        let cuts = if all {
+            restore_cut_schedule(&events, exhaustive)
+        } else {
+            events
+                .iter()
+                .enumerate()
+                .filter_map(|(cut, event)| {
+                    matches!(
+                        event,
+                        RecoveryEvent::RestoreGuardRemove
+                            | RecoveryEvent::Sync(Directory::RestoreGuardParent)
+                    )
+                    .then_some(cut)
+                })
+                .collect()
+        };
+        eprintln!(
+            "restore_finalize_schedule original={original} all={all} exhaustive={exhaustive} selected={} full={} indices={cuts:?}",
+            cuts.len(),
+            events.len()
+        );
+        for cut in cuts {
+            let event = &events[cut];
+            let f = journal_fixture();
             let (request, lease) = prepare_restore(&f, &f.source);
             let RestoreOutcome::Installed { mut journal } =
                 restore_offline(&request, &lease, &f.filesystem()).unwrap()

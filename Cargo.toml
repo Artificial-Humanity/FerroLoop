@@ -49,3 +49,7 @@ tiktoken-rs = { version = "0.12.1", default-features = false }
 
 [profile.dev.package.sha2]
 opt-level = 3
+
+# Recovery verification decodes fixture images on the normal dev/test path.
+[profile.dev.package.fl-store]
+opt-level = 3
