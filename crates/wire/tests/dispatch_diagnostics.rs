@@ -1,5 +1,18 @@
 //! Real vendor-dispatch boundary checks, isolated in subprocesses with fixture-only paths.
 
+#[used]
+#[cfg_attr(
+    target_vendor = "apple",
+    unsafe(link_section = "__DATA,__mod_init_func")
+)]
+#[cfg_attr(not(target_vendor = "apple"), unsafe(link_section = ".init_array"))]
+static INITIALIZE_ISOLATION: extern "C" fn() = {
+    extern "C" fn enable() {
+        fl_wire::test_isolation::enable();
+    }
+    enable
+};
+
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
@@ -30,44 +43,6 @@ fn executable(path: &Path, body: &str) {
 #[test]
 fn fake_transport_route_refresh_preserves_legacy_dispatch_decisions() {
     for changed in [true, false] {
-        let fixture = TempDir::new().unwrap();
-        let home = fixture.path();
-        let sessions = home.join(".local/share/muse/sessions");
-        fs::create_dir_all(&sessions).unwrap();
-        let transcript = sessions.join("session.jsonl");
-        let call_log = home.join("calls");
-        let before = serde_json::json!({
-            "session_id": "before", "agentName": "diagnostic-recipient", "cwd": home,
-        });
-        let after = serde_json::json!({
-            "session_id": "after", "agentName": "diagnostic-recipient", "cwd": home,
-        });
-        fs::write(&transcript, format!("{before}\n")).unwrap();
-        let muse = home.join("fake-muse");
-        executable(
-            &muse,
-            &format!(
-                "#!/bin/sh\nset -eu\nprintf '%s\\n' \"$3\" >> {}\nif [ \"$3\" = before ]; then\n  {}\n  exit 1\nfi\n[ \"$3\" = after ]\n",
-                shell_quote(&call_log),
-                if changed {
-                    // Copy a JSON fixture rather than interpolate its contents into shell code.
-                    let replacement = home.join("replacement.jsonl");
-                    fs::write(&replacement, format!("{after}\n")).unwrap();
-                    format!(
-                        "/bin/cp {} {}",
-                        shell_quote(&replacement),
-                        shell_quote(&transcript)
-                    )
-                } else {
-                    ":".into()
-                },
-            ),
-        );
-        let tmux = home.join("fake-tmux");
-        executable(&tmux, "#!/bin/sh\nexit 1\n");
-
-        // The parent never mutates its environment. Each child has one test and a clean,
-        // fixture-only environment, so it cannot race other tests' TMUX_ENV_LOCK guards.
         let output = Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
@@ -77,14 +52,6 @@ fn fake_transport_route_refresh_preserves_legacy_dispatch_decisions() {
             ])
             .env_clear()
             .env("PATH", "/usr/bin:/bin")
-            .env("HOME", home)
-            .env("XDG_CACHE_HOME", home.join(".cache"))
-            .env("XDG_CONFIG_HOME", home.join(".config"))
-            .env("XDG_DATA_HOME", home.join(".local/share"))
-            .env("FL_WIRE_MUSE_BIN", &muse)
-            .env("FL_WIRE_TMUX_BIN", &tmux)
-            .env("FL_WIRE_DISABLE_HOST_DISCOVERY", "1")
-            .env("DIAGNOSTIC_FIXTURE_HOME", home)
             .env(
                 "DIAGNOSTIC_FIXTURE_CHANGED",
                 if changed { "1" } else { "0" },
@@ -97,24 +64,61 @@ fn fake_transport_route_refresh_preserves_legacy_dispatch_decisions() {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
-        assert_eq!(
-            fs::read_to_string(&call_log).unwrap(),
-            if changed {
-                "before\nafter\n"
-            } else {
-                "before\n"
-            }
-        );
     }
 }
 
 #[test]
 #[ignore = "only run in the explicitly isolated fixture subprocess"]
 fn fake_transport_fixture() {
-    let home = std::env::var_os("DIAGNOSTIC_FIXTURE_HOME").expect("fixture subprocess only");
-    let home = Path::new(&home);
-    assert_eq!(std::env::var_os("HOME").unwrap(), home);
     let changed = std::env::var("DIAGNOSTIC_FIXTURE_CHANGED").unwrap() == "1";
+    let fixture = TempDir::new().unwrap();
+    let home = fixture.path();
+    let sessions = home.join(".local/share/muse/sessions");
+    fs::create_dir_all(&sessions).unwrap();
+    let transcript = sessions.join("session.jsonl");
+    let call_log = home.join("calls");
+    let before = serde_json::json!({
+        "session_id": "before", "agentName": "diagnostic-recipient", "cwd": home,
+    });
+    let after = serde_json::json!({
+        "session_id": "after", "agentName": "diagnostic-recipient", "cwd": home,
+    });
+    fs::write(&transcript, format!("{before}\n")).unwrap();
+    let muse = home.join("fake-muse");
+    executable(
+        &muse,
+        &format!(
+            "#!/bin/sh\nset -eu\nprintf '%s\\n' \"$3\" >> {}\nif [ \"$3\" = before ]; then\n  {}\n  exit 1\nfi\n[ \"$3\" = after ]\n",
+            shell_quote(&call_log),
+            if changed {
+                // Copy a JSON fixture rather than interpolate its contents into shell code.
+                let replacement = home.join("replacement.jsonl");
+                fs::write(&replacement, format!("{after}\n")).unwrap();
+                format!(
+                    "/bin/cp {} {}",
+                    shell_quote(&replacement),
+                    shell_quote(&transcript)
+                )
+            } else {
+                ":".into()
+            },
+        ),
+    );
+    let tmux = home.join("fake-tmux");
+    executable(&tmux, "#!/bin/sh\nexit 1\n");
+
+    // The parent never mutates its environment. Each child has one test and a clean,
+    // fixture-only environment, so it cannot race other tests' TMUX_ENV_LOCK guards.
+    // This subprocess runs one fixture and owns every path it exports.
+    unsafe {
+        std::env::set_var("HOME", home);
+        std::env::set_var("XDG_CACHE_HOME", home.join(".cache"));
+        std::env::set_var("XDG_CONFIG_HOME", home.join(".config"));
+        std::env::set_var("XDG_DATA_HOME", home.join(".local/share"));
+        std::env::set_var("FL_WIRE_MUSE_BIN", &muse);
+        std::env::set_var("FL_WIRE_TMUX_BIN", &tmux);
+        std::env::set_var("FL_WIRE_DISABLE_HOST_DISCOVERY", "1");
+    }
     let store = MemStore::default();
     let (msg, initial) = store
         .send_wire(SendWireArgs {
@@ -159,6 +163,14 @@ fn fake_transport_fixture() {
     assert_eq!(store.list_wire_receipts(&msg.id).unwrap(), updated);
     assert!(matches!(&routes.get("diagnostic-recipient").unwrap().route,
         VendorRoute::Muse { session_id, .. } if session_id == if changed { "after" } else { "before" }));
+    assert_eq!(
+        fs::read_to_string(&call_log).unwrap(),
+        if changed {
+            "before\nafter\n"
+        } else {
+            "before\n"
+        }
+    );
 }
 
 use fl_core::agent::{AgentRecord, AreaRecord, RegisterAgentArgs, RegistryEvent};
@@ -402,18 +414,6 @@ impl AgentRegistry for FaultStore {
 #[test]
 fn successful_push_then_store_fault_exposes_status_without_resend() {
     for fault in ["write", "final_read"] {
-        let fixture = TempDir::new().unwrap();
-        let home = fixture.path();
-        let muse = home.join("fake-muse");
-        executable(
-            &muse,
-            &format!(
-                "#!/bin/sh\nset -eu\nprintf 'push\\n' >> {}\n",
-                shell_quote(&home.join("calls"))
-            ),
-        );
-        let tmux = home.join("fake-tmux");
-        executable(&tmux, "#!/bin/sh\nexit 1\n");
         let output = Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
@@ -423,17 +423,6 @@ fn successful_push_then_store_fault_exposes_status_without_resend() {
             ])
             .env_clear()
             .env("PATH", "/usr/bin:/bin")
-            .env("HOME", home)
-            .env("XDG_RUNTIME_DIR", home)
-            .env("XDG_CACHE_HOME", home.join("cache"))
-            .env("XDG_CONFIG_HOME", home.join("config"))
-            .env("XDG_DATA_HOME", home.join("data"))
-            .env("FL_WIRE_ROUTES", home.join("routes.json"))
-            .env("FL_WIRE_SOCKET", home.join("wire.sock"))
-            .env("FL_WIRE_MUSE_BIN", muse)
-            .env("FL_WIRE_TMUX_BIN", tmux)
-            .env("FL_WIRE_DISABLE_HOST_DISCOVERY", "1")
-            .env("DIAGNOSTIC_FIXTURE_HOME", home)
             .env("DIAGNOSTIC_STORE_FAULT", fault)
             .output()
             .unwrap();
@@ -443,7 +432,6 @@ fn successful_push_then_store_fault_exposes_status_without_resend() {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
-        assert_eq!(fs::read_to_string(home.join("calls")).unwrap(), "push\n");
         let stderr = String::from_utf8(output.stderr).unwrap();
         let warning = stderr
             .lines()
@@ -490,9 +478,32 @@ fn status(client: &mut FixtureClient) -> serde_json::Value {
 #[test]
 #[ignore = "only run in the explicitly isolated fixture subprocess"]
 fn daemon_store_fault_fixture() {
-    let home = std::env::var_os("DIAGNOSTIC_FIXTURE_HOME").expect("fixture subprocess only");
-    let home = Path::new(&home);
     let fault = std::env::var("DIAGNOSTIC_STORE_FAULT").unwrap();
+    let fixture = TempDir::new().unwrap();
+    let home = fixture.path();
+    let muse = home.join("fake-muse");
+    executable(
+        &muse,
+        &format!(
+            "#!/bin/sh\nset -eu\nprintf 'push\\n' >> {}\n",
+            shell_quote(&home.join("calls"))
+        ),
+    );
+    let tmux = home.join("fake-tmux");
+    executable(&tmux, "#!/bin/sh\nexit 1\n");
+    // The subprocess owns all fixture paths; no inherited path can authorize access.
+    unsafe {
+        std::env::set_var("HOME", home);
+        std::env::set_var("XDG_RUNTIME_DIR", home);
+        std::env::set_var("XDG_CACHE_HOME", home.join("cache"));
+        std::env::set_var("XDG_CONFIG_HOME", home.join("config"));
+        std::env::set_var("XDG_DATA_HOME", home.join("data"));
+        std::env::set_var("FL_WIRE_ROUTES", home.join("routes.json"));
+        std::env::set_var("FL_WIRE_SOCKET", home.join("wire.sock"));
+        std::env::set_var("FL_WIRE_MUSE_BIN", &muse);
+        std::env::set_var("FL_WIRE_TMUX_BIN", &tmux);
+        std::env::set_var("FL_WIRE_DISABLE_HOST_DISCOVERY", "1");
+    }
     let store = Arc::new(FaultStore {
         inner: RedbStore::open(&home.join("fault.redb")).unwrap(),
         gets: Mutex::new(VecDeque::new()),

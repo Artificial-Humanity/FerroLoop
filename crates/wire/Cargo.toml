@@ -5,7 +5,11 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[features]
+wire-test-isolation = ["dep:tempfile", "fl-host-proto/hub-test-isolation"]
+
 [dependencies]
+tempfile = { workspace = true, optional = true }
 anyhow.workspace = true
 base64.workspace = true
 fl-core = { path = "../core" }
@@ -23,5 +27,7 @@ thiserror.workspace = true
 webpki-roots.workspace = true
 
 [dev-dependencies]
+fl-wire = { path = ".", features = ["wire-test-isolation"] }
+fl-host-proto = { path = "../host-proto", features = ["hub-test-isolation"] }
 tempfile.workspace = true
 tokio.workspace = true

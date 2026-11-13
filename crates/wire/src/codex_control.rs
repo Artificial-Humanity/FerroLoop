@@ -106,6 +106,8 @@ pub(crate) fn compact_thread(
 ) -> Result<(), String> {
     let deadline = Instant::now() + timeout;
     // Known limit: a Unix-socket `connect` has no timeout (it blocks only on a full backlog).
+    #[cfg(feature = "wire-test-isolation")]
+    crate::test_isolation::ensure_fixture(sock).map_err(|e| e.to_string())?;
     let stream = UnixStream::connect(sock).map_err(|e| {
         format!(
             "cannot connect to the Codex app-server control socket {}: {e}",
@@ -839,6 +841,8 @@ fn connect_for_steering(sock: &Path, deadline: Instant) -> io::Result<UnixStream
             .ok_or_else(|| io::Error::from(io::ErrorKind::TimedOut))
     };
     remaining()?;
+    #[cfg(feature = "wire-test-isolation")]
+    crate::test_isolation::ensure_fixture(sock)?;
     let address = SockAddr::unix(sock)?;
     let socket = Socket::new(Domain::UNIX, Type::STREAM, None)?;
     socket.connect_timeout(&address, remaining()?)?;

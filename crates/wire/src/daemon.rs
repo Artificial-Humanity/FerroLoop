@@ -774,6 +774,8 @@ pub struct LocalClient {
 
 impl LocalClient {
     pub fn connect(socket_path: &Path, timeout: Duration) -> io::Result<Self> {
+        #[cfg(feature = "wire-test-isolation")]
+        crate::test_isolation::ensure_fixture(socket_path)?;
         let stream = UnixStream::connect(socket_path)?;
         stream.set_read_timeout(Some(timeout))?;
         stream.set_write_timeout(Some(timeout))?;
@@ -3195,6 +3197,8 @@ pub struct DaemonHandle {
     shutdown: Arc<AtomicBool>,
     join_handle: Option<std::thread::JoinHandle<()>>,
     poll_join_handle: Option<std::thread::JoinHandle<()>>,
+    #[cfg(feature = "wire-test-isolation")]
+    _tcp_fixture: Option<crate::test_isolation::TcpFixture>,
 }
 
 impl DaemonHandle {
@@ -3232,6 +3236,8 @@ pub fn spawn_daemon<S>(store: Arc<S>, mut config: DaemonConfig) -> io::Result<Da
 where
     S: MessageStore + AgentRegistry + StateStore + Send + Sync + 'static,
 {
+    #[cfg(feature = "wire-test-isolation")]
+    crate::test_isolation::ensure_fixture(&config.socket_path)?;
     if config.psk.is_empty() && (config.listen_addr.is_some() || !config.peers.is_empty()) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -3276,6 +3282,16 @@ where
     unix_listener.set_nonblocking(true)?;
 
     let tcp_listener = if let Some(ref bind_addr) = config.listen_addr {
+        #[cfg(feature = "wire-test-isolation")]
+        if crate::test_isolation::is_enabled()
+            && bind_addr != "127.0.0.1:0"
+            && bind_addr != "[::1]:0"
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "wire tests must bind a fresh loopback TCP fixture",
+            ));
+        }
         let l = TcpListener::bind(bind_addr)?;
         let actual = l.local_addr()?.to_string();
         config.listen_addr = Some(actual);
@@ -3285,6 +3301,15 @@ where
         None
     };
 
+    #[cfg(feature = "wire-test-isolation")]
+    let tcp_fixture = if crate::test_isolation::is_enabled() {
+        tcp_listener
+            .as_ref()
+            .map(crate::test_isolation::register_tcp_listener)
+            .transpose()?
+    } else {
+        None
+    };
     let initial_routes = RouteTable::load(config.routes_path.as_deref());
     let initial_pending = seed_pending_map_from_store(store.as_ref());
     let inner = Arc::new(DaemonInner {
@@ -3470,6 +3495,8 @@ where
         shutdown: shutdown_flag,
         join_handle: Some(join_handle),
         poll_join_handle: Some(poll_join_handle),
+        #[cfg(feature = "wire-test-isolation")]
+        _tcp_fixture: tcp_fixture,
     })
 }
 
@@ -8020,6 +8047,9 @@ mod tests {
         let _ = child.wait();
 
         let probe_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+
+        let _probe_listener_fixture =
+            crate::test_isolation::register_tcp_listener(&probe_listener).unwrap();
         probe_listener.set_nonblocking(true).unwrap();
         let probe_addr = probe_listener.local_addr().unwrap();
 

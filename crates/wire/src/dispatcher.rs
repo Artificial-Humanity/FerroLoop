@@ -397,6 +397,9 @@ fn push_webhook_operator_prompt(
 
 /// Write `line` and a newline on one new connection to the webhook socket.
 fn push_webhook_line(socket_path: &Path, mut line: String) -> Result<(), PushError> {
+    #[cfg(feature = "wire-test-isolation")]
+    crate::test_isolation::ensure_fixture(socket_path)
+        .map_err(|e| PushError::Failed(e.to_string()))?;
     let mut stream = UnixStream::connect(socket_path).map_err(|e| {
         let text = format!(
             "failed to connect to webhook socket {}: {e}",
@@ -491,6 +494,8 @@ fn push_claude_socket(
         .and_then(|v| v.as_str())
         .ok_or_else(|| format!("missing `peerToken` in {}", kpath.display()))?;
 
+    #[cfg(feature = "wire-test-isolation")]
+    crate::test_isolation::ensure_fixture(socket_path).map_err(|e| e.to_string())?;
     let mut stream = UnixStream::connect(socket_path).map_err(|e| {
         format!(
             "failed to connect to claude socket {}: {e}",
@@ -1799,6 +1804,8 @@ fn post_agy_connect_rpc_with_deadline(
         body.len()
     );
     let target = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
+    #[cfg(feature = "wire-test-isolation")]
+    crate::test_isolation::ensure_tcp(&target).map_err(|e| e.to_string())?;
     let mut stream = TcpStream::connect_timeout(&target, timeout)
         .map_err(|err| format!("antigravity revert connect to {host} failed: {err}"))?;
     stream
@@ -2352,6 +2359,10 @@ pub fn run_interrupt(plan: &InterruptPlan) -> Result<(), String> {
 }
 
 pub(crate) fn tmux_bin() -> PathBuf {
+    #[cfg(feature = "wire-test-isolation")]
+    if crate::test_isolation::is_enabled() {
+        return crate::test_isolation::tmux_fixture();
+    }
     std::env::var_os("FL_WIRE_TMUX_BIN")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("tmux"))
@@ -6409,6 +6420,8 @@ pub fn dispatch_operator_prompt_to_route(
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| format!("missing `peerToken` in {}", kpath.display()))?;
 
+            #[cfg(feature = "wire-test-isolation")]
+            crate::test_isolation::ensure_fixture(socket_path).map_err(|e| e.to_string())?;
             let mut stream = UnixStream::connect(socket_path).map_err(|e| {
                 format!(
                     "failed to connect to claude socket {}: {e}",
@@ -8972,6 +8985,8 @@ mod tests {
         use std::net::TcpListener;
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+
+        let _listener_fixture = crate::test_isolation::register_tcp_listener(&listener).unwrap();
         let port = listener.local_addr().unwrap().port();
         let (req_tx, req_rx) = std::sync::mpsc::channel::<String>();
         std::thread::spawn(move || {
@@ -9614,6 +9629,8 @@ mod tests {
         assert!(parse_err.contains("could not parse a port"), "{parse_err}");
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+
+        let _listener_fixture = crate::test_isolation::register_tcp_listener(&listener).unwrap();
         let port = listener.local_addr().unwrap().port();
         let no_csrf = VendorRoute::Agy {
             conversation_id: "conv-no-csrf".into(),
@@ -9856,17 +9873,29 @@ mod tests {
     struct EnvGuard {
         key: &'static str,
         prev: Option<std::ffi::OsString>,
+        #[cfg(unix)]
+        _host_fixture: Option<fl_host_proto::HubTestHostFixture>,
     }
 
     impl EnvGuard {
         fn set(key: &'static str, value: &std::path::Path) -> Self {
             let prev = std::env::var_os(key);
+            #[cfg(unix)]
+            let host_fixture = (key == "FL_HOST_SOCK").then(|| {
+                crate::test_isolation::ensure_fixture(value).unwrap();
+                fl_host_proto::register_hub_test_host_fixture(value).unwrap()
+            });
             // SAFETY: the guard restores the previous value on drop. Callers hold
             // the matching env lock for the whole test.
             unsafe {
                 std::env::set_var(key, value);
             }
-            Self { key, prev }
+            Self {
+                key,
+                prev,
+                #[cfg(unix)]
+                _host_fixture: host_fixture,
+            }
         }
 
         fn remove(key: &'static str) -> Self {
@@ -9876,7 +9905,12 @@ mod tests {
             unsafe {
                 std::env::remove_var(key);
             }
-            Self { key, prev }
+            Self {
+                key,
+                prev,
+                #[cfg(unix)]
+                _host_fixture: None,
+            }
         }
     }
 
@@ -9897,6 +9931,7 @@ mod tests {
         serve: impl FnOnce(TcpStream) + Send + 'static,
     ) -> (u16, std::thread::JoinHandle<()>) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let _listener_fixture = crate::test_isolation::register_tcp_listener(&listener).unwrap();
         let port = listener.local_addr().unwrap().port();
         let handle = std::thread::spawn(move || {
             let (stream, _) = listener.accept().unwrap();

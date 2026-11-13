@@ -152,6 +152,14 @@ impl WsStream {
         let (host, port) = split_host_port(host_port, default_port)
             .ok_or_else(|| WsError::InvalidUrl(url.to_string()))?;
 
+        #[cfg(feature = "wire-test-isolation")]
+        if crate::test_isolation::is_enabled() && !matches!(host, "127.0.0.1" | "[::1]" | "::1") {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "unregistered wire test TCP fixture",
+            )
+            .into());
+        }
         let addr = format!("{host}:{port}")
             .to_socket_addrs()?
             .next()
@@ -161,6 +169,8 @@ impl WsStream {
                     format!("could not resolve {host}:{port}"),
                 )
             })?;
+        #[cfg(feature = "wire-test-isolation")]
+        crate::test_isolation::ensure_tcp(&addr)?;
         let tcp = TcpStream::connect_timeout(&addr, timeout)?;
         tcp.set_nodelay(true)?;
         tcp.set_read_timeout(Some(timeout))?;
@@ -623,6 +633,7 @@ mod tests {
     #[test]
     fn websocket_client_and_server_exchange_json_and_ping_pong() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let _listener_fixture = crate::test_isolation::register_tcp_listener(&listener).unwrap();
         let addr = listener.local_addr().unwrap();
 
         let server = std::thread::spawn(move || {
@@ -661,6 +672,7 @@ mod tests {
     /// Open a server-side `WsStream` whose peer is a raw TCP client that has finished the upgrade.
     fn server_with_raw_client() -> (WsStream, TcpStream) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let _listener_fixture = crate::test_isolation::register_tcp_listener(&listener).unwrap();
         let addr = listener.local_addr().unwrap();
         let raw = std::thread::spawn(move || {
             let mut tcp = TcpStream::connect(addr).unwrap();
@@ -784,6 +796,7 @@ mod tests {
     #[test]
     fn empty_and_126_byte_payloads_round_trip() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let _listener_fixture = crate::test_isolation::register_tcp_listener(&listener).unwrap();
         let addr = listener.local_addr().unwrap();
         let server = std::thread::spawn(move || {
             let (tcp, _) = listener.accept().unwrap();
