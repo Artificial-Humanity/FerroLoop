@@ -37,6 +37,13 @@ pub const MAX_DELIVER: u32 = 5;
 /// at a replaced session that still accepts input, and how long dead routes stay listed.
 pub const ROUTE_REDISCOVERY_INTERVAL: Duration = Duration::from_secs(60);
 
+/// How long a Claude reforge waits for `/clear` to produce a new native session id
+/// before the reforge prompt is withheld and the reset is reported unconfirmed.
+const CLAUDE_REFORGE_SETTLE_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Poll interval for the Claude reforge settle wait.
+const CLAUDE_REFORGE_SETTLE_POLL: Duration = Duration::from_millis(100);
+
 pub fn format_push_header(msg: &WireMessage) -> String {
     format!(
         "[fl-wire {}/{}] from {} (id: {}, thread: {}): {}",
@@ -2196,44 +2203,74 @@ pub fn clear_or_reforge_session(
     dispatch_operator_prompt_to_route(route, sender_name, slash)?;
     if let Some(prompt) = prompt {
         if let Some(before_id) = claude_before_session_id.as_deref() {
-            wait_for_claude_reforge_settle(route, before_id);
+            // On timeout this errors and the reforge prompt is not dispatched.
+            wait_for_claude_reforge_settle(route, before_id)?;
         }
         dispatch_operator_prompt_to_route(route, sender_name, prompt)?;
     }
     Ok(())
 }
 
-/// Whether a post-`/clear` Claude record proves the reset landed: the session id
-/// changed, or the status is deliverable (`idle`/`shell`).
+/// Whether a post-`/clear` Claude record proves the reset landed: only a changed
+/// native session id confirms it. Idle/`shell` status alone confirms nothing, and an
+/// absent or unreadable record is not confirmation.
 fn claude_reforge_settled(before_session_id: &str, record: Option<&serde_json::Value>) -> bool {
-    match claude_record_session_id(record) {
-        Some(id) if id != before_session_id => true,
-        _ => claude_session_deliverable(record),
+    matches!(claude_record_session_id(record), Some(id) if id != before_session_id)
+}
+
+fn claude_reforge_timeout_error(timeout: Duration) -> String {
+    format!(
+        "reforge unconfirmed: Claude session id did not change within {} seconds after /clear; the reforge prompt was not sent",
+        timeout.as_secs()
+    )
+}
+
+/// Poll `read_record` every `poll` for at most `timeout` until the session id changes.
+/// Returns `false` on timeout, including when the record becomes absent mid-poll.
+fn claude_reforge_settle_with<F: FnMut() -> Option<serde_json::Value>>(
+    before_session_id: &str,
+    timeout: Duration,
+    poll: Duration,
+    mut read_record: F,
+) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if claude_reforge_settled(before_session_id, read_record().as_ref()) {
+            return true;
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return false;
+        }
+        std::thread::sleep(poll.min(deadline - now));
     }
 }
 
-/// Bounded settle wait after `/clear` on a Claude reforge (#544-2): poll the session
-/// record every 100 ms for at most 5 s until [`claude_reforge_settled`]. On timeout the
-/// prompt is dispatched anyway: the reset dispatch already succeeded, and the prompt's
-/// own pre-paste check fails closed on an occupied composer, so failing here would only
-/// report a false reforge failure.
-fn wait_for_claude_reforge_settle(route: &VendorRoute, before_session_id: &str) {
+/// Bounded settle wait after `/clear` on a Claude reforge: poll the session record
+/// every ~100 ms for [`CLAUDE_REFORGE_SETTLE_TIMEOUT`] until the session id changes.
+/// Skip cases (`FL_WIRE_TMUX_BIN` set, `pid == 0`, non-Claude route) proceed without
+/// waiting, as test seams cannot produce a record. On timeout returns an error so the
+/// caller does not dispatch the reforge prompt.
+fn wait_for_claude_reforge_settle(
+    route: &VendorRoute,
+    before_session_id: &str,
+) -> Result<(), String> {
     let VendorRoute::Claude { pid, key_path, .. } = route else {
-        return;
+        return Ok(());
     };
     if *pid == 0 || std::env::var_os("FL_WIRE_TMUX_BIN").is_some() {
-        return;
+        return Ok(());
     }
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        let record = read_claude_session_record(*pid, key_path.as_deref());
-        if claude_reforge_settled(before_session_id, record.as_ref()) {
-            return;
-        }
-        if Instant::now() >= deadline {
-            return;
-        }
-        std::thread::sleep(Duration::from_millis(100));
+    let (pid, key_path) = (*pid, key_path.clone());
+    if claude_reforge_settle_with(
+        before_session_id,
+        CLAUDE_REFORGE_SETTLE_TIMEOUT,
+        CLAUDE_REFORGE_SETTLE_POLL,
+        || read_claude_session_record(pid, key_path.as_deref()),
+    ) {
+        Ok(())
+    } else {
+        Err(claude_reforge_timeout_error(CLAUDE_REFORGE_SETTLE_TIMEOUT))
     }
 }
 
@@ -20199,7 +20236,7 @@ exit 1"#,
     }
 
     #[test]
-    fn claude_status_classification_and_reforge_settle_545_544() {
+    fn claude_status_classification_and_reforge_settle_identity_545_544() {
         let rec = |status: &str| serde_json::json!({"status": status, "sessionId": "sess-1"});
         assert!(claude_session_deliverable(Some(&rec("idle"))));
         assert!(claude_session_deliverable(Some(&rec("shell"))));
@@ -20210,15 +20247,55 @@ exit 1"#,
         assert!(!claude_session_deliverable(Some(&serde_json::json!({}))));
         assert!(claude_session_idle(Some(&rec("idle"))));
         assert!(!claude_session_idle(Some(&rec("shell"))));
-        // Reforge settle: changed id, or deliverable status; same id + busy is unsettled.
+        // Reforge settle: only a changed native session id confirms the reset.
         assert!(claude_reforge_settled(
             "sess-1",
             Some(&serde_json::json!({"status": "busy", "sessionId": "sess-2"}))
         ));
-        assert!(claude_reforge_settled("sess-1", Some(&rec("idle"))));
-        assert!(claude_reforge_settled("sess-1", Some(&rec("shell"))));
+        assert!(!claude_reforge_settled("sess-1", Some(&rec("idle"))));
+        assert!(!claude_reforge_settled("sess-1", Some(&rec("shell"))));
         assert!(!claude_reforge_settled("sess-1", Some(&rec("busy"))));
         assert!(!claude_reforge_settled("sess-1", None));
+        assert!(!claude_reforge_settled(
+            "sess-1",
+            Some(&serde_json::json!({"status": "idle"}))
+        ));
+    }
+
+    #[test]
+    fn claude_reforge_settle_timeout_and_late_change_545_544() {
+        // Same id (even idle) for the whole window times out quickly under injection.
+        let start = Instant::now();
+        assert!(!claude_reforge_settle_with(
+            "sess-1",
+            Duration::from_millis(30),
+            Duration::from_millis(5),
+            || Some(serde_json::json!({"status": "idle", "sessionId": "sess-1"})),
+        ));
+        assert!(start.elapsed() < Duration::from_secs(2));
+        // A record that becomes absent mid-poll is not confirmation.
+        assert!(!claude_reforge_settle_with(
+            "sess-1",
+            Duration::from_millis(30),
+            Duration::from_millis(5),
+            || None,
+        ));
+        // A changed id on a later poll settles.
+        let mut calls = 0;
+        assert!(claude_reforge_settle_with(
+            "sess-1",
+            Duration::from_secs(2),
+            Duration::from_millis(5),
+            || {
+                calls += 1;
+                let id = if calls < 3 { "sess-1" } else { "sess-2" };
+                Some(serde_json::json!({"status": "busy", "sessionId": id}))
+            },
+        ));
+        assert_eq!(
+            claude_reforge_timeout_error(CLAUDE_REFORGE_SETTLE_TIMEOUT),
+            "reforge unconfirmed: Claude session id did not change within 20 seconds after /clear; the reforge prompt was not sent"
+        );
     }
 
     #[test]
