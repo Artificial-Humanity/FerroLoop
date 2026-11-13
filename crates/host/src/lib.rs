@@ -2419,6 +2419,35 @@ mod deadline_tests {
         host.shutdown().unwrap();
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn host_open_loads_registry_before_cleaning_stale_temps() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let endpoint = unresolved_endpoint(dir.path());
+        let registry = crate::survivor_registry::registry_path(&endpoint).expect("registry path");
+        std::fs::write(&registry, b"{").expect("corrupt registry");
+        std::fs::set_permissions(&registry, std::fs::Permissions::from_mode(0o600))
+            .expect("registry mode");
+        let stale = dir.path().join(format!(".flh-{}-1-1000", u32::MAX - 1));
+        std::fs::write(&stale, b"x").expect("plant");
+        std::fs::set_permissions(&stale, std::fs::Permissions::from_mode(0o600)).expect("mode");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&stale)
+            .expect("open temp")
+            .set_modified(std::time::SystemTime::now() - Duration::from_secs(120))
+            .expect("age");
+        assert!(
+            Host::open(OpenOptions::new(HostConfig::new(endpoint))).is_err(),
+            "corrupt registry refuses open"
+        );
+        assert!(
+            stale.exists(),
+            "cleanup must not run before load_registry succeeds"
+        );
+    }
+
     #[test]
     fn shutdown_returns_after_unresolved_windows_cleanup() {
         let dir = tempfile::tempdir().expect("tempdir");

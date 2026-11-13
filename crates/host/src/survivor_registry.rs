@@ -4,8 +4,13 @@
 //! atomically renamed, then the directory is synced. Names starting with `.flh-` are
 //! publication leftovers. Restart does not treat them, or a truncated file, as cleanup
 //! authority. At daemon start, `clean_stale_publish_temps` removes publish temps whose
-//! owning pid is provably dead; a temp whose pid is alive, is this process, or cannot
-//! be probed is always kept. The epoch high-water mark outlives retired sessions.
+//! owning pid is provably dead in this pid namespace and that are older than 60s; a
+//! temp whose pid is alive, is this process, or cannot be probed is kept. Residual:
+//! in a separate pid namespace, the cleaner sees a host-namespace pid as dead and
+//! its own pid as alive, so only the 60s mtime rule protects another daemon's temp
+//! there; a temp older than 60s can be deleted in that case, causing one failed
+//! publish while the published registry stays untouched. The epoch high-water mark
+//! outlives retired sessions.
 
 use std::fs::File;
 use std::io::{Read, Write};
@@ -278,17 +283,18 @@ fn publish_temp_create_error(raw_os_error: Option<i32>) -> HostError {
 /// `process_identity`: on Linux `/proc` alone can hide a live pid in
 /// another pid namespace or behind a tmpfs `/proc`, so death requires a
 /// kernel probe (`pidfd_open`/`kill(pid, 0)`) returning ESRCH. Every
-/// other failure is `Unprobeable`, never dead. Survivor recovery in
+/// other failure is `Unprobeable`, never dead. ESRCH only proves death
+/// in the cleaner's pid namespace: in a separate pid namespace, a
+/// host-namespace pid looks dead while the cleaner's own pid is alive,
+/// so only the 60s mtime rule protects another daemon's temp there and
+/// a temp older than 60s can be deleted, causing one failed publish
+/// while the published registry stays untouched. Survivor recovery in
 /// `identity.rs` keeps its prior behaviour and does not use this split.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PidProbe {
     Alive,
     Dead,
     Unprobeable,
-}
-
-fn pid_provably_dead(pid: u32) -> bool {
-    pid_provably_dead_with(pid, &probe_pid)
 }
 
 fn pid_provably_dead_with(pid: u32, probe: &dyn Fn(u32) -> PidProbe) -> bool {
@@ -427,14 +433,9 @@ fn probe_pid(pid: u32) -> PidProbe {
 /// daemon start after the registry is loaded. Never fails startup, and
 /// skips the whole cleanup when this process cannot probe its own pid.
 pub fn clean_stale_publish_temps(dir: &Path) {
-    let own_pid = std::process::id();
-    if probe_pid(own_pid) != PidProbe::Alive {
-        return;
-    }
-    clean_stale_publish_temps_with(dir, own_pid, &pid_provably_dead, SystemTime::now());
+    clean_stale_publish_temps_guarded(dir, std::process::id(), &probe_pid, SystemTime::now());
 }
 
-#[cfg(test)]
 fn clean_stale_publish_temps_guarded(
     dir: &Path,
     own_pid: u32,
@@ -447,6 +448,20 @@ fn clean_stale_publish_temps_guarded(
     clean_stale_publish_temps_with(dir, own_pid, &|pid| pid_provably_dead_with(pid, probe), now);
 }
 
+#[cfg(unix)]
+fn temp_is_old_stat(st: &libc::stat, now: SystemTime) -> bool {
+    if st.st_mtime < 0 {
+        return false;
+    }
+    let Ok(nsec) = u32::try_from(st.st_mtime_nsec) else {
+        return false;
+    };
+    let mtime = UNIX_EPOCH + Duration::new(st.st_mtime as u64, nsec);
+    now.duration_since(mtime)
+        .is_ok_and(|age| age >= TEMP_MIN_AGE)
+}
+
+#[cfg(not(unix))]
 fn temp_is_old(meta: &std::fs::Metadata, now: SystemTime) -> bool {
     match meta.modified() {
         Ok(mtime) => now
@@ -528,16 +543,10 @@ fn clean_stale_publish_temps_with(
         let Ok(name_c) = std::ffi::CString::new(name.clone()) else {
             continue;
         };
-        let Ok(meta) = std::fs::symlink_metadata(entry.path()) else {
-            continue;
-        };
-        if !temp_is_old(&meta, now) {
-            continue;
-        }
         let Some(st) = fstatat_cleanup(dirfd, &name_c) else {
             continue;
         };
-        if !private_temp_stat(&st) {
+        if !private_temp_stat(&st) || !temp_is_old_stat(&st, now) {
             continue;
         }
         if pid == own_pid || !pid_dead(pid) {
@@ -1592,7 +1601,7 @@ mod tests {
         let stale = dir.join(format!(".flh-{}-1-1000", u32::MAX - 1));
         plant_temp(&stale);
         age_temp(&stale);
-        assert!(pid_provably_dead(u32::MAX - 1));
+        assert!(pid_provably_dead_with(u32::MAX - 1, &probe_pid));
         clean_stale_publish_temps(&dir);
         #[cfg(any(target_os = "linux", target_os = "macos", windows))]
         assert!(!stale.exists(), "provably dead pid temp removed");
@@ -1750,6 +1759,13 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn probe_pid_one_is_alive() {
+        // Pid 1 always exists; as non-root this exercises the EPERM -> Alive mapping.
+        assert_eq!(probe_pid(1), PidProbe::Alive);
+    }
+
     #[test]
     fn unprobeable_pid_is_not_provably_dead() {
         assert!(!pid_provably_dead_with(424242, &|_| PidProbe::Unprobeable));
@@ -1766,7 +1782,13 @@ mod tests {
         clean_stale_publish_temps_guarded(
             &dir,
             std::process::id(),
-            &|_| PidProbe::Unprobeable,
+            &|pid| {
+                if pid == std::process::id() {
+                    PidProbe::Unprobeable
+                } else {
+                    PidProbe::Dead
+                }
+            },
             aged_now(),
         );
         assert!(stale.exists(), "unprobeable own pid skips cleanup");
