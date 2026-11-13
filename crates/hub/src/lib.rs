@@ -7438,11 +7438,7 @@ mod tests {
                 "live": {"status": "deferred", "mechanism": "override-only", "queued": false, "model_applied": false},
             })
         );
-        let frame = frames.try_recv().unwrap();
-        assert_eq!(
-            (frame.channel.as_str(), frame.event.as_str()),
-            ("sessions", "session.model_changed")
-        );
+        assert!(frames.try_recv().is_err(), "no change was applied or saved");
 
         // A deferred, recordless choice must not show as selected after a refresh.
         let listed = call(&state, "GET", "/api/v1/sessions", OWNER, &json!({}));
@@ -7650,6 +7646,157 @@ mod tests {
     }
 
     #[test]
+    fn model_route_vendor_cannot_write_another_vendors_hosted_record() {
+        use fl_wire::identity::VendorRoute;
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        let persona = "test-536-crossvendor";
+        assert_eq!(spin_up(&state, &spin_up_body(persona)).status, 200);
+        install_route(
+            tmp.path(),
+            persona,
+            VendorRoute::Codex {
+                thread_id: "6a145d3a-3bee-4e26-a77e-3aceb7cdbd8c".into(),
+                cwd: None,
+            },
+        );
+        let mut events = state.subscribe();
+        let resp = call(
+            &state,
+            "POST",
+            "/api/v1/sessions/6a145d3a-3bee-4e26-a77e-3aceb7cdbd8c/model",
+            OWNER,
+            &json!({"model":"gpt-6-sol", "thinking_level":"high"}),
+        );
+        assert_eq!(resp.status, 200, "{}", error_text(&resp));
+        let result = resp.json_value().unwrap();
+        assert_eq!(result["vendor"], "codex");
+        assert_eq!(result["persisted"], false);
+        assert_eq!(result["restart_applies"], false);
+        assert!(events.try_recv().is_err());
+        let list = call(&state, "GET", "/api/v1/hosted-sessions", OWNER, &json!({}));
+        assert!(list.json_value().unwrap()["sessions"][0]["model"].is_null());
+    }
+
+    #[test]
+    fn model_decommissioned_record_does_not_promise_restart() {
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        let persona = "test-536-decommissioned";
+        assert_eq!(spin_up(&state, &spin_up_body(persona)).status, 200);
+        let id = format!("claude:{persona}");
+        let teardown = call(
+            &state,
+            "POST",
+            &format!("/api/v1/sessions/{id}/decommission"),
+            OWNER,
+            &json!({"mode":"teardown"}),
+        );
+        assert_eq!(teardown.status, 200, "{}", error_text(&teardown));
+        let resp = call(
+            &state,
+            "POST",
+            &format!("/api/v1/sessions/{id}/model"),
+            OWNER,
+            &json!({"model":"sonnet"}),
+        );
+        assert_eq!(resp.status, 200, "{}", error_text(&resp));
+        assert_eq!(resp.json_value().unwrap()["restart_applies"], false);
+    }
+
+    #[test]
+    fn busy_claude_endpoint_holds_before_any_delivery() {
+        use fl_wire::identity::VendorRoute;
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        let persona = "test-536-busy";
+        let id = "933a9966-68e0-4be5-9816-a648c1924e26";
+        install_route(
+            tmp.path(),
+            persona,
+            VendorRoute::Claude {
+                pid: 0,
+                session_id: id.into(),
+                socket_path: tmp.path().join("missing.sock"),
+                key_path: Some(tmp.path().join("missing.key")),
+            },
+        );
+        state.mark_session_in_flight_from_turns(id, &[]);
+        let req = HttpRequest::new("POST", format!("/api/v1/sessions/{persona}/model"))
+            .with_json_body(&json!({"model":"sonnet"}));
+        let authority = auth::HubAuthority::Owner {
+            login: "owner".into(),
+        };
+        let result = crate::api::handle_post_session_model_with(
+            &state,
+            &authority,
+            persona,
+            &req,
+            lifecycle::set_hosted_session_model,
+            |_, _| panic!("busy endpoint sent a command"),
+        );
+        assert_eq!(result.json_value().unwrap()["live"]["status"], "held");
+    }
+
+    #[test]
+    fn busy_claude_record_holds_without_touching_host_or_terminal() {
+        use fl_wire::identity::VendorRoute;
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        let persona = "test-536-record-busy";
+        fs::write(
+            tmp.path().join("0.json"),
+            json!({"status":"busy"}).to_string(),
+        )
+        .unwrap();
+        install_route(
+            tmp.path(),
+            persona,
+            VendorRoute::Claude {
+                pid: 0,
+                session_id: "a7624d88-6ddc-4127-b80c-e6e28df718fd".into(),
+                socket_path: tmp.path().join("missing.sock"),
+                key_path: Some(tmp.path().join("missing.key")),
+            },
+        );
+        let result = call(
+            &state,
+            "POST",
+            &format!("/api/v1/sessions/{persona}/model"),
+            OWNER,
+            &json!({"model":"sonnet"}),
+        );
+        assert_eq!(result.status, 200);
+        assert_eq!(result.json_value().unwrap()["live"]["status"], "held");
+    }
+
+    #[test]
+    fn other_vendor_hosted_choices_never_promise_restart() {
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        for (vendor, persona) in [
+            ("antigravity", "test-536-agy"),
+            ("grok", "test-536-grok"),
+            ("muse", "test-536-muse"),
+        ] {
+            let mut body = spin_up_body(persona);
+            body["vendor"] = json!(vendor);
+            assert_eq!(spin_up(&state, &body).status, 200, "{vendor}");
+            let resp = call(
+                &state,
+                "POST",
+                &format!("/api/v1/sessions/{vendor}:{persona}/model"),
+                OWNER,
+                &json!({"model":"gemini-4-argon", "thinking_level":"high"}),
+            );
+            assert_eq!(resp.status, 200, "{vendor}: {}", error_text(&resp));
+            let result = resp.json_value().unwrap();
+            assert_eq!(result["persisted"], true, "{vendor}");
+            assert_eq!(result["restart_applies"], false, "{vendor}");
+        }
+    }
+
+    #[test]
     fn model_save_survives_failed_claude_terminal_delivery() {
         use fl_wire::identity::VendorRoute;
         let tmp = TempDir::new().unwrap();
@@ -7665,12 +7812,18 @@ mod tests {
                 key_path: Some(tmp.path().join("missing")),
             },
         );
-        let resp = call(
+        let req = HttpRequest::new("POST", "/api/v1/sessions/ada/model")
+            .with_json_body(&json!({"model":"sonnet"}));
+        let authority = auth::HubAuthority::Owner {
+            login: "owner".into(),
+        };
+        let resp = crate::api::handle_post_session_model_with(
             &state,
-            "POST",
-            "/api/v1/sessions/ada/model",
-            OWNER,
-            &json!({"model":"sonnet"}),
+            &authority,
+            "ada",
+            &req,
+            lifecycle::set_hosted_session_model,
+            |_, _| Err("fixture terminal delivery failure".into()),
         );
         assert_eq!(resp.status, 200, "{}", error_text(&resp));
         let result = resp.json_value().unwrap();
@@ -7957,14 +8110,6 @@ mod tests {
             ("ada", "claude-sonnet-5-5", "low"),
             ("bea", "claude-haiku-4-5", "high"),
         ] {
-            let resp = call(
-                &state,
-                "POST",
-                &format!("/api/v1/sessions/{persona}/model"),
-                OWNER,
-                &json!({ "model": model, "thinking_level": effort }),
-            );
-            assert_eq!(resp.status, 200, "{persona}: {}", error_text(&resp));
             state.set_session_model_override(
                 &format!("cs-{persona}"),
                 session_actions::ModelOverride::new(model.into(), Some(effort.into())),

@@ -7588,10 +7588,22 @@ pub(crate) fn handle_post_session_model_with(
         Ok(store) => store,
         Err(()) => return store_open_failure(),
     };
-    let mut keys = vec![trimmed, canonical_id.as_str()];
-    if let Some(ref persona) = persona {
-        keys.push(persona);
-    }
+    // When the live route supplies a vendor, never fall back to an unqualified persona:
+    // that could select another vendor's record and persist an incompatible model.
+    let route_vendor_hint = route
+        .as_ref()
+        .map(route_vendor)
+        .or_else(|| matched.map(|session| session.adapter.as_str()));
+    let qualified_key = route_vendor_hint.and_then(|vendor| {
+        persona
+            .as_ref()
+            .map(|name| format!("{}:{}", vendor, name.to_ascii_lowercase()))
+    });
+    let keys = if let Some(ref qualified) = qualified_key {
+        vec![qualified.as_str()]
+    } else {
+        vec![trimmed, canonical_id.as_str()]
+    };
     let hosted = match lifecycle::find_hosted_session(&*store, &keys) {
         Ok(hosted) => hosted,
         Err(err) => {
@@ -7601,6 +7613,11 @@ pub(crate) fn handle_post_session_model_with(
             );
         }
     };
+    // A native session id without a discoverable persona must also never claim a record
+    // belonging to a different adapter.
+    let hosted = hosted.filter(|record| {
+        route_vendor_hint.is_none_or(|vendor| record.vendor.eq_ignore_ascii_case(vendor))
+    });
     if matched.is_none() && route.is_none() && hosted.is_none() {
         return HttpResponse::json(
             404,
@@ -7679,7 +7696,7 @@ pub(crate) fn handle_post_session_model_with(
         |command| deliver(route.as_ref().expect("Claude route"), command),
     );
     let method = if live_status == "applied" {
-        METHOD_OPERATOR_PROMPT
+        "terminal-paste"
     } else {
         METHOD_OVERRIDE_ONLY
     };
@@ -7698,7 +7715,10 @@ pub(crate) fn handle_post_session_model_with(
         );
     }
     // These launch adapters pass both the stored model and effort on restart.
-    let restart_applies = persisted && matches!(vendor.as_str(), "codex" | "claude");
+    let restart_applies = persisted_record
+        .as_ref()
+        .is_some_and(lifecycle::is_live_hosted)
+        && matches!(vendor.as_str(), "codex" | "claude");
     let mut data = json!({
         "ok": true,
         "session_id": canonical_id,
@@ -7715,7 +7735,9 @@ pub(crate) fn handle_post_session_model_with(
     if let Some(cli_model) = cli_model {
         data["cli_model"] = json!(cli_model);
     }
-    state.broadcast("sessions", "session.model_changed", data.clone());
+    if persisted || model_applied {
+        state.broadcast("sessions", "session.model_changed", data.clone());
+    }
     HttpResponse::json(200, data)
 }
 

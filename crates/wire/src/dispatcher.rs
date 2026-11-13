@@ -6266,6 +6266,9 @@ pub fn deliver_to_live_claude_pane(route: &VendorRoute, text: &str) -> Result<()
         .ok()
         .map(|(_, key)| key);
     let record = read_claude_session_record(*pid, key_path.as_deref());
+    if !claude_session_idle(record.as_ref()) {
+        return Err("composer_occupied_by_non_wire_input: Claude session is not idle; holding delivery without sending keys".into());
+    }
     let pane = claude_live_pane(*pid, record.as_ref(), || key)
         .or_else(|| {
             (!session_id.trim().is_empty())

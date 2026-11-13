@@ -6558,7 +6558,7 @@ fn is_decommissioned(record: &HostedSessionRecord) -> bool {
 /// A hosted record that still manages its session. A decommissioned record is history: it is kept
 /// after teardown, and the persona may since have been registered again outside the lifecycle.
 /// `stopped` is not decommissioned, so the persona does not become unmanaged.
-fn is_live_hosted(record: &HostedSessionRecord) -> bool {
+pub(crate) fn is_live_hosted(record: &HostedSessionRecord) -> bool {
     !is_decommissioned(record)
 }
 
@@ -15405,12 +15405,21 @@ mod tests {
             let launches = fake.launches.borrow();
             let launch = launches.last().unwrap().1.as_ref().unwrap();
             assert!(
-                launch.argv.iter().any(|arg| arg.contains(model)),
+                launch
+                    .argv
+                    .windows(2)
+                    .any(|pair| pair == ["--model", model]),
                 "{vendor}: {:?}",
                 launch.argv
             );
+            let effort = if vendor == "codex" {
+                "model_reasoning_effort=\"high\""
+            } else {
+                "high"
+            };
+            let flag = if vendor == "codex" { "-c" } else { "--effort" };
             assert!(
-                launch.argv.iter().any(|arg| arg.contains("high")),
+                launch.argv.windows(2).any(|pair| pair == [flag, effort]),
                 "{vendor}: {:?}",
                 launch.argv
             );
