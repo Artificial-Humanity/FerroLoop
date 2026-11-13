@@ -6558,7 +6558,7 @@ fn is_decommissioned(record: &HostedSessionRecord) -> bool {
 /// A hosted record that still manages its session. A decommissioned record is history: it is kept
 /// after teardown, and the persona may since have been registered again outside the lifecycle.
 /// `stopped` is not decommissioned, so the persona does not become unmanaged.
-fn is_live_hosted(record: &HostedSessionRecord) -> bool {
+pub(crate) fn is_live_hosted(record: &HostedSessionRecord) -> bool {
     !is_decommissioned(record)
 }
 
@@ -9903,6 +9903,7 @@ mod tests {
         });
         ready_rx.recv().unwrap();
 
+        let _fixture = fl_host_proto::register_hub_test_host_fixture(&sock_path).unwrap();
         let prev_sock = std::env::var_os("FL_HOST_SOCK");
         let prev_tmux = std::env::var_os("FL_WIRE_TMUX_BIN");
         // SAFETY: TMUX_ENV_LOCK is held; both variables are restored below.
@@ -15038,6 +15039,7 @@ mod tests {
         });
         ready_rx.recv().unwrap();
 
+        let _fixture = fl_host_proto::register_hub_test_host_fixture(&sock_path).unwrap();
         let prev_sock = std::env::var_os("FL_HOST_SOCK");
         let prev_tmux = std::env::var_os("FL_WIRE_TMUX_BIN");
         // SAFETY: TMUX_ENV_LOCK is held; both variables are restored below.
@@ -15378,6 +15380,52 @@ mod tests {
         assert!(claude_fake.live.borrow().is_empty());
         assert!(claude_fake.calls.borrow().is_empty());
         assert!(claude_fake.launches.borrow().is_empty());
+    }
+
+    #[test]
+    fn restart_launches_with_saved_model_and_effort_for_codex_and_claude() {
+        for (vendor, model) in [("codex", "gpt-6-sol"), ("claude", "claude-sonnet-5-5")] {
+            let home = TempDir::new().unwrap();
+            let _trusted = trusted_codex_home(home.path(), &std::env::current_dir().unwrap());
+            let store = MemStore::default();
+            let fake = FakeRuntime::default();
+            let env = fake.env(home.path());
+            let id = format!("{vendor}:ada");
+            spin_up(
+                &store,
+                &env,
+                &req("ada", "assistant", vendor),
+                "owner",
+                Caller::Owner,
+            )
+            .unwrap();
+            set_hosted_session_model(&store, &[&id], model, Some("high"), "owner")
+                .unwrap()
+                .unwrap();
+            fake.live.borrow_mut().clear();
+            restart_hosted_session(&store, &env, &id, "owner").unwrap();
+            let launches = fake.launches.borrow();
+            let launch = launches.last().unwrap().1.as_ref().unwrap();
+            assert!(
+                launch
+                    .argv
+                    .windows(2)
+                    .any(|pair| pair == ["--model", model]),
+                "{vendor}: {:?}",
+                launch.argv
+            );
+            let effort = if vendor == "codex" {
+                "model_reasoning_effort=\"high\""
+            } else {
+                "high"
+            };
+            let flag = if vendor == "codex" { "-c" } else { "--effort" };
+            assert!(
+                launch.argv.windows(2).any(|pair| pair == [flag, effort]),
+                "{vendor}: {:?}",
+                launch.argv
+            );
+        }
     }
 
     #[test]

@@ -3075,33 +3075,41 @@ export const App: React.FC<AppProps> = ({
     const updatedModel = res.model || model;
     const updatedThinking =
       res.thinking_level !== undefined ? res.thinking_level : thinkingLevel;
-    setSessions((prev) =>
-      prev.map((sess) =>
-        matchesTarget(sess)
-          ? {
-              ...sess,
-              model: updatedModel,
-              ...(updatedThinking !== undefined
-                ? { thinking_level: updatedThinking }
-                : {}),
-            }
-          : sess,
-      ),
-    );
-    setRoutes((prev) =>
-      prev.map((sess) =>
-        matchesTarget(sess)
-          ? {
-              ...sess,
-              model: updatedModel,
-              ...(updatedThinking !== undefined
-                ? { thinking_level: updatedThinking }
-                : {}),
-            }
-          : sess,
-      ),
-    );
-    await refreshSessionsAndTranscript(targetId);
+    const updateThinking = res.persisted || res.live?.status === "applied";
+    if (updateThinking || res.live?.model_applied) {
+      setSessions((prev) =>
+        prev.map((sess) =>
+          matchesTarget(sess)
+            ? {
+                ...sess,
+                model: updatedModel,
+                ...(updateThinking && updatedThinking !== undefined
+                  ? { thinking_level: updatedThinking }
+                  : {}),
+              }
+            : sess,
+        ),
+      );
+      setRoutes((prev) =>
+        prev.map((sess) =>
+          matchesTarget(sess)
+            ? {
+                ...sess,
+                model: updatedModel,
+                ...(updateThinking && updatedThinking !== undefined
+                  ? { thinking_level: updatedThinking }
+                  : {}),
+              }
+            : sess,
+        ),
+      );
+    }
+    // A refresh failure cannot undo the already-saved model choice.
+    try {
+      await refreshSessionsAndTranscript(targetId);
+    } catch {
+      // The next normal refresh will reconcile the session view.
+    }
     return res;
   };
 
