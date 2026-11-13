@@ -3,15 +3,23 @@
 //! The durable file is the Task 1 state path. A private temporary file is synced, then
 //! atomically renamed, then the directory is synced. Names starting with `.flh-` are
 //! publication leftovers. Restart does not treat them, or a truncated file, as cleanup
-//! authority. The epoch high-water mark outlives retired sessions.
+//! authority. At daemon start, `clean_stale_publish_temps` removes publish temps whose
+//! owning pid is provably dead in this pid namespace and that are older than 60s; a
+//! temp whose pid is alive, is this process, or cannot be probed is kept. Residual:
+//! in a separate pid namespace, the cleaner sees a host-namespace pid as dead and
+//! its own pid as alive, so only the 60s mtime rule protects another daemon's temp
+//! there; a temp older than 60s can be deleted in that case, causing one failed
+//! publish while the published registry stays untouched. The epoch high-water mark
+//! outlives retired sessions.
 
 use std::fs::File;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
+use std::time::SystemTime;
 #[cfg(any(unix, windows))]
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::UNIX_EPOCH;
 
 #[cfg(unix)]
 use fl_host_proto::private_parent_ok;
@@ -226,6 +234,389 @@ fn file_name_is_temp(path: &Path) -> bool {
         .is_some_and(|name| name.starts_with(".flh-"))
 }
 
+/// Parse a publish temp name `.flh-{pid}-{seq}-{nanos}`. Anything else —
+/// including the random-hex token temps in `fl-host-proto` — is not a
+/// publish temp this cleanup may touch. The name must be the exact
+/// canonical rendering, so `+` signs and leading zeros are rejected.
+fn parse_publish_temp(name: &str) -> Option<(u32, u64, u128)> {
+    let mut fields = name.strip_prefix(".flh-")?.split('-');
+    let pid: u32 = fields.next()?.parse().ok()?;
+    let seq: u64 = fields.next()?.parse().ok()?;
+    let nanos: u128 = fields.next()?.parse().ok()?;
+    if fields.next().is_some() || pid == 0 {
+        return None;
+    }
+    if temp_name_text(pid, seq, nanos) != name {
+        return None;
+    }
+    Some((pid, seq, nanos))
+}
+
+const TEMP_MIN_AGE: Duration = Duration::from_secs(60);
+
+/// Map a failed exclusive-create of the publish temp to an error. An
+/// already-existing temp is a stale-name collision, not evidence that the
+/// endpoint state is not a private file; every other failure keeps the
+/// genuine permission/private-file refusal.
+fn publish_temp_create_error(raw_os_error: Option<i32>) -> HostError {
+    #[cfg(unix)]
+    let collision = raw_os_error == Some(libc::EEXIST);
+    #[cfg(windows)]
+    let collision = matches!(
+        raw_os_error.map(|code| code as u32),
+        Some(windows_sys::Win32::Foundation::ERROR_FILE_EXISTS)
+            | Some(windows_sys::Win32::Foundation::ERROR_ALREADY_EXISTS)
+    );
+    #[cfg(not(any(unix, windows)))]
+    let collision = {
+        let _ = raw_os_error;
+        false
+    };
+    if collision {
+        HostError::EndpointStateCollision
+    } else {
+        HostError::EndpointStateDenied
+    }
+}
+
+/// Strict, cleanup-local pid probe. This deliberately does not reuse
+/// `process_identity`: on Linux `/proc` alone can hide a live pid in
+/// another pid namespace or behind a tmpfs `/proc`, so death requires a
+/// kernel probe (`pidfd_open`/`kill(pid, 0)`) returning ESRCH. Every
+/// other failure is `Unprobeable`, never dead. ESRCH only proves death
+/// in the cleaner's pid namespace: in a separate pid namespace, a
+/// host-namespace pid looks dead while the cleaner's own pid is alive,
+/// so only the 60s mtime rule protects another daemon's temp there and
+/// a temp older than 60s can be deleted, causing one failed publish
+/// while the published registry stays untouched. Survivor recovery in
+/// `identity.rs` keeps its prior behaviour and does not use this split.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PidProbe {
+    Alive,
+    Dead,
+    Unprobeable,
+}
+
+fn pid_provably_dead_with(pid: u32, probe: &dyn Fn(u32) -> PidProbe) -> bool {
+    pid != 0 && probe(pid) == PidProbe::Dead
+}
+
+#[cfg(target_os = "linux")]
+fn probe_pid(pid: u32) -> PidProbe {
+    if pid == 0 {
+        return PidProbe::Unprobeable;
+    }
+    if pid > i32::MAX as u32 {
+        // No process can hold a pid above the signed `pid_t` range.
+        return PidProbe::Dead;
+    }
+    match pidfd_open_cleanup(pid) {
+        Ok(fd) => {
+            use std::os::fd::AsRawFd;
+            let result = pidfd_send_cleanup(fd.as_raw_fd(), 0);
+            drop(fd);
+            match result {
+                Ok(()) => PidProbe::Alive,
+                Err(err) if err.raw_os_error() == Some(libc::ESRCH) => PidProbe::Dead,
+                Err(err) if err.raw_os_error() == Some(libc::EPERM) => PidProbe::Alive,
+                Err(_) => PidProbe::Unprobeable,
+            }
+        }
+        Err(err) if err.raw_os_error() == Some(libc::ESRCH) => kill_probe(pid),
+        Err(err)
+            if matches!(
+                err.raw_os_error(),
+                Some(libc::ENOSYS) | Some(libc::EPERM) | Some(libc::EACCES)
+            ) =>
+        {
+            kill_probe(pid)
+        }
+        Err(_) => PidProbe::Unprobeable,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn kill_probe(pid: u32) -> PidProbe {
+    // SAFETY: signal 0 only probes existence.
+    let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    if rc == 0 {
+        return PidProbe::Alive;
+    }
+    match std::io::Error::last_os_error().raw_os_error() {
+        Some(libc::ESRCH) => PidProbe::Dead,
+        Some(libc::EPERM) => PidProbe::Alive,
+        _ => PidProbe::Unprobeable,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn pidfd_open_cleanup(pid: u32) -> std::io::Result<std::os::fd::OwnedFd> {
+    use std::os::fd::FromRawFd;
+    // SAFETY: pidfd_open returns a new fd or -1.
+    let rc = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::c_int, 0) };
+    if rc < 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(rc as i32) })
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn pidfd_send_cleanup(fd: std::os::fd::RawFd, signal: i32) -> std::io::Result<()> {
+    // SAFETY: `fd` is a pidfd; a null siginfo asks the kernel to build it.
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_pidfd_send_signal,
+            fd,
+            signal,
+            std::ptr::null_mut::<libc::siginfo_t>(),
+            0,
+        )
+    };
+    if rc < 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn probe_pid(pid: u32) -> PidProbe {
+    if pid == 0 {
+        return PidProbe::Unprobeable;
+    }
+    if pid > i32::MAX as u32 {
+        return PidProbe::Dead;
+    }
+    // SAFETY: signal 0 only probes existence.
+    let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    if rc == 0 {
+        return PidProbe::Alive;
+    }
+    match std::io::Error::last_os_error().raw_os_error() {
+        Some(libc::ESRCH) => PidProbe::Dead,
+        // EPERM proves a live process we may not signal.
+        Some(libc::EPERM) => PidProbe::Alive,
+        _ => PidProbe::Unprobeable,
+    }
+}
+
+#[cfg(windows)]
+fn probe_pid(pid: u32) -> PidProbe {
+    use windows_sys::Win32::Foundation::{CloseHandle, GetLastError};
+    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+    if pid == 0 {
+        return PidProbe::Unprobeable;
+    }
+    // SAFETY: OpenProcess yields a handle we own, or null.
+    let raw = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if raw.is_null() {
+        let code = unsafe { GetLastError() };
+        return if code == windows_sys::Win32::Foundation::ERROR_INVALID_PARAMETER {
+            PidProbe::Dead
+        } else {
+            // ERROR_ACCESS_DENIED and all else: not provably dead.
+            PidProbe::Unprobeable
+        };
+    }
+    unsafe { CloseHandle(raw) };
+    PidProbe::Alive
+}
+
+#[cfg(not(any(unix, windows)))]
+fn probe_pid(pid: u32) -> PidProbe {
+    let _ = pid;
+    PidProbe::Unprobeable
+}
+
+/// Best-effort removal of publish temps left by a killed daemon. Called at
+/// daemon start after the registry is loaded. Never fails startup, and
+/// skips the whole cleanup when this process cannot probe its own pid.
+pub fn clean_stale_publish_temps(dir: &Path) {
+    clean_stale_publish_temps_guarded(dir, std::process::id(), &probe_pid, SystemTime::now());
+}
+
+fn clean_stale_publish_temps_guarded(
+    dir: &Path,
+    own_pid: u32,
+    probe: &dyn Fn(u32) -> PidProbe,
+    now: SystemTime,
+) {
+    if probe(own_pid) != PidProbe::Alive {
+        return;
+    }
+    clean_stale_publish_temps_with(dir, own_pid, &|pid| pid_provably_dead_with(pid, probe), now);
+}
+
+#[cfg(unix)]
+fn temp_is_old_stat(st: &libc::stat, now: SystemTime) -> bool {
+    if st.st_mtime < 0 {
+        return false;
+    }
+    let Ok(nsec) = u32::try_from(st.st_mtime_nsec) else {
+        return false;
+    };
+    let mtime = UNIX_EPOCH + Duration::new(st.st_mtime as u64, nsec);
+    now.duration_since(mtime)
+        .is_ok_and(|age| age >= TEMP_MIN_AGE)
+}
+
+#[cfg(not(unix))]
+fn temp_is_old(meta: &std::fs::Metadata, now: SystemTime) -> bool {
+    match meta.modified() {
+        Ok(mtime) => now
+            .duration_since(mtime)
+            .is_ok_and(|age| age >= TEMP_MIN_AGE),
+        Err(_) => false,
+    }
+}
+
+#[cfg(windows)]
+fn windows_file_id(path: &Path) -> Option<(u32, u64)> {
+    let handle = open_reparse_file(path).ok()??;
+    let info = file_info(handle.as_raw()).ok()?;
+    if info.nNumberOfLinks != 1 {
+        return None;
+    }
+    let index = (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow);
+    Some((info.dwVolumeSerialNumber, index))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn same_file(a: &std::fs::Metadata, b: &std::fs::Metadata) -> bool {
+    a.len() == b.len() && a.modified().ok() == b.modified().ok()
+}
+
+#[cfg(unix)]
+fn fstatat_cleanup(dirfd: std::os::fd::RawFd, name: &std::ffi::CString) -> Option<libc::stat> {
+    // SAFETY: `st` is plain data; `name` is NUL-terminated and relative to `dirfd`.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    let rc = unsafe { libc::fstatat(dirfd, name.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW) };
+    if rc != 0 { None } else { Some(st) }
+}
+
+#[cfg(unix)]
+fn private_temp_stat(st: &libc::stat) -> bool {
+    st.st_mode & libc::S_IFMT == libc::S_IFREG
+        && st.st_uid == unix_euid()
+        && st.st_mode & 0o777 == 0o600
+        && st.st_nlink == 1
+}
+
+#[cfg(unix)]
+fn clean_stale_publish_temps_with(
+    dir: &Path,
+    own_pid: u32,
+    pid_dead: &dyn Fn(u32) -> bool,
+    now: SystemTime,
+) {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::ffi::OsStrExt;
+    let Ok(parent_c) = std::ffi::CString::new(dir.as_os_str().as_bytes()) else {
+        return;
+    };
+    // SAFETY: O_DIRECTORY|O_NOFOLLOW refuses a non-directory/symlink dir.
+    let dirfd = unsafe {
+        libc::open(
+            parent_c.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if dirfd < 0 {
+        return;
+    }
+    let dir_owner = unsafe { OwnedFd::from_raw_fd(dirfd) };
+    let dirfd = dir_owner.as_raw_fd();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        let Some((pid, _, _)) = parse_publish_temp(&name) else {
+            continue;
+        };
+        if pid == own_pid || !pid_dead(pid) {
+            continue;
+        }
+        let Ok(name_c) = std::ffi::CString::new(name.clone()) else {
+            continue;
+        };
+        let Some(st) = fstatat_cleanup(dirfd, &name_c) else {
+            continue;
+        };
+        if !private_temp_stat(&st) || !temp_is_old_stat(&st, now) {
+            continue;
+        }
+        if pid == own_pid || !pid_dead(pid) {
+            continue;
+        }
+        let Some(fresh) = fstatat_cleanup(dirfd, &name_c) else {
+            continue;
+        };
+        if !private_temp_stat(&fresh) || st.st_dev != fresh.st_dev || st.st_ino != fresh.st_ino {
+            continue;
+        }
+        // SAFETY: `name_c` is relative to the directory fd; unlinkat does
+        // not follow a symlink at the final component.
+        unsafe { libc::unlinkat(dirfd, name_c.as_ptr(), 0) };
+    }
+}
+
+#[cfg(not(unix))]
+fn clean_stale_publish_temps_with(
+    dir: &Path,
+    own_pid: u32,
+    pid_dead: &dyn Fn(u32) -> bool,
+    now: SystemTime,
+) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        let Some((pid, _, _)) = parse_publish_temp(&name) else {
+            continue;
+        };
+        if pid == own_pid || !pid_dead(pid) {
+            continue;
+        }
+        let Ok(meta) = std::fs::symlink_metadata(entry.path()) else {
+            continue;
+        };
+        if !meta.file_type().is_file() || !temp_is_old(&meta, now) {
+            continue;
+        }
+        #[cfg(windows)]
+        let first_id = windows_file_id(&entry.path());
+        #[cfg(windows)]
+        if first_id.is_none() {
+            continue;
+        }
+        if pid == own_pid || !pid_dead(pid) {
+            continue;
+        }
+        let Ok(fresh) = std::fs::symlink_metadata(entry.path()) else {
+            continue;
+        };
+        if !fresh.file_type().is_file() {
+            continue;
+        }
+        #[cfg(windows)]
+        if windows_file_id(&entry.path()) != first_id {
+            continue;
+        }
+        #[cfg(not(any(unix, windows)))]
+        if !same_file(&meta, &fresh) {
+            continue;
+        }
+        let _ = std::fs::remove_file(entry.path());
+    }
+}
+
 fn die_for_crash() -> ! {
     // The gated vendor lives only until this process dies. Tests that must sample it
     // set FL_HOST_CRASH_HOLD_MS so the sample happens before the signal.
@@ -250,6 +641,16 @@ fn die_for_crash() -> ! {
 
 #[cfg(unix)]
 fn replace_atomic(path: &Path, bytes: &[u8], crash: Option<CrashPoint>) -> Result<(), HostError> {
+    replace_atomic_with_temp(path, bytes, crash, temp_name()?)
+}
+
+#[cfg(unix)]
+fn replace_atomic_with_temp(
+    path: &Path,
+    bytes: &[u8],
+    crash: Option<CrashPoint>,
+    temp: std::ffi::CString,
+) -> Result<(), HostError> {
     use std::ffi::CString;
     use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd};
     use std::os::unix::ffi::OsStrExt;
@@ -279,7 +680,6 @@ fn replace_atomic(path: &Path, bytes: &[u8], crash: Option<CrashPoint>) -> Resul
     let is_dir = st.st_mode & libc::S_IFMT == libc::S_IFDIR;
     // mode_t is u16 on macOS; the shared permission validator accepts u32.
     private_parent_ok(st.st_uid, unix_euid(), st.st_mode as _, is_dir)?;
-    let temp = temp_name()?;
     // SAFETY: `temp` is a relative name. O_EXCL|O_NOFOLLOW creates a new file and refuses a symlink.
     let fd = unsafe {
         libc::openat(
@@ -290,7 +690,9 @@ fn replace_atomic(path: &Path, bytes: &[u8], crash: Option<CrashPoint>) -> Resul
         )
     };
     if fd < 0 {
-        return Err(HostError::EndpointStateDenied);
+        return Err(publish_temp_create_error(
+            std::io::Error::last_os_error().raw_os_error(),
+        ));
     }
     let mut file = unsafe { File::from_raw_fd(fd) };
     // SAFETY: `file` is the descriptor just created. fchmod tightens the mode after umask.
@@ -430,8 +832,28 @@ fn temp_name() -> Result<std::ffi::CString, HostError> {
 
 #[cfg(windows)]
 fn replace_atomic(path: &Path, bytes: &[u8], crash: Option<CrashPoint>) -> Result<(), HostError> {
+    use windows_sys::Win32::System::Threading::GetCurrentProcessId;
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let temp_name = temp_name_text(
+        unsafe { GetCurrentProcessId() },
+        TEMP_SEQ.fetch_add(1, Ordering::Relaxed),
+        nanos,
+    );
+    replace_atomic_with_temp(path, bytes, crash, temp_name)
+}
+
+#[cfg(windows)]
+fn replace_atomic_with_temp(
+    path: &Path,
+    bytes: &[u8],
+    crash: Option<CrashPoint>,
+    temp_name: String,
+) -> Result<(), HostError> {
     use std::os::windows::io::{FromRawHandle, IntoRawHandle};
-    use windows_sys::Win32::Foundation::{CloseHandle, LocalFree};
+    use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, LocalFree};
     use windows_sys::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW;
     use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
     use windows_sys::Win32::Storage::FileSystem::{
@@ -439,8 +861,6 @@ fn replace_atomic(path: &Path, bytes: &[u8], crash: Option<CrashPoint>) -> Resul
         FILE_GENERIC_READ, FILE_GENERIC_WRITE, FlushFileBuffers, MOVEFILE_REPLACE_EXISTING,
         MOVEFILE_WRITE_THROUGH, MoveFileExW,
     };
-    use windows_sys::Win32::System::Threading::GetCurrentProcessId;
-
     ensure_registry_dirs(path)?;
     let owner = current_sid()?;
     if let Some(existing) = open_reparse_file(path)? {
@@ -467,15 +887,7 @@ fn replace_atomic(path: &Path, bytes: &[u8], crash: Option<CrashPoint>) -> Resul
         lpSecurityDescriptor: raw_sd,
         bInheritHandle: 0,
     };
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let temp = path.with_file_name(temp_name_text(
-        unsafe { GetCurrentProcessId() },
-        TEMP_SEQ.fetch_add(1, Ordering::Relaxed),
-        nanos,
-    ));
+    let temp = path.with_file_name(temp_name);
     let temp_w = wide_os(temp.as_os_str());
     // SAFETY: CREATE_NEW refuses an existing name. The DACL is applied at creation and the
     // handle is not inheritable.
@@ -490,9 +902,17 @@ fn replace_atomic(path: &Path, bytes: &[u8], crash: Option<CrashPoint>) -> Resul
             std::ptr::null_mut(),
         )
     };
+    // Capture the create error before LocalFree can overwrite it.
+    let create_failed =
+        handle.is_null() || handle == windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    let create_error = if create_failed {
+        Some(unsafe { GetLastError() } as i32)
+    } else {
+        None
+    };
     unsafe { LocalFree(raw_sd) };
-    if handle.is_null() || handle == windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE {
-        return Err(HostError::EndpointStateDenied);
+    if create_failed {
+        return Err(publish_temp_create_error(create_error));
     }
     let mut file = unsafe { File::from_raw_handle(handle) };
     file.write_all(bytes)?;
@@ -1060,6 +1480,429 @@ mod tests {
             temp_name_text(4242, 1, 1_000),
             temp_name_text(4242, 1, 2_000)
         );
+    }
+
+    #[test]
+    fn publish_temp_collision_is_distinct_from_permission_refusal() {
+        #[cfg(unix)]
+        {
+            assert_eq!(
+                publish_temp_create_error(Some(libc::EEXIST)),
+                HostError::EndpointStateCollision
+            );
+            assert_eq!(
+                publish_temp_create_error(Some(libc::EACCES)),
+                HostError::EndpointStateDenied
+            );
+        }
+        #[cfg(windows)]
+        {
+            assert_eq!(
+                publish_temp_create_error(Some(
+                    windows_sys::Win32::Foundation::ERROR_FILE_EXISTS as i32
+                )),
+                HostError::EndpointStateCollision
+            );
+            assert_eq!(
+                publish_temp_create_error(Some(
+                    windows_sys::Win32::Foundation::ERROR_ALREADY_EXISTS as i32
+                )),
+                HostError::EndpointStateCollision
+            );
+            assert_eq!(
+                publish_temp_create_error(Some(
+                    windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED as i32
+                )),
+                HostError::EndpointStateDenied
+            );
+        }
+        assert_eq!(
+            publish_temp_create_error(None),
+            HostError::EndpointStateDenied
+        );
+        assert_ne!(
+            HostError::EndpointStateCollision.to_string(),
+            HostError::EndpointStateDenied.to_string()
+        );
+    }
+
+    fn aged_now() -> SystemTime {
+        SystemTime::now() + Duration::from_secs(120)
+    }
+
+    fn plant_temp(path: &Path) {
+        std::fs::write(path, b"x").expect("plant");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+                .expect("temp mode");
+        }
+    }
+
+    fn age_temp(path: &Path) {
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .expect("open temp");
+        file.set_modified(SystemTime::now() - Duration::from_secs(120))
+            .expect("age temp");
+    }
+
+    #[test]
+    fn stale_publish_temp_cleanup_keeps_live_own_and_ordinary_files() {
+        let dir = std::env::temp_dir().join(format!(
+            "flh-clean-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let dead = dir.join(".flh-424242-1-1000");
+        let live = dir.join(".flh-434343-1-1000");
+        let own = dir.join(format!(".flh-{}-1-1000", std::process::id()));
+        let ordinary = dir.join("notes.txt");
+        let planted = dir.join(".flh-planted");
+        let hex_temp = dir.join(".flh-0123456789abcdef");
+        let state = dir.join("h.sock.state.json");
+        let dead_dir = dir.join(".flh-424242-2-1000");
+        for file in [&dead, &live, &own, &ordinary, &planted, &hex_temp, &state] {
+            plant_temp(file);
+        }
+        std::fs::create_dir(&dead_dir).expect("dead dir");
+        // 424242 is dead, 434343 is alive, everything else must be untouched.
+        clean_stale_publish_temps_with(&dir, std::process::id(), &|pid| pid == 424242, aged_now());
+        assert!(!dead.exists(), "dead pid temp removed");
+        assert!(live.exists(), "live pid temp preserved");
+        assert!(own.exists(), "current daemon temp preserved");
+        assert!(ordinary.exists());
+        assert!(planted.exists());
+        assert!(hex_temp.exists());
+        assert!(state.exists());
+        assert!(dead_dir.is_dir(), "directories are never removed");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stale_publish_temp_cleanup_with_real_dead_pid() {
+        // u32::MAX is never a live pid; the real probe must report it dead
+        // on platforms with process identity, and keep the file elsewhere.
+        let dir = std::env::temp_dir().join(format!(
+            "flh-clean-real-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let stale = dir.join(format!(".flh-{}-1-1000", u32::MAX - 1));
+        plant_temp(&stale);
+        age_temp(&stale);
+        assert!(pid_provably_dead_with(u32::MAX - 1, &probe_pid));
+        clean_stale_publish_temps(&dir);
+        #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+        assert!(!stale.exists(), "provably dead pid temp removed");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn unique_test_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "flh-{tag}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("dir");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).expect("mode");
+        }
+        dir
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replace_atomic_precreated_structured_temp_is_collision() {
+        let dir = unique_test_dir("collision");
+        let dest = dir.join("state.json");
+        let temp_text = temp_name_text(std::process::id(), 99, 12345);
+        let planted = dir.join(&temp_text);
+        std::fs::write(&planted, b"planted").expect("plant");
+        let temp = std::ffi::CString::new(temp_text).expect("cstr");
+        let err = replace_atomic_with_temp(&dest, b"new", None, temp).expect_err("collision");
+        assert_eq!(err, HostError::EndpointStateCollision);
+        assert_eq!(std::fs::read(&planted).expect("planted read"), b"planted");
+        assert!(!dest.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replace_atomic_unwritable_parent_is_denied() {
+        use std::os::unix::fs::PermissionsExt;
+        if unix_euid() == 0 {
+            return; // root bypasses directory write permission
+        }
+        let dir = unique_test_dir("denied");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).expect("readonly");
+        let dest = dir.join("state.json");
+        let temp =
+            std::ffi::CString::new(temp_name_text(std::process::id(), 98, 12345)).expect("cstr");
+        let err = replace_atomic_with_temp(&dest, b"new", None, temp).expect_err("denied");
+        assert_eq!(err, HostError::EndpointStateDenied);
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).expect("restore");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stale_cleanup_keeps_real_live_nonown_pid() {
+        #[cfg(unix)]
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("sleep");
+        #[cfg(windows)]
+        let mut child = std::process::Command::new("ping")
+            .args(["127.0.0.1", "-n", "30"])
+            .spawn()
+            .expect("ping");
+        #[cfg(not(any(unix, windows)))]
+        let mut child = std::process::Command::new(std::env::current_exe().expect("exe"))
+            .arg("--help")
+            .spawn()
+            .expect("child");
+        let dir = unique_test_dir("live");
+        let temp = dir.join(format!(".flh-{}-1-1000", child.id()));
+        plant_temp(&temp);
+        age_temp(&temp);
+        clean_stale_publish_temps(&dir);
+        assert!(
+            temp.exists(),
+            "live non-own pid temp preserved by real probe"
+        );
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stale_cleanup_reprobe_flip_to_live_keeps_file() {
+        let dir = unique_test_dir("flip");
+        let temp = dir.join(".flh-424242-1-1000");
+        plant_temp(&temp);
+        let calls = std::cell::Cell::new(0usize);
+        // Dead at scan, live at the pre-unlink re-probe.
+        clean_stale_publish_temps_with(
+            &dir,
+            std::process::id(),
+            &|_| {
+                calls.set(calls.get() + 1);
+                calls.get() == 1
+            },
+            aged_now(),
+        );
+        assert!(calls.get() >= 2, "pid was re-probed");
+        assert!(temp.exists(), "pid live at re-probe, temp kept");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stale_cleanup_symlink_temp_never_deletes_target() {
+        let dir = unique_test_dir("symlink");
+        let target = dir.join("target.txt");
+        std::fs::write(&target, b"keep").expect("target");
+        let link = dir.join(".flh-424242-1-1000");
+        std::os::unix::fs::symlink(&target, &link).expect("symlink");
+        clean_stale_publish_temps_with(&dir, std::process::id(), &|pid| pid == 424242, aged_now());
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .expect("link")
+                .file_type()
+                .is_symlink(),
+            "symlink entry preserved"
+        );
+        assert_eq!(std::fs::read(&target).expect("target read"), b"keep");
+        // Swap a regular temp for a symlink during the re-probe: the
+        // pre-unlink identity recheck must keep both link and target.
+        let swapped = dir.join(".flh-424243-1-1000");
+        plant_temp(&swapped);
+        let calls = std::cell::Cell::new(0usize);
+        let target2 = target.clone();
+        let swapped2 = swapped.clone();
+        clean_stale_publish_temps_with(
+            &dir,
+            std::process::id(),
+            &|_| {
+                calls.set(calls.get() + 1);
+                if calls.get() == 2 {
+                    let _ = std::fs::remove_file(&swapped2);
+                    let _ = std::os::unix::fs::symlink(&target2, &swapped2);
+                }
+                true
+            },
+            aged_now(),
+        );
+        assert!(
+            std::fs::symlink_metadata(&swapped)
+                .expect("swapped")
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(std::fs::read(&target).expect("target2 read"), b"keep");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn probe_pid_one_is_alive() {
+        // Pid 1 always exists; as non-root this exercises the EPERM -> Alive mapping.
+        assert_eq!(probe_pid(1), PidProbe::Alive);
+    }
+
+    #[test]
+    fn unprobeable_pid_is_not_provably_dead() {
+        assert!(!pid_provably_dead_with(424242, &|_| PidProbe::Unprobeable));
+        assert!(!pid_provably_dead_with(424242, &|_| PidProbe::Alive));
+        assert!(pid_provably_dead_with(424242, &|_| PidProbe::Dead));
+        assert!(!pid_provably_dead_with(0, &|_| PidProbe::Dead));
+    }
+
+    #[test]
+    fn cleanup_skips_entirely_when_own_pid_unprobeable() {
+        let dir = unique_test_dir("ownunprobeable");
+        let stale = dir.join(".flh-424242-1-1000");
+        plant_temp(&stale);
+        clean_stale_publish_temps_guarded(
+            &dir,
+            std::process::id(),
+            &|pid| {
+                if pid == std::process::id() {
+                    PidProbe::Unprobeable
+                } else {
+                    PidProbe::Dead
+                }
+            },
+            aged_now(),
+        );
+        assert!(stale.exists(), "unprobeable own pid skips cleanup");
+        // Own probeable, target unprobeable: also kept.
+        clean_stale_publish_temps_guarded(
+            &dir,
+            std::process::id(),
+            &|pid| {
+                if pid == std::process::id() {
+                    PidProbe::Alive
+                } else {
+                    PidProbe::Unprobeable
+                }
+            },
+            aged_now(),
+        );
+        assert!(stale.exists(), "unprobeable target pid kept");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cleanup_own_pid_guard_holds_when_probe_says_dead() {
+        let dir = unique_test_dir("ownguard");
+        let own = dir.join(".flh-424242-1-1000");
+        let other = dir.join(".flh-424243-1-1000");
+        plant_temp(&own);
+        plant_temp(&other);
+        clean_stale_publish_temps_with(&dir, 424242, &|_| true, aged_now());
+        assert!(own.exists(), "own pid temp kept despite dead probe");
+        assert!(!other.exists(), "other dead pid temp removed");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cleanup_keeps_young_extra_field_and_noncanonical_temps() {
+        let dir = unique_test_dir("young");
+        let young = dir.join(".flh-424242-1-1000");
+        let extra = dir.join(".flh-424242-1-1000-extra");
+        let plus = dir.join(".flh-+424242-1-1000");
+        let leading = dir.join(".flh-0424242-1-1000");
+        for file in [&young, &extra, &plus, &leading] {
+            plant_temp(file);
+        }
+        assert_eq!(parse_publish_temp(".flh-424242-1-1000-extra"), None);
+        assert_eq!(parse_publish_temp(".flh-+424242-1-1000"), None);
+        assert_eq!(parse_publish_temp(".flh-0424242-1-1000"), None);
+        // Real now: young is too fresh; the rest are not canonical temps.
+        clean_stale_publish_temps_with(
+            &dir,
+            std::process::id(),
+            &|pid| pid == 424242,
+            SystemTime::now(),
+        );
+        for file in [&young, &extra, &plus, &leading] {
+            assert!(file.exists(), "kept: {}", file.display());
+        }
+        // Aged view removes only the canonical young temp.
+        clean_stale_publish_temps_with(&dir, std::process::id(), &|pid| pid == 424242, aged_now());
+        assert!(!young.exists());
+        for file in [&extra, &plus, &leading] {
+            assert!(file.exists(), "kept: {}", file.display());
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_keeps_swapped_different_regular_file() {
+        let dir = unique_test_dir("swapregular");
+        let swapped = dir.join(".flh-424242-1-1000");
+        plant_temp(&swapped);
+        let calls = std::cell::Cell::new(0usize);
+        let dir2 = dir.clone();
+        let swapped2 = swapped.clone();
+        clean_stale_publish_temps_with(
+            &dir,
+            std::process::id(),
+            &|_| {
+                calls.set(calls.get() + 1);
+                if calls.get() == 2 {
+                    // Replacement inode is allocated while the original
+                    // still exists, so it cannot reuse its inode.
+                    let repl = dir2.join("replacement");
+                    std::fs::write(&repl, b"new").expect("repl");
+                    use std::os::unix::fs::PermissionsExt;
+                    std::fs::set_permissions(&repl, std::fs::Permissions::from_mode(0o600))
+                        .expect("repl mode");
+                    std::fs::rename(&repl, &swapped2).expect("swap rename");
+                }
+                true
+            },
+            aged_now(),
+        );
+        assert!(swapped.exists(), "swapped-in file kept");
+        assert_eq!(std::fs::read(&swapped).expect("read"), b"new");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_keeps_hardlinked_and_nonprivate_temps() {
+        let dir = unique_test_dir("privatecheck");
+        let linked = dir.join(".flh-424242-1-1000");
+        let loose = dir.join(".flh-424243-1-1000");
+        plant_temp(&linked);
+        plant_temp(&loose);
+        std::fs::hard_link(&linked, dir.join("alias")).expect("hardlink");
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&loose, std::fs::Permissions::from_mode(0o644))
+            .expect("loose mode");
+        clean_stale_publish_temps_with(&dir, std::process::id(), &|_| true, aged_now());
+        assert!(linked.exists(), "hardlinked temp kept");
+        assert!(loose.exists(), "non-0600 temp kept");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
