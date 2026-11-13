@@ -4140,12 +4140,42 @@ mod tests {
                 "release must clear diagnostics record"
             );
             let calls = TRANSPORT_CALLS.with(|n| n.get());
+            // Park `held` behind an already-active worker (as `run_fault_job`
+            // does): the send below is then queued without spawning a queue
+            // worker, whose asynchronous real dispatch would otherwise race
+            // the `attempts == 0` and empty-diagnostics assertions below.
+            lock(&inner.dispatch_queues).insert(
+                "held".into(),
+                RecipientDispatchQueue {
+                    worker_active: true,
+                    ..Default::default()
+                },
+            );
             let (response, _) = inner.handle_local_request(LocalRequest::Send {
                 args: mail("held", "later"),
             });
             let LocalResponse::Sent { message, .. } = response else {
                 panic!("send did not persist")
             };
+            // Synchronize on the queue worker state, not on timing: with a
+            // bounded deadline, `later` must be pending behind the active
+            // worker and must not have been dispatched.
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                let queued = lock(&inner.dispatch_queues)
+                    .get("held")
+                    .is_some_and(|queue| {
+                        queue.worker_active && queue.pending.iter().any(|(id, _)| id == &message.id)
+                    });
+                if queued {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "later message was not queued behind the active held worker"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
             assert_eq!(TRANSPORT_CALLS.with(|n| n.get()), calls);
             assert_eq!(
                 inner.store.inner.list_wire_receipts(&message.id).unwrap()[0].attempts,
