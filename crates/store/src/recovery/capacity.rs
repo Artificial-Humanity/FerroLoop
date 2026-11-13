@@ -30,8 +30,20 @@ fn error(l: &OperationLimits) -> RecoveryError {
 }
 fn lock(root: &Dir, l: &OperationLimits) -> Result<File, RecoveryError> {
     let file = super::scheduler::private_file(&root.path.join(".capacity.lock"), true)?;
-    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-        return Err(error(l));
+    // Contention for this accounting lock is not quota: concurrent callers
+    // sharing one root (timer tick, manual request, worker release) must
+    // serialize. Wait, bounded by the caller's deadline and cancellation.
+    loop {
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            break;
+        }
+        match std::io::Error::last_os_error().raw_os_error() {
+            Some(code) if code == libc::EWOULDBLOCK || code == libc::EINTR => {
+                l.check()?;
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            _ => return Err(error(l)),
+        }
     }
     root.same_name(l)?;
     Ok(file)
@@ -226,5 +238,37 @@ mod tests {
         assert!(reserve(&reopened, &b, "fixture", 0, 0, Arc::new(Space), &l).is_err());
         release(&reopened, &a, "fixture", Arc::new(NativeRecoveryIo), &l).unwrap();
         reserve(&reopened, &b, "fixture", 0, 0, Arc::new(Space), &l).unwrap();
+    }
+    #[test]
+    fn capacity_lock_contention_waits_rather_than_reporting_quota() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let l = OperationLimits::new(
+            Instant::now() + Duration::from_secs(30),
+            1 << 20,
+            32 << 20,
+            CancelToken::new(),
+        );
+        let root = Dir::open(tmp.path(), &l).unwrap();
+        let held = lock(&root, &l).unwrap();
+        let path = tmp.path().to_path_buf();
+        let b = request();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let wl = OperationLimits::new(
+                Instant::now() + Duration::from_secs(30),
+                1 << 20,
+                32 << 20,
+                CancelToken::new(),
+            );
+            let wroot = Dir::open(&path, &wl).unwrap();
+            tx.send(reserve(&wroot, &b, "fixture", 0, 0, Arc::new(Space), &wl))
+                .unwrap();
+        });
+        // While the lock is held the reserve must wait, not refuse as quota.
+        assert!(rx.recv_timeout(Duration::from_millis(250)).is_err());
+        drop(held);
+        rx.recv_timeout(Duration::from_secs(10)).unwrap().unwrap();
+        worker.join().unwrap();
     }
 }
