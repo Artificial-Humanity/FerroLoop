@@ -4994,6 +4994,9 @@ fn restore_finalize_uses_each_generations_distinct_dependency_profile() {
         let (mut request, lease) = prepare_restore_bundle(&f, &f.source, selected_bundle);
         request.original_profile = original_profile;
         request.available_dependencies = vec![resolution(&selected_dep), resolution(&original_dep)];
+        // Provision this two-generation dependency fixture for fixed future O/X
+        // allowances and conservative maximum-width identities before admission.
+        request.metadata_byte_limit += 64 << 10;
         let RestoreOutcome::Installed { mut journal } =
             restore_offline(&request, &lease, &f.filesystem()).unwrap()
         else {
