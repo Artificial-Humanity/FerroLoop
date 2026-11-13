@@ -193,6 +193,16 @@ impl PromptQueueTarget {
     }
 }
 
+/// Bounded re-probe budget for a prompt held by an occupied composer (mirrors the wire
+/// dispatcher's `#471` schedule: 10s doubling to 120s, at most 16 probes).
+pub(crate) const COMPOSER_HELD_MAX_PROBES: u32 = 16;
+pub(crate) const COMPOSER_HELD_INITIAL_BACKOFF_MS: i64 = 10_000;
+pub(crate) const COMPOSER_HELD_MAX_BACKOFF_MS: i64 = 120_000;
+
+fn is_composer_occupied_error(error: &str) -> bool {
+    error.contains("composer_occupied_by_non_wire_input")
+}
+
 #[derive(Debug, Default)]
 struct PromptQueueState {
     queues: BTreeMap<String, Vec<QueuedOperatorPrompt>>,
@@ -200,6 +210,8 @@ struct PromptQueueState {
     active_queue_sends: std::collections::BTreeSet<String>,
     next_seq: u64,
     targets: BTreeMap<String, PromptQueueTarget>,
+    /// Per-prompt `(probes_run, next_probe_at_ms)` for composer-occupied holds.
+    composer_hold_probes: BTreeMap<String, (u32, i64)>,
 }
 
 /// A logical dispatch claim, held across I/O without holding the queue mutex.
@@ -950,12 +962,107 @@ impl HubState {
                     queue[pos].delivery_error = Some(error);
                 }
                 Err(fl_wire::dispatcher::PushError::Failed(error)) => {
-                    queue[pos].delivery_state = QueuedDeliveryState::Unconfirmed;
-                    queue[pos].delivery_error = Some(error);
+                    if is_composer_occupied_error(&error) {
+                        // Zero keys were sent over the non-wire input, so this delivery
+                        // is known not to have landed: keep it retryable (Pending) and
+                        // arm the bounded clean-composer re-probe instead of fencing it
+                        // as Unconfirmed forever.
+                        queue[pos].delivery_state = QueuedDeliveryState::Pending;
+                        queue[pos].delivery_error = Some(error);
+                    } else {
+                        queue[pos].delivery_state = QueuedDeliveryState::Unconfirmed;
+                        queue[pos].delivery_error = Some(error);
+                    }
                 }
             }
         }
-        queue.clone()
+        let composer_held = queue.iter().any(|q| {
+            q.id == prompt_id
+                && q.delivery_state == QueuedDeliveryState::Pending
+                && q.delivery_error.as_deref().is_some_and(is_composer_occupied_error)
+        });
+        let out = queue.clone();
+        if composer_held {
+            guard
+                .composer_hold_probes
+                .entry(prompt_id.to_string())
+                .or_insert((0, stamp::now().unix_millis() as i64));
+        }
+        out
+    }
+
+    /// Whether `prompt_id` in `session_key`'s queue is a retryable composer-occupied hold.
+    pub(crate) fn is_composer_held_prompt(&self, session_key: &str, prompt_id: &str) -> bool {
+        let guard = self.prompt_queues.lock().unwrap_or_else(|e| e.into_inner());
+        guard.queues.get(session_key).is_some_and(|q| {
+            q.iter().any(|item| {
+                item.id == prompt_id
+                    && item.delivery_state == QueuedDeliveryState::Pending
+                    && item
+                        .delivery_error
+                        .as_deref()
+                        .is_some_and(is_composer_occupied_error)
+            })
+        })
+    }
+
+    /// Whether the bounded re-probe for a composer-held prompt is due at `now_ms`.
+    pub(crate) fn composer_hold_probe_due(&self, prompt_id: &str, now_ms: i64) -> bool {
+        let guard = self.prompt_queues.lock().unwrap_or_else(|e| e.into_inner());
+        match guard.composer_hold_probes.get(prompt_id) {
+            Some((probes, _)) if *probes >= COMPOSER_HELD_MAX_PROBES => false,
+            Some((_, next_at)) => now_ms >= *next_at,
+            None => true,
+        }
+    }
+
+    /// Record one re-probe of a composer-held prompt; returns the probe count, or `None`
+    /// when the bounded budget is exhausted and the prompt stays held.
+    pub(crate) fn note_composer_hold_probe(&self, prompt_id: &str, now_ms: i64) -> Option<u32> {
+        let mut guard = self.prompt_queues.lock().unwrap_or_else(|e| e.into_inner());
+        let entry = guard
+            .composer_hold_probes
+            .entry(prompt_id.to_string())
+            .or_insert((0, now_ms));
+        if entry.0 >= COMPOSER_HELD_MAX_PROBES {
+            return None;
+        }
+        entry.0 += 1;
+        let backoff = (COMPOSER_HELD_INITIAL_BACKOFF_MS << (entry.0 - 1).min(4))
+            .min(COMPOSER_HELD_MAX_BACKOFF_MS);
+        entry.1 = now_ms.saturating_add(backoff);
+        Some(entry.0)
+    }
+
+    /// Release a composer-held prompt for redelivery only when a passive probe positively
+    /// observed a clean composer (`Some(true)`). `Some(false)` (non-wire input or a dialog
+    /// still present) and `None` (composer not observable) keep the hold; no keys are ever
+    /// sent by the probe itself.
+    pub(crate) fn release_composer_held_prompt(
+        &self,
+        session_key: &str,
+        prompt_id: &str,
+        ready: Option<bool>,
+    ) -> bool {
+        if ready != Some(true) {
+            return false;
+        }
+        let mut guard = self.prompt_queues.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(queue) = guard.queues.get_mut(session_key) else {
+            return false;
+        };
+        let Some(item) = queue.iter_mut().find(|q| {
+            q.id == prompt_id
+                && q.delivery_state == QueuedDeliveryState::Pending
+                && q.delivery_error
+                    .as_deref()
+                    .is_some_and(is_composer_occupied_error)
+        }) else {
+            return false;
+        };
+        item.delivery_error = None;
+        guard.composer_hold_probes.remove(prompt_id);
+        true
     }
 
     /// Hold a known refusal without allowing a later automatic drain to change its intent.
@@ -1591,6 +1698,56 @@ mod tests {
         assert!(state.session_in_flight_unconfirmed("canonical"));
         state.remove_queued_prompt("raw", &item.id).unwrap();
         assert!(!state.session_in_flight_unconfirmed("canonical"));
+    }
+
+    #[test]
+    fn composer_occupied_hold_retries_only_on_clean_probe() {
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        let (item, _) = state.enqueue_session_prompt(
+            "ada",
+            None,
+            "hello".into(),
+            "hello".into(),
+            "owner".into(),
+            vec![],
+        );
+        let (_claimed, claim) = state
+            .claim_queued_for_dispatch("ada", "ada", &item.id, false)
+            .unwrap();
+        let queue = state.finish_queued_prompt(
+            "ada",
+            &item.id,
+            Err(fl_wire::dispatcher::PushError::Failed(
+                "composer_occupied_by_non_wire_input: composer holds non-wire input or active dialog; holding delivery without sending keys".into(),
+            )),
+        );
+        claim.finish();
+        // Zero-key hold stays retryable, not fenced as Unconfirmed.
+        assert_eq!(queue[0].delivery_state, QueuedDeliveryState::Pending);
+        assert!(state.is_composer_held_prompt("ada", &item.id));
+        // Probe that is not positively clean keeps the hold.
+        assert!(!state.release_composer_held_prompt("ada", &item.id, Some(false)));
+        assert!(!state.release_composer_held_prompt("ada", &item.id, None));
+        assert!(state.is_composer_held_prompt("ada", &item.id));
+        // Bounded probe budget.
+        let now_ms = stamp::now().unix_millis() as i64;
+        assert!(state.composer_hold_probe_due(&item.id, now_ms));
+        for _ in 0..COMPOSER_HELD_MAX_PROBES {
+            assert!(state.note_composer_hold_probe(&item.id, now_ms).is_some());
+        }
+        assert!(state.note_composer_hold_probe(&item.id, now_ms).is_none());
+        assert!(!state.composer_hold_probe_due(&item.id, now_ms + 1_000_000));
+        // A clean probe releases it for the normal drain dispatch path.
+        assert!(state.release_composer_held_prompt("ada", &item.id, Some(true)));
+        assert!(!state.is_composer_held_prompt("ada", &item.id));
+        let (claimed, claim2) = state
+            .claim_queued_for_dispatch("ada", "ada", &item.id, true)
+            .unwrap();
+        assert_eq!(claimed.id, item.id);
+        let queue = state.finish_queued_prompt("ada", &item.id, Ok(()));
+        claim2.finish();
+        assert!(queue.is_empty());
     }
 
     #[test]

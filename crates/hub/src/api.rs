@@ -6318,6 +6318,40 @@ pub fn drain_ready_session_queues(state: &HubState) {
             .session_queue(&session_id)
             .first()
             .map(|item| item.id.clone());
+        // A composer-occupied hold is retried only when a passive, key-free probe
+        // positively observes a clean composer (`Some(true)`), on the bounded
+        // backoff schedule in `HubState` — never over non-wire input or a dialog.
+        if let Some(prompt_id) = &next
+            && state.is_composer_held_prompt(&session_id, prompt_id)
+        {
+            let now_ms = stamp::now().unix_millis() as i64;
+            if !state.composer_hold_probe_due(prompt_id, now_ms) {
+                continue;
+            }
+            let head = state.session_queue(&session_id).into_iter().next();
+            let ready = head
+                .as_ref()
+                .and_then(|item| {
+                    crate::lifecycle::find_route(
+                        home,
+                        session_route_query(item.persona.as_deref(), &canonical_id),
+                    )
+                })
+                .and_then(|route| fl_wire::dispatcher::probe_route_composer_ready(&route));
+            match state.note_composer_hold_probe(prompt_id, now_ms) {
+                Some(probes) => eprintln!(
+                    "hub: composer-held prompt {prompt_id} for {canonical_id}: reprobe {probes}/{} ready={ready:?}",
+                    crate::COMPOSER_HELD_MAX_PROBES
+                ),
+                None => eprintln!(
+                    "hub: composer-held prompt {prompt_id} for {canonical_id}: reprobes exhausted after {} probes; holding until owner action",
+                    crate::COMPOSER_HELD_MAX_PROBES
+                ),
+            }
+            if !state.release_composer_held_prompt(&session_id, prompt_id, ready) {
+                continue;
+            }
+        }
         if !state.is_session_busy_from_observation(&canonical_id, turns.as_deref())
             && let Some(prompt_id) = next
             && let Some((item, claim)) =

@@ -5963,7 +5963,7 @@ pub fn claude_route_live_pane(route: &VendorRoute) -> Option<String> {
 /// composer or only recorded unconfirmed FerroWire deliveries for `route`; `Some(false)` when the
 /// composer still holds non-wire input or an active dialog/menu; and `None` when the route does not
 /// use terminal composer verification or its rendered screen cannot be captured right now.
-pub(crate) fn probe_route_composer_ready(route: &VendorRoute) -> Option<bool> {
+pub fn probe_route_composer_ready(route: &VendorRoute) -> Option<bool> {
     let target = match route {
         VendorRoute::Muse {
             session_id,
