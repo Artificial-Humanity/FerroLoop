@@ -214,6 +214,70 @@ The exchange, lease, readiness and purge contracts below incorporate Ferris's 20
 - Reference closure uses bounded verified other live receipts/manifests and typed completed batch records. Any explicit pointer to the target operation ID or bundle name in `reference_dependencies`, shared-config descriptors or completed batch records refuses; equal member digests across independent bundles are not references. A dry-run digest binds confirmation, and closure is recomputed after half-withdrawal. Changed, incomplete or unproven closure refuses. Shared configs and batch records are never deleted.
 - Validation expectations use recovery metadata **format 2**. Finite vector scores persist as canonical 16-character lowercase hexadecimal IEEE-754 bits, so default JSON parse/reserialize preserves exact member checksums. Recomputed score comparison retains the profile's existing `1e-9` tolerance. Engine, snapshot, validation profile, manifest and verification report versions are unchanged; no global JSON parser feature is enabled. Format 1 expectations, including vector-free format 1, are explicitly unsupported with no migration or reinterpretation. No format 1 bundles were produced outside fixtures. The unchanged `Vec<f32>` probe profile is covered by a default-parser digest round-trip test.
 
+### Task 6 R3 design-record update (2026-11-13, PR #481)
+
+This dated update records the implemented review corrections and current limits;
+it leaves the original task checkboxes and operational gates unchanged.
+**Operational HOLD remains: no deployment, restart, live backup, restore or purge.
+Only isolated local fixture tests are in scope.**
+
+- Admission now reserves the worst-case terminal journal frame before publishing
+  the guard, including both verification reports, the accepting lease, terminal
+  context and reconciliation or absence evidence. Later new inputs have matching
+  caps; retries preserve historically accepted evidence, including records larger
+  than the new-input caps. The `RJR1` format and cumulative frame schedule remain
+  unchanged: at most `5 + 12 * 4 + 4 * 4 = 69` writer frames within the 96-frame
+  reservation. The shared 12-attempt resume/finalize limit and separate four-attempt
+  rollback reserve remain in force; renewal does not reset them or enlarge quotas.
+- Restore pins and purge audit intent/member/completion rows publish through
+  flushed temporary files and atomic `NOREPLACE` rename, followed by directory
+  sync. Typed cleanup/resume handles only the owning operation's proven temporary
+  file under its locks; it does not authorize broad cleanup. Existing guard,
+  phase/generation, forensic retention and strict restore `2L` constraints remain.
+- Read-only restore status exposes `accepted_reconciliation` and
+  `accepted_absence_reconciliation`. These let an operator recover a lost request
+  from journal-accepted evidence for an intent retry. Status does not change
+  acceptance, consume attempts or mutate artifacts; retries still require the
+  already accepted evidence rather than replacement evidence.
+
+**Purge limitation:** current inspection and confirmed purge both require full
+bundle verification **and a matching receipt**. Consequently they cannot purge
+most corrupt or incomplete quarantine material, including an image digest
+mismatch, missing report, truncated manifest or missing receipt. This fails
+closed; it does not authorize or establish the safety of manual deletion.
+An as-found purge mode is deferred to
+[#514](https://github.com/Artificial-Humanity/FerroLoop/issues/514).
+The restore floor for stores under about 8 MiB is separately deferred to
+[#515](https://github.com/Artificial-Humanity/FerroLoop/issues/515), and scheduled
+exhaustive CI to [#516](https://github.com/Artificial-Humanity/FerroLoop/issues/516).
+None is implemented by this documentation update.
+
+**Fixture verification modes:** the workspace dev profile now builds `sha2` at
+`opt-level = 3`. With `FL_RECOVERY_EXHAUSTIVE` unset, each of the two terminal
+matrices runs a 12-case pairwise sample under its existing test name; neither is
+ignored. `FL_RECOVERY_EXHAUSTIVE=1` selects the complete 96-case removal matrix
+and 288-case sync matrix using the same assertions. From the repository root,
+use isolated native Linux ext4/XFS fixture storage; set `FL_RECOVERY_TEST_DIR`
+to an isolated fixture directory there when the default temporary filesystem is
+unsupported. These are portable Cargo commands, with no private wrapper required:
+
+```sh
+# Default recovery_restore suite (FL_RECOVERY_EXHAUSTIVE unset).
+cargo test -p fl-store --test recovery_restore -- --test-threads=1
+
+# Exhaustive removal matrix: 96 cases.
+FL_RECOVERY_EXHAUSTIVE=1 cargo test -p fl-store --test recovery_restore restore_terminal_all_generations_are_held_across_removal_and_later_authority_open -- --exact --test-threads=1
+
+# Exhaustive sync matrix: 288 cases.
+FL_RECOVERY_EXHAUSTIVE=1 cargo test -p fl-store --test recovery_restore restore_terminal_absent_guard_and_pin_recheck_authority_and_layout_after_every_sync -- --exact --test-threads=1
+```
+
+The default `recovery_restore` CI runtime of **10 minutes or less remains an
+unverified target**. The initial local 75-test baseline took **1714.167 s**;
+it does not establish that target. Final-head full-workspace verification and
+both exhaustive runs remain **pending** for the coordinator after integration.
+This record makes no final-head pass or activation claim.
+
 ### Task 7: Package reproducible acceptance evidence and rollout gates
 
 **Files:** Create `docs/operations/ferrostore-recovery.md`, `crates/store/tests/recovery_acceptance.rs`, and `crates/store/examples/recovery_fixture_baseline.rs`; update the architecture inventory only where implemented capability is now true. Evidence lives in private project scratch, with a redacted schema/example in docs.
