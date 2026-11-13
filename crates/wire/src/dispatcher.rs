@@ -29,6 +29,53 @@ pub enum SessionResetMode {
     Reforge,
 }
 
+/// A reset cannot safely establish a new native conversation on this route.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct SessionResetRefusal {
+    pub code: &'static str,
+    pub vendor: String,
+    pub reason: &'static str,
+    pub alternative: &'static str,
+    pub error: String,
+}
+
+impl std::fmt::Display for SessionResetRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&serde_json::to_string(self).map_err(|_| std::fmt::Error)?)
+    }
+}
+
+impl std::error::Error for SessionResetRefusal {}
+
+/// Check reset support without inspecting or changing any transport or runtime.
+pub fn preflight_session_reset(route: &VendorRoute) -> Result<(), SessionResetRefusal> {
+    match route {
+        VendorRoute::Codex { .. }
+        | VendorRoute::Muse { .. }
+        | VendorRoute::Grok { .. }
+        | VendorRoute::HostCli { .. } => {
+            Err(SessionResetRefusal::for_vendor(route.canonical_vendor()))
+        }
+        VendorRoute::Claude { .. } | VendorRoute::Agy { .. } | VendorRoute::Webhook { .. } => {
+            Ok(())
+        }
+    }
+}
+
+impl SessionResetRefusal {
+    fn for_vendor(vendor: &str) -> Self {
+        Self {
+            code: "reset_unsupported",
+            vendor: vendor.to_string(),
+            reason: "identity_unconfirmable",
+            alternative: "remodel_same_vendor",
+            error: format!(
+                "Clear/Reforge is unavailable for {vendor}: the native session identity cannot be confirmed. Use remodel with the same vendor to start a fresh session."
+            ),
+        }
+    }
+}
+
 /// Maximum automatic push delivery attempts before leaving a message `Pending` for explicit poll.
 pub const MAX_DELIVER: u32 = 5;
 
@@ -998,6 +1045,13 @@ fn deliver_to_codex_route(
     cwd: Option<&PathBuf>,
     text: &str,
 ) -> Result<(), String> {
+    if ["/new", "/clear"]
+        .iter()
+        .any(|slash| text.trim().eq_ignore_ascii_case(slash))
+    {
+        return Err(SessionResetRefusal::for_vendor("codex").to_string());
+    }
+
     // `codex queue --message` bypasses the TUI slash-command parser and would send the literal
     // text as a chat turn, so `/compact` goes through the app-server RPC instead. A failure is
     // returned as is: falling back to `codex queue` would be the bug.
@@ -1983,18 +2037,12 @@ fn truncate_agy_transcript_file(path: &Path) -> Result<(), String> {
     fs::write(path, keep).map_err(|err| format!("failed to truncate {}: {err}", path.display()))
 }
 
-/// Reset a live vendor session. Tmux-backed Muse and Grok routes send `C-u`,
-/// the slash command, and `Enter` through `tmux send-keys`. Codex and Grok use
-/// `/new`. Claude, Muse, and Webhook use `/clear`.
+/// Reset a supported live vendor session, then deliver the hydration prompt for Reforge.
 ///
-/// Antigravity rewinds the open cascade with `RevertToCascadeStep`
-/// (`stepIndex` 0, `conversationOnly` true) and keeps only the `step_index` 0
-/// transcript line. A mock `FL_WIRE_AGY_BIN` without a listening address and
-/// csrf token still sends `/clear`.
-///
-/// Reforge requires a non-empty prompt before any tmux or vendor dispatch.
-/// It waits 2s after a tmux reset (skipped when `FL_WIRE_TMUX_BIN` is set)
-/// and then delivers that prompt on the same route.
+/// Codex, Muse, Grok and all HostCli routes refuse before any transport or probe because
+/// their native session identity cannot be confirmed. Antigravity retains its in-place
+/// cascade rewind; Claude and the deterministic Webhook transport keep their current paths.
+/// Reforge requires a non-empty prompt before checking route support.
 pub fn clear_or_reforge_session(
     route: &VendorRoute,
     mode: SessionResetMode,
@@ -2006,6 +2054,7 @@ pub fn clear_or_reforge_session(
     } else {
         None
     };
+    preflight_session_reset(route).map_err(|refusal| refusal.to_string())?;
     if let VendorRoute::Agy {
         conversation_id,
         ls_address,
@@ -2019,18 +2068,7 @@ pub fn clear_or_reforge_session(
         }
         return Ok(());
     }
-    let slash = session_reset_slash(route);
-    if let Some(target) = alive_tmux_reset_target(route) {
-        send_tmux_reset_keys(&target, slash)?;
-        if let Some(prompt) = prompt {
-            if std::env::var_os("FL_WIRE_TMUX_BIN").is_none() {
-                std::thread::sleep(Duration::from_millis(2000));
-            }
-            dispatch_operator_prompt_to_route(route, sender_name, prompt)?;
-        }
-        return Ok(());
-    }
-    dispatch_operator_prompt_to_route(route, sender_name, slash)?;
+    dispatch_operator_prompt_to_route(route, sender_name, "/clear")?;
     if let Some(prompt) = prompt {
         dispatch_operator_prompt_to_route(route, sender_name, prompt)?;
     }
@@ -2042,105 +2080,6 @@ fn require_reforge_prompt(reforge_prompt: Option<&str>) -> Result<&str, String> 
         .map(str::trim)
         .filter(|prompt| !prompt.is_empty())
         .ok_or_else(|| "missing reforge prompt".to_string())
-}
-
-fn session_reset_slash(route: &VendorRoute) -> &'static str {
-    match route {
-        VendorRoute::Codex { .. } | VendorRoute::Grok { .. } => "/new",
-        VendorRoute::HostCli { vendor, .. }
-            if vendor.eq_ignore_ascii_case("codex") || vendor.eq_ignore_ascii_case("grok") =>
-        {
-            "/new"
-        }
-        VendorRoute::Claude { .. }
-        | VendorRoute::Muse { .. }
-        | VendorRoute::Agy { .. }
-        | VendorRoute::HostCli { .. }
-        | VendorRoute::Webhook { .. } => "/clear",
-    }
-}
-
-fn alive_tmux_reset_target(route: &VendorRoute) -> Option<String> {
-    let ordered: [&Option<String>; 2] = match route {
-        VendorRoute::Grok {
-            tmux_pane,
-            tmux_target,
-            ..
-        }
-        | VendorRoute::HostCli {
-            tmux_pane,
-            tmux_target,
-            ..
-        } => [tmux_pane, tmux_target],
-        VendorRoute::Muse {
-            tmux_target,
-            tmux_pane,
-            ..
-        } => [tmux_target, tmux_pane],
-        VendorRoute::Claude { .. }
-        | VendorRoute::Codex { .. }
-        | VendorRoute::Agy { .. }
-        | VendorRoute::Webhook { .. } => return None,
-    };
-    let mut seen = Vec::new();
-    for slot in ordered {
-        let Some(raw) = slot else {
-            continue;
-        };
-        let target = raw.trim();
-        if target.is_empty() || seen.iter().any(|seen| seen == target) {
-            continue;
-        }
-        seen.push(target.to_string());
-        if tmux_target_alive(target) {
-            return Some(target.to_string());
-        }
-    }
-    None
-}
-
-fn send_tmux_reset_keys(target: &str, slash: &str) -> Result<(), String> {
-    if std::env::var_os("FL_WIRE_TMUX_BIN").is_none()
-        && let Some((mut client, stream)) = resolve_live_host_session(target)
-    {
-        let grant = client
-            .claim_controller(stream.clone())
-            .map_err(|e| format!("failed to claim fl-host controller for {target}: {e}"))?;
-        let outcome = client
-            .write_raw(stream.clone(), grant.lease, b"\x15".to_vec())
-            .map_err(|e| format!("fl-host write_raw C-u failed: {e}"))?;
-        if !matches!(outcome, fl_host_proto::SendOutcome::Written) {
-            return Err(format!("fl-host write_raw C-u returned {outcome:?}"));
-        }
-        let outcome = client
-            .write_raw(stream.clone(), grant.lease, slash.as_bytes().to_vec())
-            .map_err(|e| format!("fl-host write_raw {slash} failed: {e}"))?;
-        if !matches!(outcome, fl_host_proto::SendOutcome::Written) {
-            return Err(format!("fl-host write_raw {slash} returned {outcome:?}"));
-        }
-        std::thread::sleep(TMUX_PASTE_SETTLE_DELAY);
-        let outcome = client
-            .write_raw(stream, grant.lease, b"\r".to_vec())
-            .map_err(|e| format!("fl-host write_raw Enter failed: {e}"))?;
-        if !matches!(outcome, fl_host_proto::SendOutcome::Written) {
-            return Err(format!("fl-host write_raw Enter returned {outcome:?}"));
-        }
-        return Ok(());
-    }
-    let tmux = tmux_bin();
-    let target = tmux_exact_target(target);
-    for key in ["C-u", slash, "Enter"] {
-        let status = Command::new(&tmux)
-            .args(["send-keys", "-t", &target, key])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .map_err(|e| format!("failed to spawn tmux send-keys: {e}"))?;
-        if !status.success() {
-            return Err(format!("tmux send-keys {key} exited with {status}"));
-        }
-    }
-    Ok(())
 }
 
 /// Method label of [`InterruptPlan::TmuxKey`].
@@ -8692,65 +8631,131 @@ mod tests {
         assert!(!is_owner_sender(""));
     }
 
+    fn unsupported_reset_routes() -> Vec<(VendorRoute, &'static str)> {
+        let mut routes = Vec::new();
+        for id in ["", "placeholder", "Fixture.codex"] {
+            routes.push((
+                VendorRoute::Codex {
+                    thread_id: id.into(),
+                    cwd: None,
+                },
+                "codex",
+            ));
+            routes.push((
+                VendorRoute::Muse {
+                    session_id: id.into(),
+                    cwd: None,
+                    tmux_target: Some("fixture:muse".into()),
+                    tmux_pane: Some("%999999".into()),
+                },
+                "muse",
+            ));
+            routes.push((
+                VendorRoute::Grok {
+                    session_id: id.into(),
+                    cwd: None,
+                    tmux_target: Some("fixture:grok".into()),
+                    tmux_pane: Some("%999999".into()),
+                },
+                "grok",
+            ));
+            for (vendor, canonical) in [
+                (" ClAuDe ", "claude"),
+                (" CoDeX ", "codex"),
+                (" MuSe ", "muse"),
+                (" GrOk ", "grok"),
+                (" AGY ", "antigravity"),
+                (" Lemonade ", "lemonade"),
+                (" OLLAMA ", "ollama"),
+                ("host_cli", "host_cli"),
+                ("custom", "custom"),
+                ("", ""),
+            ] {
+                routes.push((
+                    VendorRoute::HostCli {
+                        vendor: vendor.into(),
+                        session_id: id.into(),
+                        cwd: None,
+                        tmux_target: Some("fixture:host".into()),
+                        tmux_pane: Some("%999999".into()),
+                    },
+                    canonical,
+                ));
+            }
+        }
+        routes
+    }
+
+    fn assert_reset_refusal(value: serde_json::Value, vendor: &str) {
+        assert_eq!(value["code"], "reset_unsupported");
+        assert_eq!(value["vendor"], vendor);
+        assert_eq!(value["reason"], "identity_unconfirmable");
+        assert_eq!(value["alternative"], "remodel_same_vendor");
+        let error = value["error"].as_str().unwrap();
+        assert!(error.contains("identity"), "{error}");
+        assert!(
+            error.contains("remodel") && error.contains("same vendor"),
+            "{error}"
+        );
+    }
+
     #[test]
-    fn clear_or_reforge_tmux_sends_reset_keys_then_prompt() {
-        use std::os::unix::fs::PermissionsExt;
+    fn reset_preflight_refuses_every_unconfirmable_route_without_transport() {
+        for (route, vendor) in unsupported_reset_routes() {
+            let refusal = preflight_session_reset(&route).expect_err("must refuse without probing");
+            assert_reset_refusal(serde_json::to_value(&refusal).unwrap(), vendor);
+            assert_reset_refusal(serde_json::from_str(&refusal.to_string()).unwrap(), vendor);
+        }
+    }
 
-        let _tmux_lock = TMUX_ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
-        let tmp = TempDir::new().unwrap();
-        let tmux_out = tmp.path().join("tmux.out");
-        let tmux_stdin = tmp.path().join("tmux.stdin");
-        let tmux_bin = tmp.path().join("fake-tmux.sh");
-        fs::write(
-            &tmux_bin,
-            format!(
-                "#!/bin/sh\necho \"$*\" >> \"{}\"\nif [ \"$1\" = \"display-message\" ] || [ \"$1\" = \"list-panes\" ]; then\n  echo \"%9\"\nelif [ \"$1\" = \"load-buffer\" ]; then\n  cat > \"{}\"\nfi\n",
-                tmux_out.display(),
-                tmux_stdin.display()
-            ),
-        )
-        .unwrap();
-        fs::set_permissions(&tmux_bin, fs::Permissions::from_mode(0o755)).unwrap();
+    #[test]
+    fn reset_preflight_preserves_supported_route_paths() {
+        let routes = [
+            VendorRoute::Claude {
+                pid: 0,
+                session_id: "".into(),
+                socket_path: "/fixture/absent".into(),
+                key_path: None,
+            },
+            VendorRoute::Agy {
+                conversation_id: "".into(),
+                ls_pid: None,
+                ls_address: None,
+                csrf_token: None,
+                agentapi_exe: None,
+            },
+            VendorRoute::Webhook {
+                socket_path: "/fixture/absent".into(),
+            },
+        ];
+        for route in routes {
+            assert!(preflight_session_reset(&route).is_ok());
+        }
+    }
 
-        let grok = VendorRoute::Grok {
-            session_id: "gs-1".into(),
-            cwd: None,
-            tmux_target: Some("grok:felicia".into()),
-            tmux_pane: Some("%9".into()),
-        };
-        let muse = VendorRoute::Muse {
-            session_id: "ms-1".into(),
-            cwd: None,
-            tmux_target: Some("muse:felicia".into()),
-            tmux_pane: None,
-        };
+    #[test]
+    fn clear_or_reforge_refuses_unconfirmable_routes_before_dispatch() {
+        for (route, vendor) in unsupported_reset_routes() {
+            for mode in [SessionResetMode::Clear, SessionResetMode::Reforge] {
+                let error =
+                    clear_or_reforge_session(&route, mode, "owner", Some("hydrate fixture"))
+                        .expect_err("must refuse without dispatch");
+                assert_reset_refusal(serde_json::from_str(&error).unwrap(), vendor);
+            }
+        }
+    }
 
-        // SAFETY: this test is the only fl-wire test that keeps FL_WIRE_TMUX_BIN set
-        // for clear/reforge. The guard restores the previous value on drop.
-        let _env = EnvGuard::set("FL_WIRE_TMUX_BIN", &tmux_bin);
-        clear_or_reforge_session(&grok, SessionResetMode::Clear, "owner", None).unwrap();
-        clear_or_reforge_session(
-            &muse,
-            SessionResetMode::Reforge,
-            "owner",
-            Some("reforge muse now"),
-        )
-        .unwrap();
-        drop(_env);
-
-        let log = fs::read_to_string(&tmux_out).unwrap();
-        assert!(log.contains("send-keys -t %9 C-u"));
-        assert!(log.contains("send-keys -t %9 /new"));
-        assert!(log.contains("send-keys -t %9 Enter"));
-        assert!(log.contains("send-keys -t =muse:=felicia C-u"));
-        assert!(log.contains("send-keys -t =muse:=felicia /clear"));
-        assert!(log.contains("send-keys -t =muse:=felicia Enter"));
-        assert!(log.contains("load-buffer -b fl-wire-muse-"));
-        let pasted = fs::read_to_string(&tmux_stdin).unwrap();
-        assert_eq!(pasted.trim(), "reforge muse now");
-        let reset_at = log.find("send-keys -t =muse:=felicia /clear").unwrap();
-        let paste_at = log.find("load-buffer -b fl-wire-muse-").unwrap();
-        assert!(reset_at < paste_at);
+    #[test]
+    fn unconfirmable_reset_still_validates_reforge_prompt_first() {
+        for (route, _) in unsupported_reset_routes() {
+            for prompt in [None, Some(""), Some("  \n")] {
+                assert_eq!(
+                    clear_or_reforge_session(&route, SessionResetMode::Reforge, "owner", prompt)
+                        .unwrap_err(),
+                    "missing reforge prompt"
+                );
+            }
+        }
     }
 
     #[test]
@@ -8909,7 +8914,7 @@ mod tests {
     }
 
     #[test]
-    fn interrupt_and_reset_keys_name_the_window_exactly() {
+    fn interrupt_keys_name_the_window_exactly() {
         let _tmux_lock = TMUX_ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
         let tmp = TempDir::new().unwrap();
         let (tmux_bin, out) = write_fake_tmux_prefix_matching(tmp.path());
@@ -8919,12 +8924,9 @@ mod tests {
             key: "Escape",
         };
         run_interrupt(&plan).unwrap();
-        send_tmux_reset_keys("muse:kacey-2", "/clear").unwrap();
-        assert!(send_tmux_reset_keys("muse:kacey", "/clear").is_err());
         drop(_env);
         let log = fs::read_to_string(&out).unwrap();
         assert!(log.contains("send-keys -t =muse:=kacey-2 Escape"), "{log}");
-        assert!(log.contains("send-keys -t =muse:=kacey-2 C-u"), "{log}");
         assert!(!log.contains("send-keys -t muse:kacey"), "{log}");
     }
 
@@ -9046,49 +9048,6 @@ mod tests {
         let _no_env = EnvGuard::remove("ANTIGRAVITY_CSRF_TOKEN");
         let _no_addr = EnvGuard::remove("ANTIGRAVITY_LS_ADDRESS");
         assert!(run_interrupt(&no_token).is_err());
-    }
-
-    #[test]
-    fn clear_or_reforge_codex_sends_new_then_prompt() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let _codex_lock = CODEX_ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
-        let tmp = TempDir::new().unwrap();
-        let out = tmp.path().join("codex.out");
-        let bin = tmp.path().join("fake-codex.sh");
-        fs::write(
-            &bin,
-            format!(
-                "#!/bin/sh\nprintf '%s\\n' \"$@\" >> \"{}\"\n",
-                out.display()
-            ),
-        )
-        .unwrap();
-        fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
-
-        // SAFETY: restores FL_WIRE_CODEX_BIN when the guard drops.
-        let _env = EnvGuard::set("FL_WIRE_CODEX_BIN", &bin);
-        clear_or_reforge_session(
-            &VendorRoute::Codex {
-                thread_id: "thread-7".into(),
-                cwd: None,
-            },
-            SessionResetMode::Reforge,
-            "owner",
-            Some("reforge codex"),
-        )
-        .unwrap();
-        drop(_env);
-
-        let log = fs::read_to_string(&out).unwrap();
-        let lines: Vec<&str> = log.lines().collect();
-        assert_eq!(lines[0], "queue");
-        assert_eq!(lines[1], "--thread");
-        assert_eq!(lines[2], "thread-7");
-        assert_eq!(lines[3], "--message");
-        assert_eq!(lines[4], "/new");
-        assert_eq!(lines[5], "queue");
-        assert_eq!(lines[9], "reforge codex");
     }
 
     /// A fake `codex` that records its arguments, so a test can tell whether `codex queue` ran.
@@ -11233,22 +11192,17 @@ exit 1"#,
         dispatch_to_route(&eve_route, &eve_msg).unwrap();
 
         let dee_route = table.get("dee").unwrap().route.clone();
-        clear_or_reforge_session(&dee_route, SessionResetMode::Clear, "owner", None).unwrap();
+        let refusal = clear_or_reforge_session(&dee_route, SessionResetMode::Clear, "owner", None)
+            .unwrap_err();
+        assert_reset_refusal(serde_json::from_str(&refusal).unwrap(), "grok");
 
         let plan = plan_interrupt(&fay_route, None).unwrap();
         run_interrupt(&plan).unwrap();
 
         let writes = recorded_writes.lock().unwrap().clone();
-        // The reset is raw writes (C-u, the command, then a separate CR), not `send_line`.
-        let dee: Vec<&[u8]> = writes
-            .iter()
-            .filter(|(s, _)| s == "Dee.grok")
-            .map(|(_, b)| b.as_slice())
-            .collect();
-        let expected: [&[u8]; 3] = [b"\x15", b"/new", b"\r"];
         assert!(
-            dee.windows(3).any(|w| w == expected),
-            "expected grok C-u, /new, CR raw writes, got: {dee:?}"
+            writes.iter().all(|(session, _)| session != "Dee.grok"),
+            "refused reset must not write to the host"
         );
         let writes_str: Vec<(String, String)> = writes
             .iter()
