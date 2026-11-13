@@ -9903,6 +9903,7 @@ mod tests {
         });
         ready_rx.recv().unwrap();
 
+        let _fixture = fl_host_proto::register_hub_test_host_fixture(&sock_path).unwrap();
         let prev_sock = std::env::var_os("FL_HOST_SOCK");
         let prev_tmux = std::env::var_os("FL_WIRE_TMUX_BIN");
         // SAFETY: TMUX_ENV_LOCK is held; both variables are restored below.
@@ -15038,6 +15039,7 @@ mod tests {
         });
         ready_rx.recv().unwrap();
 
+        let _fixture = fl_host_proto::register_hub_test_host_fixture(&sock_path).unwrap();
         let prev_sock = std::env::var_os("FL_HOST_SOCK");
         let prev_tmux = std::env::var_os("FL_WIRE_TMUX_BIN");
         // SAFETY: TMUX_ENV_LOCK is held; both variables are restored below.

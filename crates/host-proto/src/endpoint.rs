@@ -19,6 +19,65 @@ pub enum HostEndpoint {
     },
 }
 
+// Cargo can unify this feature into normal executables under --all-targets. The
+// guard stays off unless the hub libtest's startup constructor enables it.
+#[cfg(feature = "hub-test-isolation")]
+static HUB_TEST_ISOLATION: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Enable host isolation for the hub libtest process before its tests run.
+#[cfg(feature = "hub-test-isolation")]
+#[doc(hidden)]
+pub fn enable_hub_test_isolation() {
+    HUB_TEST_ISOLATION.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+#[cfg(all(feature = "hub-test-isolation", unix))]
+static HUB_FIXTURES: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+
+/// Permit one explicitly registered mock host endpoint for the guard's lifetime.
+#[cfg(all(feature = "hub-test-isolation", unix))]
+#[doc(hidden)]
+pub struct HubTestHostFixture(PathBuf);
+
+#[cfg(all(feature = "hub-test-isolation", unix))]
+impl Drop for HubTestHostFixture {
+    fn drop(&mut self) {
+        let mut fixtures = HUB_FIXTURES.lock().unwrap();
+        if let Some(i) = fixtures.iter().position(|p| p == &self.0) {
+            fixtures.remove(i);
+        }
+    }
+}
+
+#[cfg(all(feature = "hub-test-isolation", unix))]
+fn canonical_fixture_path(path: &Path) -> Result<PathBuf, HostError> {
+    if !path.is_absolute()
+        || path
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return Err(HostError::Protocol("invalid hub test host socket".into()));
+    }
+    let name = path
+        .file_name()
+        .ok_or_else(|| HostError::Protocol("missing hub test socket name".into()))?;
+    let parent = path
+        .parent()
+        .and_then(|p| p.canonicalize().ok())
+        .ok_or_else(|| HostError::Protocol("missing hub test socket parent".into()))?;
+    Ok(parent.join(name))
+}
+
+/// Register the exact path created by a hub test's mock host fixture.
+#[cfg(all(feature = "hub-test-isolation", unix))]
+#[doc(hidden)]
+pub fn register_hub_test_host_fixture(path: &Path) -> Result<HubTestHostFixture, HostError> {
+    let path = canonical_fixture_path(path)?;
+    HUB_FIXTURES.lock().unwrap().push(path.clone());
+    Ok(HubTestHostFixture(path))
+}
+
 impl std::fmt::Debug for HostEndpoint {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("HostEndpoint(redacted)")
@@ -119,6 +178,41 @@ impl HostEndpoint {
     }
 
     pub fn discover() -> Result<Self, HostError> {
+        // Dependency cfg(test) does not propagate from fl-hub to fl-wire or here.
+        #[cfg(feature = "hub-test-isolation")]
+        if HUB_TEST_ISOLATION.load(std::sync::atomic::Ordering::SeqCst) {
+            return Self::discover_hub_test_fixture();
+        }
+        Self::discover_default()
+    }
+
+    #[cfg(feature = "hub-test-isolation")]
+    fn discover_hub_test_fixture() -> Result<Self, HostError> {
+        #[cfg(unix)]
+        {
+            let path = std::env::var_os("FL_HOST_SOCK")
+                .filter(|v| !v.is_empty())
+                .map(PathBuf::from)
+                .ok_or_else(|| {
+                    HostError::Protocol("host discovery disabled in hub tests".into())
+                })?;
+            let canonical = canonical_fixture_path(&path)?;
+            if !HUB_FIXTURES.lock().unwrap().contains(&canonical)
+                || std::fs::symlink_metadata(&canonical).is_ok_and(|m| m.file_type().is_symlink())
+            {
+                return Err(HostError::Protocol(
+                    "unregistered hub test host socket".into(),
+                ));
+            }
+            Self::unix(canonical)
+        }
+        #[cfg(not(unix))]
+        Err(HostError::Protocol(
+            "host discovery disabled in hub tests".into(),
+        ))
+    }
+
+    fn discover_default() -> Result<Self, HostError> {
         if let Ok(configured) = std::env::var("FL_HOST_SOCK")
             && !configured.is_empty()
         {

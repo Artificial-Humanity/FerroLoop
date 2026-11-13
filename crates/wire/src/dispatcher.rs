@@ -8573,6 +8573,7 @@ mod tests {
         let (tmux_bin, _tmux_out, tmux_stdin) = write_fake_tmux(tmp.path(), true);
         let _env = EnvGuard::set("FL_WIRE_TMUX_BIN", &tmux_bin);
         let (route, listener) = claude_route_with_mock_socket(tmp.path(), Some("Felicity:@12.%12"));
+        fs::write(tmp.path().join("0.json"), r#"{"status":"idle"}"#).unwrap();
         deliver_to_live_claude_pane(&route, "/model sonnet").unwrap();
         assert_eq!(
             fs::read_to_string(tmux_stdin).unwrap().trim(),

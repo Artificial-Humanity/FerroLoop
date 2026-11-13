@@ -1530,6 +1530,47 @@ pub(crate) static SECRET_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(
 #[cfg(test)]
 pub(crate) static TMUX_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+// Libtest runs dependency code without propagating cfg(test). Turn on the
+// dependency's host guard before any test starts, even if this binary is renamed.
+// No production hub or other executable links this test-only constructor.
+#[cfg(all(
+    test,
+    not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_vendor = "apple",
+        windows
+    ))
+))]
+compile_error!("fl-hub tests require a pre-main host isolation constructor on this platform");
+
+#[cfg(all(
+    test,
+    any(
+        target_os = "linux",
+        target_os = "android",
+        target_vendor = "apple",
+        windows
+    )
+))]
+mod isolate_host_before_tests {
+    extern "C" fn enable() {
+        fl_host_proto::enable_hub_test_isolation();
+    }
+
+    #[used]
+    #[cfg_attr(
+        target_vendor = "apple",
+        unsafe(link_section = "__DATA,__mod_init_func")
+    )]
+    #[cfg_attr(
+        all(unix, not(target_vendor = "apple")),
+        unsafe(link_section = ".init_array")
+    )]
+    #[cfg_attr(windows, unsafe(link_section = ".CRT$XCU"))]
+    static INITIALIZE: extern "C" fn() = enable;
+}
+
 #[cfg(test)]
 mod attachment_policy_tests;
 
@@ -1547,6 +1588,78 @@ mod tests {
     use std::collections::BTreeMap;
     use std::fs;
     use tempfile::TempDir;
+
+    // Subprocesses exercise the real dependency configuration without mutating the
+    // environment shared by unrelated parallel tests.
+    #[cfg(unix)]
+    #[test]
+    fn hub_test_binary_allows_only_registered_host_fixtures() {
+        const CHILD: &str = "FL_HUB_TEST_ISOLATION_CHILD";
+        if let Ok(mode) = std::env::var(CHILD) {
+            if mode == "fixture" || mode == "symlink" {
+                let path = std::path::PathBuf::from(std::env::var_os("FL_HOST_SOCK").unwrap());
+                let guard = fl_host_proto::register_hub_test_host_fixture(&path).unwrap();
+                assert_eq!(
+                    fl_host_proto::HostEndpoint::discover().is_ok(),
+                    mode == "fixture"
+                );
+                drop(guard);
+                assert!(fl_host_proto::HostEndpoint::discover().is_err());
+            } else {
+                assert!(fl_host_proto::HostEndpoint::discover().is_err());
+            }
+            return;
+        }
+        let tmp = TempDir::new().unwrap();
+        let fixture = tmp.path().join("fixture.sock");
+        let symlink = tmp.path().join("escape.sock");
+        std::os::unix::fs::symlink("/run/user/1000/ferroloop/fl-host.sock", &symlink).unwrap();
+        let renamed_dir =
+            TempDir::new_in(std::env::current_exe().unwrap().parent().unwrap()).unwrap();
+        let renamed = renamed_dir.path().join("renamed-hub-test");
+        fs::hard_link(std::env::current_exe().unwrap(), &renamed).unwrap();
+        for mode in [
+            "implicit",
+            "renamed",
+            "live",
+            "unregistered",
+            "fixture",
+            "symlink",
+        ] {
+            let executable = if mode == "renamed" {
+                renamed.clone()
+            } else {
+                std::env::current_exe().unwrap()
+            };
+            let mut child = std::process::Command::new(executable);
+            child
+                .args([
+                    "--exact",
+                    "tests::hub_test_binary_allows_only_registered_host_fixtures",
+                ])
+                .env(CHILD, mode)
+                .env("TMPDIR", "/run/user/1000/ferroloop")
+                .env_remove("FL_HOST_SOCK");
+            match mode {
+                "live" => {
+                    child.env("FL_HOST_SOCK", "/run/user/1000/ferroloop/fl-host.sock");
+                }
+                "unregistered" | "fixture" => {
+                    child.env("FL_HOST_SOCK", &fixture);
+                }
+                "symlink" => {
+                    child.env("FL_HOST_SOCK", &symlink);
+                }
+                _ => {}
+            }
+            let output = child.output().unwrap();
+            assert!(
+                output.status.success(),
+                "{mode}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
 
     #[test]
     fn failed_queued_send_retains_prompt_in_original_order() {

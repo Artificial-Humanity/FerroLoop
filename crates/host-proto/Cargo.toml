@@ -6,6 +6,10 @@ rust-version.workspace = true
 license.workspace = true
 description = "Typed host IPC messages, bounded framing, and authenticated platform transport"
 
+[features]
+# Enabled by fl-hub's dev-dependency so its test binary cannot discover a live host.
+hub-test-isolation = []
+
 [dependencies]
 base64.workspace = true
 getrandom = "0.2"

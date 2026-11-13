@@ -22,6 +22,10 @@ pub use client::{
     ReliableControllerGrant, ReliableEventStream, events,
 };
 pub use endpoint::HostEndpoint;
+#[cfg(feature = "hub-test-isolation")]
+pub use endpoint::enable_hub_test_isolation;
+#[cfg(all(feature = "hub-test-isolation", unix))]
+pub use endpoint::{HubTestHostFixture, register_hub_test_host_fixture};
 #[cfg(unix)]
 pub use endpoint::{probe_explicit_run_user_dir, probe_run_user_dir};
 pub use frame::{
