@@ -1175,6 +1175,37 @@ mod lock_tests {
 mod read_tests {
     use super::*;
 
+    #[derive(Default)]
+    struct CountJsonReads {
+        calls: AtomicU64,
+        bytes: AtomicU64,
+    }
+    impl RecoveryIo for CountJsonReads {
+        fn read_exact_at(&self, file: &File, bytes: &mut [u8], offset: u64) -> io::Result<()> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            file.read_exact_at(bytes, offset)?;
+            self.bytes.fetch_add(bytes.len() as u64, Ordering::Relaxed);
+            Ok(())
+        }
+    }
+    fn counted_json_limits() -> (OperationLimits, Arc<CountJsonReads>) {
+        let reads = Arc::new(CountJsonReads::default());
+        let mut l = OperationLimits::new(
+            std::time::Instant::now() + std::time::Duration::from_secs(10),
+            1 << 20,
+            1 << 20,
+            super::super::CancelToken::new(),
+        );
+        l.publication_io = Some(Arc::new(PublicationIo::new(
+            reads.clone(),
+            1 << 20,
+            1 << 20,
+            1 << 20,
+            4096,
+        )));
+        (l, reads)
+    }
+
     #[test]
     fn oversized_parsed_json_still_refuses_before_owned_decode() {
         let root = tempfile::tempdir().unwrap();
@@ -1190,12 +1221,7 @@ mod read_tests {
             std::os::unix::fs::PermissionsExt::from_mode(0o600),
         )
         .unwrap();
-        let l = OperationLimits::new(
-            std::time::Instant::now() + std::time::Duration::from_secs(10),
-            1 << 20,
-            1 << 20,
-            super::super::CancelToken::new(),
-        );
+        let (l, reads) = counted_json_limits();
         let dir = Dir::open(root.path(), &l).unwrap();
         assert!(matches!(
             read_json::<String>(&dir, "parsed.json", &l),
@@ -1204,6 +1230,38 @@ mod read_tests {
                 ..
             })
         ));
+        assert_eq!(
+            reads.calls.load(Ordering::Relaxed),
+            0,
+            "oversized JSON must refuse before any read"
+        );
+        assert_eq!(
+            reads.bytes.load(Ordering::Relaxed),
+            0,
+            "oversized JSON must refuse before reading any bytes"
+        );
+        assert_eq!(
+            std::fs::read(root.path().join("parsed.json")).unwrap(),
+            bytes
+        );
+    }
+
+    #[test]
+    fn fitting_parsed_json_reads_and_decodes_under_same_memory_ceiling() {
+        let root = crate::recovery::test_support::fixture_root();
+        let value = "fits".repeat(1024);
+        let bytes = serde_json::to_vec(&value).unwrap();
+        std::fs::write(root.path().join("parsed.json"), &bytes).unwrap();
+        std::fs::set_permissions(
+            root.path().join("parsed.json"),
+            std::os::unix::fs::PermissionsExt::from_mode(0o600),
+        )
+        .unwrap();
+        let (l, reads) = counted_json_limits();
+        let dir = Dir::open(root.path(), &l).unwrap();
+        assert_eq!(read_json::<String>(&dir, "parsed.json", &l).unwrap(), value);
+        assert!(reads.calls.load(Ordering::Relaxed) > 0);
+        assert_eq!(reads.bytes.load(Ordering::Relaxed), bytes.len() as u64);
         assert_eq!(
             std::fs::read(root.path().join("parsed.json")).unwrap(),
             bytes
