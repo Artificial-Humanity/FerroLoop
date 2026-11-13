@@ -35,5 +35,6 @@ uuid.workspace = true
 walkdir.workspace = true
 
 [dev-dependencies]
+fl-host-proto = { path = "../host-proto", features = ["hub-test-isolation"] }
 fl-github = { path = "../github", features = ["fake"] }
 tempfile.workspace = true
