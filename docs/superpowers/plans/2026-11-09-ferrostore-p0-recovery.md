@@ -293,16 +293,23 @@ through all R4 code changes.
 **Purge limitation:** inspection and confirmed purge require full bundle
 verification **and a matching receipt**. They cannot purge most corrupt or
 incomplete quarantine material, including an image digest mismatch, missing
-report, truncated manifest or missing receipt. A corrupt completed-batch member
-with a quarantined receipt can also block inspection and confirmed purge of an
-unrelated healthy target throughout the approved root. That refusal now names
-the referenced member bundle relative to the root and retains its typed cause;
-it does not accept corrupt material or delete anything. Regression snapshots
-prove retained recovery artifacts and source unchanged with zero unlinks; a
-confirmed request may refresh only existing store-lock timestamp bookkeeping.
-An as-found purge mode remains deferred to
-[#514](https://github.com/Artificial-Humanity/FerroLoop/issues/514), with no manual
-deletion authorization. The restore floor for stores under about 8 MiB remains
+report, truncated manifest or missing receipt. A corrupt live catalogued bundle
+or completed-batch member with a quarantined receipt can also block inspection
+and confirmed purge of an unrelated healthy target throughout the approved root.
+Member-name diagnostics cover only some failures: a corrupt image, truncated
+manifest or missing report in a completed-batch member names that member relative
+to the root and retains its typed cause. The blocker remains unnamed when a
+member directory is missing or replaced by a symlink, a member file has mode 0644
+or is replaced by a symlink, a quarantined `receipt.json` contains garbage, or the
+manifest hash differs from the batch record. A corrupt live catalogued bundle
+also remains unnamed. These refusals remain fail-closed; they do not accept
+corrupt material or delete anything. Regression snapshots prove retained
+recovery artifacts and source unchanged with zero unlinks; a confirmed request
+may refresh only existing store-lock timestamp bookkeeping. The root-wide
+blocking and remaining unnamed diagnostics remain under
+[#514](https://github.com/Artificial-Humanity/FerroLoop/issues/514); an as-found
+purge mode remains deferred, with no automatic cleanup or manual deletion
+authorization. The restore floor for stores under about 8 MiB remains
 [#515](https://github.com/Artificial-Humanity/FerroLoop/issues/515), and scheduled
 exhaustive CI remains [#516](https://github.com/Artificial-Humanity/FerroLoop/issues/516).
 
