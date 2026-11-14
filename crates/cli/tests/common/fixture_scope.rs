@@ -171,8 +171,12 @@ impl FixtureScopeBuilder {
 
     fn path(&self, name: &str) -> io::Result<PathBuf> {
         let mut components = Path::new(name).components();
-        if name == "manifest.json"
-            || !matches!(components.next(), Some(Component::Normal(_)))
+        if name.eq_ignore_ascii_case("manifest.json")
+            || !name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+            || name.ends_with('.')
+            || !matches!(components.next(), Some(Component::Normal(part)) if part == OsStr::new(name))
             || components.next().is_some()
         {
             return Err(io::Error::new(
@@ -181,6 +185,30 @@ impl FixtureScopeBuilder {
             ));
         }
         Ok(self.root.path().join(name))
+    }
+
+    /// Create one direct child directory owned by this scope. This does not
+    /// register the directory or authorize any of its descendants as resources.
+    pub fn create_directory(&mut self, name: &str) -> io::Result<PathBuf> {
+        let path = self.path(name)?;
+        if self
+            .identities
+            .iter()
+            .filter_map(identity_path)
+            .any(|registered| {
+                registered.file_name().is_some_and(|part| {
+                    part.to_str()
+                        .is_some_and(|part| part.eq_ignore_ascii_case(name))
+                })
+            })
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "fixture directory conflicts with a registered resource",
+            ));
+        }
+        std::fs::create_dir(&path)?;
+        Ok(path)
     }
 
     /// Create and retain a file owned by this helper for an existing route.
@@ -421,6 +449,102 @@ impl Drop for FixtureScope {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn owned_layout_retains_directories_and_refuses_unregistered_descendants() {
+        let mut builder = FixtureScopeBuilder::new().unwrap();
+        let home = builder.create_directory("home").unwrap();
+        let stores = builder.create_directory("stores").unwrap();
+        let root = builder.root.path().to_path_buf();
+        assert_eq!(
+            home.canonicalize().unwrap().parent(),
+            Some(root.canonicalize().unwrap().as_path())
+        );
+        assert_eq!(
+            stores.canonicalize().unwrap().parent(),
+            Some(root.canonicalize().unwrap().as_path())
+        );
+
+        let mut command = std::process::Command::new("unused-fixture-program");
+        command.env("SHOULD_BE_CLEARED", "yes");
+        crate::common::isolate_command(&mut command, &home).unwrap();
+        let env: std::collections::HashMap<_, _> = command.get_envs().collect();
+        assert!(!env.contains_key(OsStr::new("SHOULD_BE_CLEARED")));
+        assert_eq!(env.get(OsStr::new("HOME")), Some(&Some(home.as_os_str())));
+        assert_eq!(
+            env.get(OsStr::new("PATH")),
+            Some(&Some(home.join("no-bin").as_os_str()))
+        );
+
+        let scope = Arc::new(builder.finish().unwrap());
+        assert!(
+            scope
+                .context()
+                .check(&FixtureIdentity::Store {
+                    backend: StoreBackend::Redb,
+                    path: stores.join("fl.redb"),
+                    access: PathAccess::Create,
+                })
+                .is_err()
+        );
+        let retained = Arc::clone(&scope);
+        drop(scope);
+        assert!(home.is_dir() && stores.is_dir());
+        drop(retained);
+        assert!(!root.exists());
+    }
+
+    #[test]
+    fn owned_layout_rejects_aliases_duplicates_and_resource_conflicts() {
+        let mut builder = FixtureScopeBuilder::new().unwrap();
+        let root = builder.root.path().to_path_buf();
+        let child = builder.create_directory("home").unwrap();
+        for name in [
+            "home",
+            "manifest.json",
+            "MANIFEST.JSON",
+            "manifest.json/.",
+            "manifest.json/",
+            "../outside",
+            "a/b",
+            "a\\b",
+            ".",
+            "..",
+            "name.",
+            "name ",
+        ] {
+            assert!(builder.create_directory(name).is_err(), "accepted {name:?}");
+        }
+        builder
+            .creation_target("reserved", CreationTarget::Route)
+            .unwrap();
+        assert!(builder.create_directory("reserved").is_err());
+        assert!(builder.create_directory("RESERVED").is_err());
+        assert!(!root.join("reserved").exists());
+        std::fs::write(root.join("file"), b"unchanged").unwrap();
+        assert!(builder.create_directory("file").is_err());
+        assert_eq!(std::fs::read(root.join("file")).unwrap(), b"unchanged");
+        assert!(child.is_dir());
+        drop(builder);
+        assert!(!root.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn owned_layout_rejects_existing_symlink() {
+        use std::os::unix::fs::symlink;
+        let mut builder = FixtureScopeBuilder::new().unwrap();
+        let root = builder.root.path().to_path_buf();
+        let link = root.join("link");
+        symlink(root.join("missing"), &link).unwrap();
+        assert!(builder.create_directory("link").is_err());
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+    }
 
     #[test]
     fn direct_child_runner_only_accepts_exact_top_level_help() {
