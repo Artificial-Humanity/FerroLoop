@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Unmodeled {
     MigrationTemporaryFiles,
+    FerroCompactionAndStaleTempSweep,
     WorkspaceScan,
     RouteWriteTemporaryFiles,
 }
@@ -79,6 +80,10 @@ impl StateAccessPlan {
         ];
         if migration_possible {
             unmodeled.push(Unmodeled::MigrationTemporaryFiles);
+        }
+        if ferro {
+            // Ordinary writes may trigger auto-compaction and stale sibling cleanup.
+            unmodeled.push(Unmodeled::FerroCompactionAndStaleTempSweep);
         }
         Ok(Self {
             logical: logical.to_path_buf(),
@@ -183,6 +188,35 @@ mod tests {
                 assert_eq!(p.redb_metadata_sibling, Some(absolute("x.fls")));
                 assert!(p.served_socket.is_none());
             }
+        }
+    }
+    #[test]
+    fn ferro_compaction_and_stale_temp_sweeps_are_unmodeled() {
+        let route = absolute("route.json");
+        for (logical, backend_env, expected_backend, expected_unmodeled) in [
+            ("data.fls", None, fl_store::BackendKind::Ferro, true),
+            ("data.redb", None, fl_store::BackendKind::Ferro, true),
+            (
+                "data.redb",
+                Some("redb"),
+                fl_store::BackendKind::Redb,
+                false,
+            ),
+        ] {
+            let plan = StateAccessPlan::derive(
+                &absolute(logical),
+                None,
+                backend_env,
+                route_input(&route, &route, None, None),
+            )
+            .unwrap();
+            assert_eq!(plan.backend, expected_backend);
+            assert_eq!(
+                plan.unmodeled
+                    .contains(&Unmodeled::FerroCompactionAndStaleTempSweep),
+                expected_unmodeled,
+                "wrong compaction coverage for {logical} with {backend_env:?}"
+            );
         }
     }
     #[test]
