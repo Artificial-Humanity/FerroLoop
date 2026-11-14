@@ -3,6 +3,9 @@
 //! stores. The vector leg is the deterministic local hashing embedder: no
 //! network and no model download.
 
+#[allow(dead_code)]
+mod common;
+
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 use std::process::Stdio;
@@ -12,10 +15,9 @@ use serde_json::{Value, json};
 use tempfile::TempDir;
 
 /// `backend`: `None` is the default engine (FerroStore); `Some("redb")` forces redb.
-fn fl(cfg: &TempDir, db: &Path, backend: Option<&str>) -> Command {
-    let mut c = Command::cargo_bin("fl").unwrap();
-    c.env("XDG_CONFIG_HOME", cfg.path())
-        .env("XDG_DATA_HOME", cfg.path().join("data"))
+fn fl_command(cfg: &TempDir, db: &Path, backend: Option<&str>) -> std::process::Command {
+    let mut c = common::isolated_fl(cfg.path()).unwrap();
+    c.env("XDG_DATA_HOME", cfg.path().join("data"))
         .env_remove("FL_DB")
         .env_remove("FL_STORE_BACKEND")
         .current_dir(cfg.path())
@@ -25,6 +27,39 @@ fn fl(cfg: &TempDir, db: &Path, backend: Option<&str>) -> Command {
         c.env("FL_STORE_BACKEND", b);
     }
     c
+}
+
+fn fl(cfg: &TempDir, db: &Path, backend: Option<&str>) -> Command {
+    Command::from_std(fl_command(cfg, db, backend))
+}
+
+#[test]
+fn state_search_command_uses_private_paths_and_selected_backend() {
+    let cfg = TempDir::new().unwrap();
+    let db = cfg.path().join("s.redb");
+    let command = fl_command(&cfg, &db, Some("redb"));
+    let env = |name: &str| {
+        command
+            .get_envs()
+            .find(|(key, _)| *key == name)
+            .and_then(|(_, value)| value)
+            .map(|value| value.to_os_string())
+    };
+    assert_eq!(
+        env("XDG_RUNTIME_DIR").as_deref(),
+        Some(cfg.path().as_os_str())
+    );
+    assert_eq!(
+        env("FL_WIRE_SOCKET").as_deref(),
+        Some(cfg.path().join("w").as_os_str())
+    );
+    assert_eq!(
+        env("FL_STORE_BACKEND").as_deref(),
+        Some(std::ffi::OsStr::new("redb"))
+    );
+    assert_eq!(command.get_current_dir(), Some(cfg.path()));
+    let args: Vec<_> = command.get_args().collect();
+    assert_eq!(args, [std::ffi::OsStr::new("--db"), db.as_os_str()]);
 }
 
 fn set_memory(
@@ -451,15 +486,8 @@ fn mcp_fl_memory_search_takes_a_mode_and_defaults_to_auto() {
     let db = cfg.path().join("s.redb");
     seed(&cfg, &db, None);
 
-    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_fl"));
+    let mut child = fl_command(&cfg, &db, None);
     child
-        .current_dir(cfg.path())
-        .env("XDG_CONFIG_HOME", cfg.path())
-        .env("XDG_DATA_HOME", cfg.path().join("data"))
-        .env_remove("FL_DB")
-        .env_remove("FL_STORE_BACKEND")
-        .arg("--db")
-        .arg(&db)
         .args(["state", "mcp"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped());
