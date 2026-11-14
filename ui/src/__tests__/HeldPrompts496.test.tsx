@@ -17,7 +17,7 @@ function heldItem(overrides: Partial<QueuedOperatorPrompt> = {}): QueuedOperator
     created_at: "2026-11-10T20:00:00Z",
     delivery_state: "pending",
     delivery_error: HOLD_REASON,
-    hold_reason: "composer_occupied_zero_keys",
+    hold_reason: "composer_occupied",
     ...overrides,
   };
 }
@@ -30,6 +30,9 @@ describe("held operator prompts (#496 defect 1)", () => {
 
   it("detects composer-held prompts by their structured hold_reason, not error text", () => {
     expect(isComposerHeldPrompt(heldItem())).toBe(true);
+    expect(isComposerHeldPrompt(heldItem({ hold_reason: "composer_unlocated" }))).toBe(true);
+    expect(isComposerHeldPrompt(heldItem({ hold_reason: "session_busy" }))).toBe(true);
+    expect(isComposerHeldPrompt(heldItem({ hold_reason: "composer_occupied_zero_keys" }))).toBe(false);
     // Post-paste error shares the wire prefix but is not a zero-key hold (B1).
     expect(isComposerHeldPrompt(heldItem({ hold_reason: null, delivery_error: "composer_occupied_by_non_wire_input: composer holds non-wire input after paste; aborting Enter retries" }))).toBe(false);
     expect(isComposerHeldPrompt(heldItem({ hold_reason: null, delivery_error: null }))).toBe(false);
