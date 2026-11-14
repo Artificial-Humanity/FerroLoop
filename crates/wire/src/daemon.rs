@@ -6553,6 +6553,7 @@ mod tests {
         )
         .unwrap();
         fs::set_permissions(&slow, fs::Permissions::from_mode(0o755)).unwrap();
+        let _slow_fixture = crate::test_isolation::register_executable(&slow).unwrap();
 
         let store = Arc::new(RedbStore::open(&tmp.path().join("s.redb")).unwrap());
         let cfg = test_config(tmp.path(), "slow");
@@ -6669,6 +6670,7 @@ mod tests {
         let release = tmp.path().join("release");
         fs::write(&script, format!("#!/bin/sh\nprintf '%s\\n' \"$5\" >> '{}'\ncase \"$5\" in *first*) while [ ! -e '{}' ]; do sleep 0.02; done ;; esac\n", log.display(), release.display())).unwrap();
         fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        let _script_fixture = crate::test_isolation::register_executable(&script).unwrap();
         let prev = std::env::var_os("FL_WIRE_CODEX_BIN");
         unsafe { std::env::set_var("FL_WIRE_CODEX_BIN", &script) };
         let store = Arc::new(RedbStore::open(&tmp.path().join("s.redb")).unwrap());
@@ -6757,6 +6759,7 @@ mod tests {
         )
         .unwrap();
         fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        let _script_fixture = crate::test_isolation::register_executable(&script).unwrap();
         let prev = std::env::var_os("FL_WIRE_CODEX_BIN");
         unsafe { std::env::set_var("FL_WIRE_CODEX_BIN", &script) };
         let store = Arc::new(RedbStore::open(&tmp.path().join("s.redb")).unwrap());

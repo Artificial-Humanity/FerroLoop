@@ -2753,6 +2753,16 @@ mod tests {
     fn missing_socket_is_a_clear_error() {
         let dir = TempDir::new().unwrap();
         let sock = dir.path().join("absent.sock");
+        let unregistered = compact_thread(&sock, "t", SHORT).unwrap_err();
+        assert!(
+            unregistered.contains("unregistered wire test socket"),
+            "{unregistered}"
+        );
+        // Retain registration for a closed fixture socket so the connection
+        // reaches the offline error path without contacting any live service.
+        let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        let _fixture = crate::test_isolation::register_unix_socket(&sock).unwrap();
+        drop(listener);
         let err = compact_thread(&sock, "t", SHORT).unwrap_err();
         assert!(
             err.contains("cannot connect") && err.contains("absent.sock"),
@@ -3026,6 +3036,9 @@ mod tests {
         // 1. Missing / offline socket -> Unknown (never embeds socket filesystem path).
         let dir = TempDir::new().unwrap();
         let missing = dir.path().join("missing.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&missing).unwrap();
+        let _fixture = crate::test_isolation::register_unix_socket(&missing).unwrap();
+        drop(listener);
         let out = inspect_thread_queues(&missing, &["thread-1"], now_ms, SHORT);
         assert!(matches!(
             &out[0],

@@ -9400,10 +9400,11 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let (bin, out) = fake_codex_queue_bin(tmp.path());
         let _bin_env = EnvGuard::set("FL_WIRE_CODEX_BIN", &bin);
-        let _sock_env = EnvGuard::set(
-            "FL_WIRE_CODEX_CONTROL_SOCK",
-            &tmp.path().join("no-such.sock"),
-        );
+        let sock = tmp.path().join("no-such.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        let _socket_fixture = crate::test_isolation::register_unix_socket(&sock).unwrap();
+        drop(listener);
+        let _sock_env = EnvGuard::set("FL_WIRE_CODEX_CONTROL_SOCK", &sock);
 
         let err = dispatch_operator_prompt_to_route(&codex_route("thread-9"), "owner", "/compact")
             .unwrap_err();
@@ -9542,6 +9543,7 @@ mod tests {
         .unwrap();
         fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
 
+        let _bin_fixture = crate::test_isolation::register_executable(&bin).unwrap();
         let _agy_lock = AGY_ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
         let ls_address = Some("127.0.0.1:1".to_string());
         let exe = Some(bin.clone());
@@ -9786,6 +9788,7 @@ mod tests {
         )
         .unwrap();
         fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
+        let _bin_fixture = crate::test_isolation::register_executable(&bin).unwrap();
         let route = VendorRoute::Agy {
             conversation_id: conversation_id.clone(),
             ls_pid: None,
@@ -14630,7 +14633,7 @@ exit 1"#,
         new_path.push(":");
         new_path.push(&old_path);
         let _path = EnvGuard::set("PATH", Path::new(&new_path));
-        let _no_tmux = EnvGuard::remove("FL_WIRE_TMUX_BIN");
+        let _tmux = EnvGuard::set("FL_WIRE_TMUX_BIN", &fake_tmux);
         let missing_sock = tmp.path().join("missing-host.sock");
         let _sock = EnvGuard::set("FL_HOST_SOCK", &missing_sock);
         let home = tmp.path().join("home");
