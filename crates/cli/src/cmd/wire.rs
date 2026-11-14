@@ -2948,8 +2948,13 @@ fn execute_register_with_hydration_env(
 }
 
 fn run_listen_loop(env: &StateEnv<'_>, explicit_from: Option<&str>) -> Result<i32, (i32, String)> {
-    let persona = resolve_caller(env, explicit_from, None);
+    // Resolve and check once before caller discovery can open a store or capture a route.
+    // Keep this same endpoint for subscription and the offline polling fallback.
     let sock = resolve_socket_path(env, None);
+    let fixture_root = std::env::var_os("FL_TEST_ISOLATION_ROOT").map(PathBuf::from);
+    fl_fixture_path::check_endpoint(fixture_root.as_deref(), &sock)
+        .map_err(|error| (1, error.to_string()))?;
+    let persona = resolve_caller_at(env, explicit_from, None, &sock).map_err(|error| (1, error))?;
     if let Some(mut sub) =
         classify_local_connection(LocalClient::connect(&sock, DEFAULT_LOCAL_RPC_TIMEOUT))
             .map_err(|error| (1, error))?
@@ -2969,7 +2974,7 @@ fn run_listen_loop(env: &StateEnv<'_>, explicit_from: Option<&str>) -> Result<i3
     }
     let mut seen = std::collections::BTreeSet::new();
     loop {
-        let items = execute_read(
+        let items = execute_read_at(
             env,
             WireFilter {
                 recipient: Some(persona.clone()),
@@ -2979,6 +2984,7 @@ fn run_listen_loop(env: &StateEnv<'_>, explicit_from: Option<&str>) -> Result<i3
                 limit: None,
             },
             false,
+            &sock,
         )
         .map_err(|e| (1, e))?;
         for item in items {

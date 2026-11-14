@@ -33,6 +33,8 @@ enum Invocation {
     WireWait,
     LegacyWait,
     LegacyExecutableWait,
+    LegacyListen,
+    LegacyExecutableListen,
 }
 
 fn run_refused_command(root: &Path, outside_socket: &Path, db: &Path, invocation: Invocation) {
@@ -44,6 +46,7 @@ fn run_refused_command(root: &Path, outside_socket: &Path, db: &Path, invocation
             | Invocation::LegacyExecutableRead
             | Invocation::LegacyExecutableAck
             | Invocation::LegacyExecutableWait
+            | Invocation::LegacyExecutableListen
     ) {
         let alias = root.join("agent-msg");
         if !alias.exists() {
@@ -76,6 +79,8 @@ fn run_refused_command(root: &Path, outside_socket: &Path, db: &Path, invocation
             | Invocation::WireWait
             | Invocation::LegacyWait
             | Invocation::LegacyExecutableWait
+            | Invocation::LegacyListen
+            | Invocation::LegacyExecutableListen
     ) {
         // Exercise the hydration and route-capture entry path; refusal must
         // happen before either can open a store or touch a route.
@@ -200,6 +205,12 @@ fn run_refused_command(root: &Path, outside_socket: &Path, db: &Path, invocation
         }
         Invocation::LegacyExecutableWait => {
             command.args(["--db", db.to_str().unwrap(), "wait"]);
+        }
+        Invocation::LegacyListen => {
+            command.args(["agent-msg", "--db", db.to_str().unwrap(), "listen"]);
+        }
+        Invocation::LegacyExecutableListen => {
+            command.args(["--db", db.to_str().unwrap(), "listen"]);
         }
         Invocation::WireAck => {
             command.args([
@@ -327,6 +338,71 @@ fn legacy_wait_refuses_before_store_or_route_mutation() {
 #[test]
 fn legacy_executable_wait_refuses_before_store_or_route_mutation() {
     assert_outside_socket_refusal(Invocation::LegacyExecutableWait);
+}
+
+#[test]
+fn legacy_listen_refuses_before_store_or_route_mutation() {
+    assert_outside_socket_refusal(Invocation::LegacyListen);
+}
+
+#[test]
+fn legacy_executable_listen_refuses_before_store_or_route_mutation() {
+    assert_outside_socket_refusal(Invocation::LegacyExecutableListen);
+}
+
+// Listen is intentionally long-running. A bounded child verifies that an authorized
+// offline endpoint still reaches the local-store polling path rather than refusing.
+#[test]
+fn legacy_listen_private_offline_socket_keeps_polling() {
+    use std::time::{Duration, Instant};
+
+    let root = tempfile::tempdir().unwrap();
+    let db = root.path().join("offline.redb");
+    let mut child = common::isolated_fl(root.path())
+        .unwrap()
+        .current_dir(root.path())
+        .env("FL_TEST_ISOLATION_ROOT", root.path())
+        .env("FL_WIRE_SOCKET", root.path().join("missing.sock"))
+        .args([
+            "agent-msg",
+            "--db",
+            db.to_str().unwrap(),
+            "--from",
+            "felicia",
+            "listen",
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut exited = false;
+    while !db.exists() && Instant::now() < deadline {
+        if child.try_wait().unwrap().is_some() {
+            exited = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    // Let at least one polling interval elapse, then always reap the child.
+    if !exited && db.exists() {
+        std::thread::sleep(Duration::from_millis(400));
+        exited = child.try_wait().unwrap().is_some();
+    }
+    if !exited {
+        child.kill().unwrap();
+    }
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        db.exists(),
+        "offline store was not opened: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !exited,
+        "listen stopped polling: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[test]
