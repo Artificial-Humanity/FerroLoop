@@ -1458,6 +1458,45 @@ pub fn lifecycle_id_to_host_session_id(
     }
 }
 
+/// Select a unique, running canonical Claude session from authoritative host summaries.
+/// Opaque host ids are intentionally excluded: the summary carries no trusted vendor field.
+pub(crate) fn select_claude_host_session<'a>(
+    sessions: &'a [SessionSummary],
+    target: &str,
+) -> Result<Option<&'a SessionSummary>, &'static str> {
+    let target = target.trim();
+    let persona = if let Some(persona) = target.strip_prefix("claude:") {
+        persona
+    } else if let Some((persona, vendor)) = target.split_once('.') {
+        if !vendor.eq_ignore_ascii_case("claude") {
+            return Err("invalid Claude target");
+        }
+        persona
+    } else {
+        target
+    };
+    if persona.is_empty() || persona.contains(['.', ':']) {
+        return Err("invalid Claude target");
+    }
+    let mut matches = sessions.iter().filter(|summary| {
+        if !matches!(summary.state, ChildState::Running(_)) {
+            return false;
+        }
+        let Some((name, vendor)) = summary.stream.session.as_str().split_once('.') else {
+            return false;
+        };
+        !name.is_empty()
+            && !name.contains(':')
+            && vendor.eq_ignore_ascii_case("claude")
+            && name.eq_ignore_ascii_case(persona)
+    });
+    let first = matches.next();
+    if matches.next().is_some() {
+        return Err("ambiguous Claude host session");
+    }
+    Ok(first)
+}
+
 /// Live `SessionId`s in `sessions` that belong to `unit`.
 ///
 /// - `unit == ""` or `unit == "muse"` matches nothing (the shared Muse container is never a single
@@ -1547,6 +1586,28 @@ mod tests {
             latest: 0,
             input: InputState::Writable,
         }
+    }
+
+    #[test]
+    fn claude_host_selector_requires_unique_canonical_running_stream() {
+        let one = summary("Ada.claude", true);
+        let other_vendor = summary("Ada.codex", true);
+        let stopped = summary("Ada.claude", false);
+        assert_eq!(
+            select_claude_host_session(&[one.clone(), other_vendor], "ada")
+                .unwrap()
+                .unwrap()
+                .stream,
+            one.stream
+        );
+        assert!(
+            select_claude_host_session(&[stopped], "ada")
+                .unwrap()
+                .is_none()
+        );
+        assert!(select_claude_host_session(&[one.clone()], "Ada.codex").is_err());
+        assert!(select_claude_host_session(&[one.clone()], "Ada.claude.extra").is_err());
+        assert!(select_claude_host_session(&[one.clone(), one], "ada").is_err());
     }
 
     #[test]
