@@ -561,6 +561,10 @@ fn claude_record_session_id(record: Option<&serde_json::Value>) -> Option<String
         .map(str::to_string)
 }
 
+fn claude_record_matches_native_session(record: Option<&serde_json::Value>, native: &str) -> bool {
+    claude_record_session_id(record).as_deref() == Some(native)
+}
+
 /// `true` when the session record says Claude is waiting for input. An absent or unreadable
 /// record, or any other status, is "not idle": pasting into a busy turn would interleave the
 /// message with whatever is being typed or run.
@@ -7035,6 +7039,16 @@ pub fn dispatch_bound_claude_operator_prompt(
             "Claude registration is no longer current; re-register and resubmit".into(),
         ));
     };
+    // A process can switch Claude conversations without replacing its registration.
+    // Bind its current session record to the pinned native UUID before host selection.
+    if !claude_record_matches_native_session(
+        read_claude_session_record(*pid, key_path.as_deref()).as_ref(),
+        binding.native_session(),
+    ) {
+        return Err(ClaudeBoundError::Refused(
+            "Claude process session is unavailable or changed; re-register and resubmit".into(),
+        ));
+    }
     let target = format!("claude:{}", binding.persona());
     let mut host = resolve_claude_host(&target, *pid).map_err(ClaudeBoundError::Refused)?;
     if !host.is_pty
@@ -7062,6 +7076,14 @@ pub fn dispatch_bound_claude_operator_prompt(
     binding
         .revalidate()
         .map_err(|e| ClaudeBoundError::Refused(e.to_string()))?;
+    if !claude_record_matches_native_session(
+        read_claude_session_record(*pid, key_path.as_deref()).as_ref(),
+        binding.native_session(),
+    ) {
+        return Err(ClaudeBoundError::Refused(
+            "Claude process session is unavailable or changed; re-register and resubmit".into(),
+        ));
+    }
     let opts = TmuxPasteOptions {
         bracketed: true,
         verify_submission: true,
@@ -7617,6 +7639,7 @@ mod tests {
         let claims = Arc::new(Mutex::new(Vec::<StreamId>::new()));
         let attempted_writes = Arc::new(Mutex::new(Vec::new()));
         let attempted_server = Arc::clone(&attempted_writes);
+        let record_path = tmp.path().join(format!("{}.json", std::process::id()));
         let scenario = Arc::new(AtomicUsize::new(0));
         let raw_captures = Arc::new(AtomicUsize::new(0));
         let scenario_server = Arc::clone(&scenario);
@@ -7650,6 +7673,7 @@ mod tests {
                     let scenario = Arc::clone(&scenario_server);
                     let raw_captures = Arc::clone(&raw_server);
                     let attempted_writes = Arc::clone(&attempted_server);
+                    let record_path = record_path.clone();
                     tokio::spawn(async move {
                         while let Ok(HostRequest::Extended { id, request }) = conn.recv().await {
                             let response = match request {
@@ -7680,6 +7704,9 @@ mod tests {
                                     }
                                 }
                                 ExtensionRequest::CaptureRendered { mut stream } => {
+                                    if scenario.load(Ordering::SeqCst) == 7 {
+                                        fs::write(&record_path, r#"{"status":"idle","sessionId":"replacement"}"#).unwrap();
+                                    }
                                     if scenario.load(Ordering::SeqCst) == 2 {
                                         stream.epoch = SessionEpoch(4);
                                     }
@@ -7828,7 +7855,7 @@ mod tests {
             fs::write(&source, serde_json::to_vec(&table).unwrap()).unwrap();
             fs::write(
                 tmp.path().join(format!("{pid}.json")),
-                r#"{"status":"idle"}"#,
+                serde_json::json!({"status":"idle", "sessionId": native}).to_string(),
             )
             .unwrap();
             let binding =
@@ -7854,6 +7881,16 @@ mod tests {
             dispatch_bound_claude_operator_prompt(&binding, "owner", "fixture message").unwrap();
             assert!(writes.lock().unwrap().len() > before_writes);
             assert_eq!(claims.lock().unwrap().last(), Some(&claude_stream));
+            let after_success_claims = claims.lock().unwrap().len();
+            let after_success_writes = writes.lock().unwrap().len();
+            // A conversation change during bound capture must be caught before claim.
+            scenario.store(7, Ordering::SeqCst);
+            assert!(matches!(
+                dispatch_bound_claude_operator_prompt(&binding, "owner", "fixture message"),
+                Err(ClaudeBoundError::Refused(_))
+            ));
+            assert_eq!(claims.lock().unwrap().len(), after_success_claims);
+            assert_eq!(writes.lock().unwrap().len(), after_success_writes);
         }
         let _ = stop_tx.send(());
         server.join().unwrap();
@@ -20815,6 +20852,28 @@ exit 1"#,
         )
         .expect("non-Claude call must not take the Claude busy-main gate");
         assert_eq!(out, PrePasteOutcome::CleanProceedToPaste);
+    }
+
+    #[test]
+    fn pinned_native_session_requires_matching_current_record() {
+        let native = "dce797a0-d963-4c1b-a06b-7fa6bffda7fa";
+        assert!(!claude_record_matches_native_session(None, native));
+        assert!(!claude_record_matches_native_session(
+            Some(&serde_json::json!({"status":"idle"})),
+            native
+        ));
+        assert!(!claude_record_matches_native_session(
+            Some(&serde_json::json!({"sessionId":"  "})),
+            native
+        ));
+        assert!(!claude_record_matches_native_session(
+            Some(&serde_json::json!({"sessionId":"other"})),
+            native
+        ));
+        assert!(claude_record_matches_native_session(
+            Some(&serde_json::json!({"sessionId":native})),
+            native
+        ));
     }
 
     #[test]

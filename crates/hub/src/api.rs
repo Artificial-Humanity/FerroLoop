@@ -7023,38 +7023,37 @@ fn handle_post_session_prompt(
             None,
         )
     });
-    let strict_binding = match fl_wire::claude_registration::ClaudeRegistrationBinding::from_intent(
-        source, session_id,
-    ) {
-        Ok(binding) => binding,
-        Err(_)
-            if intended_vendor
-                .as_deref()
-                .is_some_and(|vendor| vendor != "claude") =>
-        {
-            None
-        }
-        Err(error) => {
-            return HttpResponse::json(
-                409,
-                json!({
-                    "error": error.to_string(), "delivered": false, "delivery_stage": "refused"
-                }),
-            );
-        }
-    };
-    if intended_vendor.as_deref() == Some("claude") && strict_binding.is_none() {
-        return HttpResponse::json(
+    use fl_wire::claude_registration::{ClaudeRegistrationBinding, ClaudeRegistrationError};
+    let refuse = |error: &dyn std::fmt::Display| {
+        HttpResponse::json(
             409,
-            json!({
-                "error": "Claude registration is unbound; re-register and resubmit",
-                "delivered": false, "delivery_stage": "refused"
-            }),
-        );
-    }
+            json!({"error": error.to_string(), "delivered": false, "delivery_stage": "refused"}),
+        )
+    };
     let claude_binding = if authority.is_owner() {
-        strict_binding
+        let binding = match ClaudeRegistrationBinding::from_intent(source, session_id) {
+            Ok(binding) => binding,
+            Err(ClaudeRegistrationError::Source(_))
+                if intended_vendor
+                    .as_deref()
+                    .is_some_and(|vendor| vendor != "claude") =>
+            {
+                None
+            }
+            Err(error) => return refuse(&error),
+        };
+        if intended_vendor.as_deref() == Some("claude") && binding.is_none() {
+            return refuse(&"Claude registration is unbound; re-register and resubmit");
+        }
+        binding
     } else {
+        // Peer delivery is authorized separately and never uses terminal paste. A
+        // bare or opaque target nevertheless requires a valid primary before discovery.
+        if intended_vendor.is_none()
+            && let Err(error) = ClaudeRegistrationBinding::validate_source(&source)
+        {
+            return refuse(&error);
+        }
         None
     };
 
@@ -7166,20 +7165,28 @@ fn handle_post_session_prompt(
         .open_store()
         .map(|store| snapshot_discovery_names(&store))
         .unwrap_or_default();
+    // A vendor-qualified peer target is classified by the adapter registry, but
+    // existing discovery indexes it by persona. Keep the vendor constraint through
+    // dispatch so this lookup cannot retarget another adapter.
+    let peer_persona = (!authority.is_owner())
+        .then(|| fl_wire::identity::parse_hosted_identity(session_id).ok())
+        .flatten()
+        .map(|(_, persona)| persona);
+    let lookup_target = peer_persona.as_deref().unwrap_or(session_id);
     let (snap, sessions) = if claude_binding.is_some() {
         // Transcript lookup can use the pinned native UUID directly. Do not merge
         // passive/legacy route discoveries into this authority path.
         (names, Vec::new())
-    } else if let Some(session) = lookup_one_route_session(&names, home, session_id) {
+    } else if let Some(session) = lookup_one_route_session(&names, home, lookup_target) {
         (names, vec![session])
     } else {
         let snap = load_discovery_snapshot(state);
         let sessions = lookup_sessions(&snap, home);
         (snap, sessions)
     };
-    let observed_target = sessions
-        .iter()
-        .find(|s| s.id == session_id.trim() || s.persona.as_deref() == Some(session_id.trim()));
+    let observed_target = sessions.iter().find(|s| {
+        s.id == lookup_target.trim() || s.persona.as_deref() == Some(lookup_target.trim())
+    });
     if authority.is_owner()
         && claude_binding.is_none()
         && observed_target.is_some_and(|s| s.adapter == "claude")
@@ -7221,7 +7228,7 @@ fn handle_post_session_prompt(
                 .as_ref()
                 .map(|target| (target.session_id.clone(), target.persona.clone()))
         })
-        .unwrap_or_else(|| resolve_session_target_in(&sessions, session_id));
+        .unwrap_or_else(|| resolve_session_target_in(&sessions, lookup_target));
     let intended_codex_thread_id = match sessions
         .iter()
         .find(|session| session.id == canonical_session_id)
@@ -12684,7 +12691,7 @@ mod claude_registration_binding_tests {
                 pid,
                 session_id: "dce797a0-d963-4c1b-a06b-7fa6bffda7fa".into(),
                 socket_path: tmp.path().join("peer.sock"),
-                key_path: None,
+                key_path: Some(tmp.path().join("fixture.key")),
             },
             updated_at: At::from_unix_millis(1),
             identity_at: None,
@@ -12744,22 +12751,27 @@ mod claude_registration_binding_tests {
                 _ => {}
             }
             let before = std::fs::read(&alternate).unwrap();
-            for requested in [
-                "ada",
-                "dce797a0-d963-4c1b-a06b-7fa6bffda7fa",
-                "unknown:syntax",
-            ] {
-                let request = HttpRequest::new("POST", "/unused").with_json_body(&json!({
+            let peer = HubAuthority::Peer {
+                agent: Some("fiona".into()),
+            };
+            for authority in [&owner, &peer] {
+                for requested in [
+                    "ada",
+                    "dce797a0-d963-4c1b-a06b-7fa6bffda7fa",
+                    "unknown:syntax",
+                ] {
+                    let request = HttpRequest::new("POST", "/unused").with_json_body(&json!({
                     "prompt": "hello", "attachments": [{"name":"evidence.txt", "data_base64":"aGVsbG8="}]
                 }));
-                let (response, costs) = crate::discovery::cost_counters::measure(|| {
-                    handle_post_session_prompt(&state, &owner, requested, &request)
-                });
-                assert_eq!(response.status, 409, "{condition}: {requested}");
-                assert_eq!(costs.route_scans, 0);
-                assert_eq!(costs.store_opens, 0);
-                assert_eq!(std::fs::read(&alternate).unwrap(), before);
-                assert!(!tmp.path().join("attachments").exists());
+                    let (response, costs) = crate::discovery::cost_counters::measure(|| {
+                        handle_post_session_prompt(&state, authority, requested, &request)
+                    });
+                    assert_eq!(response.status, 409, "{condition}: {requested}");
+                    assert_eq!(costs.route_scans, 0);
+                    assert_eq!(costs.store_opens, 0);
+                    assert_eq!(std::fs::read(&alternate).unwrap(), before);
+                    assert!(!tmp.path().join("attachments").exists());
+                }
             }
             if primary.is_dir() {
                 std::fs::remove_dir(&primary).unwrap();
@@ -12778,6 +12790,106 @@ mod claude_registration_binding_tests {
             cwd: None,
         };
         assert!(require_intended_vendor(&codex, Some("codex")).is_ok());
+    }
+
+    #[test]
+    fn direct_and_queued_native_record_refusals_precede_host_connection() {
+        let (tmp, state, _path, _entry, binding) = fixture();
+        let record = tmp.path().join(format!("{}.json", std::process::id()));
+        for value in [
+            None,
+            Some(json!({"status":"idle"})),
+            Some(json!({"status":"idle", "sessionId":"another-session"})),
+        ] {
+            if let Some(value) = value {
+                std::fs::write(&record, value.to_string()).unwrap();
+            } else if record.exists() {
+                std::fs::remove_file(&record).unwrap();
+            }
+            let direct = dispatch_operator_prompt_with_intent_for_session(
+                &state,
+                Some("ada"),
+                binding.native_session(),
+                "owner",
+                "hello",
+                OperatorPromptIntent::Ordinary,
+                None,
+                true,
+                Some(&binding),
+                None,
+                false,
+            );
+            assert!(
+                matches!(direct, Err(OperatorPromptError::Push(PushError::NotConnected(ref error))) if error.contains("session is unavailable or changed"))
+            );
+            let queued = dispatch_queued_operator_prompt_with_intent_for_session(
+                &state,
+                Some("ada"),
+                binding.native_session(),
+                "owner",
+                "hello",
+                OperatorPromptIntent::OwnerSendNow,
+                None,
+                true,
+                Some(&binding),
+                None,
+            );
+            assert!(
+                matches!(queued, Err(OperatorPromptError::Push(PushError::NotConnected(ref error))) if error.contains("session is unavailable or changed"))
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn peer_route_does_not_require_terminal_binding_and_owner_does_not_fallback() {
+        use std::io::Read;
+        use std::os::unix::net::UnixListener;
+        use std::time::Instant;
+        let (tmp, state, _path, mut entry, _binding) = fixture();
+        let primary = tmp.path().join(".cache/agent-bus/routes.json");
+        std::fs::create_dir_all(primary.parent().unwrap()).unwrap();
+        entry.hosted_id = None;
+        entry.hydration_generation = None;
+        entry.pid_start_time = None;
+        let VendorRoute::Claude {
+            socket_path,
+            key_path,
+            ..
+        } = &entry.route
+        else {
+            unreachable!()
+        };
+        std::fs::write(
+            key_path.as_ref().unwrap(),
+            r#"{"peerToken":"fixture-token"}"#,
+        )
+        .unwrap();
+        let listener = UnixListener::bind(socket_path).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        write(&primary, &entry);
+        crate::discovery::note_route_file_scan(Some(tmp.path()), Instant::now());
+        let request = HttpRequest::new("POST", "/unused")
+            .with_json_body(&json!({"prompt":"hello", "send_now":true}));
+        let owner = HubAuthority::Owner {
+            login: "owner".into(),
+        };
+        let refused = handle_post_session_prompt(&state, &owner, "claude:ada", &request);
+        assert_eq!(refused.status, 409);
+        assert!(matches!(listener.accept(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock));
+        let peer = HubAuthority::Peer {
+            agent: Some("fiona".into()),
+        };
+        let response = handle_post_session_prompt(&state, &peer, "claude:ada", &request);
+        let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(response.status, 200);
+        assert_eq!(body["delivered"], true, "{body}");
+        let (mut socket, _) = listener.accept().unwrap();
+        let mut frames = String::new();
+        socket.read_to_string(&mut frames).unwrap();
+        assert!(frames.contains("fixture-token"));
+        assert!(frames.contains("hello"));
+        assert!(frames.contains("fiona"));
     }
 
     #[test]

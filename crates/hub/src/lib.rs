@@ -2307,6 +2307,13 @@ mod tests {
         )
         .unwrap();
         fs::write(ui_dir.join("app.js"), "console.log('ferrodeck');").unwrap();
+        // Most prompt fixtures use a bare persona. Supply a valid primary source;
+        // tests of source failure construct or remove it explicitly.
+        let routes = crate::discovery::route_table_path(Some(home)).unwrap();
+        fs::create_dir_all(routes.parent().unwrap()).unwrap();
+        if !routes.exists() {
+            fs::write(routes, br#"{"entries":{}}"#).unwrap();
+        }
 
         HubState::new(HubServerConfig {
             listen: "127.0.0.1:0".into(),
@@ -9603,27 +9610,28 @@ mod tests {
     }
 
     #[test]
-    fn owner_prompt_reaches_a_claude_tmux_pane_but_a_peer_never_does() {
+    fn unbound_owner_prompt_is_refused_but_peer_uses_claude_socket() {
         let _lock = TMUX_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = TempDir::new().unwrap();
         let state = test_hub_state(&tmp);
         let tmux = FakeTmux::install(tmp.path());
         let listener = install_claude_tmux_route(tmp.path(), "felicity");
 
-        // The Owner token: pasted into the pane, nothing on the peer socket.
-        let sent = post_prompt(
+        // This legacy tmux-only registration cannot establish hosted terminal authority.
+        let refused = call(
             &state,
-            "felicity",
+            "POST",
+            "/api/v1/sessions/felicity/prompt",
             OWNER,
-            None,
             &json!({ "prompt": "hello from the owner", "send_now": true }),
         );
-        assert_eq!(sent["delivered"], true, "{sent}");
-        assert_eq!(sent["by"], "lmcfarlin");
-        let log = tmux.log();
-        assert!(log.contains("paste-buffer -d -b"), "{log}");
-        assert!(log.contains("send-keys -t %12 Enter"), "{log}");
-        assert_eq!(socket_from(&listener), None, "owner prompt used the socket");
+        assert_eq!(refused.status, 409);
+        assert!(tmux.log().is_empty());
+        assert_eq!(
+            socket_from(&listener),
+            None,
+            "refused owner prompt used the socket"
+        );
 
         // A Peer token that claims to be the owner, however it spells the claim, takes the
         // peer-session socket and never the pane.

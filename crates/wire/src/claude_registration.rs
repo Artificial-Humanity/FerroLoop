@@ -145,6 +145,15 @@ impl fmt::Debug for ClaudeRegistrationBinding {
 }
 
 impl ClaudeRegistrationBinding {
+    /// Validate the selected primary without granting terminal authority. Peer delivery
+    /// still needs its own route authorization; an unclassified alias may not discover
+    /// routes when this source is unavailable or ambiguous.
+    pub fn validate_source(source: &Path) -> Result<(), ClaudeRegistrationError> {
+        strict_table(source)
+            .map(|_| ())
+            .map_err(ClaudeRegistrationError::Source)
+    }
+
     /// Inspect raw admission intent against all entries in the primary source before any
     /// discovery ordering or deduplication can pick a route. A non-Claude result is not
     /// authority to deliver; it leaves existing non-Claude handling in charge.

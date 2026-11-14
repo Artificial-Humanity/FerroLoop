@@ -53,6 +53,9 @@ fn env() -> Env {
         fs::create_dir_all(base.join(dir)).unwrap();
     }
     fs::write(base.join("ui/index.html"), "<html>spa</html>").unwrap();
+    let routes = crate::discovery::route_table_path(Some(&base.join("data"))).unwrap();
+    fs::create_dir_all(routes.parent().unwrap()).unwrap();
+    fs::write(routes, br#"{"entries":{}}"#).unwrap();
     let state = HubState::new(HubServerConfig {
         listen: "127.0.0.1:0".into(),
         store_path: base.join("data/store.redb"),

@@ -43,6 +43,11 @@ pub(crate) fn hub_with_ferris(tmp: &TempDir, turns: usize) -> HubState {
         fs::write(&bin, "#!/bin/sh\ncase \"$1 $2\" in\n  'agentapi send-message') printf '%s\\n' \"$4\" >> \"$0.calls\" ;;\nesac\n").unwrap();
         fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
     }
+    // The prompt admission gate validates the selected primary before bare-alias
+    // discovery. This fixture starts with a valid empty primary by default.
+    let routes = crate::discovery::route_table_path(Some(tmp.path())).unwrap();
+    fs::create_dir_all(routes.parent().unwrap()).unwrap();
+    fs::write(&routes, br#"{"entries":{}}"#).unwrap();
     write_ferris_transcript(tmp.path(), turns);
     {
         let store = state.open_store().unwrap();
