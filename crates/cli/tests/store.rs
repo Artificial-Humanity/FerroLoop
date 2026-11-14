@@ -298,7 +298,7 @@ fn ferro_with_dead_extents(path: &Path) {
 fn status_on_ferro_reports_live_and_dead_bytes_and_keeps_the_other_keys() {
     let env = Env::new();
     ferro_with_dead_extents(&env.physical_ferro());
-    let v = status_json(env.ferro(), &env.logical());
+    let v = status_json(env.isolated_ferro(), &env.logical());
     let size = v["size_bytes"].as_u64().unwrap();
     let live = v["live_bytes"].as_u64().unwrap();
     let dead = v["dead_bytes"].as_u64().unwrap();
@@ -313,7 +313,7 @@ fn status_on_ferro_reports_live_and_dead_bytes_and_keeps_the_other_keys() {
     ] {
         assert!(v.get(key).is_some(), "{key} missing: {v}");
     }
-    env.ferro()
+    env.isolated_ferro()
         .arg("--db")
         .arg(env.logical())
         .args(["store", "status"])
@@ -327,12 +327,12 @@ fn status_on_ferro_reports_live_and_dead_bytes_and_keeps_the_other_keys() {
 fn status_has_null_live_and_dead_bytes_where_the_engine_cannot_say() {
     let env = Env::new();
     open_with(&env.logical(), BackendKind::Redb);
-    let v = status_json(env.fl(), &env.logical());
+    let v = status_json(env.isolated_fl(), &env.logical());
     assert_eq!(v["live_bytes"], Value::Null, "{v}");
     assert_eq!(v["dead_bytes"], Value::Null, "{v}");
     // A ferro selection with no store yet has none either, and none is made.
     let env = Env::new();
-    let v = status_json(env.ferro(), &env.logical());
+    let v = status_json(env.isolated_ferro(), &env.logical());
     assert_eq!(v["live_bytes"], Value::Null, "{v}");
     assert_eq!(v["dead_bytes"], Value::Null, "{v}");
     assert!(env.files().is_empty(), "{:?}", env.files());
@@ -345,7 +345,7 @@ fn status_leaves_an_empty_and_a_garbage_fls_untouched_and_reports_null_sizes() {
         let env = Env::new();
         std::fs::write(env.physical_ferro(), &bytes).unwrap();
         let before = snapshot(&[env.stores.path()]);
-        let v = status_json(env.ferro(), &env.logical());
+        let v = status_json(env.isolated_ferro(), &env.logical());
         assert_eq!(v["exists"], true, "{v}");
         assert_eq!(v["live_bytes"], Value::Null, "{v}");
         assert_eq!(v["dead_bytes"], Value::Null, "{v}");
@@ -354,7 +354,7 @@ fn status_leaves_an_empty_and_a_garbage_fls_untouched_and_reports_null_sizes() {
             v["sizes_note"].as_str().unwrap().contains("could not read"),
             "{v}"
         );
-        env.ferro()
+        env.isolated_ferro()
             .arg("--db")
             .arg(env.logical())
             .args(["store", "status"])
@@ -372,12 +372,12 @@ fn status_works_on_a_read_only_fls_and_writes_nothing() {
     use std::os::unix::fs::PermissionsExt;
     let env = Env::new();
     ferro_with_dead_extents(&env.physical_ferro());
-    let rw = status_json(env.ferro(), &env.logical());
+    let rw = status_json(env.isolated_ferro(), &env.logical());
     let path = env.physical_ferro();
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o400)).unwrap();
     let before = snapshot(&[env.stores.path()]);
     let out = env
-        .ferro()
+        .isolated_ferro()
         .arg("--db")
         .arg(env.logical())
         .args(["store", "status", "--json"])
@@ -405,7 +405,7 @@ fn status_works_on_a_read_only_fls_and_writes_nothing() {
 fn status_size_is_the_sum_of_the_live_and_dead_bytes_of_one_reading() {
     let env = Env::new();
     ferro_with_dead_extents(&env.physical_ferro());
-    let v = status_json(env.ferro(), &env.logical());
+    let v = status_json(env.isolated_ferro(), &env.logical());
     assert_eq!(
         v["size_bytes"].as_u64().unwrap(),
         v["live_bytes"].as_u64().unwrap() + v["dead_bytes"].as_u64().unwrap(),
