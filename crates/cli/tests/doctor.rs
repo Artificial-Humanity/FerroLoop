@@ -262,6 +262,10 @@ fn doctor_command_uses_private_defaults() {
     };
     assert_eq!(env("HOME").as_deref(), Some(w.home.path().as_os_str()));
     assert_eq!(
+        env("PATH").as_deref(),
+        Some(w.home.path().join("no-bin").as_os_str())
+    );
+    assert_eq!(
         env("XDG_CONFIG_HOME").as_deref(),
         Some(w.home.path().join(".config").as_os_str())
     );
@@ -633,15 +637,14 @@ fn a_broken_config_does_not_stop_the_doctor_but_keeps_the_store_check_honest() {
 }
 
 #[test]
-fn doctor_spawns_nothing_and_needs_no_network_or_path() {
-    // No PATH to find a helper on, no proxy, no HOME-wide tools. If the
-    // command ran a subprocess or reached the network it would fail or hang here.
+fn doctor_spawns_nothing_and_needs_no_network_or_tools() {
+    // PATH points to the private, empty no-bin directory; no proxy or
+    // HOME-wide tools are inherited. A helper cannot be found there.
     let w = World::new();
     w.install();
     let out = w
         .fl()
         .args(["doctor", "--json"])
-        .env_remove("PATH")
         .timeout(std::time::Duration::from_secs(20))
         .output()
         .unwrap();
