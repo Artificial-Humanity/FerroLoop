@@ -198,7 +198,7 @@ fn a_relative_path_means_the_current_directory() {
     std::fs::create_dir(env.dir("base")).unwrap();
     let created = {
         let out = env
-            .fl(&env.dir("base"))
+            .isolated_fl(&env.dir("base"))
             .args(["project", "init", "./sub/../child", "--json"])
             .assert()
             .success()
@@ -213,7 +213,7 @@ fn a_relative_path_means_the_current_directory() {
         env.dir("base").join("child").display().to_string()
     );
     assert!(!env.dir("base").join("sub").exists());
-    env.fl(env.work.path())
+    env.isolated_fl(env.work.path())
         .args(["project", "init", ""])
         .assert()
         .failure()
@@ -283,15 +283,26 @@ fn an_existing_repository_keeps_its_history_and_gets_no_commit() {
 fn the_github_binding_is_written_and_read_back_by_fl() {
     let env = Env::new();
     let root = env.dir("hosted");
-    let created = env.init_json(&[
-        root.to_str().unwrap(),
-        "--github",
-        "acme/hosted",
-        "--credential",
-        "env",
-        "--name",
-        "Hosted_One",
-    ]);
+    let out = env
+        .isolated_fl(env.work.path())
+        .args([
+            "project",
+            "init",
+            root.to_str().unwrap(),
+            "--github",
+            "acme/hosted",
+            "--credential",
+            "env",
+            "--name",
+            "Hosted_One",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let created: Value = serde_json::from_slice(&out).unwrap();
     assert_eq!(created["slug"], "hosted_one");
     assert_eq!(created["name"], "Hosted_One");
     assert_eq!(
@@ -302,7 +313,7 @@ fn the_github_binding_is_written_and_read_back_by_fl() {
     assert!(config.contains("[project.tracker]"), "{config}");
     assert!(config.contains("credential = \"env\""), "{config}");
     // The catalog commands never contact GitHub, so this loads the binding and runs offline.
-    env.fl(&root)
+    env.isolated_fl(&root)
         .args(["project", "list"])
         .assert()
         .success()
