@@ -1009,7 +1009,11 @@ struct FixtureDaemon(std::process::Child);
 
 impl FixtureDaemon {
     fn start(env: &TestEnv) -> Self {
-        let mut daemon = Self(diagnostics_daemon_command(env).spawn().unwrap());
+        Self::start_command(env, diagnostics_daemon_command(env))
+    }
+
+    fn start_command(env: &TestEnv, mut command: Command) -> Self {
+        let mut daemon = Self(command.spawn().unwrap());
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         loop {
             if let Ok(mut client) = fl_wire::daemon::LocalClient::connect(
@@ -1313,11 +1317,55 @@ fn wire_status_renders_codex_queues_known_bounded_estimated_age_and_unknown_neve
     assert!(!text.contains("future: 0"), "{text}");
 }
 
+// The daemon and its clients must share the same private multi-process store.
+fn codex_queue_command(env: &TestEnv) -> Command {
+    let mut command = common::isolated_fl(&env.root).unwrap();
+    command
+        .current_dir(&env.work_dir)
+        .env("XDG_CONFIG_HOME", &env.cfg_dir)
+        .env("XDG_DATA_HOME", &env.data_dir)
+        .env("FL_DB", env.root.join("queue.fls"))
+        .env("FL_STORE_BACKEND", "ferro")
+        .env("FL_WIRE_SOCKET", &env.sock_file)
+        .env("FL_WIRE_ROUTES", &env.routes_file)
+        .env("HOSTNAME", "fixture-node");
+    command
+}
+
+#[test]
+fn codex_queue_daemon_command_uses_private_fixtures() {
+    let env = TestEnv::new();
+    let command = codex_queue_command(&env);
+    let get = |key: &str| {
+        command
+            .get_envs()
+            .find(|(name, _)| *name == key)
+            .and_then(|(_, value)| value)
+            .map(|v| v.to_os_string())
+    };
+    for (name, path) in [
+        ("FL_DB", env.root.join("queue.fls")),
+        ("FL_WIRE_SOCKET", env.sock_file.clone()),
+        ("FL_WIRE_ROUTES", env.routes_file.clone()),
+        ("FL_WIRE_CODEX_CONTROL_SOCK", env.root.join("c")),
+        ("PATH", env.root.join("no-bin")),
+    ] {
+        assert_eq!(get(name).as_deref(), Some(path.as_os_str()), "{name}");
+    }
+    assert_eq!(
+        get("FL_STORE_BACKEND").as_deref(),
+        Some(std::ffi::OsStr::new("ferro"))
+    );
+    assert_eq!(
+        get("FL_WIRE_DISABLE_HOST_DISCOVERY").as_deref(),
+        Some(std::ffi::OsStr::new("1"))
+    );
+}
+
 #[test]
 fn wire_status_active_and_inactive_daemon_fail_codex_queue_to_unknown_when_offline() {
     let env = TestEnv::new();
-    let reg = env
-        .fl()
+    let reg = codex_queue_command(&env)
         .args([
             "wire",
             "register",
@@ -1343,7 +1391,7 @@ fn wire_status_active_and_inactive_daemon_fail_codex_queue_to_unknown_when_offli
     table.save(Some(&env.routes_file)).unwrap();
 
     // 1. Inactive daemon + offline Codex control socket -> Unknown (never 0).
-    let mut inactive_json_cmd = env.fl();
+    let mut inactive_json_cmd = codex_queue_command(&env);
     inactive_json_cmd
         .env_remove("CODEX_HOME")
         .env_remove("FL_WIRE_CODEX_BIN")
@@ -1356,8 +1404,7 @@ fn wire_status_active_and_inactive_daemon_fail_codex_queue_to_unknown_when_offli
     assert_eq!(inactive["codex_queues"][0]["queue"]["state"], "unknown");
     assert!(inactive["codex_queues"][0]["queue"].get("depth").is_none());
 
-    let inactive_text_out = env
-        .fl()
+    let inactive_text_out = codex_queue_command(&env)
         .env_remove("CODEX_HOME")
         .env_remove("FL_WIRE_CODEX_BIN")
         .env_remove("FL_WIRE_CODEX_CONTROL_SOCK")
@@ -1376,24 +1423,15 @@ fn wire_status_active_and_inactive_daemon_fail_codex_queue_to_unknown_when_offli
     );
 
     // 2. Live daemon + offline Codex control socket -> Unknown (never 0).
-    let store_path = env.data_dir.join("fl/fl.redb");
-    let store = std::sync::Arc::new(fl_store::open_store(&store_path).unwrap());
-    let mut daemon = fl_wire::daemon::spawn_daemon(
-        store,
-        fl_wire::daemon::DaemonConfig {
-            node_id: "fixture-node".into(),
-            host: "fixture-host".into(),
-            socket_path: env.sock_file.clone(),
-            routes_path: Some(env.routes_file.clone()),
-            home_override: Some(env.root.clone()),
-            listen_addr: None,
-            peers: vec![],
-            psk: vec![],
-        },
-    )
-    .unwrap();
+    let mut daemon_command = codex_queue_command(&env);
+    daemon_command
+        .args(["wire", "daemon"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let daemon = FixtureDaemon::start_command(&env, daemon_command);
 
-    let mut active_json_cmd = env.fl();
+    let mut active_json_cmd = codex_queue_command(&env);
     active_json_cmd.args(["wire", "status", "--json"]);
     let active = run_json(active_json_cmd);
     assert_eq!(active["node_id"], "fixture-node");
@@ -1406,8 +1444,11 @@ fn wire_status_active_and_inactive_daemon_fail_codex_queue_to_unknown_when_offli
     );
     assert!(active["codex_queues"][0]["queue"].get("depth").is_none());
 
-    let active_text_out = env.fl().args(["wire", "status"]).output().unwrap();
-    daemon.stop();
+    let active_text_out = codex_queue_command(&env)
+        .args(["wire", "status"])
+        .output()
+        .unwrap();
+    drop(daemon);
     assert!(active_text_out.status.success());
     let active_text = String::from_utf8(active_text_out.stdout).unwrap();
     assert!(
