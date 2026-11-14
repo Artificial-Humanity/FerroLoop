@@ -681,6 +681,7 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tokio",
+ "uuid",
  "webpki-roots",
 ]
 

@@ -43,6 +43,11 @@ pub(crate) fn hub_with_ferris(tmp: &TempDir, turns: usize) -> HubState {
         fs::write(&bin, "#!/bin/sh\ncase \"$1 $2\" in\n  'agentapi send-message') printf '%s\\n' \"$4\" >> \"$0.calls\" ;;\nesac\n").unwrap();
         fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
     }
+    // The prompt admission gate validates the selected primary before bare-alias
+    // discovery. This fixture starts with a valid empty primary by default.
+    let routes = crate::discovery::route_table_path(Some(tmp.path())).unwrap();
+    fs::create_dir_all(routes.parent().unwrap()).unwrap();
+    fs::write(&routes, br#"{"entries":{}}"#).unwrap();
     write_ferris_transcript(tmp.path(), turns);
     {
         let store = state.open_store().unwrap();
@@ -1091,6 +1096,9 @@ fn replacement_admission_checks_queue_created_after_its_discovery() {
     let mut replacement = original.clone();
     replacement.id = "conv-ferris-2".into();
     let input = |session: &crate::DiscoveredSessionSummary| crate::DirectPromptInput {
+        claude_terminal: false,
+        claude_binding: None,
+        intended_vendor: None,
         queue_target: crate::PromptQueueTarget::observed(session, "ferris"),
         intended_codex_thread_id: None,
         persona: Some("ferris".into()),
@@ -1367,6 +1375,9 @@ fn retained_alias_is_ambiguous_until_its_original_queue_and_flight_are_gone() {
             false,
             false,
             crate::DirectPromptInput {
+                claude_terminal: false,
+                claude_binding: None,
+                intended_vendor: None,
                 queue_target: crate::PromptQueueTarget::observed(session, "ferris"),
                 intended_codex_thread_id: None,
                 persona: Some("ferris".into()),
@@ -1667,7 +1678,7 @@ fn unknown_prompt_uses_full_attempt_fallback() {
 }
 
 #[test]
-fn prompt_to_recorded_attempt_still_resolves_via_full_fallback() {
+fn prompt_to_unbound_claude_attempt_is_refused() {
     let tmp = TempDir::new().unwrap();
     let state = hub_with_ferris(&tmp, 3);
     let listed = get(&state, "/api/v1/sessions").0.json_value().unwrap();
@@ -1675,7 +1686,52 @@ fn prompt_to_recorded_attempt_still_resolves_via_full_fallback() {
         .as_array()
         .unwrap()
         .iter()
-        .find(|session| session["source"] == "attempt")
+        .find(|session| session["source"] == "attempt" && session["adapter"] == "claude")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap();
+    let response = handle_http_request(
+        &state,
+        &HttpRequest::new("POST", format!("/api/v1/sessions/{attempt}/prompt"))
+            .with_header("Authorization", OWNER)
+            .with_json_body(&json!({ "prompt": "hi", "send_now": true })),
+    );
+    assert_eq!(response.status, 409);
+}
+
+#[test]
+fn prompt_to_recorded_attempt_still_resolves_via_full_fallback() {
+    let tmp = TempDir::new().unwrap();
+    let state = hub_with_ferris(&tmp, 3);
+    // The fallback path is vendor-independent; the shared attempts are Claude and
+    // must be refused without a pinned registration. Use a separate non-Claude
+    // attempt to exercise the normal recorded-attempt lookup.
+    {
+        let store = state.open_store().unwrap();
+        let project = store.add_project("fallback-antigravity").unwrap();
+        store
+            .append_attempt(Attempt {
+                id: None,
+                at: None,
+                project,
+                record: RecordId(seq_iri(9)),
+                adapter: "antigravity".into(),
+                status: AttemptStatus::Completed,
+                duration_ms: 1,
+                tokens_in: 1,
+                tokens_out: 1,
+                cost_usd_micros: 0,
+                paths_touched: PathsTouched::Counted(0),
+                output_excerpt: Some("done".into()),
+            })
+            .unwrap();
+    }
+    let listed = get(&state, "/api/v1/sessions").0.json_value().unwrap();
+    let attempt = listed["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|session| session["source"] == "attempt" && session["adapter"] == "antigravity")
         .unwrap()["id"]
         .as_str()
         .unwrap();

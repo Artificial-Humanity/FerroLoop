@@ -12,6 +12,7 @@ pub mod dispatcher;
 pub mod host_runtime;
 pub mod identity;
 pub mod peer;
+mod registration_evidence;
 pub mod scanner;
 pub mod vendor_adapter;
 pub mod ws;
