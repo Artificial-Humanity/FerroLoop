@@ -2,10 +2,13 @@
 #![cfg(unix)]
 
 use std::os::unix::fs::PermissionsExt;
-use std::process::{Child, Command, Output, Stdio};
+use std::process::{Child, Output, Stdio};
 use std::time::{Duration, Instant};
 
 use fl_host_proto::{BlockingHostClient, HostEndpoint, SessionId, SpawnKind, SpawnSpec, StreamId};
+
+#[allow(dead_code)]
+mod common;
 
 struct Fixture {
     root: tempfile::TempDir,
@@ -17,7 +20,8 @@ impl Fixture {
         let root = tempfile::tempdir().unwrap();
         std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let endpoint = HostEndpoint::unix(root.path().join("host.sock")).unwrap();
-        let daemon = Command::new(env!("CARGO_BIN_EXE_fl"))
+        let daemon = common::isolated_fl(root.path())
+            .unwrap()
             .args(["host", "serve", "--socket"])
             .arg(endpoint.socket_path())
             .stdin(Stdio::null())
@@ -47,7 +51,8 @@ impl Fixture {
         BlockingHostClient::connect(&self.endpoint).unwrap()
     }
     fn capture(&self, args: &[&str]) -> Output {
-        Command::new(env!("CARGO_BIN_EXE_fl"))
+        common::isolated_fl(self.root.path())
+            .unwrap()
             .args(["host", "capture", "capture-test"])
             .args(args)
             .env("FL_HOST_SOCK", self.endpoint.socket_path())
@@ -123,6 +128,32 @@ fn success(output: Output) -> Vec<u8> {
     output.stdout
 }
 
+// Inspect the shared constructor without starting fl or a host service.
+#[test]
+fn capture_command_uses_private_environment() {
+    let root = tempfile::tempdir().unwrap();
+    let cmd = common::isolated_fl(root.path()).unwrap();
+    let env = |key: &str| {
+        cmd.get_envs()
+            .find(|(name, _)| *name == key)
+            .and_then(|(_, value)| value)
+            .map(|value| value.to_os_string())
+    };
+    assert_eq!(env("HOME").as_deref(), Some(root.path().as_os_str()));
+    assert_eq!(
+        env("PATH").as_deref(),
+        Some(root.path().join("no-bin").as_os_str())
+    );
+    assert_eq!(
+        env("FL_HOST_SOCK").as_deref(),
+        Some(root.path().join("h").as_os_str())
+    );
+    assert_eq!(
+        env("FL_WIRE_SOCKET").as_deref(),
+        Some(root.path().join("w").as_os_str())
+    );
+}
+
 // Catches accidentally switching the default to a screen or applying byte truncation differently.
 #[test]
 fn default_and_explicit_raw_preserve_bytes_and_limits() {
@@ -188,7 +219,8 @@ fn invalid_capture_flags_fail_before_connecting() {
         vec!["--rendered", "--max-bytes", "16384"],
     ] {
         let root = tempfile::tempdir().unwrap();
-        let output = Command::new(env!("CARGO_BIN_EXE_fl"))
+        let output = common::isolated_fl(root.path())
+            .unwrap()
             .args(["host", "capture", "capture-test"])
             .args(&flags)
             .env("FL_HOST_SOCK", root.path().join("absent.sock"))
@@ -266,8 +298,9 @@ async fn older_daemon_is_refused_without_unknown_capture_request() {
                 .unwrap();
         }
     });
+    let mut command = common::isolated_fl(root.path()).unwrap();
     let output = tokio::task::spawn_blocking(move || {
-        Command::new(env!("CARGO_BIN_EXE_fl"))
+        command
             .args(["host", "capture", "capture-test", "--rendered"])
             .env("FL_HOST_SOCK", socket)
             .output()
@@ -296,7 +329,8 @@ fn invalid_config_warns_once_then_host_capture_uses_default_store() {
     std::fs::create_dir_all(&data_dir).unwrap();
     let config = config_dir.join("config.toml");
     std::fs::write(&config, "not valid [toml").unwrap();
-    let out = Command::new(env!("CARGO_BIN_EXE_fl"))
+    let out = common::isolated_fl(f.root.path())
+        .unwrap()
         .args(["host", "capture", "claude:missing"])
         .env("FL_HOST_SOCK", f.endpoint.socket_path())
         .env("XDG_CONFIG_HOME", f.root.path().join("config"))
