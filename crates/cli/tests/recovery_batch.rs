@@ -7,7 +7,7 @@ use std::process::Command;
 
 fn recovery_fixture_command(root: &Path) -> Command {
     let endpoint = format!("unix://{}/absent.sock", root.display());
-    let mut cmd = common::isolated_command(env!("CARGO_BIN_EXE_fl"), root).unwrap();
+    let mut cmd = common::isolated_fl(root).unwrap();
     cmd.args([
         "recovery",
         "batch",

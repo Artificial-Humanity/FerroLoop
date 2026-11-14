@@ -8,7 +8,7 @@ use predicates::str::contains;
 /// XDG directories are private too: `fl` reads `$XDG_CONFIG_HOME/fl/config.toml` (a real
 /// developer's project bindings) before it opens any store.
 fn fl(dir: &std::path::Path) -> Command {
-    let mut c = Command::from_std(common::isolated_command(env!("CARGO_BIN_EXE_fl"), dir).unwrap());
+    let mut c = Command::from_std(common::isolated_fl(dir).unwrap());
     c.env("FL_VAULT_PATH", dir.join("vault.enc"))
         .env("FL_VAULT_KEY_PATH", dir.join("vault.key"))
         .env("HOME", dir)

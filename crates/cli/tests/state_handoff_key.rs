@@ -12,8 +12,7 @@ use serde_json::Value;
 const SCOPE: &str = "project:demo";
 
 fn fl(cfg: &tempfile::TempDir, db: &Path) -> Command {
-    let mut c =
-        Command::from_std(common::isolated_command(env!("CARGO_BIN_EXE_fl"), cfg.path()).unwrap());
+    let mut c = Command::from_std(common::isolated_fl(cfg.path()).unwrap());
     c.env("XDG_CONFIG_HOME", cfg.path())
         .env_remove("FL_DB")
         .arg("--db")

@@ -27,6 +27,9 @@
 //! `FL_BLESS_GOLDEN=1 cargo test -p fl-cli --test store_golden` rewrites the
 //! files from the current output.
 
+#[allow(dead_code)]
+mod common;
+
 use assert_cmd::Command;
 use fl_core::Catalog;
 use fl_store::{BackendKind, StoreOptions};
@@ -64,7 +67,7 @@ impl Sandbox {
     }
 
     fn fl_at(&self, db: &Path, args: &[&str]) -> Command {
-        let mut c = Command::cargo_bin("fl").unwrap();
+        let mut c = Command::from_std(common::isolated_fl(self.root.path()).unwrap());
         c.env("HOME", self.dir("home"))
             .env("XDG_CONFIG_HOME", self.dir("config"))
             .env("XDG_DATA_HOME", self.dir("data"))
@@ -574,5 +577,32 @@ fn verify_refuses_a_missing_fls() {
         "verify-fls-path",
         sb.fl_at(&sb.fls(), &["verify"]),
         "fl --db <DIR>/stores/fl.fls store verify",
+    );
+}
+
+#[test]
+fn store_command_uses_private_paths_without_launching() {
+    let sb = Sandbox::new();
+    let cmd = sb.fl(&["status"]);
+    let args: Vec<_> = cmd.get_args().collect();
+    assert_eq!(args[0], "--db");
+    assert_eq!(args[1], sb.redb().as_os_str());
+    for name in [
+        "HOME",
+        "XDG_CONFIG_HOME",
+        "XDG_DATA_HOME",
+        "XDG_RUNTIME_DIR",
+        "TMPDIR",
+        "FL_WIRE_SOCKET",
+    ] {
+        let value = cmd
+            .get_envs()
+            .find_map(|(key, value)| (key == name).then_some(value).flatten())
+            .unwrap();
+        assert!(Path::new(value).starts_with(sb.root.path()), "{name}");
+    }
+    assert!(
+        cmd.get_envs()
+            .all(|(key, value)| key != "FL_DB" || value.is_none())
     );
 }

@@ -56,13 +56,11 @@ fn an_fl_unit_runs_a_real_subcommand_with_real_flags() {
             .collect();
         assert_eq!(sub, path, "{name}: {exec}");
 
-        let out = Command::from_std(
-            common::isolated_command(env!("CARGO_BIN_EXE_fl"), root.path()).unwrap(),
-        )
-        .args(&sub)
-        .arg("--help")
-        .output()
-        .unwrap();
+        let out = Command::from_std(common::isolated_fl(root.path()).unwrap())
+            .args(&sub)
+            .arg("--help")
+            .output()
+            .unwrap();
         let help = String::from_utf8_lossy(&out.stdout).into_owned();
         assert!(out.status.success(), "{name}: fl {sub:?} --help\n{help}");
         for flag in words.iter().filter(|w| w.starts_with("--")) {
@@ -79,11 +77,10 @@ fn an_fl_unit_runs_a_real_subcommand_with_real_flags() {
 fn the_hub_unit_ui_dir_is_the_flag_the_hub_reads() {
     // the unit's `--ui-dir` is the flag `fl hub serve` takes, ahead of `[hub] ui_dir`
     let root = tempfile::tempdir().unwrap();
-    let help =
-        Command::from_std(common::isolated_command(env!("CARGO_BIN_EXE_fl"), root.path()).unwrap())
-            .args(["hub", "serve", "--help"])
-            .output()
-            .unwrap();
+    let help = Command::from_std(common::isolated_fl(root.path()).unwrap())
+        .args(["hub", "serve", "--help"])
+        .output()
+        .unwrap();
     let help = String::from_utf8_lossy(&help.stdout).into_owned();
     assert!(help.contains("--ui-dir <UI_DIR>"), "{help}");
     // the repository a bound hub names is `--repo-root`, which the unit's comment points at
