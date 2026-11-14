@@ -55,7 +55,7 @@ impl TestEnv {
     }
 
     fn cmd_for(&self, bin_path: &std::path::Path) -> Command {
-        let mut c = Command::new(bin_path);
+        let mut c = common::isolated_command(bin_path, &self.root).unwrap();
         c.current_dir(&self.work_dir)
             .env("HOME", &self.root)
             .env("XDG_RUNTIME_DIR", &self.root)
@@ -65,8 +65,6 @@ impl TestEnv {
             .env("FL_WIRE_ROUTES", &self.routes_file)
             .env("FL_WIRE_SOCKET", &self.sock_file)
             .env("FL_WIRE_DISABLE_HOST_DISCOVERY", "1")
-            .env_remove("FL_HOST_SOCK")
-            .env_remove("FL_WIRE_CODEX_CONTROL_SOCK")
             .env("CODEX_HOME", self.root.join("codex-home"))
             .env("FL_WIRE_CODEX_BIN", self.root.join("absent-codex"))
             .env_remove("FL_DB")
@@ -108,17 +106,30 @@ impl TestEnv {
 fn fixture_scrubs_inherited_live_routes() {
     let env = TestEnv::new();
     let cmd = env.fl();
+    assert_eq!(
+        cmd.get_program(),
+        std::ffi::OsStr::new(env!("CARGO_BIN_EXE_fl"))
+    );
+    let alias = env.symlink_bin("agent-msg");
+    let alias_cmd = env.cmd_for(&alias);
+    assert_eq!(alias_cmd.get_program(), alias.as_os_str());
     assert!(
-        cmd.get_envs()
-            .any(|(name, value)| name == "FL_HOST_SOCK" && value.is_none())
+        format!("{cmd:?}").contains("env -i"),
+        "child environment must be cleared"
     );
     assert!(
-        cmd.get_envs()
-            .any(|(name, value)| name == "FL_WIRE_CODEX_CONTROL_SOCK" && value.is_none())
+        format!("{alias_cmd:?}").contains("env -i"),
+        "alias environment must be cleared"
     );
     let codex_home = env.root.join("codex-home");
     let codex_bin = env.root.join("absent-codex");
+    let host_socket = env.root.join("h");
+    let codex_socket = env.root.join("c");
+    let private_path = env.root.join("no-bin");
     for (key, expected) in [
+        ("FL_HOST_SOCK", &host_socket),
+        ("FL_WIRE_CODEX_CONTROL_SOCK", &codex_socket),
+        ("PATH", &private_path),
         ("CODEX_HOME", &codex_home),
         ("FL_WIRE_CODEX_BIN", &codex_bin),
         ("FL_WIRE_SOCKET", &env.sock_file),
@@ -777,15 +788,9 @@ fn agent_msg_hydrate_runs_agent_hydrate_and_forwards_its_exit_status() {
     )
     .unwrap();
     std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let path = format!(
-        "{}:{}",
-        bindir.display(),
-        std::env::var("PATH").unwrap_or_default()
-    );
-
     let out = env
         .cmd_for(&agent_msg_bin)
-        .env("PATH", path)
+        .env("PATH", &bindir)
         .args(["hydrate", "Kayla", "--replace"])
         .output()
         .unwrap();
