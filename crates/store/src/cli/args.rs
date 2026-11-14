@@ -331,3 +331,62 @@ impl BenchArgs {
         Ok((report.text(), 0))
     }
 }
+
+/// Explicit administrative recovery. The approved private root is never
+/// inferred from a daemon, source path or an unavailable service.
+#[derive(Args, Debug, Clone)]
+pub struct RecoveryArgs {
+    #[arg(long, global = true)]
+    pub root: Option<PathBuf>,
+    #[arg(long, global = true)]
+    pub lease: Option<PathBuf>,
+    #[arg(long, global = true)]
+    pub request: Option<PathBuf>,
+    #[arg(long, global = true, default_value_t = 60000)]
+    pub timeout_ms: u64,
+    #[arg(long, global = true, default_value_t = 2147483648)]
+    pub byte_limit: u64,
+    #[arg(long, global = true, default_value_t = 1073741824)]
+    pub memory_byte_limit: u64,
+    #[command(subcommand)]
+    pub action: RecoveryCommand,
+}
+#[derive(clap::Subcommand, Debug, Clone)]
+pub enum RecoveryCommand {
+    /// Write an explicit, short-lived administrative exclusion attestation.
+    Lease,
+    /// Inspect one completed verified bundle without repairing receipts.
+    Inspect {
+        operation: uuid::Uuid,
+    },
+    /// Verify an existing completed image without creating another image.
+    Verify {
+        operation: uuid::Uuid,
+    },
+    /// Back up an existing physical source without daemon contact or migration.
+    BackupOffline,
+    /// Install exactly one candidate and keep ordinary opens fenced.
+    Restore,
+    Resume,
+    Rollback,
+    /// Abandon an untouched pre-exchange restore, retaining its artifacts.
+    Abandon,
+    /// Explicit typed client/dependency/effect reconciliation before admission.
+    Finalize,
+    /// Finalize the journal-proven original verified generation using rollback reserve.
+    FinalizeRollback,
+    /// Finalize original absence, retaining the candidate and creating no store.
+    FinalizeAbsence,
+    /// List exact retained artifacts, restart counters and current deadline.
+    Status,
+    /// Inspect by default. Mutating confirmation must match the request's op ID.
+    Purge {
+        #[arg(long)]
+        confirm: Option<uuid::Uuid>,
+    },
+}
+impl RecoveryArgs {
+    pub fn run(&self, selected: Option<&Path>) -> Result<(Output, i32)> {
+        json_output(&super::recovery::run(self, selected)?)
+    }
+}

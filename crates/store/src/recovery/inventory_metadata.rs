@@ -201,7 +201,12 @@ fn links(path: &Path) -> Result<Vec<Link>, ()> {
     }
     Err(())
 }
-pub(super) fn scan(root: &Path, paths: &mut BTreeSet<PathBuf>, warnings: &mut Vec<String>) {
+pub(super) fn scan(
+    root: &Path,
+    paths: &mut BTreeSet<PathBuf>,
+    recovery_metadata: &mut Vec<RecoveryMetadata>,
+    warnings: &mut Vec<String>,
+) {
     let mut pending = vec![(root.to_path_buf(), 0)];
     let mut visited = 0;
     while let Some((path, depth)) = pending.pop() {
@@ -217,6 +222,25 @@ pub(super) fn scan(root: &Path, paths: &mut BTreeSet<PathBuf>, warnings: &mut Ve
                 continue;
             }
         };
+        if path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.ends_with(".restore-guard"))
+        {
+            let mut store_name = path.as_os_str().to_os_string();
+            // The suffix is ASCII; stripping it does not inspect the guarded file.
+            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                store_name = path
+                    .with_file_name(name.strip_suffix(".restore-guard").expect("suffix checked"))
+                    .into_os_string();
+            }
+            recovery_metadata.push(RecoveryMetadata {
+                store_path: PathBuf::from(store_name),
+                path: path.clone(),
+                kind: RecoveryMetadataKind::RestoreGuard,
+                metadata: file_metadata(&meta),
+            });
+        }
         if store_extension(&path) {
             paths.insert(path.clone());
         }
@@ -278,6 +302,7 @@ pub fn preflight_candidates(roots: &[PathBuf]) -> Result<Vec<PathBuf>, RecoveryE
 }
 /// Metadata-only scan results can be reported even when artifact reads are unsafe.
 pub struct CandidateScan {
+    pub recovery_metadata: Vec<RecoveryMetadata>,
     pub paths: Vec<PathBuf>,
     pub warnings: Vec<String>,
 }
@@ -300,12 +325,16 @@ pub fn scan_candidates(roots: &[PathBuf]) -> Result<CandidateScan, RecoveryError
     }
     let mut paths = BTreeSet::new();
     let mut warnings = Vec::new();
+    let mut recovery_metadata = Vec::new();
     for root in roots {
-        scan(root, &mut paths, &mut warnings);
+        scan(root, &mut paths, &mut recovery_metadata, &mut warnings);
     }
     warnings.sort();
     warnings.dedup();
+    recovery_metadata.sort_by(|a, b| a.path.cmp(&b.path));
+    recovery_metadata.dedup_by(|a, b| a.path == b.path);
     Ok(CandidateScan {
+        recovery_metadata,
         paths: paths.into_iter().collect(),
         warnings,
     })

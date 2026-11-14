@@ -54,10 +54,10 @@ Single-session requests return HTTP 409 with `code: reset_unsupported`, the cano
 `status: 409` per refused session. The alternative is an explicit remodel to the same
 vendor to start a fresh session; FerroLoop does not run it automatically.
 
-Claude's strengthened reset confirmation is owned by the separate #544/#545 change. That
-change must be integrated from main before release: its contract requires a changed native
-`sessionId`, a bounded 20-second wait and an error without a startup prompt on timeout.
-This branch does not claim that the current Claude reset tail already enforces that contract.
+Claude Reforge requires a native `sessionId` from its session record before sending
+`/clear`. If that identity is unavailable, it refuses before sending keys or a startup
+prompt. After `/clear`, it waits up to 20 seconds for a changed `sessionId`; timeout returns
+an error without sending the startup prompt or broadcasting `session.cleared`.
 
 Antigravity keeps its in-place cascade rewind described below. It does not establish a new
 native session identity and remains outside this confirmation contract, pending a separate

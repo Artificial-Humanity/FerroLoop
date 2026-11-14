@@ -87,6 +87,7 @@ pub fn collect_inventory(inputs: &InventoryInputs) -> Result<StoreMap, RecoveryE
     let mut warnings = inputs.warnings.clone();
     let scan = scan_candidates(&roots)?;
     let scan_complete = scan.warnings.is_empty();
+    let recovery_metadata = scan.recovery_metadata;
     warnings.extend(scan.warnings);
     let mut paths: BTreeSet<_> = scan.paths.into_iter().collect();
     let mut bindings = Vec::new();
@@ -441,6 +442,7 @@ pub fn collect_inventory(inputs: &InventoryInputs) -> Result<StoreMap, RecoveryE
     warnings.sort();
     warnings.dedup();
     Ok(StoreMap {
+        recovery_metadata,
         schema_version: 1,
         collected_at_unix_ms: epoch(SystemTime::now()).unwrap_or(0),
         host_identifier: inputs.host_identifier.clone(),
@@ -461,6 +463,33 @@ pub fn collect_inventory(inputs: &InventoryInputs) -> Result<StoreMap, RecoveryE
 mod tests {
     use super::*;
     use std::os::unix::fs::{PermissionsExt, symlink};
+    #[test]
+    fn restore_guard_is_stat_only_recovery_metadata_not_a_store_candidate() {
+        let root = crate::recovery::test_support::fixture_root();
+        let baseline = collect_inventory(&inputs(root.path())).unwrap();
+        let guard = root.path().join("fixture.fls.restore-guard");
+        // Deliberately unreadable and malformed: inventory must only stat it.
+        fs::write(&guard, b"never decode these private bytes").unwrap();
+        fs::set_permissions(&guard, fs::Permissions::from_mode(0o000)).unwrap();
+        let map = collect_inventory(&inputs(root.path())).unwrap();
+        assert!(map.stores.is_empty());
+        let value = serde_json::to_value(&map).unwrap();
+        assert_eq!(value["recovery_metadata"][0]["kind"], "restore_guard");
+        assert_eq!(
+            value["recovery_metadata"][0]["store_path"],
+            root.path().join("fixture.fls").to_str().unwrap()
+        );
+        assert_eq!(
+            value["recovery_metadata"][0]["path"],
+            guard.to_str().unwrap()
+        );
+        assert_eq!(value["recovery_metadata"][0]["metadata"]["size_bytes"], 32);
+        assert_eq!(map.complete, baseline.complete);
+        assert_eq!(
+            map.warnings, baseline.warnings,
+            "guard must not change coverage"
+        );
+    }
     fn inputs(root: &Path) -> InventoryInputs {
         InventoryInputs {
             roots: vec![root.to_path_buf()],

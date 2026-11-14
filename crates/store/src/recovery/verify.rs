@@ -24,6 +24,7 @@ use std::{
 /// at 256 MiB and elapsed time at 30 seconds. Full verification uses explicit
 /// caller-supplied limits. No disk writer, migration or transport is attached.
 pub fn open_recovery_image_existing(path: &Path) -> Result<crate::FerroStore, RecoveryError> {
+    super::admission::check_restore_admission(path)?;
     // The signature has no caller budget: this convenience reader has a finite,
     // documented admission ceiling. Full verification always uses caller limits.
     let limits = OperationLimits::new(
@@ -52,7 +53,64 @@ pub fn verify_existing_copy(
     profile: &ValidationProfile,
     limits: &OperationLimits,
 ) -> Result<VerificationReport, RecoveryError> {
+    super::admission::check_restore_admission(path)?;
+    verify_copy(path, expected, profile, limits)
+}
+pub(crate) fn verify_restore_copy(
+    path: &Path,
+    expected: &ValidationExpectations,
+    profile: &ValidationProfile,
+    limits: &OperationLimits,
+    access: &super::admission::RestoreAccess,
+) -> Result<VerificationReport, RecoveryError> {
+    if !access.permits(path) {
+        return Err(limits.verification());
+    }
+    verify_copy(path, expected, profile, limits)
+}
+fn verify_copy(
+    path: &Path,
+    expected: &ValidationExpectations,
+    profile: &ValidationProfile,
+    limits: &OperationLimits,
+) -> Result<VerificationReport, RecoveryError> {
+    verify_with_decoder(
+        path,
+        expected,
+        profile,
+        limits,
+        crate::ferrostore::recovery::decode_existing,
+    )
+}
+pub(crate) fn verify_physical_original(
+    path: &Path,
+    expected: &ValidationExpectations,
+    profile: &ValidationProfile,
+    limits: &OperationLimits,
+) -> Result<VerificationReport, RecoveryError> {
+    super::admission::check_restore_admission(path)?;
+    verify_with_decoder(
+        path,
+        expected,
+        profile,
+        limits,
+        crate::ferrostore::recovery::decode_physical_existing,
+    )
+}
+type ImageDecoder =
+    fn(
+        &File,
+        &OperationLimits,
+    ) -> Result<(crate::FerroStore, crate::ferrostore::ImageDescriptor), RecoveryError>;
+fn verify_with_decoder(
+    path: &Path,
+    expected: &ValidationExpectations,
+    profile: &ValidationProfile,
+    limits: &OperationLimits,
+    decode: ImageDecoder,
+) -> Result<VerificationReport, RecoveryError> {
     limits.check()?;
+    require_validation_format(expected, limits)?;
     let held = PrivateFile::open(path, false, limits)?;
     if expected.source_file_identity == Some(held.identity()) {
         return Err(RecoveryError::RefusedInput {
@@ -61,7 +119,7 @@ pub fn verify_existing_copy(
         });
     }
     let before = hash_file(&held.file, limits)?;
-    let (store, descriptor) = crate::ferrostore::recovery::decode_existing(&held.file, limits)?;
+    let (store, descriptor) = decode(&held.file, limits)?;
     let actual =
         crate::ferrostore::recovery::expectations_from_reader(&store, descriptor, profile, limits)?;
     compare(expected, &actual, limits)?;
@@ -74,8 +132,7 @@ pub fn verify_existing_copy(
     if held.identity() != reopened.identity() {
         return Err(limits.verification());
     }
-    let (reader, descriptor) =
-        crate::ferrostore::recovery::decode_existing(&reopened.file, limits)?;
+    let (reader, descriptor) = decode(&reopened.file, limits)?;
     let second = crate::ferrostore::recovery::expectations_from_reader(
         &reader, descriptor, profile, limits,
     )?;
@@ -122,13 +179,25 @@ pub fn verify_existing_copy(
         verifier_build_identity: super::manifest::BuildIdentity::current(),
     })
 }
+fn require_validation_format(
+    expected: &ValidationExpectations,
+    l: &OperationLimits,
+) -> Result<(), RecoveryError> {
+    if expected.version != super::manifest::VALIDATION_FORMAT_VERSION {
+        return Err(RecoveryError::Unsupported {
+            operation_id: l.operation_id,
+            reason: "validation metadata format 2 required; V1 refused without migration",
+        });
+    }
+    Ok(())
+}
 pub(crate) fn compare(
     a: &ValidationExpectations,
     b: &ValidationExpectations,
     l: &OperationLimits,
 ) -> Result<(), RecoveryError> {
     l.check()?;
-    if a.version != 1
+    if a.version != super::manifest::VALIDATION_FORMAT_VERSION
         || a.version != b.version
         || a.descriptor != b.descriptor
         || a.catalog_identity != b.catalog_identity
@@ -150,9 +219,9 @@ pub(crate) fn compare(
         if left.len() != right.len()
             || left.iter().zip(right).any(|((a, x), (b, y))| {
                 a != b
-                    || !x.is_finite()
-                    || !y.is_finite()
-                    || (x - y).abs() > super::profiles::VECTOR_SCORE_TOLERANCE_V1
+                    || !x.value().is_finite()
+                    || !y.value().is_finite()
+                    || (x.value() - y.value()).abs() > super::profiles::VECTOR_SCORE_TOLERANCE_V1
             })
         {
             return Err(l.verification());
@@ -167,6 +236,7 @@ pub fn copy_and_verify(
     profile: &ValidationProfile,
     limits: &OperationLimits,
 ) -> Result<VerificationReport, RecoveryError> {
+    require_validation_format(expected, limits)?;
     limits.quota(65536, limits.memory_byte_limit, "copy working memory")?;
     let source = PrivateFile::open(image, false, limits)?;
     let before = hash_file(&source.file, limits)?;
@@ -478,7 +548,7 @@ pub(crate) fn privacy(
     Ok(())
 }
 pub(crate) fn hash_file(file: &File, l: &OperationLimits) -> Result<(u64, String), RecoveryError> {
-    l.quota(65536, l.memory_byte_limit, "hash working memory")?;
+    l.admit_memory(65536)?;
     let len = file.metadata().map_err(|_| l.verification())?.len();
     l.quota(len, l.byte_limit, "image bytes")?;
     let mut hash = Sha256::new();
@@ -648,6 +718,26 @@ pub(crate) fn profile_digest(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn streamed_hash_admits_its_buffer_alongside_retained_models() {
+        let file = tempfile::tempfile().unwrap();
+        file.set_len(8 << 20).unwrap();
+        let l = limits();
+        let retained = l.with_retained_memory(123456).unwrap();
+        assert_eq!(hash_file(&file, &retained).unwrap().0, 8 << 20);
+        assert_eq!(l.admitted_memory_bytes(), 123456 + 65536);
+
+        let mut tight = limits();
+        tight.memory_byte_limit = 123456 + 65536 - 1;
+        let retained = tight.with_retained_memory(123456).unwrap();
+        assert!(matches!(
+            hash_file(&file, &retained),
+            Err(RecoveryError::Quota {
+                resource: "working memory",
+                ..
+            })
+        ));
+    }
     fn limits() -> OperationLimits {
         OperationLimits::new(
             std::time::Instant::now() + std::time::Duration::from_secs(10),

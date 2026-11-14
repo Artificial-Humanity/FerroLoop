@@ -208,6 +208,19 @@ fn is_composer_occupied_error(error: &str) -> bool {
     fl_wire::is_composer_occupied_zero_keys_error(error)
 }
 
+/// Hold reason stored on a queue item for a zero-keys wire hold (#545-3): exactly
+/// `composer_occupied`, `composer_unlocated`, or `session_busy`. A generic zero-keys
+/// hold (including the legacy generic text) is an occupied composer.
+fn composer_hold_reason(error: &str) -> &'static str {
+    if error.contains("composer_unlocated") {
+        "composer_unlocated"
+    } else if error.contains("session_busy") {
+        "session_busy"
+    } else {
+        "composer_occupied"
+    }
+}
+
 #[derive(Debug, Default)]
 struct PromptQueueState {
     queues: BTreeMap<String, Vec<QueuedOperatorPrompt>>,
@@ -973,8 +986,8 @@ impl HubState {
                 Err(fl_wire::dispatcher::PushError::Failed(error)) => {
                     if is_composer_occupied_error(&error) {
                         queue[pos].delivery_state = QueuedDeliveryState::Pending;
+                        queue[pos].hold_reason = Some(composer_hold_reason(&error).to_string());
                         queue[pos].delivery_error = Some(error);
-                        queue[pos].hold_reason = Some("composer_occupied_zero_keys".to_string());
                         queue[pos].retries_exhausted = false;
                     } else {
                         queue[pos].delivery_state = QueuedDeliveryState::Unconfirmed;

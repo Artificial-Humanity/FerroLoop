@@ -113,6 +113,21 @@ describe("DiffViewer", () => {
 });
 
 describe("GitPrPane", () => {
+  it("keeps the icon controls and phone select in sync when switching views", () => {
+    render(<GitPrPane worktrees={SAMPLE_WORKTREES} prs={SAMPLE_PRS} />);
+    const worktrees = screen.getByRole("button", { name: "Worktrees & Diffs (2)" });
+    const prs = screen.getByRole("button", { name: "Pull Requests & Governance (2)" });
+    const select = screen.getByTestId("git-subview-select");
+    expect(worktrees).toHaveAttribute("aria-pressed", "true");
+    expect(prs).toHaveAttribute("aria-pressed", "false");
+    fireEvent.click(prs);
+    expect(prs).toHaveAttribute("aria-pressed", "true");
+    expect(select).toHaveValue("prs");
+    expect(screen.getByTestId("git-pane-title")).toHaveTextContent("Pull Requests & Governance");
+    fireEvent.change(select, { target: { value: "worktrees" } });
+    expect(worktrees).toHaveAttribute("aria-pressed", "true");
+    expect(screen.getByTestId("git-pane-title")).toHaveTextContent("Worktrees & Diffs");
+  });
   it("renders WorktreeSummary list, selects a worktree, and filters diff by modified file", () => {
     const onSelectWorktree = vi.fn();
     const onRefreshWorktrees = vi.fn();
