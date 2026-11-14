@@ -1,3 +1,6 @@
+#[allow(dead_code)]
+mod common;
+
 use assert_cmd::Command;
 use predicates::prelude::PredicateBooleanExt;
 use predicates::str::contains;
@@ -52,6 +55,15 @@ impl Env {
             .current_dir(cwd);
         c
     }
+    fn isolated_fl(&self, cwd: &Path) -> Command {
+        let mut c = Command::from_std(common::isolated_fl(self.config.path()).unwrap());
+        c.env("XDG_CONFIG_HOME", self.config.path())
+            .env("XDG_DATA_HOME", self.data.path())
+            .env("FL_STORE_BACKEND", "redb")
+            .env_remove("FL_DB")
+            .current_dir(cwd);
+        c
+    }
     fn default_store(&self) -> PathBuf {
         self.data.path().join("fl").join("fl.redb")
     }
@@ -76,13 +88,13 @@ const STRANGER: &str = "urn:uuid:0190a1b2-c3d4-7e5f-8a6b-7c8d9e0f1a2b";
 #[test]
 fn a_project_bound_in_config_uses_its_store_from_a_subdirectory() {
     let env = Env::new();
-    let repo = git_repo();
+    let repo = tempfile::tempdir().unwrap();
     let stores = tempfile::tempdir().unwrap();
     let a = stores.path().join("a.redb");
     env.write_config(&bind(repo.path(), &a));
     let sub = repo.path().join("sub");
     std::fs::create_dir(&sub).unwrap();
-    env.fl(&sub)
+    env.isolated_fl(&sub)
         .args(["project", "add", repo.path().to_str().unwrap()])
         .assert()
         .success();
@@ -98,14 +110,17 @@ fn a_project_bound_in_config_uses_its_store_from_a_subdirectory() {
 #[test]
 fn a_symlinked_working_directory_binds_like_the_real_one() {
     let env = Env::new();
-    let repo = git_repo();
+    let repo = tempfile::tempdir().unwrap();
     let stores = tempfile::tempdir().unwrap();
     let a = stores.path().join("a.redb");
     env.write_config(&bind(repo.path(), &a));
     let links = tempfile::tempdir().unwrap();
     let link = links.path().join("via-link");
     std::os::unix::fs::symlink(repo.path(), &link).unwrap();
-    env.fl(&link).args(["project", "list"]).assert().success();
+    env.isolated_fl(&link)
+        .args(["project", "list"])
+        .assert()
+        .success();
     assert!(a.exists(), "a symlinked cwd did not bind");
     assert!(!env.default_store().exists());
 }
@@ -113,14 +128,14 @@ fn a_symlinked_working_directory_binds_like_the_real_one() {
 #[test]
 fn precedence_is_db_then_env_then_config_then_default() {
     let env = Env::new();
-    let repo = git_repo();
+    let repo = tempfile::tempdir().unwrap();
     let stores = tempfile::tempdir().unwrap();
     let flag = stores.path().join("flag.redb");
     let var = stores.path().join("env.redb");
     let cfg = stores.path().join("cfg.redb");
     env.write_config(&bind(repo.path(), &cfg));
 
-    env.fl(repo.path())
+    env.isolated_fl(repo.path())
         .env("FL_DB", &var)
         .args(["--db", flag.to_str().unwrap(), "project", "list"])
         .assert()
@@ -130,7 +145,7 @@ fn precedence_is_db_then_env_then_config_then_default() {
         "--db did not win"
     );
 
-    env.fl(repo.path())
+    env.isolated_fl(repo.path())
         .env("FL_DB", &var)
         .args(["project", "list"])
         .assert()
@@ -140,7 +155,7 @@ fn precedence_is_db_then_env_then_config_then_default() {
         "$FL_DB did not beat the config"
     );
 
-    env.fl(repo.path())
+    env.isolated_fl(repo.path())
         .args(["project", "list"])
         .assert()
         .success();
@@ -150,7 +165,7 @@ fn precedence_is_db_then_env_then_config_then_default() {
     );
 
     let elsewhere = tempfile::tempdir().unwrap();
-    env.fl(elsewhere.path())
+    env.isolated_fl(elsewhere.path())
         .args(["project", "list"])
         .assert()
         .success();
