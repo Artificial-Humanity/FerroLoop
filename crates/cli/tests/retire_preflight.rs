@@ -24,6 +24,9 @@ enum Invocation {
     WireSend,
     LegacySend,
     LegacyExecutableSend,
+    WireRead,
+    LegacyRead,
+    LegacyExecutableRead,
 }
 
 fn run_refused_command(root: &Path, outside_socket: &Path, db: &Path, invocation: Invocation) {
@@ -32,6 +35,7 @@ fn run_refused_command(root: &Path, outside_socket: &Path, db: &Path, invocation
         Invocation::LegacyExecutable
             | Invocation::LegacyExecutableRegister
             | Invocation::LegacyExecutableSend
+            | Invocation::LegacyExecutableRead
     ) {
         let alias = root.join("agent-msg");
         if !alias.exists() {
@@ -55,6 +59,9 @@ fn run_refused_command(root: &Path, outside_socket: &Path, db: &Path, invocation
             | Invocation::WireSend
             | Invocation::LegacySend
             | Invocation::LegacyExecutableSend
+            | Invocation::WireRead
+            | Invocation::LegacyRead
+            | Invocation::LegacyExecutableRead
     ) {
         // Exercise the hydration and route-capture entry path; refusal must
         // happen before either can open a store or touch a route.
@@ -162,6 +169,15 @@ fn run_refused_command(root: &Path, outside_socket: &Path, db: &Path, invocation
                 "body",
             ]);
         }
+        Invocation::WireRead => {
+            command.args(["--db", db.to_str().unwrap(), "wire", "read", "--ack"]);
+        }
+        Invocation::LegacyRead => {
+            command.args(["agent-msg", "--db", db.to_str().unwrap(), "read", "--ack"]);
+        }
+        Invocation::LegacyExecutableRead => {
+            command.args(["--db", db.to_str().unwrap(), "read", "--ack"]);
+        }
     }
     let output = command.output().unwrap();
     assert!(!output.status.success(), "command unexpectedly succeeded");
@@ -217,6 +233,51 @@ fn legacy_send_refuses_before_store_or_route_mutation() {
 #[test]
 fn legacy_executable_send_refuses_before_store_or_route_mutation() {
     assert_outside_socket_refusal(Invocation::LegacyExecutableSend);
+}
+
+#[test]
+fn wire_read_refuses_before_store_or_route_mutation() {
+    assert_outside_socket_refusal(Invocation::WireRead);
+}
+
+#[test]
+fn legacy_read_refuses_before_store_or_route_mutation() {
+    assert_outside_socket_refusal(Invocation::LegacyRead);
+}
+
+#[test]
+fn legacy_executable_read_refuses_before_store_or_route_mutation() {
+    assert_outside_socket_refusal(Invocation::LegacyExecutableRead);
+}
+
+#[test]
+fn wire_read_private_offline_socket_uses_store_normally() {
+    let root = tempfile::tempdir().unwrap();
+    let db = root.path().join("offline.redb");
+    let output = common::isolated_fl(root.path())
+        .unwrap()
+        .current_dir(root.path())
+        .env("FL_TEST_ISOLATION_ROOT", root.path())
+        .env("FL_WIRE_SOCKET", root.path().join("missing.sock"))
+        .args([
+            "--db",
+            db.to_str().unwrap(),
+            "wire",
+            "read",
+            "--for",
+            "felicia",
+            "--ack",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result, serde_json::json!([]));
 }
 
 #[test]

@@ -1472,8 +1472,17 @@ pub fn execute_read(
     ack: bool,
 ) -> Result<Vec<WireInboxItem>, String> {
     let sock = resolve_socket_path(env, None);
+    execute_read_at(env, filter, ack, &sock)
+}
+
+fn execute_read_at(
+    env: &StateEnv<'_>,
+    filter: WireFilter,
+    ack: bool,
+    sock: &Path,
+) -> Result<Vec<WireInboxItem>, String> {
     if let Some(mut client) =
-        classify_local_connection(LocalClient::connect(&sock, DEFAULT_LOCAL_RPC_TIMEOUT))?
+        classify_local_connection(LocalClient::connect(sock, DEFAULT_LOCAL_RPC_TIMEOUT))?
     {
         match client.request(&LocalRequest::Read { filter, ack })? {
             LocalResponse::Inbox { items } => return Ok(items),
@@ -1863,13 +1872,20 @@ pub fn run(env: &StateEnv<'_>, cmd: WireCmd) -> Result<i32, (i32, String)> {
             for_agent,
             json,
         } => {
-            let recipient = resolve_caller(env, for_agent.as_deref(), None);
+            // Keep this endpoint through caller capture and read; reject it
+            // before caller discovery can open a store or update a route.
+            let sock = resolve_socket_path(env, None);
+            let fixture_root = std::env::var_os("FL_TEST_ISOLATION_ROOT").map(PathBuf::from);
+            fl_fixture_path::check_endpoint(fixture_root.as_deref(), &sock)
+                .map_err(|error| (1, error.to_string()))?;
+            let recipient = resolve_caller_at(env, for_agent.as_deref(), None, &sock)
+                .map_err(|error| (1, error))?;
             let thread_id = thread
                 .as_deref()
                 .map(parse_message_id)
                 .transpose()
                 .map_err(|e| (1, e))?;
-            let items = execute_read(
+            let items = execute_read_at(
                 env,
                 WireFilter {
                     recipient: Some(recipient),
@@ -1879,6 +1895,7 @@ pub fn run(env: &StateEnv<'_>, cmd: WireCmd) -> Result<i32, (i32, String)> {
                     limit: None,
                 },
                 ack,
+                &sock,
             )
             .map_err(|e| (1, e))?;
             print_inbox_items(&items, json);
