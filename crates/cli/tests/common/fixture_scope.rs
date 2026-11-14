@@ -52,6 +52,7 @@ pub struct FixtureScopeBuilder {
     files: Vec<File>,
     identities: Vec<FixtureIdentity>,
     version: u32,
+    poisoned: bool,
     root: TempDir,
 }
 
@@ -167,6 +168,7 @@ impl FixtureScopeBuilder {
             files: Vec::new(),
             identities: Vec::new(),
             version: 1,
+            poisoned: false,
             root: tempfile::tempdir()?,
         })
     }
@@ -430,9 +432,186 @@ impl FixtureScopeBuilder {
         Ok((store, sibling))
     }
 
+    /// Provision the fixed wire-prune Redb fixture. This is not a child runner
+    /// or permission to use the fixture at a runtime I/O boundary.
+    #[cfg(unix)]
+    pub fn v2_wire_prune_redb(&mut self) -> io::Result<PathBuf> {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        if self.poisoned {
+            return Err(io::Error::other("fixture builder is poisoned"));
+        }
+        if self.version != 2 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "v2 not selected",
+            ));
+        }
+        let store = self.path("wire-prune.redb")?;
+        let sibling = self.path("wire-prune.fls")?;
+        let root = self.root.path().canonicalize()?;
+        for identity in &self.identities {
+            let mut paths = Vec::new();
+            if let Some(path) = identity_path(identity) {
+                paths.push(path);
+            }
+            if let FixtureIdentity::RedbSiblingMetadata { redb_path, .. } = identity {
+                paths.push(redb_path);
+            }
+            for path in paths {
+                let parent = path.parent().ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "registered resource has no parent",
+                    )
+                })?;
+                let parent = parent.canonicalize().map_err(|e| {
+                    io::Error::new(e.kind(), format!("preflight registered parent: {e}"))
+                })?;
+                if !parent.starts_with(&root) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "registered parent is outside the fixture root",
+                    ));
+                }
+                match std::fs::symlink_metadata(path) {
+                    Ok(metadata) if metadata.file_type().is_symlink() => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::PermissionDenied,
+                            "registered resource is a symlink",
+                        ));
+                    }
+                    Ok(_) => {}
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                    Err(e) => {
+                        return Err(io::Error::new(
+                            e.kind(),
+                            format!("preflight registered resource: {e}"),
+                        ));
+                    }
+                }
+                let name = path.file_name().and_then(OsStr::to_str).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "unprovable resource name")
+                })?;
+                if parent == root
+                    && (name.eq_ignore_ascii_case("wire-prune.redb")
+                        || name.eq_ignore_ascii_case("wire-prune.fls"))
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::AlreadyExists,
+                        "fixture path conflicts with a declared resource",
+                    ));
+                }
+            }
+        }
+        // Treat portable case aliases as collisions even on a case-sensitive host.
+        for entry in std::fs::read_dir(&root)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let name = name.to_str().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "unprovable fixture directory entry",
+                )
+            })?;
+            if name.eq_ignore_ascii_case("wire-prune.redb")
+                || name.eq_ignore_ascii_case("wire-prune.fls")
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "fixture path already exists",
+                ));
+            }
+        }
+        require_absent(&store)?;
+        require_absent(&sibling)?;
+
+        // From the instant exclusive creation is attempted, every error is
+        // terminal for this builder, and private writes may have occurred.
+        self.poisoned = true;
+        let result = (|| {
+            let file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&store)
+                .map_err(|e| {
+                    io::Error::new(
+                        e.kind(),
+                        format!("exclusive Redb creation (private writes may have occurred): {e}"),
+                    )
+                })?;
+            drop(file);
+            let database = fl_store::RedbStore::open_with_retries(&store, 0).map_err(|e| {
+                io::Error::other(format!(
+                    "Redb initialization (private writes may have occurred): {e}"
+                ))
+            })?;
+            drop(database);
+            let metadata = std::fs::symlink_metadata(&store).map_err(|e| {
+                io::Error::new(
+                    e.kind(),
+                    format!("post-initialization store check (private writes occurred): {e}"),
+                )
+            })?;
+            let canonical = store.canonicalize().map_err(|e| {
+                io::Error::new(
+                    e.kind(),
+                    format!("post-initialization canonicalization (private writes occurred): {e}"),
+                )
+            })?;
+            if !metadata.file_type().is_file() || canonical.parent() != Some(root.as_path()) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "post-initialization store is not a contained regular file; private writes occurred",
+                ));
+            }
+            require_absent(&sibling).map_err(|e| {
+                io::Error::new(
+                    e.kind(),
+                    format!("post-initialization sibling check (private writes occurred): {e}"),
+                )
+            })?;
+            Ok(())
+        })();
+        result?;
+        let grant = MetadataGrant {
+            allowed: true,
+            allow_not_found: true,
+        };
+        self.identities.extend([
+            FixtureIdentity::Store {
+                backend: StoreBackend::Redb,
+                path: store.clone(),
+                access: PathAccess::Existing,
+            },
+            FixtureIdentity::RedbSiblingMetadata {
+                redb_path: store.clone(),
+                path: sibling,
+                no_follow: grant.clone(),
+                follow: grant,
+            },
+        ]);
+        self.poisoned = false;
+        Ok(store)
+    }
+
+    #[cfg(not(unix))]
+    pub fn v2_wire_prune_redb(&mut self) -> io::Result<PathBuf> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "Redb fixture provisioning is unsupported on this platform",
+        ))
+    }
+
     /// Write a manifest once and validate it with the same strict loader used by
     /// the eventual child. Builder consumption prevents further registrations.
     pub fn finish(self) -> io::Result<FixtureScope> {
+        if self.poisoned {
+            return Err(io::Error::other(
+                "fixture builder is poisoned; private writes may have occurred",
+            ));
+        }
         let manifest = self.root.path().join("manifest.json");
         let bytes = serde_json::to_vec(
             &serde_json::json!({ "version": self.version, "identities": self.identities }),
@@ -800,6 +979,116 @@ mod tests {
         let owner = Arc::clone(&scope);
         drop(scope);
         assert!(config.exists() && store.exists());
+        drop(owner);
+        assert!(!root.exists());
+    }
+
+    // These tests never pass preflight and cannot reach Redb initialization.
+    #[cfg(unix)]
+    #[test]
+    fn prune_redb_negative_refuses_version_collisions_and_existing_paths() {
+        let mut builder = FixtureScopeBuilder::new().unwrap();
+        let root = builder.root.path().to_path_buf();
+        assert!(builder.v2_wire_prune_redb().is_err());
+        assert!(!builder.poisoned);
+        builder.enable_operations_v2();
+        builder
+            .creation_target("WIRE-PRUNE.REDB", CreationTarget::Route)
+            .unwrap();
+        assert!(builder.v2_wire_prune_redb().is_err());
+        assert!(!builder.poisoned);
+        assert!(!root.join("wire-prune.redb").exists());
+
+        let mut builder = FixtureScopeBuilder::new().unwrap();
+        builder.enable_operations_v2();
+        let root = builder.root.path().to_path_buf();
+        builder
+            .creation_target("wire-prune.fls", CreationTarget::Route)
+            .unwrap();
+        assert!(builder.v2_wire_prune_redb().is_err());
+        assert!(!builder.poisoned);
+        assert!(!root.join("wire-prune.redb").exists());
+
+        for name in [
+            "wire-prune.redb",
+            "wire-prune.fls",
+            "WIRE-PRUNE.REDB",
+            "WIRE-PRUNE.FLS",
+        ] {
+            let mut builder = FixtureScopeBuilder::new().unwrap();
+            builder.enable_operations_v2();
+            let root = builder.root.path().to_path_buf();
+            std::fs::write(root.join(name), b"unchanged").unwrap();
+            assert!(builder.v2_wire_prune_redb().is_err());
+            assert!(!builder.poisoned);
+            assert_eq!(std::fs::read(root.join(name)).unwrap(), b"unchanged");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prune_redb_negative_refuses_dangling_links_without_touching_them() {
+        use std::os::unix::fs::symlink;
+        for name in ["wire-prune.redb", "wire-prune.fls"] {
+            let mut builder = FixtureScopeBuilder::new().unwrap();
+            builder.enable_operations_v2();
+            let root = builder.root.path().to_path_buf();
+            symlink(root.join("absent"), root.join(name)).unwrap();
+            assert!(builder.v2_wire_prune_redb().is_err());
+            assert!(!builder.poisoned);
+            assert!(
+                std::fs::symlink_metadata(root.join(name))
+                    .unwrap()
+                    .file_type()
+                    .is_symlink()
+            );
+            if name.ends_with("fls") {
+                assert!(!root.join("wire-prune.redb").exists());
+            }
+        }
+    }
+
+    #[test]
+    fn prune_redb_negative_poison_refuses_finish_before_manifest_io() {
+        let mut builder = FixtureScopeBuilder::new().unwrap();
+        let root = builder.root.path().to_path_buf();
+        builder.poisoned = true;
+        // An existing manifest would otherwise produce AlreadyExists. The
+        // poison must take precedence without reading or writing the manifest.
+        std::fs::write(root.join("manifest.json"), b"unchanged").unwrap();
+        let err = match builder.finish() {
+            Ok(_) => panic!("poisoned builder finished"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("poisoned"));
+    }
+
+    // Positive store initialization and reopen are CI-only, pending a separate
+    // execution ruling. No ordinary test invokes this initializer.
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "positive private Redb initialization requires separate CI approval"]
+    fn prune_redb_positive_initialized_reopens_and_cleans_up_ci_only() {
+        let mut builder = FixtureScopeBuilder::new().unwrap();
+        builder.enable_operations_v2();
+        let root = builder.root.path().to_path_buf();
+        let path = builder.v2_wire_prune_redb().unwrap();
+        let scope = Arc::new(builder.finish().unwrap());
+        let reopened = fl_store::RedbStore::open_with_retries(&path, 0).unwrap();
+        drop(reopened);
+        assert!(
+            scope
+                .context()
+                .check(&FixtureIdentity::Store {
+                    backend: StoreBackend::Redb,
+                    path: path.clone(),
+                    access: PathAccess::Existing,
+                })
+                .is_ok()
+        );
+        let owner = Arc::clone(&scope);
+        drop(scope);
+        assert!(path.exists());
         drop(owner);
         assert!(!root.exists());
     }
