@@ -50,6 +50,18 @@ impl Env {
         c
     }
 
+    fn isolated_ferro(&self) -> Command {
+        let mut c = self.isolated_fl();
+        c.env("FL_STORE_BACKEND", "ferro");
+        c
+    }
+
+    fn isolated_redb(&self) -> Command {
+        let mut c = self.isolated_fl();
+        c.env("FL_STORE_BACKEND", "redb");
+        c
+    }
+
     fn ferro(&self) -> Command {
         let mut c = self.fl();
         c.env("FL_STORE_BACKEND", "ferro");
@@ -227,7 +239,7 @@ fn status_refuses_an_unknown_engine() {
 #[test]
 fn checkpoint_on_redb_does_nothing_and_succeeds() {
     let env = Env::new();
-    env.redb()
+    env.isolated_redb()
         .arg("--db")
         .arg(env.logical())
         .args(["store", "checkpoint"])
@@ -254,7 +266,7 @@ fn checkpoint_on_ferro_checkpoints_an_existing_store() {
 #[test]
 fn checkpoint_on_ferro_does_not_create_a_missing_store() {
     let env = Env::new();
-    env.ferro()
+    env.isolated_ferro()
         .arg("--db")
         .arg(env.logical())
         .args(["store", "checkpoint"])
@@ -476,7 +488,7 @@ fn compact_on_redb_says_it_is_fls_only_and_touches_nothing() {
     let env = Env::new();
     open_with(&env.logical(), BackendKind::Redb);
     let bytes = std::fs::read(env.logical()).unwrap();
-    env.redb()
+    env.isolated_redb()
         .arg("--db")
         .arg(env.logical())
         .args(["store", "compact"])
@@ -486,7 +498,7 @@ fn compact_on_redb_says_it_is_fls_only_and_touches_nothing() {
             "compaction applies to the FerroStore (.fls) engine only",
         ));
     let out = env
-        .redb()
+        .isolated_redb()
         .arg("--db")
         .arg(env.logical())
         .args(["store", "compact", "--json"])
