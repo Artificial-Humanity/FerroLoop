@@ -5,6 +5,10 @@
 //! replacement or other time-of-check/time-of-use races. Callers must invoke
 //! it immediately before the operation they intend to guard.
 
+mod context;
+
+pub use context::{FixtureContext, FixtureIdentity, PathAccess, StoreBackend};
+
 use std::io;
 use std::path::{Component, Path, PathBuf};
 
