@@ -3,6 +3,9 @@
 //! install, the exit codes, the crash and resume paths (through the test-only fault seam),
 //! concurrency, and that `fl doctor` agrees with what was installed.
 
+#[allow(dead_code)]
+mod common;
+
 use assert_cmd::Command;
 use fl_core::install::ReleaseManifest;
 use fl_install::fixture;
@@ -94,13 +97,15 @@ impl World {
         self.prefix().join("bin")
     }
 
-    /// `fl` with a scrubbed environment.
-    fn fl(&self) -> Command {
-        let mut c = Command::cargo_bin("fl").unwrap();
-        c.env_clear()
-            .env("HOME", self.home.path())
-            .current_dir(self.cwd.path());
+    /// `fl` with a private environment, shared by all installer children.
+    fn fl_command(&self) -> std::process::Command {
+        let mut c = common::isolated_fl(self.home.path()).unwrap();
+        c.current_dir(self.cwd.path());
         c
+    }
+
+    fn fl(&self) -> Command {
+        Command::from_std(self.fl_command())
     }
 
     /// A release in the artifact dir, and its manifest file.
@@ -678,10 +683,30 @@ fn wait_all(mut procs: Vec<Proc>, limit: std::time::Duration) -> Vec<Out> {
 }
 
 #[test]
+fn install_commands_use_private_runtime_environment() {
+    let w = World::new();
+    let command = w.fl_command();
+    let get = |name: &str| {
+        command
+            .get_envs()
+            .find(|(key, _)| *key == name)
+            .and_then(|(_, value)| value)
+    };
+    assert_eq!(get("HOME"), Some(w.home.path().as_os_str()));
+    assert_eq!(get("XDG_RUNTIME_DIR"), Some(w.home.path().as_os_str()));
+    assert_eq!(get("PATH"), Some(w.home.path().join("no-bin").as_os_str()));
+    assert_eq!(
+        get("FL_WIRE_SOCKET"),
+        Some(w.home.path().join("w").as_os_str())
+    );
+    assert_eq!(get("FL_DB"), Some(w.home.path().join("fl.fls").as_os_str()));
+    assert_eq!(command.get_current_dir(), Some(w.cwd.path()));
+}
+
+#[test]
 fn many_processes_installing_at_once_never_corrupt_the_install() {
     let w = World::new();
     let (_, man) = w.release("0.1.0", "a");
-    let bin = assert_cmd::cargo::cargo_bin("fl");
     // Every installer waits for the lock far longer than a loaded machine needs, and the whole
     // batch has a deadline: a hang fails with what each child had written, it does not stall.
     let batch = |mans: Vec<&Path>| -> Vec<Out> {
@@ -689,11 +714,8 @@ fn many_processes_installing_at_once_never_corrupt_the_install() {
             .iter()
             .enumerate()
             .map(|(i, man)| {
-                let mut c = std::process::Command::new(&bin);
-                c.env_clear()
-                    .env("HOME", w.home.path())
-                    .current_dir(w.cwd.path())
-                    .args(["install", "--yes", "--profile", "headless"])
+                let mut c = w.fl_command();
+                c.args(["install", "--yes", "--profile", "headless"])
                     .args(["--lock-timeout", "600", "--prefix"])
                     .arg(w.prefix())
                     .arg("--manifest")
@@ -806,11 +828,8 @@ fn directories_get_their_modes_whatever_the_umask() {
             std::fs::create_dir_all(w.bin()).unwrap();
             std::fs::write(w.bin().join("fl"), "mine").unwrap();
         }
-        let mut c = std::process::Command::new(assert_cmd::cargo::cargo_bin("fl"));
-        c.env_clear()
-            .env("HOME", w.home.path())
-            .current_dir(w.cwd.path())
-            .args(["install", "--yes", "--profile", "headless", "--prefix"])
+        let mut c = w.fl_command();
+        c.args(["install", "--yes", "--profile", "headless", "--prefix"])
             .arg(w.prefix())
             .arg("--manifest")
             .arg(&man)
