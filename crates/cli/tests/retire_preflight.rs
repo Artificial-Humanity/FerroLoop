@@ -23,6 +23,14 @@ enum Invocation {
     LegacyRegister,
     LegacyExecutableRegister,
     WireSend,
+    WireBroadcast,
+    WireBroadcastNoDaemon,
+    LegacyBroadcast,
+    LegacyExecutableBroadcast,
+    WireAsk,
+    WireAskNoDaemon,
+    WireReply,
+    WireReplyNoDaemon,
     LegacySend,
     LegacyExecutableSend,
     WireRead,
@@ -51,6 +59,7 @@ fn run_refused_command(root: &Path, outside_socket: &Path, db: &Path, invocation
         Invocation::LegacyExecutable
             | Invocation::LegacyExecutableRegister
             | Invocation::LegacyExecutableSend
+            | Invocation::LegacyExecutableBroadcast
             | Invocation::LegacyExecutableRead
             | Invocation::LegacyExecutableAck
             | Invocation::LegacyExecutableWait
@@ -76,6 +85,14 @@ fn run_refused_command(root: &Path, outside_socket: &Path, db: &Path, invocation
             | Invocation::LegacyRegister
             | Invocation::LegacyExecutableRegister
             | Invocation::WireSend
+            | Invocation::WireBroadcast
+            | Invocation::WireBroadcastNoDaemon
+            | Invocation::LegacyBroadcast
+            | Invocation::LegacyExecutableBroadcast
+            | Invocation::WireAsk
+            | Invocation::WireAskNoDaemon
+            | Invocation::WireReply
+            | Invocation::WireReplyNoDaemon
             | Invocation::LegacySend
             | Invocation::LegacyExecutableSend
             | Invocation::WireRead
@@ -180,6 +197,61 @@ fn run_refused_command(root: &Path, outside_socket: &Path, db: &Path, invocation
                 "subject",
                 "body",
             ]);
+        }
+        Invocation::WireBroadcast | Invocation::WireBroadcastNoDaemon => {
+            command.args([
+                "--db",
+                db.to_str().unwrap(),
+                "wire",
+                "broadcast",
+                "subject",
+                "body",
+            ]);
+            if matches!(invocation, Invocation::WireBroadcastNoDaemon) {
+                command.arg("--no-daemon");
+            }
+        }
+        Invocation::LegacyBroadcast => {
+            command.args([
+                "agent-msg",
+                "--db",
+                db.to_str().unwrap(),
+                "broadcast",
+                "subject",
+                "body",
+            ]);
+        }
+        Invocation::LegacyExecutableBroadcast => {
+            command.args(["--db", db.to_str().unwrap(), "broadcast", "subject", "body"]);
+        }
+        Invocation::WireAsk | Invocation::WireAskNoDaemon => {
+            command.args([
+                "--db",
+                db.to_str().unwrap(),
+                "wire",
+                "ask",
+                "felicia",
+                "subject",
+                "body",
+                "--timeout",
+                "1",
+            ]);
+            if matches!(invocation, Invocation::WireAskNoDaemon) {
+                command.arg("--no-daemon");
+            }
+        }
+        Invocation::WireReply | Invocation::WireReplyNoDaemon => {
+            command.args([
+                "--db",
+                db.to_str().unwrap(),
+                "wire",
+                "reply",
+                "01a1db00-5252-7726-bef6-1d442d8e2d39",
+                "body",
+            ]);
+            if matches!(invocation, Invocation::WireReplyNoDaemon) {
+                command.arg("--no-daemon");
+            }
         }
         Invocation::LegacySend => {
             command.args([
@@ -376,6 +448,54 @@ fn legacy_executable_register_refuses_before_store_or_route_mutation() {
 #[test]
 fn wire_send_refuses_before_store_or_route_mutation() {
     assert_outside_socket_refusal(Invocation::WireSend);
+}
+
+#[test]
+fn messaging_commands_refuse_before_store_or_route_mutation() {
+    for invocation in [
+        Invocation::WireBroadcast,
+        Invocation::WireBroadcastNoDaemon,
+        Invocation::LegacyBroadcast,
+        Invocation::LegacyExecutableBroadcast,
+        Invocation::WireAsk,
+        Invocation::WireAskNoDaemon,
+        Invocation::WireReply,
+        Invocation::WireReplyNoDaemon,
+    ] {
+        assert_outside_socket_refusal(invocation);
+    }
+}
+
+// CI-only: all processes and the offline endpoint stay under the private root.
+#[test]
+fn messaging_commands_keep_private_offline_behavior() {
+    let root = tempfile::tempdir().unwrap();
+    let db = root.path().join("offline.redb");
+    let run = |args: &[&str]| {
+        let output = common::isolated_fl(root.path())
+            .unwrap()
+            .current_dir(root.path())
+            .env("FL_TEST_ISOLATION_ROOT", root.path())
+            .env("FL_WIRE_SOCKET", root.path().join("missing.sock"))
+            .args(["--db", db.to_str().unwrap(), "wire"])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()
+    };
+    let broadcast = run(&["broadcast", "subject", "body", "--from", "felix", "--json"]);
+    assert_eq!(broadcast["message"]["subject"], "subject");
+    let ask = run(&[
+        "ask", "felicia", "question", "body", "--from", "felix", "--json",
+    ]);
+    let ask_id = ask["message"]["id"].as_str().unwrap();
+    let reply = run(&["reply", ask_id, "answer", "--from", "felicia", "--json"]);
+    assert_eq!(reply["message"]["body"], "answer");
 }
 
 #[test]

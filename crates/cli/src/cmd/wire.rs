@@ -316,16 +316,8 @@ pub fn resolve_routes_path_for(env: &StateEnv<'_>) -> PathBuf {
     )
 }
 
-pub fn resolve_caller(
-    env: &StateEnv<'_>,
-    explicit: Option<&str>,
-    transcript: Option<&Path>,
-) -> String {
-    resolve_caller_with_source(env, explicit, transcript).0
-}
-
-/// [`resolve_caller`] that also reports where the persona came from, so a caller about to
-/// register a route can tell a named persona from one inferred out of the surroundings.
+/// Resolve a caller with its source for legacy compatibility tests.
+#[cfg(test)]
 pub fn resolve_caller_with_source(
     env: &StateEnv<'_>,
     explicit: Option<&str>,
@@ -1582,26 +1574,6 @@ pub(super) fn execute_ack_at(
     Ok(out)
 }
 
-pub fn execute_reply_with_options(
-    env: &StateEnv<'_>,
-    parent_id: &MessageId,
-    subject_override: Option<String>,
-    body: String,
-    sender_name: String,
-    no_daemon: bool,
-) -> Result<(WireMessage, Vec<DeliveryReceipt>), String> {
-    let sock = resolve_socket_path(env, None);
-    execute_reply_with_options_at(
-        env,
-        parent_id,
-        subject_override,
-        body,
-        sender_name,
-        no_daemon,
-        &sock,
-    )
-}
-
 pub(super) fn execute_reply_with_options_at(
     env: &StateEnv<'_>,
     parent_id: &MessageId,
@@ -1653,16 +1625,6 @@ pub(super) fn execute_reply_with_options_at(
         no_daemon,
         sock,
     )
-}
-
-pub fn wait_for_reply(
-    env: &StateEnv<'_>,
-    ask_id: &MessageId,
-    recipient: &str,
-    timeout: Duration,
-) -> Result<Option<WireMessage>, String> {
-    let sock = resolve_socket_path(env, None);
-    wait_for_reply_at(env, ask_id, recipient, timeout, &sock)
 }
 
 pub(super) fn wait_for_reply_at(
@@ -1792,13 +1754,18 @@ pub fn run(env: &StateEnv<'_>, cmd: WireCmd) -> Result<i32, (i32, String)> {
             no_daemon,
             json,
         } => {
-            let sender_name = resolve_caller(env, from.as_deref(), None);
+            let sock = resolve_socket_path(env, None);
+            let fixture_root = std::env::var_os("FL_TEST_ISOLATION_ROOT").map(PathBuf::from);
+            fl_fixture_path::check_endpoint(fixture_root.as_deref(), &sock)
+                .map_err(|error| (1, error.to_string()))?;
+            let sender_name =
+                resolve_caller_at(env, from.as_deref(), None, &sock).map_err(|error| (1, error))?;
             let urgency = if urgent {
                 MessageUrgency::Urgent
             } else {
                 MessageUrgency::Normal
             };
-            let (msg, receipts) = execute_send_with_options(
+            let (msg, receipts) = execute_send_with_options_at(
                 env,
                 SendWireArgs {
                     id: None,
@@ -1817,6 +1784,7 @@ pub fn run(env: &StateEnv<'_>, cmd: WireCmd) -> Result<i32, (i32, String)> {
                     at: now_at(),
                 },
                 no_daemon || wire_no_daemon_env(),
+                &sock,
             )
             .map_err(|e| (1, e))?;
             print_sent(&msg, &receipts, json);
@@ -1832,8 +1800,13 @@ pub fn run(env: &StateEnv<'_>, cmd: WireCmd) -> Result<i32, (i32, String)> {
             no_daemon,
             json,
         } => {
+            let sock = resolve_socket_path(env, None);
+            let fixture_root = std::env::var_os("FL_TEST_ISOLATION_ROOT").map(PathBuf::from);
+            fl_fixture_path::check_endpoint(fixture_root.as_deref(), &sock)
+                .map_err(|error| (1, error.to_string()))?;
             let parsed_to = WireAddress::parse(&to).map_err(|e| (1, e.to_string()))?;
-            let sender_name = resolve_caller(env, from.as_deref(), None);
+            let sender_name =
+                resolve_caller_at(env, from.as_deref(), None, &sock).map_err(|error| (1, error))?;
             let urgency = if urgent {
                 MessageUrgency::Urgent
             } else {
@@ -1842,7 +1815,7 @@ pub fn run(env: &StateEnv<'_>, cmd: WireCmd) -> Result<i32, (i32, String)> {
             let now_ms = now_millis();
             let now = At::from_unix_millis(now_ms);
             let deadline_at = timeout.map(|secs| At::from_unix_millis(now_ms + secs * 1000));
-            let (ask_msg, receipts) = execute_send_with_options(
+            let (ask_msg, receipts) = execute_send_with_options_at(
                 env,
                 SendWireArgs {
                     id: None,
@@ -1861,6 +1834,7 @@ pub fn run(env: &StateEnv<'_>, cmd: WireCmd) -> Result<i32, (i32, String)> {
                     at: now,
                 },
                 no_daemon || wire_no_daemon_env(),
+                &sock,
             )
             .map_err(|e| (1, e))?;
 
@@ -1869,8 +1843,14 @@ pub fn run(env: &StateEnv<'_>, cmd: WireCmd) -> Result<i32, (i32, String)> {
                 return Ok(0);
             };
 
-            match wait_for_reply(env, &ask_msg.id, &sender_name, Duration::from_secs(secs))
-                .map_err(|e| (1, e))?
+            match wait_for_reply_at(
+                env,
+                &ask_msg.id,
+                &sender_name,
+                Duration::from_secs(secs),
+                &sock,
+            )
+            .map_err(|e| (1, e))?
             {
                 Some(reply) => {
                     if json {
@@ -1907,15 +1887,21 @@ pub fn run(env: &StateEnv<'_>, cmd: WireCmd) -> Result<i32, (i32, String)> {
             no_daemon,
             json,
         } => {
+            let sock = resolve_socket_path(env, None);
+            let fixture_root = std::env::var_os("FL_TEST_ISOLATION_ROOT").map(PathBuf::from);
+            fl_fixture_path::check_endpoint(fixture_root.as_deref(), &sock)
+                .map_err(|error| (1, error.to_string()))?;
             let parent_id = parse_message_id(&message_id).map_err(|e| (1, e))?;
-            let sender_name = resolve_caller(env, from.as_deref(), None);
-            let (msg, receipts) = execute_reply_with_options(
+            let sender_name =
+                resolve_caller_at(env, from.as_deref(), None, &sock).map_err(|error| (1, error))?;
+            let (msg, receipts) = execute_reply_with_options_at(
                 env,
                 &parent_id,
                 subject,
                 body,
                 sender_name,
                 no_daemon || wire_no_daemon_env(),
+                &sock,
             )
             .map_err(|e| (1, e))?;
             print_sent(&msg, &receipts, json);
