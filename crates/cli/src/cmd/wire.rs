@@ -388,11 +388,6 @@ fn cli_host_probes_allowed() -> bool {
     host_probes_allowed(None)
 }
 
-fn record_registration_diagnostic(env: &StateEnv<'_>, diagnostic: RouteRegistrationDiagnostic) {
-    let sock = resolve_socket_path(env, None);
-    let _ = record_registration_diagnostic_at(env, diagnostic, &sock);
-}
-
 fn record_registration_diagnostic_at(
     env: &StateEnv<'_>,
     diagnostic: RouteRegistrationDiagnostic,
@@ -586,6 +581,7 @@ fn verify_hosted_session_in_store<S: fl_core::StateStore>(
 }
 
 struct RegistrationGuardArgs<'a, S: fl_core::StateStore> {
+    #[allow(dead_code)] // Used by the legacy guard fixture in unit tests.
     env: &'a StateEnv<'a>,
     store: Option<&'a S>,
     persona: &'a str,
@@ -616,6 +612,7 @@ struct RegistrationGuardRefusal {
     diagnostic: Box<RouteRegistrationDiagnostic>,
 }
 
+#[cfg(test)]
 fn evaluate_registration_guard<S: fl_core::StateStore>(
     args: RegistrationGuardArgs<'_, S>,
 ) -> Result<RegistrationGuardVerdict, RegistrationGuardRefusal> {
@@ -1481,12 +1478,47 @@ fn execute_read_at(
     ack: bool,
     sock: &Path,
 ) -> Result<Vec<WireInboxItem>, String> {
+    execute_read_at_typed(env, filter, ack, sock).map_err(|error| error.to_string())
+}
+
+#[derive(Debug)]
+enum WireReadError {
+    Fixture(std::io::Error),
+    Other(String),
+}
+
+impl std::fmt::Display for WireReadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Fixture(error) => error.fmt(f),
+            Self::Other(error) => error.fmt(f),
+        }
+    }
+}
+
+impl From<String> for WireReadError {
+    fn from(error: String) -> Self {
+        Self::Other(error)
+    }
+}
+
+fn execute_read_at_typed(
+    env: &StateEnv<'_>,
+    filter: WireFilter,
+    ack: bool,
+    sock: &Path,
+) -> Result<Vec<WireInboxItem>, WireReadError> {
     if let Some(mut client) =
-        classify_local_connection(LocalClient::connect(sock, DEFAULT_LOCAL_RPC_TIMEOUT))?
+        classify_local_connection_typed(LocalClient::connect(sock, DEFAULT_LOCAL_RPC_TIMEOUT))
+            .map_err(WireReadError::Fixture)?
     {
         match client.request(&LocalRequest::Read { filter, ack })? {
             LocalResponse::Inbox { items } => return Ok(items),
-            other => return Err(format!("unexpected daemon response: {other:?}")),
+            other => {
+                return Err(WireReadError::Other(format!(
+                    "unexpected daemon response: {other:?}"
+                )));
+            }
         }
     }
     let store = env.open_for_scope(Some(&StateScope::Workspace))?;
@@ -2359,6 +2391,12 @@ fn vendor_hook_response(
         vendor_str.unwrap_or("claude")
     };
     let canonical_hook_vendor = canonical_vendor_id(hook_vendor);
+    // The hook's no-op cases above never contact wire. Once processing a real
+    // event, fence the exact endpoint before opening a store or reading routes.
+    let sock = resolve_socket_path(&hook_env, None);
+    let fixture_root = std::env::var_os("FL_TEST_ISOLATION_ROOT").map(PathBuf::from);
+    fl_fixture_path::check_endpoint(fixture_root.as_deref(), &sock)
+        .map_err(|error| (1, error.to_string()))?;
     let store_opt = hook_env.open_for_scope(Some(&StateScope::Workspace)).ok();
 
     // Codex 0.166 shares one app-server daemon. That process keeps AGENT_PERSONA from
@@ -2498,39 +2536,64 @@ fn vendor_hook_response(
     // A persona inferred from the process tree or conflicting with a live explicit incumbent
     // must not take a route over, send `RegisterRoute` to a pre-#460 daemon, or acknowledge
     // unread mail.
-    let verdict = match evaluate_registration_guard(RegistrationGuardArgs {
-        env: &hook_env,
-        store: store_opt.as_ref(),
-        persona: &persona,
-        challenger_vendor: Some(canonical_hook_vendor),
-        challenger_adapter,
-        challenger_session_identity,
-        challenger_pid,
-        raw_hosted_id: raw_hosted_id.as_deref(),
-        raw_generation: caller_generation.as_deref(),
-        env_persona: env_persona.as_deref(),
-        has_foreign_agy_env,
-        ignore_process_hosted_env: is_codex,
-        replace: false,
-        proc_ctx: CallerProcessContext::Hook {
-            caller_pid: hook_caller_pid,
-            session_id: &session_id,
+    let existing_entry =
+        existing_route_entry_for_at(&hook_env, &persona, &sock).map_err(|error| (1, error))?;
+    let verdict = match evaluate_registration_guard_with_existing(
+        RegistrationGuardArgs {
+            env: &hook_env,
+            store: store_opt.as_ref(),
+            persona: &persona,
+            challenger_vendor: Some(canonical_hook_vendor),
+            challenger_adapter,
+            challenger_session_identity,
+            challenger_pid,
+            raw_hosted_id: raw_hosted_id.as_deref(),
+            raw_generation: caller_generation.as_deref(),
+            env_persona: env_persona.as_deref(),
+            has_foreign_agy_env,
+            ignore_process_hosted_env: is_codex,
+            replace: false,
+            proc_ctx: CallerProcessContext::Hook {
+                caller_pid: hook_caller_pid,
+                session_id: &session_id,
+            },
         },
-    }) {
+        existing_entry,
+    ) {
         Ok(verdict) => verdict,
         Err(refusal) => {
             eprintln!("fl wire: {}", refusal.message);
-            record_registration_diagnostic(&hook_env, *refusal.diagnostic);
+            record_registration_diagnostic_at(&hook_env, *refusal.diagnostic, &sock)
+                .map_err(|error| (1, error))?;
             return Ok(json!({}));
         }
     };
 
-    if let Some(route) = route
-        && !record_caller_route_checked_with_meta(
+    if let Some(route) = route {
+        if !persona_source.is_trusted() {
+            let existing = existing_route_entry_for_at(&hook_env, &persona, &sock)
+                .map_err(|error| (1, error))?
+                .map(|entry| entry.route);
+            if let Err(note) = route_replacement_verdict(
+                &persona,
+                existing.as_ref(),
+                &route,
+                persona_source,
+                &process_exists,
+            ) {
+                eprintln!("{note}");
+                return Ok(json!({}));
+            }
+        }
+        let explicit = matches!(
+            persona_source,
+            PersonaSource::Explicit | PersonaSource::Env | PersonaSource::Transcript
+        );
+        match record_caller_route_with_provenance_meta_at(
             &hook_env,
             &persona,
             route,
-            persona_source,
+            explicit,
             RouteRegistrationMeta {
                 replace: false,
                 hosted_id: verdict.effective_hosted_id.as_deref(),
@@ -2538,12 +2601,18 @@ fn vendor_hook_response(
                 hosted_session_verified: verdict.hosted_session_verified,
                 unverified_process: verdict.unverified_process,
             },
-        )
-    {
-        return Ok(json!({}));
+            &sock,
+        ) {
+            Ok(()) => {}
+            Err(RouteCaptureError::Fixture(error)) => return Err((1, error.to_string())),
+            Err(RouteCaptureError::Other(error)) => {
+                eprintln!("fl wire: could not register route: {error}");
+                return Ok(json!({}));
+            }
+        }
     }
 
-    let items = execute_read(
+    let items = match execute_read_at_typed(
         &hook_env,
         WireFilter {
             recipient: Some(persona.clone()),
@@ -2553,8 +2622,12 @@ fn vendor_hook_response(
             limit: None,
         },
         true,
-    )
-    .unwrap_or_default();
+        &sock,
+    ) {
+        Ok(items) => items,
+        Err(WireReadError::Fixture(error)) => return Err((1, error.to_string())),
+        Err(WireReadError::Other(_)) => Vec::new(),
+    };
 
     if items.is_empty() {
         return Ok(json!({}));

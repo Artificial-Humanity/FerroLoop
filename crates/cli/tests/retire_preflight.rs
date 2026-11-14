@@ -15,6 +15,7 @@ use std::path::Path;
 #[derive(Clone, Copy)]
 enum Invocation {
     Retire,
+    ClaudeHook,
     LegacySubcommand,
     LegacyExecutable,
     WireStatus,
@@ -38,7 +39,14 @@ enum Invocation {
 }
 
 fn run_refused_command(root: &Path, outside_socket: &Path, db: &Path, invocation: Invocation) {
-    let mut command = if matches!(
+    let mut command = if matches!(invocation, Invocation::ClaudeHook) {
+        let alias = root.join("agent-bus-claude-hook");
+        if !alias.exists() {
+            let binary = common::isolated_fl(root).unwrap();
+            symlink(binary.get_program(), &alias).unwrap();
+        }
+        common::isolated_command(alias, root).unwrap()
+    } else if matches!(
         invocation,
         Invocation::LegacyExecutable
             | Invocation::LegacyExecutableRegister
@@ -89,6 +97,12 @@ fn run_refused_command(root: &Path, outside_socket: &Path, db: &Path, invocation
             .env("CLAUDE_SESSION_ID", "fixture-session");
     }
     match invocation {
+        Invocation::ClaudeHook => {
+            command
+                .env("FL_DB", db)
+                .env("CLAUDE_CODE_MESSAGING_SOCKET", root.join("12345.sock"))
+                .stdin(std::process::Stdio::piped());
+        }
         Invocation::Retire => {
             command.args([
                 "--db",
@@ -239,10 +253,89 @@ fn run_refused_command(root: &Path, outside_socket: &Path, db: &Path, invocation
             ]);
         }
     }
-    let output = command.output().unwrap();
+    let output = if matches!(invocation, Invocation::ClaudeHook) {
+        use std::io::Write;
+        let mut child = command
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(br#"{"session_id":"fixture-session"}"#)
+            .unwrap();
+        child.wait_with_output().unwrap()
+    } else {
+        command.output().unwrap()
+    };
     assert!(!output.status.success(), "command unexpectedly succeeded");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("fixture endpoint refused"), "{stderr}");
+}
+
+#[test]
+fn claude_hook_outside_socket_refuses_before_store_or_route_mutation() {
+    assert_outside_socket_refusal(Invocation::ClaudeHook);
+}
+
+#[test]
+fn claude_hook_noop_inputs_do_not_require_wire() {
+    use std::io::Write;
+    for input in [
+        "",
+        r#"{"stop_hook_active":true}"#,
+        r#"{"vendor":"grok","session_id":"headless"}"#,
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let summary = root.path().join(".grok/sessions/headless/summary.json");
+        std::fs::create_dir_all(summary.parent().unwrap()).unwrap();
+        std::fs::write(&summary, r#"{"session_kind":"headless"}"#).unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let socket = outside.path().join("wire.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let alias = root.path().join("agent-bus-claude-hook");
+        symlink(
+            common::isolated_fl(root.path()).unwrap().get_program(),
+            &alias,
+        )
+        .unwrap();
+        let missing = root.path().join("not-created/fl.redb");
+        let mut child = common::isolated_command(alias, root.path())
+            .unwrap()
+            .current_dir(root.path())
+            .env("FL_TEST_ISOLATION_ROOT", root.path())
+            .env("FL_WIRE_SOCKET", &socket)
+            .env("FL_DB", &missing)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(input.as_bytes())
+            .unwrap();
+        let out = child.wait_with_output().unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&out.stdout).unwrap(),
+            serde_json::json!({})
+        );
+        assert!(!missing.parent().unwrap().exists());
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+    }
 }
 
 #[test]
