@@ -1,4 +1,8 @@
 //! Metadata-only inventory, driven through the real CLI with an isolated home.
+
+#[allow(dead_code)]
+mod common;
+
 use assert_cmd::Command;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
@@ -17,15 +21,18 @@ impl World {
         Self { home, stores }
     }
     fn fl(&self) -> Command {
-        let mut cmd = Command::cargo_bin("fl").unwrap();
-        cmd.env_clear()
-            .env_remove("AGENT_PERSONA")
-            .env_remove("AGENT_NAME")
-            .env_remove("FL_HOSTED_ID")
-            .env_remove("AGENT_HYDRATION_GENERATION")
-            .env("HOME", self.home.path())
-            .current_dir(self.home.path())
-            .timeout(Duration::from_secs(10));
+        let mut cmd = Command::from_std(self.fl_command());
+        cmd.timeout(Duration::from_secs(10));
+        cmd
+    }
+    fn fl_command(&self) -> std::process::Command {
+        let mut cmd = common::isolated_fl(self.home.path()).unwrap();
+        // Inventory checks the default and config-selected stores, rather than
+        // a fixture FL_DB override.
+        cmd.env_remove("FL_DB")
+            .env("XDG_CONFIG_HOME", self.home.path().join(".config"))
+            .env("XDG_DATA_HOME", self.home.path().join(".local/share"))
+            .current_dir(self.home.path());
         cmd
     }
     fn config(&self) {
@@ -47,6 +54,35 @@ impl World {
             .clone();
         serde_json::from_slice(&output).unwrap()
     }
+}
+#[test]
+fn recovery_command_uses_private_runtime_and_config() {
+    let world = World::new();
+    let command = world.fl_command();
+    let env = |name: &str| {
+        command
+            .get_envs()
+            .find(|(key, _)| *key == name)
+            .and_then(|(_, value)| value)
+            .map(|value| value.to_os_string())
+    };
+    assert_eq!(
+        env("PATH").as_deref(),
+        Some(world.home.path().join("no-bin").as_os_str())
+    );
+    assert_eq!(
+        env("FL_WIRE_SOCKET").as_deref(),
+        Some(world.home.path().join("w").as_os_str())
+    );
+    assert_eq!(
+        env("XDG_CONFIG_HOME").as_deref(),
+        Some(world.home.path().join(".config").as_os_str())
+    );
+    assert_eq!(
+        env("XDG_DATA_HOME").as_deref(),
+        Some(world.home.path().join(".local/share").as_os_str())
+    );
+    assert_eq!(env("FL_DB"), None);
 }
 fn has_path(map: &Value, path: &Path) -> bool {
     map["stores"].as_array().unwrap().iter().any(|s| {
