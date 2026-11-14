@@ -4841,16 +4841,15 @@ fn composer_shows_target_placeholder_with_raw(
         // untrusted: it counts only when target ownership is proven — `M` must
         // be a target line count (full/body, incl. raw variant, via the
         // descriptor) and the composer must equal exactly that placeholder
-        // (plus prompt prefix), with no appended text. `[Pasted Content`
-        // keeps its existing raw-fallback behaviour.
+        // (plus prompt prefix), with no appended text. Any Claude marker
+        // forces strict ownership even when a legacy `[Pasted Content`
+        // marker is also present (mixed markers). A legacy-only screen
+        // (no Claude marker) keeps `composer_shows_pasted_placeholder`.
         let cleaned = normalize_terminal_screen(screen);
         let lines: Vec<&str> = cleaned.lines().collect();
         let placeholder_lines = composer_placeholder_lines(&lines);
         let has_claude = placeholder_lines.iter().any(|l| l.contains("[Pasted text"));
-        let has_pasted_content = placeholder_lines
-            .iter()
-            .any(|l| l.contains("[Pasted Content"));
-        if has_claude && !has_pasted_content {
+        if has_claude {
             let d_target = build_delivery_descriptor("", trimmed, raw_text);
             let (matches_target, is_placeholder) = composer_equals_single_target(screen, &d_target);
             return matches_target && is_placeholder;
@@ -20442,6 +20441,65 @@ exit 1"#,
         let pc = format!("◆ Ready.\n{rule}\n❯ [Pasted Content 999 chars]\n{rule}\n  status");
         assert!(composer_shows_target_placeholder_with_raw(
             &pc, target, None, true
+        ));
+    }
+
+    #[test]
+    fn raw_fallback_mixed_claude_and_legacy_markers_require_ownership() {
+        let rule = "─".repeat(120);
+        let target = "line one\nline two\nline three";
+        // Same-line mixed: mismatched Claude M + legacy marker must fail and
+        // the RawFallback confirm loop must send 0 Enter retries.
+        // Multiline mixed: Claude marker line + legacy marker line must fail.
+        // Matching Claude M plus legacy marker must still fail (composer
+        // does not equal exactly the single Claude placeholder).
+        for bad in [
+            format!(
+                "◆ Ready.\n{rule}\n❯ [Pasted text #1 +4 lines] [Pasted Content 999 chars]\n{rule}\n  status"
+            ),
+            format!(
+                "◆ Ready.\n{rule}\n❯ [Pasted text #1 +4 lines]\n  [Pasted Content 999 chars]\n{rule}\n  status"
+            ),
+            format!(
+                "◆ Ready.\n{rule}\n❯ [Pasted text #1 +3 lines] [Pasted Content 999 chars]\n{rule}\n  status"
+            ),
+            format!(
+                "◆ Ready.\n{rule}\n❯ [Pasted text #1 +3 lines]\n  [Pasted Content 999 chars]\n{rule}\n  status"
+            ),
+        ] {
+            assert!(
+                composer_shows_pasted_placeholder(&bad),
+                "broad placeholder must see mixed screen: {bad}"
+            );
+            assert!(
+                !composer_shows_target_placeholder_with_raw(&bad, target, None, true),
+                "mixed markers must fail strict ownership: {bad}"
+            );
+            let mut retries = 0u32;
+            confirm_paste_submission(
+                target,
+                |_| {},
+                || Some(ScreenCapture::RawFallback(bad.clone())),
+                || false,
+                || {
+                    retries += 1;
+                    Ok(())
+                },
+            )
+            .expect("raw mixed-marker placeholder must not error");
+            assert_eq!(
+                retries, 0,
+                "raw fallback must not Enter-retry mixed-marker placeholder"
+            );
+        }
+        // Legacy-only screen keeps broad raw-fallback behaviour unchanged.
+        let legacy_only =
+            format!("◆ Ready.\n{rule}\n❯ [Pasted Content 999 chars]\n{rule}\n  status");
+        assert!(composer_shows_target_placeholder_with_raw(
+            &legacy_only,
+            target,
+            None,
+            true
         ));
     }
 
