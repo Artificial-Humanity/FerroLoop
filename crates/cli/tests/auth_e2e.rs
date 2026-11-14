@@ -1,5 +1,8 @@
 //! `fl auth` end to end, on the real binary with a private HOME.
 
+#[allow(dead_code)]
+mod common;
+
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::path::PathBuf;
@@ -21,36 +24,45 @@ impl Env {
     }
 
     fn fl(&self) -> Command {
-        let mut c = Command::new(env!("CARGO_BIN_EXE_fl"));
+        let mut c = common::isolated_fl(&self.root).unwrap();
         c.current_dir(&self.root)
-            .env("HOME", &self.root)
             .env("XDG_DATA_HOME", self.root.join("data"))
             .env("XDG_CONFIG_HOME", self.root.join("config"))
-            .env("XDG_RUNTIME_DIR", &self.root)
-            .env("XDG_CACHE_HOME", &self.root);
-        for name in [
-            "FL_DB",
-            "FL_VAULT_PATH",
-            "FL_VAULT_KEY_PATH",
-            "FL_VAULT_MASTER_KEY",
-            "FL_HUB_TOKEN",
-            "FL_HUB_URL",
-            "AGENT_PERSONA",
-            "AGENT_NAME",
-            "FL_HOSTED_ID",
-            "AGENT_HYDRATION_GENERATION",
-            "CLAUDECODE",
-            "ANTIGRAVITY_AGENT",
-            "CODEX_SANDBOX",
-        ] {
-            c.env_remove(name);
-        }
+            .env("XDG_CACHE_HOME", &self.root)
+            .env_remove("FL_DB");
         c
     }
 
     fn ledger(&self) -> PathBuf {
         self.root.join("data/fl/warrants.json")
     }
+}
+
+#[test]
+fn auth_commands_use_private_fixture_defaults() {
+    let env = Env::new();
+    let command = env.fl();
+    let setting = |name: &str| {
+        command
+            .get_envs()
+            .find(|(key, _)| *key == name)
+            .and_then(|(_, value)| value)
+            .map(|value| value.to_os_string())
+    };
+    assert_eq!(setting("HOME").as_deref(), Some(env.root.as_os_str()));
+    assert_eq!(
+        setting("FL_WIRE_SOCKET").as_deref(),
+        Some(env.root.join("w").as_os_str())
+    );
+    assert_eq!(
+        setting("PATH").as_deref(),
+        Some(env.root.join("no-bin").as_os_str())
+    );
+    assert_eq!(
+        setting("FL_HUB_URL").as_deref(),
+        Some(std::ffi::OsStr::new("http://127.0.0.1:0"))
+    );
+    assert_eq!(setting("FL_DB"), None);
 }
 
 fn code(out: &Output) -> i32 {
@@ -371,11 +383,12 @@ fn a_hub_peer_token_or_an_unreachable_hub_does_not_unlock_grant() {
         text(&out)
     );
 
+    // Port zero cannot name a listening service, so this cannot contact a live Hub.
     let out = env
         .fl()
         .env("AGENT_PERSONA", "feira")
         .env("FL_HUB_TOKEN", "t")
-        .env("FL_HUB_URL", "http://127.0.0.1:1")
+        .env("FL_HUB_URL", "http://127.0.0.1:0")
         .args([
             "auth",
             "grant",
