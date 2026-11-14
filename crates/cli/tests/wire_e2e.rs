@@ -2367,6 +2367,23 @@ fn cli_queues_when_daemon_unreachable_and_daemon_delivers_on_startup() {
         .stderr(Stdio::null());
     let daemon = FixtureDaemon::start_command_at(&sock, daemon_command);
     let store = fl_store::open_store(&store_path).unwrap();
+    // Delivery can finish before the daemon's polling thread clears its marker.
+    // Keep the daemon alive until that separate store write completes.
+    let wait_for_marker_clear = |phase: &str| {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let awaiting = store.list_wire_awaiting_daemon().unwrap();
+            if awaiting.is_empty() {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "awaiting-daemon marker did not clear after {phase}: {} remaining",
+                awaiting.len()
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    };
 
     let deadline = Instant::now() + Duration::from_secs(3);
     let mut delivered = None;
@@ -2381,6 +2398,7 @@ fn cli_queues_when_daemon_unreachable_and_daemon_delivers_on_startup() {
     }
     let payload = delivered.expect("daemon must pick up and deliver queued message");
     assert!(payload.contains("queued-subj"));
+    wait_for_marker_clear("startup delivery");
     assert!(store.list_wire_awaiting_daemon().unwrap().is_empty());
 
     // 3. While the daemon is running at `sock`, a client pointing at the WRONG socket path
@@ -2421,9 +2439,10 @@ fn cli_queues_when_daemon_unreachable_and_daemon_delivers_on_startup() {
             std::thread::sleep(Duration::from_millis(25));
         }
     }
-    drop(daemon);
     let payload_2 = delivered_wrong_sock
         .expect("running daemon must pick up message from client with wrong socket path");
     assert!(payload_2.contains("wrong-sock-subj"));
+    wait_for_marker_clear("wrong-socket delivery");
     assert!(store.list_wire_awaiting_daemon().unwrap().is_empty());
+    drop(daemon);
 }
