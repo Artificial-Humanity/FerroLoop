@@ -934,8 +934,11 @@ fn prune_muse_roster(persona: &str) -> std::io::Result<()> {
     Ok(())
 }
 
-pub(crate) fn remove_caller_route(env: &StateEnv<'_>, persona: &str) -> Result<(), String> {
-    let sock = resolve_socket_path(env, None);
+pub(crate) fn remove_caller_route(
+    env: &StateEnv<'_>,
+    persona: &str,
+    socket: &Path,
+) -> Result<(), String> {
     let rpath = resolve_routes_path_for(env);
     let paths: Vec<PathBuf> = if env.explicit_db.is_none() && resolve_routes_path().is_none() {
         std::iter::once(rpath)
@@ -944,7 +947,7 @@ pub(crate) fn remove_caller_route(env: &StateEnv<'_>, persona: &str) -> Result<(
     } else {
         vec![rpath]
     };
-    remove_route_at(&sock, &paths, persona).map_err(|error| error.to_string())
+    remove_route_at(socket, &paths, persona).map_err(|error| error.to_string())
 }
 
 pub(crate) fn sync_store_retired_personas<S: AgentRegistry>(store: &S) {
@@ -2472,6 +2475,12 @@ pub fn run_agent_msg(env: &StateEnv<'_>, cli: AgentMsgCli) -> Result<i32, (i32, 
             },
         ),
         AgentMsgCmd::Unregister { name } => {
+            // Resolve and validate the same endpoint that route removal will use,
+            // before opening the store or changing retirement state.
+            let socket = resolve_socket_path(env, None);
+            let fixture_root = std::env::var_os("FL_TEST_ISOLATION_ROOT").map(PathBuf::from);
+            fl_fixture_path::check_endpoint(fixture_root.as_deref(), &socket)
+                .map_err(|error| (1, error.to_string()))?;
             let store = env
                 .open_for_scope(Some(&StateScope::Workspace))
                 .map_err(|e| (1, e))?;
@@ -2481,7 +2490,7 @@ pub fn run_agent_msg(env: &StateEnv<'_>, cli: AgentMsgCli) -> Result<i32, (i32, 
                 .retire_agent(&target.id, now_at(), &by)
                 .map_err(|e| (1, e.to_string()))?;
             sync_store_retired_personas(&store);
-            remove_caller_route(env, &by)
+            remove_caller_route(env, &by, &socket)
                 .map_err(|e| (1, format!("agent retired but route removal failed: {e}")))?;
             prune_muse_roster(&by).map_err(|e| {
                 (

@@ -8,26 +8,58 @@ mod common;
 use fl_core::agent::{AgentRole, AgentStatus, RegisterAgentArgs};
 use fl_core::at::At;
 use fl_core::store::AgentRegistry;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{PermissionsExt, symlink};
 use std::os::unix::net::UnixListener;
 use std::path::Path;
 
-fn run_refused_retire(root: &Path, outside_socket: &Path, db: &Path) {
-    let mut command = common::isolated_fl(root).unwrap();
+#[derive(Clone, Copy)]
+enum Invocation {
+    Retire,
+    LegacySubcommand,
+    LegacyExecutable,
+}
+
+fn run_refused_retire(root: &Path, outside_socket: &Path, db: &Path, invocation: Invocation) {
+    let mut command = if matches!(invocation, Invocation::LegacyExecutable) {
+        let alias = root.join("agent-msg");
+        if !alias.exists() {
+            let binary = common::isolated_fl(root).unwrap();
+            symlink(binary.get_program(), &alias).unwrap();
+        }
+        common::isolated_command(alias, root).unwrap()
+    } else {
+        common::isolated_fl(root).unwrap()
+    };
     command
         .current_dir(root)
         .env("FL_TEST_ISOLATION_ROOT", root)
         .env("FL_WIRE_SOCKET", outside_socket)
-        .env("FL_TEST_SPAWN_MARKER", root.join("vendor-spawned"))
-        .args([
-            "--db",
-            db.to_str().unwrap(),
-            "agent",
-            "retire",
-            "felicia",
-            "--by",
-            "owner",
-        ]);
+        .env("FL_TEST_SPAWN_MARKER", root.join("vendor-spawned"));
+    match invocation {
+        Invocation::Retire => {
+            command.args([
+                "--db",
+                db.to_str().unwrap(),
+                "agent",
+                "retire",
+                "felicia",
+                "--by",
+                "owner",
+            ]);
+        }
+        Invocation::LegacySubcommand => {
+            command.args([
+                "agent-msg",
+                "--db",
+                db.to_str().unwrap(),
+                "unregister",
+                "felicia",
+            ]);
+        }
+        Invocation::LegacyExecutable => {
+            command.args(["--db", db.to_str().unwrap(), "unregister", "felicia"]);
+        }
+    }
     let output = command.output().unwrap();
     assert!(
         !output.status.success(),
@@ -39,6 +71,20 @@ fn run_refused_retire(root: &Path, outside_socket: &Path, db: &Path) {
 
 #[test]
 fn retire_outside_socket_refuses_before_store_creation_or_existing_state_mutation() {
+    assert_outside_socket_refusal(Invocation::Retire);
+}
+
+#[test]
+fn legacy_unregister_outside_socket_refuses_before_store_creation_or_existing_state_mutation() {
+    assert_outside_socket_refusal(Invocation::LegacySubcommand);
+}
+
+#[test]
+fn legacy_executable_unregister_refuses_before_store_creation_or_existing_state_mutation() {
+    assert_outside_socket_refusal(Invocation::LegacyExecutable);
+}
+
+fn assert_outside_socket_refusal(invocation: Invocation) {
     let root = tempfile::tempdir().unwrap();
     let outside = tempfile::tempdir().unwrap();
     let socket = outside.path().join("wire.sock");
@@ -89,7 +135,12 @@ fn retire_outside_socket_refuses_before_store_creation_or_existing_state_mutatio
 
     // Refusal must precede creation of even the parent directory of a new store.
     let missing_dir = root.path().join("not-created");
-    run_refused_retire(root.path(), &socket, &missing_dir.join("fl.redb"));
+    run_refused_retire(
+        root.path(),
+        &socket,
+        &missing_dir.join("fl.redb"),
+        invocation,
+    );
     assert!(
         !missing_dir.exists(),
         "preflight must precede store directory creation"
@@ -117,7 +168,7 @@ fn retire_outside_socket_refuses_before_store_creation_or_existing_state_mutatio
         before_events = store.registry_events_after(0).unwrap();
     }
     let before_store = std::fs::read(&db).unwrap();
-    run_refused_retire(root.path(), &socket, &db);
+    run_refused_retire(root.path(), &socket, &db, invocation);
     assert_eq!(
         std::fs::read(&db).unwrap(),
         before_store,
