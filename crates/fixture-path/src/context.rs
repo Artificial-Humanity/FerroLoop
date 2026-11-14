@@ -154,12 +154,18 @@ fn validate_identity(root: &Path, identity: &FixtureIdentity) -> io::Result<()> 
                 {
                     return Err(refused("existing fixture must be a file"));
                 }
-                #[cfg(unix)]
                 if matches!(identity, FixtureIdentity::UnixSocket { .. }) {
-                    use std::os::unix::fs::FileTypeExt;
-                    if !metadata.file_type().is_socket() {
-                        return Err(refused("existing fixture must be a socket"));
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::FileTypeExt;
+                        if !metadata.file_type().is_socket() {
+                            return Err(refused("existing fixture must be a socket"));
+                        }
                     }
+                    #[cfg(not(unix))]
+                    return Err(refused(
+                        "existing Unix socket fixtures are unsupported on this platform",
+                    ));
                 }
             }
             Ok(())
@@ -384,6 +390,25 @@ mod tests {
             json!({"version": 1, "identities": [{"kind":"route", "path": outside.path().join("routes"), "access":"create" }]}),
         );
         assert!(FixtureContext::load(root.path(), &file).is_err());
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn existing_unix_socket_fixture_is_refused_without_type_validation() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("not-a-socket");
+        std::fs::write(&path, b"ordinary file").unwrap();
+        let file = manifest(
+            root.path(),
+            json!({"version": 1, "identities": [
+                {"kind": "unix_socket", "path": path, "access": "existing"}
+            ]}),
+        );
+        let error = match FixtureContext::load(root.path(), &file) {
+            Ok(_) => panic!("unverifiable Unix socket accepted"),
+            Err(error) => error,
+        };
+        assert!(is_fixture_endpoint_refusal(&error));
     }
 
     #[cfg(unix)]
