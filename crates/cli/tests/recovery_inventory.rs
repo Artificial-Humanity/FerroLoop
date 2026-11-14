@@ -26,12 +26,16 @@ impl World {
         cmd
     }
     fn fl_command(&self) -> std::process::Command {
+        self.fl_command_with_home(self.home.path())
+    }
+    fn fl_command_with_home(&self, home: &Path) -> std::process::Command {
         let mut cmd = common::isolated_fl(self.home.path()).unwrap();
         // Inventory checks the default and config-selected stores, rather than
         // a fixture FL_DB override.
         cmd.env_remove("FL_DB")
-            .env("XDG_CONFIG_HOME", self.home.path().join(".config"))
-            .env("XDG_DATA_HOME", self.home.path().join(".local/share"))
+            .env("HOME", home)
+            .env("XDG_CONFIG_HOME", home.join(".config"))
+            .env("XDG_DATA_HOME", home.join(".local/share"))
             .current_dir(self.home.path());
         cmd
     }
@@ -83,6 +87,26 @@ fn recovery_command_uses_private_runtime_and_config() {
         Some(world.home.path().join(".local/share").as_os_str())
     );
     assert_eq!(env("FL_DB"), None);
+
+    // A short alias for the same home must also redirect XDG store discovery.
+    let alias = Path::new("/fixture-home-alias");
+    let aliased = world.fl_command_with_home(alias);
+    let aliased_env = |name: &str| {
+        aliased
+            .get_envs()
+            .find(|(key, _)| *key == name)
+            .and_then(|(_, value)| value)
+            .map(|value| value.to_os_string())
+    };
+    assert_eq!(aliased_env("HOME").as_deref(), Some(alias.as_os_str()));
+    assert_eq!(
+        aliased_env("XDG_CONFIG_HOME").as_deref(),
+        Some(alias.join(".config").as_os_str())
+    );
+    assert_eq!(
+        aliased_env("XDG_DATA_HOME").as_deref(),
+        Some(alias.join(".local/share").as_os_str())
+    );
 }
 fn has_path(map: &Value, path: &Path) -> bool {
     map["stores"].as_array().unwrap().iter().any(|s| {
@@ -191,9 +215,8 @@ fn inventory_never_reads_store_contents_or_connects_to_its_socket() {
         std::process::id(),
         home_directory.as_raw_fd()
     ));
-    world
-        .fl()
-        .env("HOME", &short_home)
+    Command::from_std(world.fl_command_with_home(&short_home))
+        .timeout(Duration::from_secs(10))
         .args(["recovery", "inventory", "--root"])
         .arg(short_home.join(".local/share/fl"))
         .arg("--json")
