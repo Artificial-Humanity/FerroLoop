@@ -1,4 +1,4 @@
-//! Black-box coverage of the retirement preflight at the actual CLI entry.
+//! Black-box coverage of wire endpoint preflights at the actual CLI entry.
 //! These tests run in CI; they construct only private stores and endpoints.
 #![cfg(unix)]
 
@@ -17,9 +17,10 @@ enum Invocation {
     Retire,
     LegacySubcommand,
     LegacyExecutable,
+    WireStatus,
 }
 
-fn run_refused_retire(root: &Path, outside_socket: &Path, db: &Path, invocation: Invocation) {
+fn run_refused_command(root: &Path, outside_socket: &Path, db: &Path, invocation: Invocation) {
     let mut command = if matches!(invocation, Invocation::LegacyExecutable) {
         let alias = root.join("agent-msg");
         if !alias.exists() {
@@ -59,12 +60,12 @@ fn run_refused_retire(root: &Path, outside_socket: &Path, db: &Path, invocation:
         Invocation::LegacyExecutable => {
             command.args(["--db", db.to_str().unwrap(), "unregister", "felicia"]);
         }
+        Invocation::WireStatus => {
+            command.args(["--db", db.to_str().unwrap(), "wire", "status", "--json"]);
+        }
     }
     let output = command.output().unwrap();
-    assert!(
-        !output.status.success(),
-        "retirement unexpectedly succeeded"
-    );
+    assert!(!output.status.success(), "command unexpectedly succeeded");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("fixture endpoint refused"), "{stderr}");
 }
@@ -82,6 +83,32 @@ fn legacy_unregister_outside_socket_refuses_before_store_creation_or_existing_st
 #[test]
 fn legacy_executable_unregister_refuses_before_store_creation_or_existing_state_mutation() {
     assert_outside_socket_refusal(Invocation::LegacyExecutable);
+}
+
+#[test]
+fn wire_status_outside_socket_refuses_before_store_or_route_fallback() {
+    assert_outside_socket_refusal(Invocation::WireStatus);
+}
+
+#[test]
+fn wire_status_private_offline_socket_keeps_offline_fallback() {
+    let root = tempfile::tempdir().unwrap();
+    let db = root.path().join("offline.redb");
+    let output = common::isolated_fl(root.path())
+        .unwrap()
+        .current_dir(root.path())
+        .env("FL_TEST_ISOLATION_ROOT", root.path())
+        .env("FL_WIRE_SOCKET", root.path().join("missing.sock"))
+        .args(["--db", db.to_str().unwrap(), "wire", "status", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let status: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(status["daemon"], "inactive");
 }
 
 fn assert_outside_socket_refusal(invocation: Invocation) {
@@ -135,7 +162,7 @@ fn assert_outside_socket_refusal(invocation: Invocation) {
 
     // Refusal must precede creation of even the parent directory of a new store.
     let missing_dir = root.path().join("not-created");
-    run_refused_retire(
+    run_refused_command(
         root.path(),
         &socket,
         &missing_dir.join("fl.redb"),
@@ -168,7 +195,7 @@ fn assert_outside_socket_refusal(invocation: Invocation) {
         before_events = store.registry_events_after(0).unwrap();
     }
     let before_store = std::fs::read(&db).unwrap();
-    run_refused_retire(root.path(), &socket, &db, invocation);
+    run_refused_command(root.path(), &socket, &db, invocation);
     assert_eq!(
         std::fs::read(&db).unwrap(),
         before_store,
@@ -193,6 +220,6 @@ fn assert_outside_socket_refusal(invocation: Invocation) {
     assert_eq!(
         listener.accept().unwrap_err().kind(),
         std::io::ErrorKind::WouldBlock,
-        "retirement must not connect to the out-of-root socket"
+        "command must not connect to the out-of-root socket"
     );
 }

@@ -1884,6 +1884,12 @@ pub fn run(env: &StateEnv<'_>, cmd: WireCmd) -> Result<i32, (i32, String)> {
         }
         WireCmd::Status { json } => {
             let sock = resolve_socket_path(env, None);
+            // A fixture refusal is terminal: do not connect or enter the
+            // offline path, which reads routes and can initialize the store.
+            // Keep using this same resolved socket for the status request.
+            let fixture_root = std::env::var_os("FL_TEST_ISOLATION_ROOT").map(PathBuf::from);
+            fl_fixture_path::check_endpoint(fixture_root.as_deref(), &sock)
+                .map_err(|error| (1, error.to_string()))?;
             if let Some(mut client) =
                 classify_local_connection(LocalClient::connect(&sock, DEFAULT_LOCAL_RPC_TIMEOUT))
                     .map_err(|error| (1, error))?
