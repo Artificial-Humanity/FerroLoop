@@ -1010,7 +1010,7 @@ fn migrate_and_verify_refuse_what_they_cannot_do_and_create_nothing() {
         &["store", "verify"],
     ] {
         // No store at all.
-        env.fl()
+        env.isolated_fl()
             .arg("--db")
             .arg(env.logical())
             .args(args)
@@ -1019,7 +1019,7 @@ fn migrate_and_verify_refuse_what_they_cannot_do_and_create_nothing() {
             .stderr(contains("no redb store at"));
         assert!(env.files().is_empty(), "{args:?}: {:?}", env.files());
         // An explicit .fls path names no redb.
-        env.fl()
+        env.isolated_fl()
             .arg("--db")
             .arg(env.physical_ferro())
             .args(args)
@@ -1032,7 +1032,7 @@ fn migrate_and_verify_refuse_what_they_cannot_do_and_create_nothing() {
     // verify needs both files.
     open_with(&env.logical(), BackendKind::Redb);
     let before = snapshot(&[env.stores.path()]);
-    env.fl()
+    env.isolated_fl()
         .arg("--db")
         .arg(env.logical())
         .args(["store", "verify"])
@@ -1042,7 +1042,7 @@ fn migrate_and_verify_refuse_what_they_cannot_do_and_create_nothing() {
     assert_eq!(before, snapshot(&[env.stores.path()]));
     std::fs::remove_file(env.logical()).unwrap();
     open_with(&env.logical(), BackendKind::Ferro);
-    env.fl()
+    env.isolated_fl()
         .arg("--db")
         .arg(env.logical())
         .args(["store", "verify"])
