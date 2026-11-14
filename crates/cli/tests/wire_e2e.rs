@@ -1012,19 +1012,23 @@ impl FixtureDaemon {
         Self::start_command(env, diagnostics_daemon_command(env))
     }
 
-    fn start_command(env: &TestEnv, mut command: Command) -> Self {
+    fn start_command(env: &TestEnv, command: Command) -> Self {
+        Self::start_command_at(&env.sock_file, command)
+    }
+
+    fn start_command_at(socket: &std::path::Path, mut command: Command) -> Self {
         let mut daemon = Self(command.spawn().unwrap());
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         loop {
-            if let Ok(mut client) = fl_wire::daemon::LocalClient::connect(
-                &env.sock_file,
-                std::time::Duration::from_millis(100),
-            ) && matches!(
-                client.request(&fl_wire::daemon::LocalRequest::Status {
-                    include_codex_queues: false,
-                }),
-                Ok(fl_wire::daemon::LocalResponse::Status(_))
-            ) {
+            if let Ok(mut client) =
+                fl_wire::daemon::LocalClient::connect(socket, std::time::Duration::from_millis(100))
+                && matches!(
+                    client.request(&fl_wire::daemon::LocalRequest::Status {
+                        include_codex_queues: false,
+                    }),
+                    Ok(fl_wire::daemon::LocalResponse::Status(_))
+                )
+            {
                 return daemon;
             }
             assert!(
@@ -1976,6 +1980,76 @@ fn daemon_hosted_replace_operator_replace_and_foreign_child_replace_e2e() {
 }
 
 #[cfg(unix)]
+fn run_user_command(env: &TestEnv, run_user_dir: &std::path::Path, fallback: bool) -> Command {
+    let mut command = common::isolated_fl(&env.root).unwrap();
+    command
+        .current_dir(&env.work_dir)
+        .env("XDG_CONFIG_HOME", &env.cfg_dir)
+        .env("XDG_DATA_HOME", &env.data_dir)
+        .env_remove("FL_DB")
+        .env("FL_STORE_BACKEND", "ferro")
+        .env("FL_TEST_RUN_USER_DIR", run_user_dir)
+        .env("HOSTNAME", "node-run-user");
+    if fallback {
+        command
+            .env_remove("XDG_RUNTIME_DIR")
+            .env_remove("FL_WIRE_SOCKET")
+            .env_remove("FL_WIRE_ROUTES");
+    } else {
+        command
+            .env("FL_WIRE_SOCKET", run_user_dir.join("fl-wire.sock"))
+            .env("FL_WIRE_ROUTES", run_user_dir.join("fl-wire-routes.json"));
+    }
+    command
+}
+
+#[cfg(unix)]
+#[test]
+fn run_user_commands_use_private_fixtures() {
+    let env = TestEnv::new();
+    let dir = env.root.join("run-user-synth");
+    let cmd = run_user_command(&env, &dir, true);
+    let get = |key: &str| {
+        cmd.get_envs()
+            .find(|(name, _)| *name == key)
+            .and_then(|(_, value)| value)
+            .map(|v| v.to_os_string())
+    };
+    assert_eq!(
+        get("FL_TEST_RUN_USER_DIR").as_deref(),
+        Some(dir.as_os_str())
+    );
+    for name in [
+        "XDG_RUNTIME_DIR",
+        "FL_WIRE_SOCKET",
+        "FL_WIRE_ROUTES",
+        "FL_DB",
+    ] {
+        assert_eq!(get(name), None, "{name}");
+    }
+    assert_eq!(
+        get("FL_HOST_SOCK").as_deref(),
+        Some(env.root.join("h").as_os_str())
+    );
+    let daemon = run_user_command(&env, &dir, false);
+    let env_value = |key: &str| {
+        daemon
+            .get_envs()
+            .find(|(name, _)| *name == key)
+            .and_then(|(_, value)| value)
+            .map(|v| v.to_os_string())
+    };
+    assert_eq!(
+        env_value("FL_WIRE_SOCKET").as_deref(),
+        Some(dir.join("fl-wire.sock").as_os_str())
+    );
+    assert_eq!(
+        env_value("FL_WIRE_ROUTES").as_deref(),
+        Some(dir.join("fl-wire-routes.json").as_os_str())
+    );
+}
+
+#[cfg(unix)]
 #[test]
 fn mcp_and_cli_discover_daemon_via_run_user_fallback_without_xdg_runtime_dir_and_fanout_agy_persona()
  {
@@ -1983,7 +2057,7 @@ fn mcp_and_cli_discover_daemon_via_run_user_fallback_without_xdg_runtime_dir_and
     use std::time::{Duration, Instant};
 
     let env = TestEnv::new();
-    let store_path = env.data_dir.join("fl/fl.redb");
+    let store_path = env.root.join("run-user.fls");
     let run_user_dir = env.root.join("run-user-synth");
     std::fs::create_dir_all(&run_user_dir).unwrap();
     let sock_in_run_user = run_user_dir.join("fl-wire.sock");
@@ -2009,7 +2083,7 @@ fn mcp_and_cli_discover_daemon_via_run_user_fallback_without_xdg_runtime_dir_and
     std::fs::set_permissions(&fake_agy, std::fs::Permissions::from_mode(0o755)).unwrap();
 
     // Register felicia and felix in the store and seed `routes_in_run_user` with a bare-UUID Agy route for felicia.
-    let mut reg_felicia = env.fl();
+    let mut reg_felicia = run_user_command(&env, &run_user_dir, true);
     reg_felicia.args([
         "wire",
         "register",
@@ -2021,7 +2095,7 @@ fn mcp_and_cli_discover_daemon_via_run_user_fallback_without_xdg_runtime_dir_and
     ]);
     assert!(reg_felicia.output().unwrap().status.success());
 
-    let mut reg_felix = env.fl();
+    let mut reg_felix = run_user_command(&env, &run_user_dir, true);
     reg_felix.args([
         "wire",
         "register",
@@ -2048,39 +2122,17 @@ fn mcp_and_cli_discover_daemon_via_run_user_fallback_without_xdg_runtime_dir_and
     table.save(Some(&routes_in_run_user)).unwrap();
 
     // Start daemon at `<run_user_dir>/fl-wire.sock` with `<run_user_dir>/fl-wire-routes.json`.
-    let store = std::sync::Arc::new(fl_store::open_store(&store_path).unwrap());
-    let mut daemon = fl_wire::daemon::spawn_daemon(
-        store,
-        fl_wire::daemon::DaemonConfig {
-            node_id: "node-run-user".into(),
-            host: "host-run-user".into(),
-            socket_path: sock_in_run_user.clone(),
-            routes_path: Some(routes_in_run_user.clone()),
-            home_override: Some(env.root.clone()),
-            listen_addr: None,
-            peers: vec![],
-            psk: vec![],
-        },
-    )
-    .unwrap();
+    let mut daemon_command = run_user_command(&env, &run_user_dir, false);
+    daemon_command
+        .args(["wire", "daemon"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let daemon = FixtureDaemon::start_command_at(&sock_in_run_user, daemon_command);
 
     // 1. `fl wire status --json` with `XDG_RUNTIME_DIR`, `FL_WIRE_SOCKET`, and `FL_WIRE_ROUTES` UNSET
     //    (and `--db` omitted, discovering `/run/user/<uid>` via `FL_TEST_RUN_USER_DIR`).
-    let status_out = Command::new(env!("CARGO_BIN_EXE_fl"))
-        .current_dir(&env.work_dir)
-        .env("HOME", &env.root)
-        .env("XDG_CONFIG_HOME", &env.cfg_dir)
-        .env("XDG_DATA_HOME", &env.data_dir)
-        .env_remove("XDG_RUNTIME_DIR")
-        .env_remove("FL_WIRE_SOCKET")
-        .env_remove("FL_WIRE_ROUTES")
-        .env("FL_TEST_RUN_USER_DIR", &run_user_dir)
-        .env("FL_WIRE_DISABLE_HOST_DISCOVERY", "1")
-        .env_remove("FL_HOST_SOCK")
-        .env_remove("AGENT_PERSONA")
-        .env_remove("AGENT_NAME")
-        .env_remove("FL_HOSTED_ID")
-        .env_remove("AGENT_HYDRATION_GENERATION")
+    let status_out = run_user_command(&env, &run_user_dir, true)
         .args(["wire", "status", "--json"])
         .output()
         .unwrap();
@@ -2099,21 +2151,8 @@ fn mcp_and_cli_discover_daemon_via_run_user_fallback_without_xdg_runtime_dir_and
     // 2. `fl wire mcp` (`send_message` and `broadcast_message`) with `XDG_RUNTIME_DIR` UNSET
     //    must connect to the daemon at `<run_user_dir>/fl-wire.sock`, deliver through the daemon's
     //    loaded route table, and push both direct send and `@all` broadcast fan-out!
-    let mut mcp_child = Command::new(env!("CARGO_BIN_EXE_fl"))
-        .current_dir(&env.work_dir)
-        .env("HOME", &env.root)
-        .env("XDG_CONFIG_HOME", &env.cfg_dir)
-        .env("XDG_DATA_HOME", &env.data_dir)
-        .env_remove("XDG_RUNTIME_DIR")
-        .env_remove("FL_WIRE_SOCKET")
-        .env_remove("FL_WIRE_ROUTES")
-        .env("FL_TEST_RUN_USER_DIR", &run_user_dir)
-        .env("FL_WIRE_DISABLE_HOST_DISCOVERY", "1")
-        .env_remove("FL_HOST_SOCK")
+    let mut mcp_child = run_user_command(&env, &run_user_dir, true)
         .env("AGENT_PERSONA", "felix")
-        .env_remove("AGENT_NAME")
-        .env_remove("FL_HOSTED_ID")
-        .env_remove("AGENT_HYDRATION_GENERATION")
         .args(["wire", "mcp"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -2165,7 +2204,7 @@ fn mcp_and_cli_discover_daemon_via_run_user_fallback_without_xdg_runtime_dir_and
         }
         std::thread::sleep(Duration::from_millis(20));
     }
-    daemon.stop();
+    drop(daemon);
 
     assert_eq!(
         invocations.matches("agentapi send-message").count(),
