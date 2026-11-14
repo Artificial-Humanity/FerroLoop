@@ -1,11 +1,15 @@
+#[allow(dead_code)]
+mod common;
+
 use std::path::Path;
 
 use assert_cmd::Command;
 use serde_json::Value;
 
 fn fl(cfg: &tempfile::TempDir, db: &Path, cwd: &Path) -> Command {
-    let mut c = Command::cargo_bin("fl").unwrap();
-    c.env("XDG_CONFIG_HOME", cfg.path())
+    let mut c = Command::from_std(common::isolated_fl(cfg.path()).unwrap());
+    c.env_remove("FL_DB")
+        .env("XDG_CONFIG_HOME", cfg.path())
         .arg("--db")
         .arg(db)
         .current_dir(cwd);

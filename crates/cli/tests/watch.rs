@@ -1,6 +1,9 @@
 //! `fl watch`, black box: human and `--json` output, and the `--fail-on-critical` exit status.
 //! Hermetic: a temporary home and store, no hub.
 
+#[allow(dead_code)]
+mod common;
+
 use assert_cmd::Command;
 use fl_core::at::At;
 use fl_core::ids::{ProjectId, RecordId, seq_iri};
@@ -17,23 +20,21 @@ use std::path::PathBuf;
 
 struct Env {
     home: tempfile::TempDir,
-    stores: tempfile::TempDir,
 }
 
 impl Env {
     fn new() -> Self {
-        Self {
-            home: tempfile::tempdir().unwrap(),
-            stores: tempfile::tempdir().unwrap(),
-        }
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir(home.path().join("stores")).unwrap();
+        Self { home }
     }
 
     fn logical(&self) -> PathBuf {
-        self.stores.path().join("fl.redb")
+        self.home.path().join("stores/fl.redb")
     }
 
     fn fl(&self) -> Command {
-        let mut c = Command::cargo_bin("fl").unwrap();
+        let mut c = Command::from_std(common::isolated_fl(self.home.path()).unwrap());
         c.env("HOME", self.home.path())
             .env("XDG_CONFIG_HOME", self.home.path().join("config"))
             .env("XDG_DATA_HOME", self.home.path().join("data"))
@@ -369,7 +370,7 @@ fn a_lone_redb_under_the_ferro_engine_is_not_migrated() {
         names.sort();
         names
     };
-    let files_before = listing(env.stores.path());
+    let files_before = listing(&env.home.path().join("stores"));
 
     for args in [
         vec!["watch", "status", "--json"],
@@ -388,7 +389,11 @@ fn a_lone_redb_under_the_ferro_engine_is_not_migrated() {
         !fls.exists(),
         "no `.fls` was migrated beside the lone `.redb`"
     );
-    assert_eq!(listing(env.stores.path()), files_before, "no file created");
+    assert_eq!(
+        listing(&env.home.path().join("stores")),
+        files_before,
+        "no file created"
+    );
     assert_eq!(
         std::fs::read(&redb).unwrap(),
         before,
@@ -579,4 +584,34 @@ fn empty_usage_text_says_no_usage() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(String::from_utf8_lossy(&output.stdout).contains("No usage for this period."));
+}
+
+#[test]
+fn watch_command_uses_private_store_and_socket_paths() {
+    let env = Env::new();
+    let cmd = env.fl();
+    let args: Vec<_> = cmd.get_args().collect();
+    assert_eq!(args[0], "--db");
+    assert_eq!(args[1], env.logical().as_os_str());
+    assert!(env.logical().starts_with(env.home.path()));
+    for name in [
+        "HOME",
+        "XDG_CONFIG_HOME",
+        "XDG_DATA_HOME",
+        "XDG_RUNTIME_DIR",
+        "FL_WIRE_SOCKET",
+    ] {
+        let value = cmd
+            .get_envs()
+            .find_map(|(key, value)| (key == name).then_some(value).flatten())
+            .unwrap();
+        assert!(
+            std::path::Path::new(value).starts_with(env.home.path()),
+            "{name}"
+        );
+    }
+    assert!(
+        cmd.get_envs()
+            .all(|(key, value)| key != "FL_DB" || value.is_none())
+    );
 }
