@@ -19,6 +19,7 @@ enum Invocation {
     LegacySubcommand,
     LegacyExecutable,
     WireStatus,
+    WireDaemon,
     WireRegister,
     LegacyRegister,
     LegacyExecutableRegister,
@@ -145,6 +146,18 @@ fn run_refused_command(root: &Path, outside_socket: &Path, db: &Path, invocation
         }
         Invocation::WireStatus => {
             command.args(["--db", db.to_str().unwrap(), "wire", "status", "--json"]);
+        }
+        Invocation::WireDaemon => {
+            // Missing token makes the ordering observable: the socket refusal
+            // must occur before a token read would return a different error.
+            command.args([
+                "--db",
+                db.to_str().unwrap(),
+                "wire",
+                "daemon",
+                "--token-file",
+                root.join("missing-token").to_str().unwrap(),
+            ]);
         }
         Invocation::WireRegister => {
             command.args([
@@ -345,6 +358,76 @@ fn run_refused_command(root: &Path, outside_socket: &Path, db: &Path, invocation
     assert!(!output.status.success(), "command unexpectedly succeeded");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("fixture endpoint refused"), "{stderr}");
+}
+
+// CI-only: the private fixtures are the only sockets this child may see.
+#[test]
+fn wire_daemon_outside_socket_refuses_before_token_store_or_socket_io() {
+    assert_outside_socket_refusal(Invocation::WireDaemon);
+}
+
+// An explicit socket must be checked even when the environment default is private.
+#[test]
+fn wire_daemon_checks_explicit_socket_before_token_read() {
+    let root = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let socket = outside.path().join("wire.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let db = root.path().join("missing-store").join("fl.redb");
+    let token = root.path().join("missing-token");
+    let output = common::isolated_fl(root.path())
+        .unwrap()
+        .env("FL_TEST_ISOLATION_ROOT", root.path())
+        .args([
+            "--db",
+            db.to_str().unwrap(),
+            "wire",
+            "daemon",
+            "--socket",
+            socket.to_str().unwrap(),
+            "--token-file",
+            token.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("fixture endpoint refused"), "{stderr}");
+    assert!(!root.path().join("missing-store").exists());
+    assert!(socket.exists(), "existing socket was unlinked");
+    assert_eq!(
+        listener.accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+}
+
+// A private endpoint passes preflight and reaches the ordinary token error.
+// No daemon is spawned and no store is opened in this case.
+#[test]
+fn wire_daemon_private_socket_reaches_token_read() {
+    let root = tempfile::tempdir().unwrap();
+    let db = root.path().join("missing-store").join("fl.redb");
+    let token = root.path().join("missing-token");
+    let output = common::isolated_fl(root.path())
+        .unwrap()
+        .env("FL_TEST_ISOLATION_ROOT", root.path())
+        .args([
+            "--db",
+            db.to_str().unwrap(),
+            "wire",
+            "daemon",
+            "--token-file",
+            token.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("could not read"), "{stderr}");
+    assert!(stderr.contains("missing-token"), "{stderr}");
+    assert!(!root.path().join("missing-store").exists());
+    assert!(!root.path().join("w").exists());
 }
 
 #[test]

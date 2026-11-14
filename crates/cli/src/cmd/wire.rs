@@ -2217,7 +2217,12 @@ pub fn run(env: &StateEnv<'_>, cmd: WireCmd) -> Result<i32, (i32, String)> {
             socket,
             token_file,
         } => {
+            // Refuse an out-of-root fixture endpoint before reading the token
+            // or opening the store; carry this same path into the daemon.
             let sock = resolve_socket_path(env, socket.as_deref());
+            let fixture_root = std::env::var_os("FL_TEST_ISOLATION_ROOT").map(PathBuf::from);
+            fl_fixture_path::check_endpoint(fixture_root.as_deref(), &sock)
+                .map_err(|error| (1, error.to_string()))?;
             let listen_addr =
                 listen.or_else(|| env.cfg.wire.as_ref().and_then(|w| w.listen.clone()));
             let mut peer_list = peers;
