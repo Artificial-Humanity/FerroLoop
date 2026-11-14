@@ -2,10 +2,37 @@
 #![cfg(unix)]
 
 use std::os::unix::fs::PermissionsExt;
+use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use fl_host_proto::{BlockingHostClient, HostEndpoint};
+
+#[allow(dead_code)]
+mod common;
+
+fn isolated_fl(root: &Path) -> Command {
+    common::isolated_fl(root).unwrap()
+}
+
+#[test]
+fn host_commands_use_private_fixture_environment() {
+    let dir = tempfile::tempdir().unwrap();
+    let command = isolated_fl(dir.path());
+    let get = |name: &str| {
+        command
+            .get_envs()
+            .find(|(key, _)| *key == name)
+            .and_then(|(_, value)| value)
+    };
+    assert_eq!(get("HOME"), Some(dir.path().as_os_str()));
+    assert_eq!(get("FL_HOST_SOCK"), Some(dir.path().join("h").as_os_str()));
+    assert_eq!(
+        get("FL_WIRE_SOCKET"),
+        Some(dir.path().join("w").as_os_str())
+    );
+    assert_eq!(get("PATH"), Some(dir.path().join("no-bin").as_os_str()));
+}
 
 struct Daemon(Child);
 impl Drop for Daemon {
@@ -21,8 +48,7 @@ fn host_serve_reports_its_cli_build_through_rpc_and_status() {
     std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     let socket = dir.path().join("host.sock");
     let endpoint = HostEndpoint::unix(&socket).unwrap();
-    let bin = env!("CARGO_BIN_EXE_fl");
-    let version = Command::new(bin)
+    let version = isolated_fl(dir.path())
         .args(["version", "--json"])
         .output()
         .unwrap();
@@ -33,7 +59,7 @@ fn host_serve_reports_its_cli_build_through_rpc_and_status() {
         "dirty": version["dirty"], "build_time_unix": version["build_time_unix"],
     });
     let mut daemon = Daemon(
-        Command::new(bin)
+        isolated_fl(dir.path())
             .args(["host", "serve", "--socket"])
             .arg(&socket)
             .stdin(Stdio::null())
@@ -55,7 +81,7 @@ fn host_serve_reports_its_cli_build_through_rpc_and_status() {
         serde_json::to_value(client.host_status().unwrap().unwrap()).unwrap(),
         expected
     );
-    let output = Command::new(bin)
+    let output = isolated_fl(dir.path())
         .args(["host", "status", "--json"])
         .env("FL_HOST_SOCK", &socket)
         .output()
@@ -77,7 +103,7 @@ fn host_serve_reports_its_cli_build_through_rpc_and_status() {
             .unwrap()
             > 590_000_000
     );
-    let output = Command::new(bin)
+    let output = isolated_fl(dir.path())
         .args(["host", "status"])
         .env("FL_HOST_SOCK", &socket)
         .output()
@@ -141,8 +167,9 @@ async fn old_host_status_explicitly_reports_unavailable() {
                 };
                 conn.respond(&response).await.unwrap();
             });
+            let root = dir.path().to_owned();
             let output = tokio::task::spawn_blocking(move || {
-                let mut command = Command::new(env!("CARGO_BIN_EXE_fl"));
+                let mut command = isolated_fl(&root);
                 command.args(["host", "status"]).env("FL_HOST_SOCK", socket);
                 if json {
                     command.arg("--json");
