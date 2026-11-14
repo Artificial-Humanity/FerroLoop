@@ -87,6 +87,20 @@ impl Env {
         self.run_json("init", args)
     }
 
+    fn isolated_run_json(&self, verb: &str, args: &[&str]) -> Value {
+        let out = self
+            .isolated_fl(self.work.path())
+            .args(["project", verb])
+            .args(args)
+            .arg("--json")
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        serde_json::from_slice(&out).unwrap()
+    }
+
     fn run_json(&self, verb: &str, args: &[&str]) -> Value {
         let out = self
             .fl(self.work.path())
@@ -367,10 +381,10 @@ fn bad_input_is_refused_with_a_reason_and_makes_nothing() {
 fn a_name_taken_by_another_directory_is_refused() {
     let env = Env::new();
     let first = env.dir("first");
-    env.init_json(&[first.to_str().unwrap(), "--slug", "shared"]);
+    env.isolated_run_json("init", &[first.to_str().unwrap(), "--slug", "shared"]);
     let config = env.config();
     let second = env.dir("second");
-    env.fl(env.work.path())
+    env.isolated_fl(env.work.path())
         .args([
             "project",
             "init",
@@ -405,7 +419,7 @@ fn another_projects_config_block_and_comments_survive() {
 fn create_with_a_path_takes_the_name_and_runs_no_git_by_default() {
     let env = Env::new();
     let root = env.dir("some-dir");
-    let created = env.run_json(
+    let created = env.isolated_run_json(
         "create",
         &[
             "My Project",
@@ -432,7 +446,7 @@ fn create_with_a_path_takes_the_name_and_runs_no_git_by_default() {
         env.config()
     );
     // A directory that is not a repository is a project every command accepts.
-    env.fl(&root)
+    env.isolated_fl(&root)
         .args(["project", "list"])
         .assert()
         .success()
