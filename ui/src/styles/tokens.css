@@ -1244,3 +1244,12 @@ button.fd-badge:hover:not(:disabled) {
 .fd-settings-category-tooltip { display: block; position: absolute; top: 100%; left: 50%; transform: translateX(-50%); z-index: 20; white-space: nowrap; padding: 5px 8px; background: var(--bg-surface); color: var(--text-primary); border: 1px solid var(--border-subtle); border-radius: 4px; font-size: 12px; }
 .fd-settings-category-tooltip[hidden] { display: none; }
 @media (max-width: 767px) { .fd-settings-category-select { display: block; } .fd-settings-category-icons { display: none; } }
+
+/* Git/PR view mode: select on phones, compact icon controls on wider viewports. */
+.fd-git-subview-select { display: none; }
+.fd-git-subview-icons { display: flex; align-items: center; gap: 6px; }
+.fd-git-subview-icon { position: relative; min-width: 40px; min-height: 40px; display: inline-flex; align-items: center; justify-content: center; }
+.fd-git-subview-icon[aria-pressed="true"]::after { content: ""; position: absolute; inset: auto 4px 1px; border-bottom: 3px solid currentColor; }
+.fd-git-subview-tooltip { display: none; position: absolute; top: 100%; left: 0; z-index: 20; white-space: nowrap; padding: 5px 8px; background: var(--bg-surface); color: var(--text-primary); border: 1px solid var(--border-subtle); border-radius: 4px; font-size: 12px; }
+.fd-git-subview-icon:hover .fd-git-subview-tooltip, .fd-git-subview-icon:focus-visible .fd-git-subview-tooltip { display: block; }
+@media (max-width: 767px) { .fd-git-subview-select { display: block; } .fd-git-subview-icons { display: none; } }

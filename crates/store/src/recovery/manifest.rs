@@ -210,6 +210,7 @@ impl VerificationReport {
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ValidationExpectations {
+    #[serde(deserialize_with = "validation_format_version")]
     pub(crate) version: u32,
     /// Volatile exclusion evidence, never intrinsic lineage or provenance.
     pub(crate) source_file_identity: Option<(u64, u64)>,
@@ -220,12 +221,58 @@ pub struct ValidationExpectations {
     pub(crate) logical_sha256: String,
     pub(crate) collection_digests: Vec<String>,
     pub(crate) query_digests: Vec<String>,
-    pub(crate) vector_results: Vec<Vec<(String, f64)>>,
+    pub(crate) vector_results: Vec<Vec<(String, VectorScoreBits)>>,
     pub(crate) known: u64,
     pub(crate) unknown: u64,
     pub(crate) opaque_runtime_references: bool,
     pub(crate) exceptions: u64,
     pub(crate) dependencies: u64,
+}
+/// Recovery metadata only; engine/snapshot/profile/manifest/report formats are
+/// unchanged. V1 was fixture-only and is refused without migration.
+pub(crate) const VALIDATION_FORMAT_VERSION: u32 = 2;
+fn validation_format_version<'de, D: serde::Deserializer<'de>>(d: D) -> Result<u32, D::Error> {
+    let version = u32::deserialize(d)?;
+    if version != VALIDATION_FORMAT_VERSION {
+        return Err(serde::de::Error::custom(
+            "unsupported validation metadata format; format 2 required",
+        ));
+    }
+    Ok(version)
+}
+/// Exact finite score representation under the default JSON parser. Persisted
+/// bits bind the checksum; recomputed scores retain the profile's tolerance.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct VectorScoreBits(u64);
+impl VectorScoreBits {
+    pub(crate) fn new(score: f64) -> Option<Self> {
+        score.is_finite().then_some(Self(score.to_bits()))
+    }
+    pub(crate) fn value(self) -> f64 {
+        f64::from_bits(self.0)
+    }
+}
+impl Serialize for VectorScoreBits {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&format!("{:016x}", self.0))
+    }
+}
+impl<'de> Deserialize<'de> for VectorScoreBits {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let text = String::deserialize(d)?;
+        if text.len() != 16
+            || !text
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
+            return Err(serde::de::Error::custom(
+                "canonical finite score bits required",
+            ));
+        }
+        let bits = u64::from_str_radix(&text, 16).map_err(serde::de::Error::custom)?;
+        Self::new(f64::from_bits(bits))
+            .ok_or_else(|| serde::de::Error::custom("finite score bits required"))
+    }
 }
 impl std::fmt::Debug for ValidationExpectations {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -283,7 +330,7 @@ impl BundleManifestV1 {
         limits.check()?;
         let independent_copy_status = report.independent_copy_status(limits)?;
         let profile_sha = super::verify::profile_digest(profile, limits)?;
-        if expected.version != 1
+        if expected.version != VALIDATION_FORMAT_VERSION
             || profile.version != super::profiles::PROFILE_VERSION
             || expected.catalog_identity != profile.catalog_identity
             || expected.profile_sha256 != profile_sha
@@ -416,7 +463,7 @@ impl BundleManifestV1 {
         })
     }
 }
-fn sha256(s: &str) -> bool {
+pub(crate) fn sha256(s: &str) -> bool {
     s.len() == 64
         && s.bytes()
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
@@ -425,6 +472,132 @@ fn sha256(s: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn validation_vector_score_metadata_roundtrip_preserves_exact_checksum() {
+        use crate::recovery::{
+            CancelToken, CaptureBudget, OperationLimits, ProfileKind, ValidationProfile,
+        };
+        use std::time::{Duration, Instant};
+        let root = crate::recovery::test_support::fixture_root();
+        let store = crate::FerroStore::open(root.path().join("scores.fls")).unwrap();
+        let l = OperationLimits::new(
+            Instant::now() + Duration::from_secs(10),
+            16 << 20,
+            64 << 20,
+            CancelToken::new(),
+        );
+        let pin = store
+            .capture_recovery(
+                &CaptureBudget::new(l.deadline, 16 << 20, 64 << 20, Duration::from_secs(1)),
+                &l.cancel,
+            )
+            .unwrap();
+        let mut expected = pin
+            .expectations(
+                &ValidationProfile::new(ProfileKind::SmallEmpty, "score fixture"),
+                &l,
+            )
+            .unwrap();
+        expected.vector_results = vec![
+            (0..1024)
+                .map(|n| {
+                    (
+                        format!("{n:064x}"),
+                        VectorScoreBits::new(f64::from(n) / 7.0).unwrap(),
+                    )
+                })
+                .collect(),
+        ];
+        let bytes = serde_json::to_vec(&expected).unwrap();
+        let decoded: ValidationExpectations = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            bytes,
+            serde_json::to_vec(&decoded).unwrap(),
+            "persisted vector score metadata changed exact bytes"
+        );
+        assert_eq!(
+            super::super::verify::serialized_checksum(&expected, &l).unwrap(),
+            super::super::verify::serialized_checksum(&decoded, &l).unwrap(),
+            "persisted vector score metadata changed exact member checksum"
+        );
+        let mut old = serde_json::to_value(&decoded).unwrap();
+        old["version"] = serde_json::json!(1);
+        old["vector_results"] = serde_json::json!([]);
+        assert!(
+            serde_json::from_value::<ValidationExpectations>(old)
+                .unwrap_err()
+                .to_string()
+                .contains("unsupported validation metadata format")
+        );
+    }
+    #[test]
+    fn validation_score_bits_refuse_nonfinite_noncanonical_and_numeric_v1() {
+        for score in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert!(VectorScoreBits::new(score).is_none());
+        }
+        for encoded in [
+            "\"7ff0000000000000\"",
+            "\"fff0000000000000\"",
+            "\"7ff8000000000001\"",
+            "\"3FF0000000000000\"",
+            "\"0\"",
+            "1.0",
+        ] {
+            assert!(
+                serde_json::from_str::<VectorScoreBits>(encoded).is_err(),
+                "{encoded}"
+            );
+        }
+        for score in [
+            0.0,
+            -0.0,
+            f64::MIN_POSITIVE,
+            f64::MAX,
+            f64::from_bits(1),
+            1.0 / 7.0,
+        ] {
+            let bits = VectorScoreBits::new(score).unwrap();
+            let decoded: VectorScoreBits =
+                serde_json::from_slice(&serde_json::to_vec(&bits).unwrap()).unwrap();
+            assert_eq!(decoded.value().to_bits(), score.to_bits());
+        }
+    }
+    #[test]
+    fn vector_probe_f32_profile_digest_roundtrips_under_default_json_parser() {
+        use crate::recovery::{
+            CancelToken, OperationLimits, ProfileKind, ValidationProfile, profiles::QueryProbe,
+        };
+        use std::time::{Duration, Instant};
+        let l = OperationLimits::new(
+            Instant::now() + Duration::from_secs(10),
+            1 << 20,
+            1 << 20,
+            CancelToken::new(),
+        );
+        let mut profile =
+            ValidationProfile::new(ProfileKind::MixedTablesVectors, "float probe fixture");
+        profile.probes.push(QueryProbe::Vector {
+            collection: "vectors".into(),
+            vector: vec![
+                0.0,
+                -0.0,
+                f32::MIN_POSITIVE,
+                f32::MAX,
+                f32::from_bits(1),
+                std::f32::consts::PI,
+                1.0 / 257.0,
+                1.0 / 7.0,
+            ],
+            limit: 8,
+        });
+        let bytes = serde_json::to_vec(&profile).unwrap();
+        let decoded: ValidationProfile = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(bytes, serde_json::to_vec(&decoded).unwrap());
+        assert_eq!(
+            super::super::verify::profile_digest(&profile, &l).unwrap(),
+            super::super::verify::profile_digest(&decoded, &l).unwrap()
+        );
+    }
     #[test]
     fn effective_configuration_keeps_defaults_sources_and_rebuild_inputs() {
         let config = EffectiveCodeIndexConfig {
@@ -463,5 +636,19 @@ mod tests {
         let mut absent = serde_json::to_value(config).unwrap();
         absent.as_object_mut().unwrap().remove("ignore_rules");
         assert!(serde_json::from_value::<EffectiveCodeIndexConfig>(absent).is_err());
+    }
+}
+
+/// A typed view of the existing V1 reference list; no bundle encoding changes.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DependencyManifest {
+    pub references: Vec<ReferenceDependency>,
+}
+impl From<&BundleManifestV1> for DependencyManifest {
+    fn from(manifest: &BundleManifestV1) -> Self {
+        Self {
+            references: manifest.reference_dependencies.clone(),
+        }
     }
 }

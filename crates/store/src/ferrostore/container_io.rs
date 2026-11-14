@@ -122,6 +122,11 @@ impl ContainerIo for File {
 
 /// The directory side: making, opening, naming and syncing container files.
 pub(super) trait ContainerFs: Send + Sync {
+    /// Admission check in this filesystem namespace, before creation and engine open.
+    fn check_restore_admission(&self, path: &Path) -> Result<(), StoreError> {
+        crate::recovery::admission::check_restore_admission(path)
+            .map_err(|e| super::backend(e.to_string()))
+    }
     /// The same file system as a shared handle, which a [`super::Disk`]
     /// keeps: compaction (spec §5) reopens its path after the file under it
     /// is swapped.

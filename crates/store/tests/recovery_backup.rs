@@ -1766,26 +1766,64 @@ fn default_ceiling_is_admitted_with_bounded_reserve() {
         PublicationOutcome::Durable(_)
     ));
 }
+fn assert_exact_retained_locks(f: &Fixture) -> fs::File {
+    use std::os::unix::fs::MetadataExt;
+    let source = fs::metadata(&f.source).unwrap();
+    let store_name = format!("{}:{}.lock", source.dev(), source.ino());
+    let locks = f.destination.join(".locks");
+    let names: std::collections::BTreeSet<_> = fs::read_dir(&locks)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert_eq!(
+        names,
+        [std::ffi::OsString::from("catalog.lock"), store_name.into()]
+            .into_iter()
+            .collect(),
+        "only the physical store lock and stable catalog lock may remain"
+    );
+    let catalog_path = locks.join("catalog.lock");
+    let metadata = fs::symlink_metadata(&catalog_path).unwrap();
+    assert!(metadata.is_file());
+    assert_eq!(metadata.mode() & 0o7777, 0o600);
+    assert_eq!(metadata.uid(), unsafe { libc::geteuid() });
+    assert_eq!(metadata.nlink(), 1);
+    assert_eq!(metadata.len(), 0);
+    let held = fs::File::open(catalog_path).unwrap();
+    assert_eq!(
+        (
+            held.metadata().unwrap().dev(),
+            held.metadata().unwrap().ino()
+        ),
+        (metadata.dev(), metadata.ino())
+    );
+    held
+}
+
 #[test]
 fn operation_lock_is_reclaimed_and_store_lock_has_diagnostics() {
+    use std::os::unix::fs::MetadataExt;
     let f = Fixture::new();
     let r = f.request();
-    backup(
-        &f.store,
-        &r,
-        &NativeRecoveryFs::new(f.destination.clone(), reconciliation_limits()),
-        &CancelToken::new(),
-    )
-    .unwrap();
-    let names: Vec<_> = fs::read_dir(f.destination.join(".locks"))
-        .unwrap()
-        .map(|e| e.unwrap().path())
-        .collect();
-    assert_eq!(names.len(), 1);
-    let v: serde_json::Value = serde_json::from_slice(&fs::read(&names[0]).unwrap()).unwrap();
+    let native = NativeRecoveryFs::new(f.destination.clone(), reconciliation_limits());
+    backup(&f.store, &r, &native, &CancelToken::new()).unwrap();
+    let catalog = assert_exact_retained_locks(&f);
+    let identity = fs::metadata(&f.source).unwrap();
+    let store_lock =
+        f.destination
+            .join(".locks")
+            .join(format!("{}:{}.lock", identity.dev(), identity.ino()));
+    let v: serde_json::Value = serde_json::from_slice(&fs::read(store_lock).unwrap()).unwrap();
     assert_eq!(v["operation_id"], r.operation_id.to_string());
     assert_eq!(v["pid"], std::process::id());
     assert!(v["started_at_unix_ms"].as_u64().unwrap() > 0);
+    backup(&f.store, &f.request(), &native, &CancelToken::new()).unwrap();
+    let retained = assert_exact_retained_locks(&f).metadata().unwrap();
+    let original = catalog.metadata().unwrap();
+    assert_eq!(
+        (retained.dev(), retained.ino()),
+        (original.dev(), original.ino())
+    );
 }
 
 struct ExhaustedOpen;
@@ -1928,6 +1966,7 @@ fn thousand_operations_do_not_exhaust_shared_directories() {
     }
     let mut total_growth = 0u64;
     let mut maximum_growth = 0u64;
+    let mut catalog_lock = None;
     let mut stat = std::mem::MaybeUninit::<libc::statvfs>::uninit();
     use std::os::fd::AsRawFd;
     let held = fs::File::open(&f.destination).unwrap();
@@ -1994,6 +2033,9 @@ fn thousand_operations_do_not_exhaust_shared_directories() {
             growth <= directory_reserve,
             "operation={n} actual_directory_growth={growth} reserve={directory_reserve}"
         );
+        if n == 0 {
+            catalog_lock = Some(assert_exact_retained_locks(&f));
+        }
         total_growth += growth;
         maximum_growth = maximum_growth.max(growth);
     }
@@ -2002,9 +2044,11 @@ fn thousand_operations_do_not_exhaust_shared_directories() {
         1000 * directory_reserve,
         total_growth as f64 / (1000 * directory_reserve) as f64
     );
+    let retained = assert_exact_retained_locks(&f).metadata().unwrap();
+    let original = catalog_lock.unwrap().metadata().unwrap();
     assert_eq!(
-        fs::read_dir(f.destination.join(".locks")).unwrap().count(),
-        1
+        (retained.dev(), retained.ino()),
+        (original.dev(), original.ino())
     );
     assert!(matches!(
         backup(&f.store, &f.request(), &native, &CancelToken::new()).unwrap(),
@@ -2075,7 +2119,24 @@ struct AllocationFault {
 }
 impl RecoveryIo for AllocationFault {
     fn before(&self, e: RecoveryEvent) -> io::Result<()> {
-        if matches!(e, RecoveryEvent::Flush(_)) {
+        // Admission lock durability is not publication preparation. Only bundle
+        // and receipt flushes cross the boundary used by the exact outcome oracle.
+        if matches!(
+            e,
+            RecoveryEvent::Flush(
+                Member::Image
+                    | Member::VerificationCopy
+                    | Member::Validation
+                    | Member::Report
+                    | Member::Manifest
+                    | Member::Profile
+                    | Member::IndexConfig
+                    | Member::Config
+                    | Member::Warrants
+                    | Member::VaultCiphertext
+                    | Member::Receipt
+            )
+        ) {
             self.prepared
                 .store(true, std::sync::atomic::Ordering::Release);
         }
@@ -2093,6 +2154,25 @@ impl RecoveryIo for AllocationFault {
         Ok(())
     }
 }
+#[test]
+fn allocation_fault_preparation_tracks_publication_flushes_only() {
+    for member in [Member::Image, Member::Manifest, Member::Receipt] {
+        let fault = AllocationFault {
+            target: None,
+            errno: 0,
+            seen: Mutex::new(vec![]),
+            reached: Default::default(),
+            prepared: Default::default(),
+        };
+        for admission in [Member::CatalogLock, Member::LockDiagnostics] {
+            fault.before(RecoveryEvent::Flush(admission)).unwrap();
+            assert!(!fault.prepared.load(std::sync::atomic::Ordering::Acquire));
+        }
+        fault.before(RecoveryEvent::Flush(member)).unwrap();
+        assert!(fault.prepared.load(std::sync::atomic::Ordering::Acquire));
+    }
+}
+
 fn complete_bundle(path: &Path) {
     use sha2::{Digest, Sha256};
     let manifest: serde_json::Value =

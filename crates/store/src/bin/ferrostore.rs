@@ -9,7 +9,9 @@
 //! filesystem ([`SiblingScratch`]), not in the RAM-backed `/tmp`.
 
 use clap::{Args, Parser, Subcommand};
-use fl_store::cli::args::{BenchArgs, GetArgs, InspectArgs, PutArgs, QueryArgs, ServeArgs, emit};
+use fl_store::cli::args::{
+    BenchArgs, GetArgs, InspectArgs, PutArgs, QueryArgs, RecoveryArgs, ServeArgs, emit,
+};
 use fl_store::cli::{self as store_cli, Create, Output, SiblingScratch, Target, Wording};
 use fl_store::{BackendKind, choose_backend};
 use std::path::PathBuf;
@@ -80,6 +82,13 @@ impl Engine {
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// Explicit offline recovery with a private approved root and bound request.
+    Recovery {
+        #[arg(long)]
+        store: Option<PathBuf>,
+        #[command(flatten)]
+        args: RecoveryArgs,
+    },
     /// The engine, files and format version of a store. Read-only.
     Status {
         #[command(flatten)]
@@ -194,6 +203,10 @@ fn run(cmd: Cmd) -> store_cli::Result<i32> {
         Ok(code)
     };
     match cmd {
+        Cmd::Recovery { store, args } => {
+            let (out, code) = args.run(store.as_deref())?;
+            printed(out, code)
+        }
         Cmd::Status {
             store,
             engine,

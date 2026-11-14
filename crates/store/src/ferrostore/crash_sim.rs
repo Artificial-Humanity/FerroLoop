@@ -569,6 +569,16 @@ impl SimFs {
 }
 
 impl ContainerFs for SimFs {
+    fn check_restore_admission(&self, path: &Path) -> Result<(), StoreError> {
+        // Simulated names must never inspect the host filesystem. A fence in
+        // this namespace refuses even if its simulated contents are malformed.
+        let guard = crate::recovery::admission::guard_path(path);
+        if self.lock().names.contains_key(&guard) {
+            Err(super::backend("restore admission fenced"))
+        } else {
+            Ok(())
+        }
+    }
     fn shared(&self) -> Arc<dyn ContainerFs> {
         Arc::new(self.clone())
     }
