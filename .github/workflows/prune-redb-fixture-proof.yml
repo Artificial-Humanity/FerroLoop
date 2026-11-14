@@ -1,0 +1,33 @@
+# PROPOSAL ONLY: Owner-tier workflow review and a separate positive-execution
+# ruling are required before this is installed, dispatched, or executed.
+# Intended location: .github/workflows/prune-redb-fixture-proof.yml
+name: prune-redb-fixture-proof
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  redb_fixture_proof:
+    name: redb fixture proof (one reviewed test)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: 6eaaba86600804f76f91a2411877553a99430b46
+      - name: Verify reviewed target
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = 6eaaba86600804f76f91a2411877553a99430b46
+      - name: Run exactly one ignored Redb fixture test
+        shell: bash
+        env:
+          CARGO_TERM_COLOR: never
+        run: |
+          set -euo pipefail
+          cargo test -p fl-cli --test fixture_scope fixture_scope::tests::prune_redb_positive_initialized_reopens_and_cleans_up_ci_only -- --ignored --exact --color never | tee "$RUNNER_TEMP/prune-redb-result.txt"
+          grep -Fx 'test fixture_scope::tests::prune_redb_positive_initialized_reopens_and_cleans_up_ci_only ... ok' "$RUNNER_TEMP/prune-redb-result.txt"
+          grep -E '^test result: ok\. 1 passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/prune-redb-result.txt"
