@@ -179,9 +179,9 @@ fn precedence_is_db_then_env_then_config_then_default() {
 #[test]
 fn a_malformed_config_is_an_error_naming_the_file() {
     let env = Env::new();
-    let repo = git_repo();
+    let repo = tempfile::tempdir().unwrap();
     env.write_config("[[project]\nroot =");
-    env.fl(repo.path())
+    env.isolated_fl(repo.path())
         .args(["project", "list"])
         .assert()
         .code(2)
@@ -196,12 +196,12 @@ fn a_malformed_config_is_an_error_naming_the_file() {
 #[test]
 fn a_relative_store_path_in_config_is_refused() {
     let env = Env::new();
-    let repo = git_repo();
+    let repo = tempfile::tempdir().unwrap();
     env.write_config(&format!(
         "[[project]]\nroot = \"{}\"\nstore = \"stores/a.redb\"\n",
         repo.path().display()
     ));
-    env.fl(repo.path())
+    env.isolated_fl(repo.path())
         .args(["project", "list"])
         .assert()
         .code(2)
@@ -310,14 +310,14 @@ fn a_store_that_cannot_be_opened_during_an_iri_search_is_an_error_not_a_skip() {
 #[test]
 fn a_symlinked_config_root_binds_like_the_real_one() {
     let env = Env::new();
-    let repo = git_repo();
+    let repo = tempfile::tempdir().unwrap();
     let stores = tempfile::tempdir().unwrap();
     let a = stores.path().join("a.redb");
     let links = tempfile::tempdir().unwrap();
     let link = links.path().join("via-link");
     std::os::unix::fs::symlink(repo.path(), &link).unwrap();
     env.write_config(&bind(&link, &a));
-    env.fl(repo.path())
+    env.isolated_fl(repo.path())
         .args(["project", "list"])
         .assert()
         .success();
@@ -676,32 +676,32 @@ fn a_gate_iri_passed_as_a_project_is_refused_not_listed_as_empty() {
 #[test]
 fn project_add_uses_the_store_bound_to_the_path_not_the_current_directory() {
     let env = Env::new();
-    let (ra, rb) = (git_repo(), git_repo());
+    let (ra, rb) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
     let stores = tempfile::tempdir().unwrap();
     let (a, b) = (stores.path().join("a.redb"), stores.path().join("b.redb"));
     env.write_config(&format!("{}{}", bind(ra.path(), &a), bind(rb.path(), &b)));
     // `a` exists (and holds nothing), so "not written there" is a check on a
     // store that was really there to be written.
-    env.fl(ra.path())
+    env.isolated_fl(ra.path())
         .args(["project", "list"])
         .assert()
         .success()
         .stdout("");
     assert!(a.exists());
 
-    env.fl(ra.path())
+    env.isolated_fl(ra.path())
         .args(["project", "add", rb.path().to_str().unwrap()])
         .assert()
         .success();
 
     let root = rb.path().canonicalize().unwrap();
     let root = root.to_str().unwrap();
-    env.fl(rb.path())
+    env.isolated_fl(rb.path())
         .args(["project", "list"])
         .assert()
         .success()
         .stdout(contains(root));
-    env.fl(ra.path())
+    env.isolated_fl(ra.path())
         .args(["project", "list"])
         .assert()
         .success()
@@ -718,7 +718,7 @@ fn an_empty_or_relative_xdg_data_home_falls_back_to_home_not_the_cwd() {
         let env = Env::new();
         let home = tempfile::tempdir().unwrap();
         let cwd = tempfile::tempdir().unwrap();
-        env.fl(cwd.path())
+        env.isolated_fl(cwd.path())
             .env("XDG_DATA_HOME", value)
             .env("HOME", home.path())
             .args(["project", "list"])
