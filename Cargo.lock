@@ -484,6 +484,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "fl-fixture-path"
+version = "0.1.0"
+dependencies = [
+ "tempfile",
+]
+
+[[package]]
 name = "fl-gate"
 version = "0.1.0"
 dependencies = [

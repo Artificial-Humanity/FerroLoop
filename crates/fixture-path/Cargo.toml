@@ -1,0 +1,10 @@
+[package]
+name = "fl-fixture-path"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Filesystem path checks for private test fixtures"
+
+[dev-dependencies]
+tempfile.workspace = true
