@@ -1,4 +1,8 @@
+#[allow(dead_code)]
+mod common;
+
 use assert_cmd::Command;
+use assert_cmd::assert::OutputAssertExt;
 use predicates::prelude::PredicateBooleanExt;
 use predicates::str::contains;
 use std::path::Path;
@@ -100,9 +104,19 @@ fn a_refused_attempt_is_still_recorded_and_shows_up_in_stats() {
 fn stats_over_a_project_with_no_attempts_says_so_rather_than_printing_nothing() {
     let d = tempfile::tempdir().unwrap();
     let db = d.path().join("t.redb").display().to_string();
-    let _repo = project(&db);
-    cli(&db)
-        .args(["stats", "--project", "1"])
+    let repo = d.path().join("project");
+    std::fs::create_dir(&repo).unwrap();
+    common::isolated_fl(d.path())
+        .unwrap()
+        .current_dir(d.path())
+        .args(["--db", &db, "project", "add"])
+        .arg(&repo)
+        .assert()
+        .success();
+    common::isolated_fl(d.path())
+        .unwrap()
+        .current_dir(d.path())
+        .args(["--db", &db, "stats", "--project", "1"])
         .assert()
         .success()
         .stdout(contains("attempts: 0"));
