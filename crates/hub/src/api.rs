@@ -7179,13 +7179,33 @@ fn handle_post_session_clear(
         }
     };
 
-    let (canonical_id, persona) = resolve_session_target(state, session_id);
+    // Reset target resolution reads saved metadata only. General discovery can probe
+    // terminals, including an unsupported route that is about to refuse the request.
+    let snap = load_discovery_snapshot(state);
+    let targets =
+        crate::discovery::saved_reset_targets(&snap, state.config.home_override.as_deref());
+    let requested = session_id.trim();
+    let Some((canonical_id, persona, route)) = targets.iter().find(|(id, persona, route)| {
+        id == requested
+            || persona.eq_ignore_ascii_case(requested)
+            || route_matches_session_id(route, requested)
+    }) else {
+        return HttpResponse::json(
+            404,
+            json!({
+                "error": "no saved route for this session; refresh or register the session, then try again"
+            }),
+        );
+    };
+    if let Err(refusal) = preflight_session_reset(route) {
+        return HttpResponse::json(409, json!(refusal));
+    }
     match reset_session(
         state,
         authority.actor_name(),
         session_id,
-        &canonical_id,
-        persona.as_deref(),
+        canonical_id,
+        Some(persona.as_str()),
         mode,
     ) {
         Ok(data) => HttpResponse::json(200, data),
@@ -7196,7 +7216,7 @@ fn handle_post_session_clear(
 /// Clear or reforge one session: select and preflight its route, prepare guidance, then drop
 /// queued prompts and model overrides and reset the live vendor route. `mode` is `"clear"` or `"reforge"`. `raw_session_id`
 /// is the id the caller used (its queue is dropped too); `canonical_id` and `persona` come from
-/// [`resolve_session_target`]. Returns the response body, or `(status, error)`: 404 when there
+/// the saved reset target metadata. Returns the response body, or `(status, error)`: 404 when there
 /// is no agent record (reforge) or no live route, 409 for an unsupported reset, and 502
 /// when the dispatch itself fails. Error bodies retain structured refusal fields.
 /// Shared by the single-session clear handler and the bulk action.
@@ -7958,7 +7978,7 @@ fn handle_post_session_context_window(
 }
 
 /// `POST /api/v1/sessions/bulk-action` (Record 44): run `compact`, `clear` or `reforge` on
-/// every discovered session that has a live route. Owner only. One failure never stops the
+/// sessions with saved routes (Clear/Reforge), or discovered live routes (Compact). Owner only. One failure never stops the
 /// batch; each session reports its own result.
 fn handle_post_session_bulk_action(
     state: &HubState,
@@ -7987,12 +8007,20 @@ fn handle_post_session_bulk_action(
     }
 
     let snap = load_discovery_snapshot(state);
-    let targets: Vec<(String, Option<String>)> =
+    let targets: Vec<(String, Option<String>)> = if action == "compact" {
         discover_route_sessions_without_model_info(&snap, state.config.home_override.as_deref())
             .into_iter()
             .filter(|s| s.source == "route")
             .map(|s| (s.id, s.persona))
-            .collect();
+            .collect()
+    } else {
+        // Clear/Reforge enumerate saved routes only; do not probe unsupported sessions
+        // merely to discover that their reset cannot be confirmed.
+        crate::discovery::saved_reset_targets(&snap, state.config.home_override.as_deref())
+            .into_iter()
+            .map(|(id, persona, _)| (id, Some(persona)))
+            .collect()
+    };
     let actor = authority.actor_name();
     let mut results = Vec::with_capacity(targets.len());
     for (id, persona) in &targets {
@@ -11690,8 +11718,14 @@ mod council_guidance_tests {
                     HttpRequest::new("POST", "/fixture").with_json_body(&json!({"mode":mode}));
                 let denied = handle_post_session_clear(&state, &peer, persona, &req);
                 assert_eq!(denied.status, 403);
-                for alias in [persona, id] {
-                    let response = handle_post_session_clear(&state, &owner, alias, &req);
+                for alias in [persona.clone(), id.clone(), persona.to_ascii_uppercase()] {
+                    let (response, costs) = crate::discovery::cost_counters::measure(|| {
+                        handle_post_session_clear(&state, &owner, &alias, &req)
+                    });
+                    assert_eq!(
+                        costs.route_scans, 0,
+                        "unsupported HTTP reset must not discover/probe"
+                    );
                     assert_eq!(
                         response.status,
                         409,
@@ -11701,10 +11735,16 @@ mod council_guidance_tests {
                     assert_reset_refusal(&response.json_value().unwrap(), vendor);
                 }
             }
-            let bulk = handle_post_session_bulk_action(
-                &state,
-                &owner,
-                &HttpRequest::new("POST", "/fixture").with_json_body(&json!({"action":mode})),
+            let (bulk, costs) = crate::discovery::cost_counters::measure(|| {
+                handle_post_session_bulk_action(
+                    &state,
+                    &owner,
+                    &HttpRequest::new("POST", "/fixture").with_json_body(&json!({"action":mode})),
+                )
+            });
+            assert_eq!(
+                costs.route_scans, 0,
+                "unsupported bulk reset must not discover/probe"
             );
             assert_eq!(bulk.status, 200);
             let body = bulk.json_value().unwrap();
@@ -11736,6 +11776,47 @@ mod council_guidance_tests {
                 events.try_recv().is_err(),
                 "no cleared event or startup prompt"
             );
+        }
+    }
+
+    #[test]
+    fn unknown_http_reset_refuses_without_discovery_or_choice_mutation() {
+        let tmp = TempDir::new().unwrap();
+        let state = HubState::new(HubServerConfig {
+            store_path: tmp.path().join("store.redb"),
+            repo_root: tmp.path().into(),
+            home_override: Some(tmp.path().into()),
+            ..HubServerConfig::default()
+        });
+        let owner = HubAuthority::Owner {
+            login: "owner".into(),
+        };
+        seed_reset_choices(&state, &["unsaved-thread"]);
+        let mut events = state.subscribe();
+        for mode in ["clear", "reforge"] {
+            let (response, costs) = crate::discovery::cost_counters::measure(|| {
+                handle_post_session_clear(
+                    &state,
+                    &owner,
+                    "unsaved-thread",
+                    &HttpRequest::new("POST", "/fixture").with_json_body(&json!({"mode":mode})),
+                )
+            });
+            assert_eq!(response.status, 404);
+            assert_eq!(
+                costs.route_scans, 0,
+                "unknown reset must not discover/probe"
+            );
+            let body = response.json_value().unwrap();
+            assert!(
+                body["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("refresh or register")
+            );
+            assert_eq!(state.session_queue("unsaved-thread").len(), 1);
+            assert!(state.session_model_override("unsaved-thread").is_some());
+            assert!(events.try_recv().is_err());
         }
     }
 

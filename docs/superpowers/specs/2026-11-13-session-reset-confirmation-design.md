@@ -104,3 +104,13 @@ this identity-confirmation contract and needs a separate audit. State this limit
 in the PR body. Never use a fake binary/test environment to bypass production
 preflight. The proposed verified Enter retry is deferred with native observers:
 with no exact observer, no reset command is written at all.
+
+## Saved-route resolution ruling (2026-11-14)
+
+Ferris approved saved-route-only Clear/Reforge resolution and bulk enumeration in wire
+`01a1dae3-45a0-720f-b548-3769ba4e3c16`. Unknown/unsaved single targets return HTTP 404
+with refresh/register guidance without active discovery or terminal/host/vendor probes.
+Bulk reset includes only saved/registered routes; Compact retains existing discovery.
+Supported saved reset routes retain normal validation and dispatch behavior. This avoids
+probing unsupported routes merely to identify them before refusal, without adding passive
+scanner infrastructure.

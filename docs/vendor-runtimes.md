@@ -37,6 +37,12 @@ in the transcript.
 
 ## Clear and Reforge
 
+Clear and Reforge resolve targets only from saved/registered routes. A single request for
+an unknown or unsaved session returns HTTP 404 with guidance to refresh or register the
+session first; it does not actively discover that target. Bulk Clear/Reforge includes only
+saved routes. Compact keeps its existing discovery behavior. Supported saved reset routes
+retain their normal validation and dispatch checks.
+
 Codex, Muse, Grok and every generic `HostCli` route refuse both actions before reset
 commands, startup prompts, queue/model changes or discovery invalidation. FerroLoop cannot
 confirm a changed native session identity bound to the exact terminal for these routes.
