@@ -146,16 +146,16 @@ fn a_missing_project_is_refused_and_names_the_id() {
 #[test]
 fn a_record_moves_between_states() {
     let d = tempfile::tempdir().unwrap();
-    let _repo = project(&d);
-    cli(&d)
+    let _repo = isolated_project(&d);
+    isolated_cli(&d)
         .args(["record", "add", "--project", "1", "--title", "t"])
         .assert()
         .success();
-    cli(&d)
+    isolated_cli(&d)
         .args(["record", "move", "1", "--to", "doing"])
         .assert()
         .success();
-    cli(&d)
+    isolated_cli(&d)
         .args(["record", "list", "--project", "1"])
         .assert()
         .success()
