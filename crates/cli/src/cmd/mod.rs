@@ -31,3 +31,6 @@ pub mod vault;
 pub mod watch;
 pub mod watch_balance;
 pub mod wire;
+
+#[allow(dead_code)]
+mod state_access_plan;
