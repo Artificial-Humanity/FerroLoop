@@ -118,6 +118,16 @@ pub struct QueuedOperatorPrompt {
     /// Captured at admission; persona rediscovery must never retarget an explicit Codex send.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub intended_codex_thread_id: Option<String>,
+    /// Persisted intent only; it never authorizes delivery after deserialization.
+    #[serde(default)]
+    pub(crate) claude_terminal: bool,
+    #[serde(skip)]
+    pub(crate) claude_binding: Option<fl_wire::claude_registration::ClaudeRegistrationBinding>,
+    /// Process-local admission evidence; a deserialized item must not manufacture it.
+    #[serde(skip)]
+    pub(crate) admitted_current: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) intended_vendor: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub persona: Option<String>,
     pub prompt: String,
@@ -291,6 +301,9 @@ impl Drop for SessionDispatchGuard<'_> {
 
 pub(crate) struct DirectPromptInput {
     pub queue_target: Option<PromptQueueTarget>,
+    pub claude_terminal: bool,
+    pub claude_binding: Option<fl_wire::claude_registration::ClaudeRegistrationBinding>,
+    pub intended_vendor: Option<String>,
     pub intended_codex_thread_id: Option<String>,
     pub persona: Option<String>,
     pub prompt: String,
@@ -328,6 +341,10 @@ impl PromptQueueState {
             id: format!("qp-{}-{}", now.unix_millis(), self.next_seq),
             session_id: session_key.to_string(),
             intended_codex_thread_id: input.intended_codex_thread_id,
+            claude_terminal: input.claude_terminal,
+            claude_binding: input.claude_binding,
+            admitted_current: true,
+            intended_vendor: input.intended_vendor,
             persona: input.persona,
             prompt: input.prompt,
             effective_body: input.effective_body,
@@ -793,6 +810,10 @@ impl HubState {
                     .as_ref()
                     .and_then(|session| PromptQueueTarget::observed(session, session_key)),
                 intended_codex_thread_id,
+                claude_terminal: observed.as_ref().is_some_and(|s| s.adapter == "claude")
+                    && fl_wire::dispatcher::is_owner_sender(&by),
+                claude_binding: None,
+                intended_vendor: None,
                 persona,
                 prompt,
                 effective_body,
@@ -988,7 +1009,9 @@ impl HubState {
                         queue[pos].delivery_state = QueuedDeliveryState::Pending;
                         queue[pos].hold_reason = Some(composer_hold_reason(&error).to_string());
                         queue[pos].delivery_error = Some(error);
-                        queue[pos].retries_exhausted = false;
+                        // Bound Claude holds do not use the generic composer probe.
+                        // The UI's exhausted state provides the Send Now guidance.
+                        queue[pos].retries_exhausted = queue[pos].claude_terminal;
                     } else {
                         queue[pos].delivery_state = QueuedDeliveryState::Unconfirmed;
                         queue[pos].delivery_error = Some(error);
@@ -1724,6 +1747,9 @@ mod tests {
                 false,
                 false,
                 DirectPromptInput {
+                    claude_terminal: false,
+                    claude_binding: None,
+                    intended_vendor: None,
                     queue_target: None,
                     intended_codex_thread_id: None,
                     persona: None,
@@ -1746,6 +1772,9 @@ mod tests {
             false,
             false,
             DirectPromptInput {
+                claude_terminal: false,
+                claude_binding: None,
+                intended_vendor: None,
                 queue_target: None,
                 intended_codex_thread_id: None,
                 persona: None,

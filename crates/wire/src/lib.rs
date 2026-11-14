@@ -5,6 +5,7 @@
 #[doc(hidden)]
 pub mod test_isolation;
 
+pub mod claude_registration;
 mod codex_control;
 pub mod daemon;
 pub mod dispatch_diagnostics;

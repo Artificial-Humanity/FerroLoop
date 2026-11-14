@@ -1091,6 +1091,9 @@ fn replacement_admission_checks_queue_created_after_its_discovery() {
     let mut replacement = original.clone();
     replacement.id = "conv-ferris-2".into();
     let input = |session: &crate::DiscoveredSessionSummary| crate::DirectPromptInput {
+        claude_terminal: false,
+        claude_binding: None,
+        intended_vendor: None,
         queue_target: crate::PromptQueueTarget::observed(session, "ferris"),
         intended_codex_thread_id: None,
         persona: Some("ferris".into()),
@@ -1367,6 +1370,9 @@ fn retained_alias_is_ambiguous_until_its_original_queue_and_flight_are_gone() {
             false,
             false,
             crate::DirectPromptInput {
+                claude_terminal: false,
+                claude_binding: None,
+                intended_vendor: None,
                 queue_target: crate::PromptQueueTarget::observed(session, "ferris"),
                 intended_codex_thread_id: None,
                 persona: Some("ferris".into()),
