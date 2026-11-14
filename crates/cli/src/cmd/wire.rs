@@ -331,6 +331,26 @@ pub fn resolve_caller_with_source(
     explicit: Option<&str>,
     transcript: Option<&Path>,
 ) -> (String, PersonaSource) {
+    resolve_caller_with_source_impl(env, explicit, transcript, None)
+        .expect("the legacy caller route path does not propagate errors")
+}
+
+/// Resolve a caller while retaining the already preflighted wire endpoint.
+fn resolve_caller_at(
+    env: &StateEnv<'_>,
+    explicit: Option<&str>,
+    transcript: Option<&Path>,
+    sock: &Path,
+) -> Result<String, String> {
+    resolve_caller_with_source_impl(env, explicit, transcript, Some(sock)).map(|result| result.0)
+}
+
+fn resolve_caller_with_source_impl(
+    env: &StateEnv<'_>,
+    explicit: Option<&str>,
+    transcript: Option<&Path>,
+    sock: Option<&Path>,
+) -> Result<(String, PersonaSource), String> {
     let store = env.open_for_scope(Some(&StateScope::Workspace)).ok();
     let reg = store.as_ref().map(|s| s as &dyn AgentRegistry);
     let rpath = resolve_routes_path_for(env);
@@ -346,9 +366,13 @@ pub fn resolve_caller_with_source(
         && persona != "unknown"
         && let Some(route) = capture_current_env_route()
     {
-        record_caller_route_checked(env, &persona, route, source);
+        if let Some(sock) = sock {
+            record_caller_route_checked_at(env, &persona, route, source, sock)?;
+        } else {
+            record_caller_route_checked(env, &persona, route, source);
+        }
     }
-    (persona, source)
+    Ok((persona, source))
 }
 
 #[derive(Debug, Clone, Default)]
@@ -867,6 +891,28 @@ fn record_caller_route_with_provenance_meta(
 ) -> Result<(), String> {
     let sock = resolve_socket_path(env, None);
     record_caller_route_with_provenance_meta_at(env, persona, route, explicit, meta, &sock)
+        .map_err(|error| error.to_string())
+}
+
+#[derive(Debug)]
+enum RouteCaptureError {
+    Fixture(std::io::Error),
+    Other(String),
+}
+
+impl std::fmt::Display for RouteCaptureError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Fixture(error) => error.fmt(f),
+            Self::Other(error) => error.fmt(f),
+        }
+    }
+}
+
+impl From<String> for RouteCaptureError {
+    fn from(error: String) -> Self {
+        Self::Other(error)
+    }
 }
 
 fn record_caller_route_with_provenance_meta_at(
@@ -876,10 +922,11 @@ fn record_caller_route_with_provenance_meta_at(
     explicit: bool,
     meta: RouteRegistrationMeta<'_>,
     sock: &Path,
-) -> Result<(), String> {
+) -> Result<(), RouteCaptureError> {
     let prune_roster = explicit && !matches!(route, VendorRoute::Muse { .. });
     if let Some(mut client) =
-        classify_local_connection(LocalClient::connect(sock, DEFAULT_LOCAL_RPC_TIMEOUT))?
+        classify_local_connection_typed(LocalClient::connect(sock, DEFAULT_LOCAL_RPC_TIMEOUT))
+            .map_err(RouteCaptureError::Fixture)?
     {
         let response = client.request(&LocalRequest::RegisterRoute {
             persona: persona.to_string(),
@@ -892,7 +939,9 @@ fn record_caller_route_with_provenance_meta_at(
             unverified_process: meta.unverified_process,
         })?;
         if !matches!(response, LocalResponse::RouteRegistered) {
-            return Err(format!("unexpected daemon response: {response:?}"));
+            return Err(RouteCaptureError::Other(format!(
+                "unexpected daemon response: {response:?}"
+            )));
         }
     } else {
         let rpath = resolve_routes_path_for(env);
@@ -912,7 +961,7 @@ fn record_caller_route_with_provenance_meta_at(
                 at: now_at(),
             }) {
                 let _ = table.save(Some(&rpath));
-                return Err(refusal.message);
+                return Err(RouteCaptureError::Other(refusal.message));
             }
         } else {
             table.upsert(persona, route, now_at());
@@ -1196,8 +1245,16 @@ fn existing_route_entry_for_at(
     persona: &str,
     sock: &Path,
 ) -> Result<Option<RouteEntry>, String> {
+    existing_route_entry_for_at_typed(env, persona, sock).map_err(|error| error.to_string())
+}
+
+fn existing_route_entry_for_at_typed(
+    env: &StateEnv<'_>,
+    persona: &str,
+    sock: &Path,
+) -> std::io::Result<Option<RouteEntry>> {
     if let Some(mut client) =
-        classify_local_connection(LocalClient::connect(sock, DEFAULT_LOCAL_RPC_TIMEOUT))?
+        classify_local_connection_typed(LocalClient::connect(sock, DEFAULT_LOCAL_RPC_TIMEOUT))?
         && let Ok(LocalResponse::Status(st)) = client.request(&LocalRequest::Status {
             include_codex_queues: false,
         })
@@ -1232,6 +1289,47 @@ pub fn record_caller_route_checked(
         source,
         RouteRegistrationMeta::default(),
     )
+}
+
+/// Preserve legacy best-effort route capture, except that a fixture boundary
+/// refusal must stop the caller before it sends or falls back locally.
+fn record_caller_route_checked_at(
+    env: &StateEnv<'_>,
+    persona: &str,
+    route: VendorRoute,
+    source: PersonaSource,
+    sock: &Path,
+) -> Result<(), String> {
+    if !source.is_trusted() {
+        let existing = existing_route_entry_for_at_typed(env, persona, sock)
+            .map_err(|error| error.to_string())?
+            .map(|entry| entry.route);
+        if let Err(note) =
+            route_replacement_verdict(persona, existing.as_ref(), &route, source, &process_exists)
+        {
+            eprintln!("{note}");
+            return Ok(());
+        }
+    }
+    let explicit = matches!(
+        source,
+        PersonaSource::Explicit | PersonaSource::Env | PersonaSource::Transcript
+    );
+    match record_caller_route_with_provenance_meta_at(
+        env,
+        persona,
+        route,
+        explicit,
+        RouteRegistrationMeta::default(),
+        sock,
+    ) {
+        Ok(()) => Ok(()),
+        Err(RouteCaptureError::Fixture(error)) => Err(error.to_string()),
+        Err(RouteCaptureError::Other(error)) => {
+            eprintln!("fl wire: could not register route: {error}");
+            Ok(())
+        }
+    }
 }
 
 fn record_caller_route_checked_with_meta(
@@ -1287,11 +1385,15 @@ pub fn parse_message_id(raw: &str) -> Result<MessageId, String> {
 
 /// Preserve offline fallback while refusing a fixture-root boundary violation.
 fn classify_local_connection<T>(connection: std::io::Result<T>) -> Result<Option<T>, String> {
+    classify_local_connection_typed(connection).map_err(|error| error.to_string())
+}
+
+fn classify_local_connection_typed<T>(
+    connection: std::io::Result<T>,
+) -> std::io::Result<Option<T>> {
     match connection {
         Ok(client) => Ok(Some(client)),
-        Err(error) if fl_fixture_path::is_fixture_endpoint_refusal(&error) => {
-            Err(error.to_string())
-        }
+        Err(error) if fl_fixture_path::is_fixture_endpoint_refusal(&error) => Err(error),
         Err(_) => Ok(None),
     }
 }
@@ -1309,8 +1411,18 @@ pub fn execute_send(
 
 pub fn execute_send_with_options(
     env: &StateEnv<'_>,
+    args: SendWireArgs,
+    no_daemon: bool,
+) -> Result<(WireMessage, Vec<DeliveryReceipt>), String> {
+    let sock = resolve_socket_path(env, None);
+    execute_send_with_options_at(env, args, no_daemon, &sock)
+}
+
+fn execute_send_with_options_at(
+    env: &StateEnv<'_>,
     mut args: SendWireArgs,
     no_daemon: bool,
+    sock: &Path,
 ) -> Result<(WireMessage, Vec<DeliveryReceipt>), String> {
     let message_id = args
         .id
@@ -1321,10 +1433,9 @@ pub fn execute_send_with_options(
             )
         })
         .clone();
-    let sock = resolve_socket_path(env, None);
     if !no_daemon {
         if let Some(mut client) =
-            classify_local_connection(LocalClient::connect(&sock, DEFAULT_LOCAL_RPC_TIMEOUT))?
+            classify_local_connection(LocalClient::connect(sock, DEFAULT_LOCAL_RPC_TIMEOUT))?
         {
             let uncertain = |error: String| {
                 format!(
@@ -1554,6 +1665,12 @@ pub fn run(env: &StateEnv<'_>, cmd: WireCmd) -> Result<i32, (i32, String)> {
             no_daemon,
             json,
         } => {
+            // Resolve once and refuse an out-of-root fixture endpoint before
+            // caller discovery can open the store or update a route.
+            let sock = resolve_socket_path(env, None);
+            let fixture_root = std::env::var_os("FL_TEST_ISOLATION_ROOT").map(PathBuf::from);
+            fl_fixture_path::check_endpoint(fixture_root.as_deref(), &sock)
+                .map_err(|error| (1, error.to_string()))?;
             let parsed_to = WireAddress::parse(&to).map_err(|e| (1, e.to_string()))?;
             let parsed_kind = MessageKind::from_wire(&kind).ok_or_else(|| {
                 (
@@ -1569,13 +1686,14 @@ pub fn run(env: &StateEnv<'_>, cmd: WireCmd) -> Result<i32, (i32, String)> {
                 .map(parse_message_id)
                 .transpose()
                 .map_err(|e| (1, e))?;
-            let sender_name = resolve_caller(env, from.as_deref(), None);
+            let sender_name =
+                resolve_caller_at(env, from.as_deref(), None, &sock).map_err(|error| (1, error))?;
             let urgency = if urgent {
                 MessageUrgency::Urgent
             } else {
                 MessageUrgency::Normal
             };
-            let (msg, receipts) = execute_send_with_options(
+            let (msg, receipts) = execute_send_with_options_at(
                 env,
                 SendWireArgs {
                     id: None,
@@ -1594,6 +1712,7 @@ pub fn run(env: &StateEnv<'_>, cmd: WireCmd) -> Result<i32, (i32, String)> {
                     at: now_at(),
                 },
                 no_daemon || wire_no_daemon_env(),
+                &sock,
             )
             .map_err(|e| (1, e))?;
             print_sent(&msg, &receipts, json);

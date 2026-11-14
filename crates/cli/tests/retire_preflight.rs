@@ -21,12 +21,17 @@ enum Invocation {
     WireRegister,
     LegacyRegister,
     LegacyExecutableRegister,
+    WireSend,
+    LegacySend,
+    LegacyExecutableSend,
 }
 
 fn run_refused_command(root: &Path, outside_socket: &Path, db: &Path, invocation: Invocation) {
     let mut command = if matches!(
         invocation,
-        Invocation::LegacyExecutable | Invocation::LegacyExecutableRegister
+        Invocation::LegacyExecutable
+            | Invocation::LegacyExecutableRegister
+            | Invocation::LegacyExecutableSend
     ) {
         let alias = root.join("agent-msg");
         if !alias.exists() {
@@ -47,6 +52,9 @@ fn run_refused_command(root: &Path, outside_socket: &Path, db: &Path, invocation
         Invocation::WireRegister
             | Invocation::LegacyRegister
             | Invocation::LegacyExecutableRegister
+            | Invocation::WireSend
+            | Invocation::LegacySend
+            | Invocation::LegacyExecutableSend
     ) {
         // Exercise the hydration and route-capture entry path; refusal must
         // happen before either can open a store or touch a route.
@@ -122,6 +130,38 @@ fn run_refused_command(root: &Path, outside_socket: &Path, db: &Path, invocation
                 "--replace",
             ]);
         }
+        Invocation::WireSend => {
+            command.args([
+                "--db",
+                db.to_str().unwrap(),
+                "wire",
+                "send",
+                "felicia",
+                "subject",
+                "body",
+            ]);
+        }
+        Invocation::LegacySend => {
+            command.args([
+                "agent-msg",
+                "--db",
+                db.to_str().unwrap(),
+                "send",
+                "felicia",
+                "subject",
+                "body",
+            ]);
+        }
+        Invocation::LegacyExecutableSend => {
+            command.args([
+                "--db",
+                db.to_str().unwrap(),
+                "send",
+                "felicia",
+                "subject",
+                "body",
+            ]);
+        }
     }
     let output = command.output().unwrap();
     assert!(!output.status.success(), "command unexpectedly succeeded");
@@ -162,6 +202,54 @@ fn legacy_register_refuses_before_store_or_route_mutation() {
 #[test]
 fn legacy_executable_register_refuses_before_store_or_route_mutation() {
     assert_outside_socket_refusal(Invocation::LegacyExecutableRegister);
+}
+
+#[test]
+fn wire_send_refuses_before_store_or_route_mutation() {
+    assert_outside_socket_refusal(Invocation::WireSend);
+}
+
+#[test]
+fn legacy_send_refuses_before_store_or_route_mutation() {
+    assert_outside_socket_refusal(Invocation::LegacySend);
+}
+
+#[test]
+fn legacy_executable_send_refuses_before_store_or_route_mutation() {
+    assert_outside_socket_refusal(Invocation::LegacyExecutableSend);
+}
+
+#[test]
+fn wire_send_private_offline_socket_queues_normally() {
+    let root = tempfile::tempdir().unwrap();
+    let db = root.path().join("offline.redb");
+    let output = common::isolated_fl(root.path())
+        .unwrap()
+        .current_dir(root.path())
+        .env("FL_TEST_ISOLATION_ROOT", root.path())
+        .env("FL_WIRE_SOCKET", root.path().join("missing.sock"))
+        .args([
+            "--db",
+            db.to_str().unwrap(),
+            "wire",
+            "send",
+            "felicia",
+            "subject",
+            "body",
+            "--from",
+            "felix",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stderr).contains("queued, the daemon will deliver"));
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(result.is_object());
 }
 
 #[test]
