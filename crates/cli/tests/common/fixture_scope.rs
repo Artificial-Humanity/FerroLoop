@@ -33,6 +33,7 @@ pub struct FixtureScopeBuilder {
 pub struct FixtureScope {
     files: Vec<File>,
     manifest: PathBuf,
+    manifest_bytes: Vec<u8>,
     context: FixtureContext,
     // Fields drop in declaration order, keeping the root until after files.
     root: TempDir,
@@ -148,10 +149,14 @@ impl FixtureScopeBuilder {
         file.write_all(&bytes)?;
         file.flush()?;
         let context = FixtureContext::load(self.root.path(), &manifest)?;
+        let mut permissions = file.metadata()?.permissions();
+        permissions.set_readonly(true);
+        file.set_permissions(permissions)?;
         drop(file);
         Ok(FixtureScope {
             files: self.files,
             manifest,
+            manifest_bytes: bytes,
             context,
             root: self.root,
         })
@@ -172,8 +177,20 @@ impl FixtureScope {
     pub fn root(&self) -> &Path {
         self.root.path()
     }
-    pub fn manifest(&self) -> &Path {
-        &self.manifest
+    /// Validate the finalized manifest immediately before passing its path to a child.
+    /// This detects accidental changes; it is not protection from a hostile process.
+    pub fn manifest_for_transfer(&self) -> io::Result<&Path> {
+        let metadata = std::fs::metadata(&self.manifest)?;
+        if !metadata.is_file()
+            || !metadata.permissions().readonly()
+            || std::fs::read(&self.manifest)? != self.manifest_bytes
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "finalized fixture manifest changed",
+            ));
+        }
+        Ok(&self.manifest)
     }
     pub fn context(&self) -> &FixtureContext {
         &self.context
@@ -186,7 +203,21 @@ impl FixtureScope {
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
+        self.manifest_for_transfer()?;
         crate::common::isolated_fl(self.root())?.args(args).output()
+    }
+}
+
+// Windows cannot delete a read-only file during TempDir cleanup. Restore only
+// that platform's writable attribute before the owned directory is removed.
+#[cfg(windows)]
+impl Drop for FixtureScope {
+    fn drop(&mut self) {
+        if let Ok(metadata) = std::fs::metadata(&self.manifest) {
+            let mut permissions = metadata.permissions();
+            permissions.set_readonly(false);
+            let _ = std::fs::set_permissions(&self.manifest, permissions);
+        }
     }
 }
 
@@ -206,7 +237,7 @@ mod tests {
             .unwrap();
         let scope = builder.finish().unwrap();
         let root = scope.root().to_path_buf();
-        assert!(scope.manifest().is_file());
+        assert!(scope.manifest_for_transfer().unwrap().is_file());
         assert!(
             scope
                 .context()
@@ -242,6 +273,36 @@ mod tests {
                     access: PathAccess::Create
                 })
                 .is_err()
+        );
+        drop(scope);
+        assert!(!root.exists());
+    }
+
+    #[test]
+    fn changed_finalized_manifest_is_refused_before_transfer() {
+        let scope = FixtureScopeBuilder::new().unwrap().finish().unwrap();
+        let path = scope.manifest_for_transfer().unwrap().to_path_buf();
+        let root = scope.root().to_path_buf();
+        assert!(std::fs::metadata(&path).unwrap().permissions().readonly());
+
+        // Simulate an accidental change after someone makes the file writable.
+        let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            permissions.set_mode(0o600);
+        }
+        #[cfg(not(unix))]
+        permissions.set_readonly(false);
+        std::fs::set_permissions(&path, permissions).unwrap();
+        std::fs::write(&path, b"changed").unwrap();
+        let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+        permissions.set_readonly(true);
+        std::fs::set_permissions(&path, permissions).unwrap();
+
+        assert_eq!(
+            scope.manifest_for_transfer().unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
         );
         drop(scope);
         assert!(!root.exists());
