@@ -515,7 +515,7 @@ fn compact_on_redb_says_it_is_fls_only_and_touches_nothing() {
 #[test]
 fn compact_on_ferro_does_not_create_or_migrate_a_store() {
     let env = Env::new();
-    env.ferro()
+    env.isolated_ferro()
         .arg("--db")
         .arg(env.logical())
         .args(["store", "compact"])
@@ -526,7 +526,7 @@ fn compact_on_ferro_does_not_create_or_migrate_a_store() {
 
     // A lone redb under a ferro selection is not migrated just to compact it.
     open_with(&env.logical(), BackendKind::Redb);
-    env.ferro()
+    env.isolated_ferro()
         .arg("--db")
         .arg(env.logical())
         .args(["store", "compact"])
@@ -657,7 +657,11 @@ fn status_and_checkpoint_do_not_create_a_missing_directory_on_either_engine() {
             let env = Env::new();
             let missing = env.stores.path().join("not-yet");
             let db = missing.join("fl.redb");
-            let mut cmd = if ferro { env.ferro() } else { env.redb() };
+            let mut cmd = if ferro {
+                env.isolated_ferro()
+            } else {
+                env.isolated_redb()
+            };
             cmd.arg("--db").arg(&db).args(["store", sub]);
             let out = cmd.output().unwrap();
             // status succeeds; checkpoint succeeds on redb and is refused on ferro.
@@ -685,7 +689,7 @@ fn status_on_an_empty_redb_file_reports_it_and_does_not_modify_it() {
         .unwrap()
         .modified()
         .unwrap();
-    let v = status_json(env.redb(), &env.logical());
+    let v = status_json(env.isolated_redb(), &env.logical());
     assert_eq!(v["exists"], true);
     assert_eq!(v["size_bytes"], 0);
     assert_eq!(v["format_version"], Value::Null);
@@ -693,7 +697,7 @@ fn status_on_an_empty_redb_file_reports_it_and_does_not_modify_it() {
     assert_eq!(meta.len(), 0, "status initialised the file");
     assert_eq!(meta.modified().unwrap(), mtime);
 
-    env.redb()
+    env.isolated_redb()
         .arg("--db")
         .arg(env.logical())
         .args(["store", "status"])
