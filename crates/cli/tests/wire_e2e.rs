@@ -1602,6 +1602,44 @@ fn daemon_hook_hijack_blocked_records_diagnostic_and_leaves_mail_unacked() {
     assert_eq!(arr[0]["status"], "pending");
 }
 
+// Use a dedicated multi-process store so the seeded inbox and both status
+// clients exercise the same private database as the child daemon.
+fn dead_route_command(env: &TestEnv) -> Command {
+    let mut command = codex_queue_command(env);
+    command.env("FL_DB", env.root.join("dead-route.fls"));
+    command
+}
+
+#[test]
+fn dead_route_daemon_command_uses_private_fixtures() {
+    let env = TestEnv::new();
+    let command = dead_route_command(&env);
+    let get = |key: &str| {
+        command
+            .get_envs()
+            .find(|(name, _)| *name == key)
+            .and_then(|(_, value)| value)
+            .map(|v| v.to_os_string())
+    };
+    for (name, path) in [
+        ("FL_DB", env.root.join("dead-route.fls")),
+        ("FL_WIRE_SOCKET", env.sock_file.clone()),
+        ("FL_WIRE_ROUTES", env.routes_file.clone()),
+        ("FL_WIRE_CODEX_CONTROL_SOCK", env.root.join("c")),
+        ("PATH", env.root.join("no-bin")),
+    ] {
+        assert_eq!(get(name).as_deref(), Some(path.as_os_str()), "{name}");
+    }
+    assert_eq!(
+        get("FL_STORE_BACKEND").as_deref(),
+        Some(std::ffi::OsStr::new("ferro"))
+    );
+    assert_eq!(
+        get("FL_WIRE_DISABLE_HOST_DISCOVERY").as_deref(),
+        Some(std::ffi::OsStr::new("1"))
+    );
+}
+
 #[test]
 fn dead_explicit_route_with_held_mail_surfaces_dead_explicit_route_in_fl_wire_status() {
     let mut exited = Command::new("sh").args(["-c", "exit 0"]).spawn().unwrap();
@@ -1609,8 +1647,15 @@ fn dead_explicit_route_with_held_mail_surfaces_dead_explicit_route_in_fl_wire_st
     let _ = exited.wait();
 
     let env = TestEnv::new();
-    let store_path = env.data_dir.join("fl/fl.redb");
-    let store = std::sync::Arc::new(fl_store::open_store(&store_path).unwrap());
+    let store_path = env.root.join("dead-route.fls");
+    let store = fl_store::open_store_with(
+        &store_path,
+        &fl_store::StoreOptions {
+            backend: Some(fl_store::BackendKind::Ferro),
+            ..Default::default()
+        },
+    )
+    .unwrap();
 
     let mut routes = fl_wire::identity::RouteTable::default();
     routes.upsert_explicit_with_meta(
@@ -1651,8 +1696,10 @@ fn dead_explicit_route_with_held_mail_surfaces_dead_explicit_route_in_fl_wire_st
             .unwrap();
     }
 
+    drop(store);
+
     // 1. Inactive daemon `fl wire status` (JSON + text).
-    let mut inactive_json_cmd = env.fl();
+    let mut inactive_json_cmd = dead_route_command(&env);
     inactive_json_cmd.args(["wire", "status", "--json"]);
     let inactive_json = run_json(inactive_json_cmd);
     assert_eq!(inactive_json["daemon"], "inactive");
@@ -1661,7 +1708,10 @@ fn dead_explicit_route_with_held_mail_surfaces_dead_explicit_route_in_fl_wire_st
         "dead_explicit_route"
     );
 
-    let inactive_text_out = env.fl().args(["wire", "status"]).output().unwrap();
+    let inactive_text_out = dead_route_command(&env)
+        .args(["wire", "status"])
+        .output()
+        .unwrap();
     assert!(inactive_text_out.status.success());
     let inactive_text = String::from_utf8(inactive_text_out.stdout).unwrap();
     assert!(
@@ -1670,22 +1720,15 @@ fn dead_explicit_route_with_held_mail_surfaces_dead_explicit_route_in_fl_wire_st
     );
 
     // 2. Active daemon `fl wire status` (JSON + text).
-    let mut daemon = fl_wire::daemon::spawn_daemon(
-        store,
-        fl_wire::daemon::DaemonConfig {
-            node_id: "node-dead".into(),
-            host: "host-dead".into(),
-            socket_path: env.sock_file.clone(),
-            routes_path: Some(env.routes_file.clone()),
-            home_override: Some(env.root.clone()),
-            listen_addr: None,
-            peers: vec![],
-            psk: vec![],
-        },
-    )
-    .unwrap();
+    let mut daemon_command = dead_route_command(&env);
+    daemon_command
+        .args(["wire", "daemon"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let daemon = FixtureDaemon::start_command(&env, daemon_command);
 
-    let mut active_json_cmd = env.fl();
+    let mut active_json_cmd = dead_route_command(&env);
     active_json_cmd.args(["wire", "status", "--json"]);
     let active_json = run_json(active_json_cmd);
     assert_eq!(
@@ -1697,8 +1740,11 @@ fn dead_explicit_route_with_held_mail_surfaces_dead_explicit_route_in_fl_wire_st
         "dead_explicit_route"
     );
 
-    let active_text_out = env.fl().args(["wire", "status"]).output().unwrap();
-    daemon.stop();
+    let active_text_out = dead_route_command(&env)
+        .args(["wire", "status"])
+        .output()
+        .unwrap();
+    drop(daemon);
     assert!(active_text_out.status.success());
     let active_text = String::from_utf8(active_text_out.stdout).unwrap();
     assert!(
