@@ -1014,7 +1014,9 @@ export const sessionDeliveryReceipts = new Map<string, {
 }>();
 /** A prompt held because the vendor composer holds non-wire input or a dialog (#496). Zero keys were sent, so it is known not to have landed and stays retryable. */
 export function isComposerHeldPrompt(item: QueuedOperatorPrompt): boolean {
-  return item.hold_reason === "composer_occupied_zero_keys";
+  return item.hold_reason === "composer_occupied"
+    || item.hold_reason === "composer_unlocated"
+    || item.hold_reason === "session_busy";
 }
 export function composerHoldText(item: QueuedOperatorPrompt): string {
   return item.retries_exhausted
