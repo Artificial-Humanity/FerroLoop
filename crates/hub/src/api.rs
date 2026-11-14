@@ -6094,6 +6094,21 @@ pub(crate) fn reset_queued_delivery_calls() {
     QUEUED_DELIVERY_CALLS.with(|c| c.set(0));
 }
 
+// Retained non-Claude classification is only a routing restriction; every
+// actual route must still pass the vendor fence. Serialized strings never grant
+// Claude terminal authority.
+fn queued_non_claude_vendor(item: &crate::QueuedOperatorPrompt) -> Option<&str> {
+    item.intended_vendor
+        .as_deref()
+        .map(fl_wire::identity::canonical_vendor_id)
+        .filter(|vendor| *vendor != "claude" && fl_core::lookup_vendor(vendor).is_some())
+        .or_else(|| item.intended_codex_thread_id.as_ref().map(|_| "codex"))
+}
+
+fn legacy_owner_unclassified(item: &crate::QueuedOperatorPrompt) -> bool {
+    !item.admitted_current && queued_non_claude_vendor(item).is_none()
+}
+
 fn drain_composer_probe(
     home: Option<&std::path::Path>,
     item: &crate::QueuedOperatorPrompt,
@@ -6107,6 +6122,9 @@ fn drain_composer_probe(
             COMPOSER_PROBE_CALLS.with(|c| c.set(c.get() + 1));
             return ready;
         }
+    }
+    if item.claude_terminal {
+        return None;
     }
     crate::lifecycle::find_route(
         home,
@@ -6134,7 +6152,20 @@ fn operator_prompt_intent(authority: &HubAuthority, send_now: bool) -> OperatorP
     }
 }
 
-#[cfg_attr(test, allow(clippy::too_many_arguments))] // Keep test transport scoped to queued calls.
+fn require_intended_vendor(
+    route: &fl_wire::identity::VendorRoute,
+    intended: Option<&str>,
+) -> Result<(), PushError> {
+    if intended.is_some_and(|vendor| route.canonical_vendor() != vendor) {
+        Err(PushError::Failed(
+            "resolved route does not match the requested vendor".into(),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn dispatch_operator_prompt_with_intent_for_session(
     state: &HubState,
     persona: Option<&str>,
@@ -6143,6 +6174,9 @@ fn dispatch_operator_prompt_with_intent_for_session(
     body: &str,
     intent: OperatorPromptIntent,
     intended_codex_thread_id: Option<&str>,
+    claude_terminal: bool,
+    claude_binding: Option<&fl_wire::claude_registration::ClaudeRegistrationBinding>,
+    intended_vendor: Option<&str>,
     #[cfg(test)] queued: bool,
 ) -> Result<OperatorPromptOutcome, OperatorPromptError> {
     #[cfg(test)]
@@ -6151,6 +6185,31 @@ fn dispatch_operator_prompt_with_intent_for_session(
             f();
         }
     });
+    if claude_terminal {
+        let binding = claude_binding.ok_or_else(|| {
+            OperatorPromptError::Push(PushError::NotConnected(
+                "Claude registration is unbound; re-register and resubmit".into(),
+            ))
+        })?;
+        return fl_wire::dispatcher::dispatch_bound_claude_operator_prompt(
+            binding,
+            sender_name,
+            body,
+        )
+        .map(|()| OperatorPromptOutcome::TransportAccepted)
+        .map_err(|e| {
+            OperatorPromptError::Push(match e {
+                fl_wire::dispatcher::ClaudeBoundError::Refused(message) => {
+                    PushError::NotConnected(format!(
+                        "Claude terminal delivery refused: {message}; re-register and resubmit"
+                    ))
+                }
+                fl_wire::dispatcher::ClaudeBoundError::Delivery(message) => {
+                    PushError::Failed(message)
+                }
+            })
+        });
+    }
     // Preserve typed steering failures across the ordinary transport's rediscovery boundary.
     // Every steering failure is final: mapping it to Failed prevents a second route attempt.
     let mut steering_error = None;
@@ -6175,6 +6234,7 @@ fn dispatch_operator_prompt_with_intent_for_session(
                 Err(()) => return Err(PushError::NotConnected("ambiguous queued session alias".into())),
                 _ => {}
             }
+            require_intended_vendor(route, intended_vendor)?;
             #[cfg(test)]
             if REFUSE_PROMPT_PUSH.with(|hook| {
                 if let Some(f) = hook.borrow_mut().take() { f(); true } else { false }
@@ -6185,6 +6245,16 @@ fn dispatch_operator_prompt_with_intent_for_session(
             if queued && QUEUED_TEST_DELIVERY.with(|flag| flag.get()) {
                 QUEUED_DELIVERY_CALLS.with(|c| c.set(c.get() + 1));
                 return Ok(OperatorPromptOutcome::TransportAccepted);
+            }
+            // An unbound owner prompt must never obtain Claude terminal authority by
+            // rediscovery. Independently established peer delivery stays peer-only.
+            if matches!(route, fl_wire::identity::VendorRoute::Claude { .. }) {
+                if fl_wire::dispatcher::is_owner_sender(sender_name) {
+                    return Err(PushError::Failed("Claude registration is unbound; re-register and resubmit".into()));
+                }
+                return fl_wire::dispatcher::dispatch_claude_peer_prompt(route, sender_name, body)
+                    .map(|()| OperatorPromptOutcome::TransportAccepted)
+                    .map_err(PushError::Failed);
             }
             let delivery = if intent == OperatorPromptIntent::OwnerSendNow
                 && match intended_codex_thread_id {
@@ -6238,6 +6308,7 @@ fn dispatch_operator_prompt_with_intent_for_session(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn dispatch_queued_operator_prompt_with_intent_for_session(
     state: &HubState,
     persona: Option<&str>,
@@ -6246,6 +6317,9 @@ fn dispatch_queued_operator_prompt_with_intent_for_session(
     body: &str,
     intent: OperatorPromptIntent,
     intended_codex_thread_id: Option<&str>,
+    claude_terminal: bool,
+    claude_binding: Option<&fl_wire::claude_registration::ClaudeRegistrationBinding>,
+    intended_vendor: Option<&str>,
 ) -> Result<OperatorPromptOutcome, OperatorPromptError> {
     #[cfg(test)]
     if let Some(err) = QUEUED_TEST_ERROR.with(|e| e.borrow().clone()) {
@@ -6253,7 +6327,8 @@ fn dispatch_queued_operator_prompt_with_intent_for_session(
         return Err(OperatorPromptError::Push(PushError::Failed(err)));
     }
     #[cfg(test)]
-    if QUEUED_TEST_DELIVERY.with(|flag| flag.get())
+    if !claude_terminal
+        && QUEUED_TEST_DELIVERY.with(|flag| flag.get())
         && matches!(state.prompt_queue_target(session_id), Ok(None))
     {
         QUEUED_DELIVERY_CALLS.with(|c| c.set(c.get() + 1));
@@ -6272,6 +6347,9 @@ fn dispatch_queued_operator_prompt_with_intent_for_session(
         body,
         intent,
         intended_codex_thread_id,
+        claude_terminal,
+        claude_binding,
+        intended_vendor,
         #[cfg(test)]
         true,
     )
@@ -6318,12 +6396,16 @@ fn with_operator_delivery(
     data
 }
 
+#[allow(clippy::too_many_arguments)]
 fn dispatch_operator_prompt_for_session_typed(
     state: &HubState,
     persona: Option<&str>,
     session_id: &str,
     sender_name: &str,
     body: &str,
+    claude_terminal: bool,
+    claude_binding: Option<&fl_wire::claude_registration::ClaudeRegistrationBinding>,
+    intended_vendor: Option<&str>,
 ) -> Result<OperatorPromptOutcome, PushError> {
     dispatch_queued_operator_prompt_with_intent_for_session(
         state,
@@ -6333,6 +6415,9 @@ fn dispatch_operator_prompt_for_session_typed(
         body,
         OperatorPromptIntent::Ordinary,
         None,
+        claude_terminal,
+        claude_binding,
+        intended_vendor,
     )
     .map_err(|e| match e {
         OperatorPromptError::Push(e) => e,
@@ -6376,23 +6461,57 @@ pub fn drain_ready_session_queues(state: &HubState) {
     for session_id in keys {
         // Keep the discovered path across the dispatch: if the file disappears before
         // the post-send observation, it is unknown rather than a new empty transcript.
-        let sessions = lookup_sessions(&snap, home);
-        let canonical_id = match state.prompt_queue_target(&session_id) {
-            Ok(Some(target)) => target.session_id,
-            Ok(None) => resolve_session_target_in(&sessions, &session_id).0,
-            Err(()) => {
-                let queue = state.note_pending_queue_error(&session_id, "ambiguous queued session alias; use the original session ID to resolve or discard its queue");
+        let head = state.session_queue(&session_id).into_iter().next();
+        if let Some(item) = head.as_ref().filter(|item| {
+            (item.claude_terminal && item.claude_binding.is_none())
+                || legacy_owner_unclassified(item)
+        }) {
+            if let Some((claimed, claim)) =
+                state.claim_queued_for_dispatch(&session_id, &session_id, &item.id, false)
+            {
+                let queue = state.hold_refused_queued_prompt(
+                    &session_id,
+                    &item.id,
+                    "Queue destination is unverified; re-register and resubmit".into(),
+                );
+                claim.finish();
                 state.broadcast(
                     "session",
                     "queue_updated",
                     json!({
-                        "session_id": session_id,
-                        "persona": queue.first().and_then(|item| item.persona.as_deref()),
-                        "is_busy": true,
-                        "queue": queue,
+                        "session_id": claimed.session_id, "persona": claimed.persona,
+                        "is_busy": true, "queue": queue,
                     }),
                 );
-                continue;
+            }
+            continue;
+        }
+        let pinned = head.as_ref().and_then(|item| item.claude_binding.as_ref());
+        let sessions = if pinned.is_some() {
+            Vec::new()
+        } else {
+            lookup_sessions(&snap, home)
+        };
+        let canonical_id = if let Some(binding) = pinned {
+            binding.native_session().to_string()
+        } else {
+            match state.prompt_queue_target(&session_id) {
+                Ok(Some(target)) => target.session_id,
+                Ok(None) => resolve_session_target_in(&sessions, &session_id).0,
+                Err(()) => {
+                    let queue = state.note_pending_queue_error(&session_id, "ambiguous queued session alias; use the original session ID to resolve or discard its queue");
+                    state.broadcast(
+                        "session",
+                        "queue_updated",
+                        json!({
+                            "session_id": session_id,
+                            "persona": queue.first().and_then(|item| item.persona.as_deref()),
+                            "is_busy": true,
+                            "queue": queue,
+                        }),
+                    );
+                    continue;
+                }
             }
         };
         let mut files = TranscriptReads::default();
@@ -6402,12 +6521,57 @@ pub fn drain_ready_session_queues(state: &HubState) {
             .session_queue(&session_id)
             .first()
             .map(|item| item.id.clone());
+        // Old or deserialized Claude items do not carry registration authority.
+        // Keep them visible; never auto-bind them from the current route.
+        let old_unbound_claude = state
+            .session_queue(&session_id)
+            .first()
+            .is_some_and(|item| {
+                item.claude_binding.is_none()
+                    && fl_wire::dispatcher::is_owner_sender(&item.by)
+                    && (item.claude_terminal
+                        || session_id.to_ascii_lowercase().starts_with("claude:")
+                        || sessions.iter().any(|session| {
+                            session.id == canonical_id && session.adapter == "claude"
+                        }))
+            });
+        if old_unbound_claude {
+            if let Some(prompt_id) = next.as_deref()
+                && let Some((item, claim)) =
+                    state.claim_queued_for_dispatch(&canonical_id, &session_id, prompt_id, false)
+            {
+                let queue = state.hold_refused_queued_prompt(
+                    &session_id,
+                    prompt_id,
+                    "Claude registration is unbound; re-register and resubmit".into(),
+                );
+                claim.finish();
+                state.broadcast(
+                    "session",
+                    "queue_updated",
+                    json!({
+                        "session_id": item.session_id, "persona": item.persona,
+                        "is_busy": true, "queue": queue,
+                    }),
+                );
+            }
+            continue;
+        }
         // A composer-occupied hold is retried only when a passive, key-free probe
         // positively observes a clean composer (`Some(true)`), on the bounded
         // backoff schedule in `HubState` — never over non-wire input or a dialog.
         if let Some(prompt_id) = &next
             && state.is_composer_held_prompt(&session_id, prompt_id)
         {
+            // Retained hosted Claude prompts stay held until explicit Send Now;
+            // the generic probe is not bound to their registration or host stream.
+            if state
+                .session_queue(&session_id)
+                .first()
+                .is_some_and(|item| item.claude_terminal)
+            {
+                continue;
+            }
             let now_ms = stamp::now().unix_millis() as i64;
             if !state.composer_hold_probe_due(prompt_id, now_ms) {
                 continue;
@@ -6445,9 +6609,20 @@ pub fn drain_ready_session_queues(state: &HubState) {
                 &canonical_id,
                 &item.by,
                 &item.effective_body,
+                item.claude_terminal,
+                item.claude_binding.as_ref(),
+                queued_non_claude_vendor(&item).or(item.intended_vendor.as_deref()),
             );
-            let queue =
-                state.finish_queued_prompt(&session_id, &item.id, delivery_res.clone().map(|_| ()));
+            let queue = if matches!(&delivery_res, Err(PushError::NotConnected(message) | PushError::Failed(message)) if message.contains("re-register and resubmit"))
+            {
+                state.hold_refused_queued_prompt(
+                    &session_id,
+                    &item.id,
+                    delivery_res.as_ref().unwrap_err().to_string(),
+                )
+            } else {
+                state.finish_queued_prompt(&session_id, &item.id, delivery_res.clone().map(|_| ()))
+            };
             #[cfg(test)]
             AFTER_QUEUE_FINISH.with(|hook| {
                 if let Some(f) = hook.borrow_mut().take() {
@@ -6534,11 +6709,43 @@ fn handle_post_queued_prompt_send_now(
     raw_session_id: &str,
     prompt_id: &str,
 ) -> HttpResponse {
-    let (canonical_id, target_persona) = match state.prompt_queue_target(raw_session_id) {
-        Ok(Some(target)) => (target.session_id, target.persona),
-        Ok(None) => resolve_session_target(state, raw_session_id),
-        Err(()) => {
-            return HttpResponse::json(409, json!({"error": "ambiguous queued session alias"}));
+    // Locate a retained binding by the exact queue id and one of its own aliases,
+    // without consulting discovery or re-resolving its destination.
+    let pinned = state
+        .queued_session_keys()
+        .into_iter()
+        .flat_map(|key| state.session_queue(&key))
+        .find(|item| {
+            item.id == prompt_id && (item.claude_terminal || legacy_owner_unclassified(item)) && {
+                let persona = item
+                    .claude_binding
+                    .as_ref()
+                    .map(|binding| binding.persona_name())
+                    .or(item.persona.as_deref());
+                raw_session_id == item.session_id
+                    || persona.is_some_and(|name| raw_session_id.eq_ignore_ascii_case(name))
+                    || fl_wire::identity::parse_hosted_identity(raw_session_id)
+                        .ok()
+                        .is_some_and(|(vendor, name)| {
+                            vendor == "claude" && persona == Some(name.as_str())
+                        })
+            }
+        });
+    let (canonical_id, target_persona) = if let Some(item) = pinned.as_ref() {
+        (
+            item.claude_binding
+                .as_ref()
+                .map(|binding| binding.native_session().to_string())
+                .unwrap_or_else(|| item.session_id.clone()),
+            item.persona.clone(),
+        )
+    } else {
+        match state.prompt_queue_target(raw_session_id) {
+            Ok(Some(target)) => (target.session_id, target.persona),
+            Ok(None) => resolve_session_target(state, raw_session_id),
+            Err(()) => {
+                return HttpResponse::json(409, json!({"error": "ambiguous queued session alias"}));
+            }
         }
     };
     if let Some(refusal) =
@@ -6569,19 +6776,28 @@ fn handle_post_queued_prompt_send_now(
         canonical_id.as_str()
     };
     let accepted_at = stamp::now().to_string();
-    let delivery_res = dispatch_queued_operator_prompt_with_intent_for_session(
-        state,
-        item.persona.as_deref().or(target_persona.as_deref()),
-        dispatch_session_id,
-        &item.by,
-        &item.effective_body,
-        operator_prompt_intent(authority, true),
-        intended_codex_thread_id,
-    );
+    let delivery_res = if legacy_owner_unclassified(&item) {
+        Err(OperatorPromptError::Push(PushError::NotConnected(
+            "Queue destination is unverified; re-register and resubmit".into(),
+        )))
+    } else {
+        dispatch_queued_operator_prompt_with_intent_for_session(
+            state,
+            item.persona.as_deref().or(target_persona.as_deref()),
+            dispatch_session_id,
+            &item.by,
+            &item.effective_body,
+            operator_prompt_intent(authority, true),
+            intended_codex_thread_id,
+            item.claude_terminal,
+            item.claude_binding.as_ref(),
+            queued_non_claude_vendor(&item).or(item.intended_vendor.as_deref()),
+        )
+    };
     let refused = matches!(
         delivery_res,
         Err(OperatorPromptError::Steer(CodexSteerError::Refused { .. }))
-    );
+    ) || matches!(&delivery_res, Err(OperatorPromptError::Push(PushError::NotConnected(message) | PushError::Failed(message))) if message.contains("re-register and resubmit"));
     let queue = if refused {
         state.hold_refused_queued_prompt(
             &queue_key,
@@ -6597,7 +6813,7 @@ fn handle_post_queued_prompt_send_now(
     };
     // Owner Send-now that lands on an occupied composer arms a new hold: reset its
     // bounded re-probe budget instead of inheriting an exhausted one.
-    if !refused && state.is_composer_held_prompt(&queue_key, prompt_id) {
+    if !refused && !item.claude_terminal && state.is_composer_held_prompt(&queue_key, prompt_id) {
         state.reset_composer_hold_probe(prompt_id, stamp::now().unix_millis() as i64);
     }
     if !refused
@@ -6795,6 +7011,53 @@ fn handle_post_session_prompt(
         );
     }
 
+    // Classify from the selected primary before discovery, attachment writes, or any
+    // route scan. Bare/opaque intent is unclassified if that source cannot be read.
+    let home = state.config.home_override.as_deref();
+    let intended_vendor = fl_wire::identity::parse_hosted_identity(session_id)
+        .ok()
+        .map(|(vendor, _)| vendor);
+    let source = crate::discovery::route_table_path(home).unwrap_or_else(|| {
+        fl_wire::identity::resolve_routes_path(
+            None,
+            std::env::var_os("FL_WIRE_ROUTES").as_deref(),
+            None,
+        )
+    });
+    use fl_wire::claude_registration::{ClaudeRegistrationBinding, ClaudeRegistrationError};
+    let refuse = |error: &dyn std::fmt::Display| {
+        HttpResponse::json(
+            409,
+            json!({"error": error.to_string(), "delivered": false, "delivery_stage": "refused"}),
+        )
+    };
+    let claude_binding = if authority.is_owner() {
+        let binding = match ClaudeRegistrationBinding::from_intent(source, session_id) {
+            Ok(binding) => binding,
+            Err(ClaudeRegistrationError::Source(_))
+                if intended_vendor
+                    .as_deref()
+                    .is_some_and(|vendor| vendor != "claude") =>
+            {
+                None
+            }
+            Err(error) => return refuse(&error),
+        };
+        if intended_vendor.as_deref() == Some("claude") && binding.is_none() {
+            return refuse(&"Claude registration is unbound; re-register and resubmit");
+        }
+        binding
+    } else {
+        // Peer delivery is authorized separately and never uses terminal paste. A
+        // bare or opaque target nevertheless requires a valid primary before discovery.
+        if intended_vendor.is_none()
+            && let Err(error) = ClaudeRegistrationBinding::validate_source(&source)
+        {
+            return refuse(&error);
+        }
+        None
+    };
+
     let mut saved_attachments: Vec<SavedPromptAttachment> =
         Vec::with_capacity(payload.attachments.len());
     if !payload.attachments.is_empty() {
@@ -6897,25 +7160,44 @@ fn handle_post_session_prompt(
 
     let sender_name = resolve_prompt_sender(authority, payload.by.as_deref());
 
-    let home = state.config.home_override.as_deref();
     // Most prompts target a live route. Its identity needs agent ordering but not the
     // project's entire attempt history. Preserve the full lookup for unknown targets.
     let names = state
         .open_store()
         .map(|store| snapshot_discovery_names(&store))
         .unwrap_or_default();
-    let fast = lookup_one_route_session(&names, home, session_id);
-    let (snap, sessions) = if let Some(session) = fast {
+    // A vendor-qualified peer target is classified by the adapter registry, but
+    // existing discovery indexes it by persona. Keep the vendor constraint through
+    // dispatch so this lookup cannot retarget another adapter.
+    let peer_persona = (!authority.is_owner())
+        .then(|| fl_wire::identity::parse_hosted_identity(session_id).ok())
+        .flatten()
+        .map(|(_, persona)| persona);
+    let lookup_target = peer_persona.as_deref().unwrap_or(session_id);
+    let (snap, sessions) = if claude_binding.is_some() {
+        // Transcript lookup can use the pinned native UUID directly. Do not merge
+        // passive/legacy route discoveries into this authority path.
+        (names, Vec::new())
+    } else if let Some(session) = lookup_one_route_session(&names, home, lookup_target) {
         (names, vec![session])
     } else {
         let snap = load_discovery_snapshot(state);
         let sessions = lookup_sessions(&snap, home);
         (snap, sessions)
     };
-    let observed_target = sessions
-        .iter()
-        .find(|s| s.id == session_id.trim() || s.persona.as_deref() == Some(session_id.trim()));
-    let retained_target = if observed_target.is_none() {
+    let observed_target = sessions.iter().find(|s| {
+        s.id == lookup_target.trim() || s.persona.as_deref() == Some(lookup_target.trim())
+    });
+    if authority.is_owner()
+        && claude_binding.is_none()
+        && observed_target.is_some_and(|s| s.adapter == "claude")
+    {
+        return HttpResponse::json(
+            409,
+            json!({"error": "Claude registration is unbound; re-register and resubmit", "delivered": false, "delivery_stage": "refused"}),
+        );
+    }
+    let retained_target = if observed_target.is_none() && claude_binding.is_none() {
         match state.prompt_queue_target(session_id.trim()) {
             Ok(target) => target,
             Err(()) => {
@@ -6934,10 +7216,20 @@ fn handle_post_session_prompt(
             }),
         );
     }
-    let (canonical_session_id, target_persona) = retained_target
+    let (canonical_session_id, target_persona) = claude_binding
         .as_ref()
-        .map(|target| (target.session_id.clone(), target.persona.clone()))
-        .unwrap_or_else(|| resolve_session_target_in(&sessions, session_id));
+        .map(|binding| {
+            (
+                binding.native_session().to_string(),
+                Some(binding.persona_name().to_string()),
+            )
+        })
+        .or_else(|| {
+            retained_target
+                .as_ref()
+                .map(|target| (target.session_id.clone(), target.persona.clone()))
+        })
+        .unwrap_or_else(|| resolve_session_target_in(&sessions, lookup_target));
     let intended_codex_thread_id = match sessions
         .iter()
         .find(|session| session.id == canonical_session_id)
@@ -6970,6 +7262,9 @@ fn handle_post_session_prompt(
         payload.send_now,
         busy,
         crate::DirectPromptInput {
+            claude_terminal: claude_binding.is_some(),
+            claude_binding: claude_binding.clone(),
+            intended_vendor: intended_vendor.clone(),
             queue_target: observed_target
                 .and_then(|session| crate::PromptQueueTarget::observed(session, session_id)),
             intended_codex_thread_id: intended_codex_thread_id.clone(),
@@ -7033,11 +7328,17 @@ fn handle_post_session_prompt(
         &effective_body,
         operator_prompt_intent(authority, payload.send_now),
         intended_codex_thread_id.as_deref(),
+        claude_binding.is_some(),
+        claude_binding.as_ref(),
+        intended_vendor.as_deref(),
         #[cfg(test)]
         false,
     );
     match &delivery_res {
         Err(OperatorPromptError::Steer(CodexSteerError::Refused { .. })) => {}
+        Err(OperatorPromptError::Push(
+            PushError::NotConnected(message) | PushError::Failed(message),
+        )) if message.contains("re-register and resubmit") => {}
         Err(OperatorPromptError::Push(PushError::NotConnected(_))) if retained_target.is_some() => {
         }
         Ok(OperatorPromptOutcome::AppServerAccepted { .. })
@@ -11499,6 +11800,9 @@ mod council_guidance_tests {
             state.prompt_queues.lock().unwrap().enqueue(
                 key,
                 crate::DirectPromptInput {
+                    claude_terminal: false,
+                    claude_binding: None,
+                    intended_vendor: None,
                     queue_target: None,
                     intended_codex_thread_id: None,
                     persona: Some("ada".into()),
@@ -11576,6 +11880,9 @@ mod council_guidance_tests {
             state.prompt_queues.lock().unwrap().enqueue(
                 key,
                 crate::DirectPromptInput {
+                    claude_terminal: false,
+                    claude_binding: None,
+                    intended_vendor: None,
                     queue_target: None,
                     intended_codex_thread_id: None,
                     persona: Some("ada".into()),
@@ -11993,6 +12300,9 @@ mod council_guidance_tests {
                 state.prompt_queues.lock().unwrap().enqueue(
                     key,
                     crate::DirectPromptInput {
+                        claude_terminal: false,
+                        claude_binding: None,
+                        intended_vendor: None,
                         queue_target: None,
                         intended_codex_thread_id: None,
                         persona: Some("ada".into()),
@@ -12886,6 +13196,500 @@ mod council_guidance_tests {
         assert_eq!(
             active_body["dispatch_diagnostics"]["records"][0]["decisive_reason"],
             "dead_explicit_route"
+        );
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod claude_registration_binding_tests {
+    use super::*;
+    use fl_core::at::At;
+    use fl_wire::claude_registration::ClaudeRegistrationBinding;
+    use fl_wire::identity::{RouteEntry, RouteTable, VendorRoute, proc_start_time_ticks};
+
+    fn fixture() -> (
+        tempfile::TempDir,
+        HubState,
+        PathBuf,
+        RouteEntry,
+        ClaudeRegistrationBinding,
+    ) {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("routes.json");
+        let pid = std::process::id();
+        let entry = RouteEntry {
+            persona: "ada".into(),
+            route: VendorRoute::Claude {
+                pid,
+                session_id: "dce797a0-d963-4c1b-a06b-7fa6bffda7fa".into(),
+                socket_path: tmp.path().join("peer.sock"),
+                key_path: Some(tmp.path().join("fixture.key")),
+            },
+            updated_at: At::from_unix_millis(1),
+            identity_at: None,
+            explicit: true,
+            hosted_id: Some("claude:ada".into()),
+            hydration_generation: Some("one".into()),
+            pid_start_time: proc_start_time_ticks(pid),
+        };
+        write(&path, &entry);
+        let binding = ClaudeRegistrationBinding::from_intent(path.clone(), "ada")
+            .unwrap()
+            .unwrap();
+        let config = crate::HubServerConfig {
+            home_override: Some(tmp.path().to_path_buf()),
+            repo_root: tmp.path().to_path_buf(),
+            store_path: tmp.path().join("store.fls"),
+            ..Default::default()
+        };
+        let state = HubState::new(config);
+        (tmp, state, path, entry, binding)
+    }
+    fn write(path: &std::path::Path, entry: &RouteEntry) {
+        let mut table = RouteTable::default();
+        table.entries.insert("ada".into(), entry.clone());
+        std::fs::write(path, serde_json::to_vec(&table).unwrap()).unwrap();
+    }
+    fn changed(mut entry: RouteEntry) -> RouteEntry {
+        entry.hydration_generation = Some("replacement".into());
+        entry
+    }
+    #[test]
+    fn invalid_primary_refuses_unclassified_before_scans_or_attachment_writes() {
+        let (tmp, state, _source, entry, _binding) = fixture();
+        let alternate = tmp.path().join("alternate-routes.json");
+        let mut stale = RouteTable::default();
+        stale.entries.insert("ada".into(), entry.clone());
+        let mut other = entry;
+        other.persona = "bea".into();
+        other.route = VendorRoute::Codex {
+            thread_id: "codex-thread".into(),
+            cwd: None,
+        };
+        stale.entries.insert("bea".into(), other);
+        std::fs::write(&alternate, serde_json::to_vec(&stale).unwrap()).unwrap();
+        let primary = tmp.path().join(".cache/agent-bus/routes.json");
+        std::fs::create_dir_all(primary.parent().unwrap()).unwrap();
+        let owner = HubAuthority::Owner {
+            login: "owner".into(),
+        };
+        for condition in ["missing", "corrupt", "unreadable", "duplicate"] {
+            match condition {
+                "corrupt" => std::fs::write(&primary, b"{broken").unwrap(),
+                "unreadable" => std::fs::create_dir(&primary).unwrap(),
+                "duplicate" => {
+                    std::fs::write(&primary, b"{\"entries\":{},\"entries\":{}}").unwrap()
+                }
+                _ => {}
+            }
+            let before = std::fs::read(&alternate).unwrap();
+            let peer = HubAuthority::Peer {
+                agent: Some("fiona".into()),
+            };
+            for authority in [&owner, &peer] {
+                for requested in [
+                    "ada",
+                    "dce797a0-d963-4c1b-a06b-7fa6bffda7fa",
+                    "unknown:syntax",
+                ] {
+                    let request = HttpRequest::new("POST", "/unused").with_json_body(&json!({
+                    "prompt": "hello", "attachments": [{"name":"evidence.txt", "data_base64":"aGVsbG8="}]
+                }));
+                    let (response, costs) = crate::discovery::cost_counters::measure(|| {
+                        handle_post_session_prompt(&state, authority, requested, &request)
+                    });
+                    assert_eq!(response.status, 409, "{condition}: {requested}");
+                    assert_eq!(costs.route_scans, 0);
+                    assert_eq!(costs.store_opens, 0);
+                    assert_eq!(std::fs::read(&alternate).unwrap(), before);
+                    assert!(!tmp.path().join("attachments").exists());
+                }
+            }
+            if primary.is_dir() {
+                std::fs::remove_dir(&primary).unwrap();
+            } else if primary.exists() {
+                std::fs::remove_file(&primary).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn explicit_non_claude_vendor_cannot_dispatch_a_claude_route() {
+        let (_tmp, _state, _path, entry, _binding) = fixture();
+        assert!(require_intended_vendor(&entry.route, Some("codex")).is_err());
+        let codex = VendorRoute::Codex {
+            thread_id: "thread".into(),
+            cwd: None,
+        };
+        assert!(require_intended_vendor(&codex, Some("codex")).is_ok());
+    }
+
+    #[test]
+    fn direct_and_queued_native_record_refusals_precede_host_connection() {
+        let (tmp, state, _path, _entry, binding) = fixture();
+        let record = tmp.path().join(format!("{}.json", std::process::id()));
+        for value in [
+            None,
+            Some(json!({"status":"idle"})),
+            Some(json!({"status":"idle", "sessionId":"another-session"})),
+        ] {
+            if let Some(value) = value {
+                std::fs::write(&record, value.to_string()).unwrap();
+            } else if record.exists() {
+                std::fs::remove_file(&record).unwrap();
+            }
+            let direct = dispatch_operator_prompt_with_intent_for_session(
+                &state,
+                Some("ada"),
+                binding.native_session(),
+                "owner",
+                "hello",
+                OperatorPromptIntent::Ordinary,
+                None,
+                true,
+                Some(&binding),
+                None,
+                false,
+            );
+            assert!(
+                matches!(direct, Err(OperatorPromptError::Push(PushError::NotConnected(ref error))) if error.contains("session is unavailable or changed"))
+            );
+            let queued = dispatch_queued_operator_prompt_with_intent_for_session(
+                &state,
+                Some("ada"),
+                binding.native_session(),
+                "owner",
+                "hello",
+                OperatorPromptIntent::OwnerSendNow,
+                None,
+                true,
+                Some(&binding),
+                None,
+            );
+            assert!(
+                matches!(queued, Err(OperatorPromptError::Push(PushError::NotConnected(ref error))) if error.contains("session is unavailable or changed"))
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn peer_route_does_not_require_terminal_binding_and_owner_does_not_fallback() {
+        use std::io::Read;
+        use std::os::unix::net::UnixListener;
+        use std::time::Instant;
+        let (tmp, state, _path, mut entry, _binding) = fixture();
+        let primary = tmp.path().join(".cache/agent-bus/routes.json");
+        std::fs::create_dir_all(primary.parent().unwrap()).unwrap();
+        entry.hosted_id = None;
+        entry.hydration_generation = None;
+        entry.pid_start_time = None;
+        let VendorRoute::Claude {
+            socket_path,
+            key_path,
+            ..
+        } = &entry.route
+        else {
+            unreachable!()
+        };
+        std::fs::write(
+            key_path.as_ref().unwrap(),
+            r#"{"peerToken":"fixture-token"}"#,
+        )
+        .unwrap();
+        let listener = UnixListener::bind(socket_path).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        write(&primary, &entry);
+        crate::discovery::note_route_file_scan(Some(tmp.path()), Instant::now());
+        let request = HttpRequest::new("POST", "/unused")
+            .with_json_body(&json!({"prompt":"hello", "send_now":true}));
+        let owner = HubAuthority::Owner {
+            login: "owner".into(),
+        };
+        let refused = handle_post_session_prompt(&state, &owner, "claude:ada", &request);
+        assert_eq!(refused.status, 409);
+        assert!(matches!(listener.accept(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock));
+        let peer = HubAuthority::Peer {
+            agent: Some("fiona".into()),
+        };
+        let response = handle_post_session_prompt(&state, &peer, "claude:ada", &request);
+        let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(response.status, 200);
+        assert_eq!(body["delivered"], true, "{body}");
+        let (mut socket, _) = listener.accept().unwrap();
+        let mut frames = String::new();
+        socket.read_to_string(&mut frames).unwrap();
+        assert!(frames.contains("fixture-token"));
+        assert!(frames.contains("hello"));
+        assert!(frames.contains("fiona"));
+    }
+
+    #[test]
+    fn direct_route_replacement_refuses_before_any_host_connection() {
+        let (_tmp, state, path, entry, binding) = fixture();
+        before_next_prompt_dispatch(move || write(&path, &changed(entry)));
+        let result = dispatch_operator_prompt_with_intent_for_session(
+            &state,
+            Some("ada"),
+            binding.native_session(),
+            "owner",
+            "hello",
+            OperatorPromptIntent::Ordinary,
+            None,
+            true,
+            Some(&binding),
+            None,
+            false,
+        );
+        assert!(
+            matches!(result, Err(OperatorPromptError::Push(PushError::NotConnected(ref error))) if error.contains("re-register and resubmit"))
+        );
+    }
+    #[test]
+    fn queued_and_send_now_revalidate_original_registration() {
+        let (_tmp, state, path, entry, binding) = fixture();
+        write(&path, &changed(entry));
+        for intent in [
+            OperatorPromptIntent::Ordinary,
+            OperatorPromptIntent::OwnerSendNow,
+        ] {
+            let result = dispatch_queued_operator_prompt_with_intent_for_session(
+                &state,
+                Some("ada"),
+                binding.native_session(),
+                "owner",
+                "hello",
+                intent,
+                None,
+                true,
+                Some(&binding),
+                None,
+            );
+            assert!(
+                matches!(result, Err(OperatorPromptError::Push(PushError::NotConnected(ref error))) if error.contains("re-register and resubmit"))
+            );
+        }
+    }
+    fn enqueue_bound(
+        state: &HubState,
+        binding: ClaudeRegistrationBinding,
+    ) -> crate::QueuedOperatorPrompt {
+        let native = binding.native_session().to_string();
+        let input = crate::DirectPromptInput {
+            queue_target: None,
+            intended_codex_thread_id: None,
+            claude_terminal: true,
+            claude_binding: Some(binding),
+            intended_vendor: None,
+            persona: Some("ada".into()),
+            prompt: "hello".into(),
+            effective_body: "hello".into(),
+            by: "owner".into(),
+            attachments: vec![],
+        };
+        state
+            .prompt_queues
+            .lock()
+            .unwrap()
+            .enqueue(&native, input)
+            .0
+    }
+
+    #[test]
+    fn send_now_refuses_replaced_registration_without_discovery() {
+        let (_tmp, state, path, entry, binding) = fixture();
+        let item = enqueue_bound(&state, binding);
+        write(&path, &changed(entry));
+        let owner = HubAuthority::Owner {
+            login: "owner".into(),
+        };
+        let (_response, costs) = crate::discovery::cost_counters::measure(|| {
+            handle_post_queued_prompt_send_now(&state, &owner, &item.session_id, &item.id)
+        });
+        assert_eq!(costs.route_scans, 0);
+        let queue = state.session_queue(&item.session_id);
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue[0].delivery_state, crate::QueuedDeliveryState::Refused);
+        assert!(
+            queue[0]
+                .delivery_error
+                .as_deref()
+                .unwrap()
+                .contains("re-register and resubmit")
+        );
+    }
+
+    // This fixture uses a store under its private temp home; no host or vendor is started.
+    #[test]
+    fn queue_drain_refuses_replaced_registration_without_discovery() {
+        let (_tmp, mut state, path, entry, binding) = fixture();
+        state.store_backend = Some(fl_store::BackendKind::Redb);
+        let item = enqueue_bound(&state, binding);
+        write(&path, &changed(entry));
+        let (_, costs) =
+            crate::discovery::cost_counters::measure(|| drain_ready_session_queues(&state));
+        assert_eq!(costs.route_scans, 0);
+        let queue = state.session_queue(&item.session_id);
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue[0].delivery_state, crate::QueuedDeliveryState::Refused);
+    }
+
+    #[test]
+    fn legacy_unknown_owner_is_held_and_classified_non_claude_stays_eligible() {
+        let (_tmp, mut state, _path, _entry, binding) = fixture();
+        state.store_backend = Some(fl_store::BackendKind::Redb);
+        let original = enqueue_bound(&state, binding);
+        let mut legacy: crate::QueuedOperatorPrompt =
+            serde_json::from_value(serde_json::to_value(&original).unwrap()).unwrap();
+        legacy.claude_terminal = false;
+        legacy.by = "alice".into();
+        legacy.persona = None;
+        assert!(legacy_owner_unclassified(&legacy));
+        let mut classified = legacy.clone();
+        classified.intended_codex_thread_id = Some("a-codex-thread".into());
+        assert!(!legacy_owner_unclassified(&classified));
+        assert_eq!(queued_non_claude_vendor(&classified), Some("codex"));
+        assert!(
+            require_intended_vendor(
+                &VendorRoute::Claude {
+                    pid: 0,
+                    session_id: "x".into(),
+                    socket_path: "unused".into(),
+                    key_path: None
+                },
+                queued_non_claude_vendor(&classified)
+            )
+            .is_err()
+        );
+        state
+            .prompt_queues
+            .lock()
+            .unwrap()
+            .queues
+            .insert(legacy.session_id.clone(), vec![legacy.clone()]);
+        reset_queued_delivery_calls();
+        let (_, costs) =
+            crate::discovery::cost_counters::measure(|| drain_ready_session_queues(&state));
+        assert_eq!(costs.route_scans, 0);
+        assert_eq!(queued_delivery_calls(), 0);
+        let held = &state.session_queue(&legacy.session_id)[0];
+        assert_eq!(held.delivery_state, crate::QueuedDeliveryState::Refused);
+        assert!(
+            held.delivery_error
+                .as_deref()
+                .unwrap()
+                .contains("re-register and resubmit")
+        );
+        for status in [
+            crate::QueuedDeliveryState::Sending,
+            crate::QueuedDeliveryState::Unconfirmed,
+        ] {
+            legacy.delivery_state = status;
+            state
+                .prompt_queues
+                .lock()
+                .unwrap()
+                .queues
+                .insert(legacy.session_id.clone(), vec![legacy.clone()]);
+            drain_ready_session_queues(&state);
+            assert_eq!(
+                state.session_queue(&legacy.session_id)[0].delivery_state,
+                status
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_unknown_send_now_holds_without_discovery() {
+        let (_tmp, state, _path, _entry, binding) = fixture();
+        let original = enqueue_bound(&state, binding);
+        let mut legacy: crate::QueuedOperatorPrompt =
+            serde_json::from_value(serde_json::to_value(&original).unwrap()).unwrap();
+        legacy.claude_terminal = false;
+        legacy.by = "alice".into();
+        state
+            .prompt_queues
+            .lock()
+            .unwrap()
+            .queues
+            .insert(legacy.session_id.clone(), vec![legacy.clone()]);
+        let owner = HubAuthority::Owner {
+            login: "owner".into(),
+        };
+        reset_queued_delivery_calls();
+        let (_, costs) = crate::discovery::cost_counters::measure(|| {
+            handle_post_queued_prompt_send_now(&state, &owner, &legacy.session_id, &legacy.id)
+        });
+        assert_eq!(costs.route_scans, 0);
+        assert_eq!(queued_delivery_calls(), 0);
+        let held = &state.session_queue(&legacy.session_id)[0];
+        assert_eq!(held.delivery_state, crate::QueuedDeliveryState::Refused);
+        assert!(
+            held.delivery_error
+                .as_deref()
+                .unwrap()
+                .contains("re-register and resubmit")
+        );
+        for status in [
+            crate::QueuedDeliveryState::Sending,
+            crate::QueuedDeliveryState::Unconfirmed,
+        ] {
+            legacy.delivery_state = status;
+            state
+                .prompt_queues
+                .lock()
+                .unwrap()
+                .queues
+                .insert(legacy.session_id.clone(), vec![legacy.clone()]);
+            let (_, costs) = crate::discovery::cost_counters::measure(|| {
+                handle_post_queued_prompt_send_now(&state, &owner, &legacy.session_id, &legacy.id)
+            });
+            assert_eq!(costs.route_scans, 0);
+            assert_eq!(
+                state.session_queue(&legacy.session_id)[0].delivery_state,
+                status
+            );
+        }
+    }
+
+    #[test]
+    fn deserialized_item_cannot_reconstitute_authority() {
+        let (_tmp, state, _path, _entry, binding) = fixture();
+        let input = crate::DirectPromptInput {
+            queue_target: None,
+            intended_codex_thread_id: None,
+            claude_terminal: true,
+            claude_binding: Some(binding),
+            intended_vendor: None,
+            persona: Some("ada".into()),
+            prompt: "hello".into(),
+            effective_body: "hello".into(),
+            by: "owner".into(),
+            attachments: vec![],
+        };
+        let (item, _) = state
+            .prompt_queues
+            .lock()
+            .unwrap()
+            .enqueue("claude:ada", input);
+        let restored: crate::QueuedOperatorPrompt =
+            serde_json::from_value(serde_json::to_value(item).unwrap()).unwrap();
+        assert!(restored.claude_terminal);
+        assert!(restored.claude_binding.is_none());
+        let result = dispatch_queued_operator_prompt_with_intent_for_session(
+            &state,
+            restored.persona.as_deref(),
+            &restored.session_id,
+            &restored.by,
+            &restored.effective_body,
+            OperatorPromptIntent::OwnerSendNow,
+            None,
+            restored.claude_terminal,
+            restored.claude_binding.as_ref(),
+            restored.intended_vendor.as_deref(),
+        );
+        assert!(
+            matches!(result, Err(OperatorPromptError::Push(PushError::NotConnected(ref error))) if error.contains("re-register and resubmit"))
         );
     }
 }
