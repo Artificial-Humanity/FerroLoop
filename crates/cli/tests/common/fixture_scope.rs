@@ -7,6 +7,7 @@
 use std::ffi::OsStr;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
+use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::path::{Component, Path, PathBuf};
 use std::process::Output;
 
@@ -21,16 +22,41 @@ pub enum CreationTarget {
     UnixSocket,
 }
 
-/// Owns all files it creates until finalization transfers them to the scope.
+/// Purpose is chosen by the helper, never inferred from a caller-provided address.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TcpFixturePurpose {
+    WirePeer,
+    Store,
+    Vendor,
+}
+
+impl TcpFixturePurpose {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::WirePeer => "wire_peer",
+            Self::Store => "store",
+            Self::Vendor => "vendor",
+        }
+    }
+}
+
+struct OwnedTcpFixture {
+    purpose: TcpFixturePurpose,
+    listener: TcpListener,
+}
+
+/// Owns all files and listeners it creates until finalization transfers them to the scope.
 pub struct FixtureScopeBuilder {
+    tcp: Vec<OwnedTcpFixture>,
     files: Vec<File>,
     identities: Vec<FixtureIdentity>,
     root: TempDir,
 }
 
-/// Owns the manifest, fixture files and directory for its entire lifetime.
-/// It does not own subprocesses or listeners; those are deliberately deferred.
+/// Owns the manifest, fixture files, parent-bound listeners and directory for its lifetime.
+/// It does not own asynchronous subprocesses or child-created listeners.
 pub struct FixtureScope {
+    tcp: Vec<OwnedTcpFixture>,
     files: Vec<File>,
     manifest: PathBuf,
     manifest_bytes: Vec<u8>,
@@ -42,6 +68,7 @@ pub struct FixtureScope {
 impl FixtureScopeBuilder {
     pub fn new() -> io::Result<Self> {
         Ok(Self {
+            tcp: Vec::new(),
             files: Vec::new(),
             identities: Vec::new(),
             root: tempfile::tempdir()?,
@@ -102,6 +129,25 @@ impl FixtureScopeBuilder {
         Ok(path)
     }
 
+    /// Bind and retain a parent-owned listener. Callers choose its purpose but
+    /// never choose or supply an endpoint; the OS assigns an exact local port.
+    pub fn bind_tcp(&mut self, purpose: TcpFixturePurpose) -> io::Result<SocketAddr> {
+        if self.tcp.iter().any(|fixture| fixture.purpose == purpose) {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "TCP fixture purpose is already registered",
+            ));
+        }
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
+        let address = listener.local_addr()?;
+        self.identities.push(FixtureIdentity::Tcp {
+            purpose: purpose.as_str().to_owned(),
+            address,
+        });
+        self.tcp.push(OwnedTcpFixture { purpose, listener });
+        Ok(address)
+    }
+
     /// Declare one exact helper-controlled future creation path.
     pub fn creation_target(&mut self, name: &str, kind: CreationTarget) -> io::Result<PathBuf> {
         let path = self.path(name)?;
@@ -154,6 +200,7 @@ impl FixtureScopeBuilder {
         file.set_permissions(permissions)?;
         drop(file);
         Ok(FixtureScope {
+            tcp: self.tcp,
             files: self.files,
             manifest,
             manifest_bytes: bytes,
@@ -194,6 +241,18 @@ impl FixtureScope {
     }
     pub fn context(&self) -> &FixtureContext {
         &self.context
+    }
+
+    /// Accept a connection on a retained fixture listener without exposing or
+    /// cloning the listener itself. A scoped server thread can borrow `self`
+    /// while a synchronous child runs; asynchronous child ownership is separate.
+    pub fn accept_tcp(&self, purpose: TcpFixturePurpose) -> io::Result<(TcpStream, SocketAddr)> {
+        let fixture = self
+            .tcp
+            .iter()
+            .find(|fixture| fixture.purpose == purpose)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "TCP fixture not registered"))?;
+        fixture.listener.accept()
     }
 
     /// Run the isolated CLI synchronously while this scope remains borrowed.
@@ -318,6 +377,50 @@ mod tests {
         builder.create_route("routes", b"{}").unwrap();
         assert!(builder.finish().is_err());
         assert!(!root.exists());
+    }
+
+    // CI-only: exercises a helper-owned private listener. Do not include this
+    // in locally audited process-free test filters.
+    #[test]
+    fn tcp_fixture_owned_listener_ci_only() {
+        let mut builder = FixtureScopeBuilder::new().unwrap();
+        let address = builder.bind_tcp(TcpFixturePurpose::WirePeer).unwrap();
+        let server_address = builder.bind_tcp(TcpFixturePurpose::Vendor).unwrap();
+        assert!(builder.bind_tcp(TcpFixturePurpose::WirePeer).is_err());
+        let scope = builder.finish().unwrap();
+        let identity = FixtureIdentity::Tcp {
+            purpose: TcpFixturePurpose::WirePeer.as_str().into(),
+            address,
+        };
+        assert!(scope.context().check(&identity).is_ok());
+        assert!(
+            scope
+                .context()
+                .check(&FixtureIdentity::Tcp {
+                    purpose: TcpFixturePurpose::Store.as_str().into(),
+                    address,
+                })
+                .is_err()
+        );
+        let wrong_address = SocketAddr::new(address.ip(), if address.port() == 1 { 2 } else { 1 });
+        assert!(
+            scope
+                .context()
+                .check(&FixtureIdentity::Tcp {
+                    purpose: TcpFixturePurpose::WirePeer.as_str().into(),
+                    address: wrong_address,
+                })
+                .is_err()
+        );
+        // A second listener cannot acquire the address while the scope owns it.
+        assert!(TcpListener::bind(address).is_err());
+        let client = TcpStream::connect(server_address).unwrap();
+        let (accepted, _) = scope.accept_tcp(TcpFixturePurpose::Vendor).unwrap();
+        drop(client);
+        drop(accepted);
+        drop(scope);
+        // Rebind the unused fixture, avoiding TIME_WAIT from the connected one.
+        assert!(TcpListener::bind(address).is_ok());
     }
 
     #[test]
