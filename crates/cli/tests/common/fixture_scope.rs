@@ -4,7 +4,7 @@
 
 #![allow(dead_code)]
 
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
@@ -314,6 +314,29 @@ fn identity_path(identity: &FixtureIdentity) -> Option<&Path> {
     }
 }
 
+// The direct-child runner cannot prove ownership of descendants. Only the
+// top-level clap help path is supported: main handles `fl --help` in parsing,
+// before executing any command. Keep this exact until process-tree ownership is
+// implemented; a caller assertion or a similar-looking subcommand is not proof.
+fn audited_fl_args<I, S>(args: I) -> io::Result<Vec<OsString>>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    let args: Vec<OsString> = args
+        .into_iter()
+        .map(|arg| arg.as_ref().to_os_string())
+        .collect();
+    if args.len() == 1 && args[0] == OsStr::new("--help") {
+        Ok(args)
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "fixture runner supports only the audited top-level --help path",
+        ))
+    }
+}
+
 impl FixtureScope {
     pub fn root(&self) -> &Path {
         self.root.path()
@@ -356,6 +379,7 @@ impl FixtureScope {
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
+        let args = audited_fl_args(args)?;
         self.manifest_for_transfer()?;
         let child = crate::common::isolated_fl(self.root())?
             .args(args)
@@ -375,6 +399,7 @@ impl FixtureScope {
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
+        let args = audited_fl_args(args)?;
         self.manifest_for_transfer()?;
         crate::common::isolated_fl(self.root())?.args(args).output()
     }
@@ -396,6 +421,41 @@ impl Drop for FixtureScope {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn direct_child_runner_only_accepts_exact_top_level_help() {
+        assert_eq!(
+            audited_fl_args(["--help"]).unwrap(),
+            [OsString::from("--help")]
+        );
+        for args in [
+            vec![],
+            vec!["wire", "daemon"],
+            vec!["agent", "spin-up"],
+            vec!["--help", "wire"],
+            vec!["wire", "--help"],
+            vec!["--session-supervisor"],
+        ] {
+            assert_eq!(
+                audited_fl_args(args).unwrap_err().kind(),
+                io::ErrorKind::PermissionDenied
+            );
+        }
+    }
+
+    #[test]
+    fn both_fixture_runners_refuse_descendant_capable_commands_before_spawn() {
+        let scope = Arc::new(FixtureScopeBuilder::new().unwrap().finish().unwrap());
+        assert_eq!(
+            scope.output_fl(["wire", "daemon"]).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        let error = match scope.spawn_fl(["agent", "spin-up"]) {
+            Ok(_) => panic!("a vendor-spawning command must be refused"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+    }
 
     #[derive(Clone)]
     struct FakeProcess {
