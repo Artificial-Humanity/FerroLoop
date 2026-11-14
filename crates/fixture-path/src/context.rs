@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use crate::{check_endpoint, refused};
 
 const MANIFEST_VERSION: u32 = 1;
+const OPERATION_MANIFEST_VERSION: u32 = 2;
 const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
 
 /// Physical store backends registered by a fixture helper.
@@ -32,6 +33,21 @@ pub enum StoreBackend {
 pub enum PathAccess {
     Existing,
     Create,
+}
+
+/// Explicit permission for one metadata operation and its missing-file result.
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MetadataGrant {
+    pub allowed: bool,
+    pub allow_not_found: bool,
+}
+
+/// A requested metadata operation; grants are independently checked.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SiblingOperation {
+    NoFollow,
+    Follow,
 }
 
 /// An exact, purpose-specific fixture identity. Root membership alone never
@@ -56,6 +72,16 @@ pub enum FixtureIdentity {
     Executable {
         path: PathBuf,
         access: PathAccess,
+    },
+    ConfigRead {
+        path: PathBuf,
+        allow_not_found: bool,
+    },
+    RedbSiblingMetadata {
+        redb_path: PathBuf,
+        path: PathBuf,
+        no_follow: MetadataGrant,
+        follow: MetadataGrant,
     },
     Tcp {
         purpose: String,
@@ -102,14 +128,53 @@ impl FixtureContext {
         }
         let manifest: Manifest =
             serde_json::from_slice(&bytes).map_err(|_| refused("fixture manifest is malformed"))?;
-        if manifest.version != MANIFEST_VERSION {
+        if manifest.version != MANIFEST_VERSION && manifest.version != OPERATION_MANIFEST_VERSION {
             return Err(refused("unsupported fixture manifest version"));
+        }
+        if manifest.version == MANIFEST_VERSION && manifest.identities.iter().any(is_v2_identity) {
+            return Err(refused(
+                "fixture operation identities require manifest version 2",
+            ));
+        }
+        // Validate relationships before inserting any identities; declaration order
+        // does not change the authority or the collision checks.
+        if manifest.version == OPERATION_MANIFEST_VERSION {
+            for identity in &manifest.identities {
+                match identity {
+                    FixtureIdentity::ConfigRead { path, .. } => {
+                        strict_resource_path(root, path)?;
+                    }
+                    FixtureIdentity::RedbSiblingMetadata {
+                        redb_path, path, ..
+                    } => {
+                        strict_resource_path(root, redb_path)?;
+                        strict_resource_path(root, path)?;
+                        if *path != redb_path.with_extension("fls")
+                            || !manifest.identities.contains(&FixtureIdentity::Store {
+                                backend: StoreBackend::Redb,
+                                path: redb_path.clone(),
+                                access: PathAccess::Existing,
+                            })
+                        {
+                            return Err(refused(
+                                "sibling metadata requires its exact registered redb store",
+                            ));
+                        }
+                    }
+                    _ => {}
+                }
+            }
         }
         let mut identities = HashSet::new();
         let mut resources = HashSet::new();
         for identity in manifest.identities {
             validate_identity(root, &identity)?;
-            if !resources.insert(resource_key(&identity)?) || !identities.insert(identity) {
+            if !resources.insert(if manifest.version == OPERATION_MANIFEST_VERSION {
+                strict_resource_key(root, &identity)?
+            } else {
+                resource_key(&identity)?
+            }) || !identities.insert(identity)
+            {
                 return Err(refused("duplicate or conflicting fixture identity"));
             }
         }
@@ -128,6 +193,53 @@ impl FixtureContext {
             return Err(refused("fixture identity is not registered"));
         }
         Ok(())
+    }
+
+    /// Validate an exact config-read grant and the current file shape. This is
+    /// only a snapshot; a future reader must retain ownership and recheck I/O.
+    pub fn check_config_read(&self, identity: &FixtureIdentity) -> io::Result<()> {
+        let FixtureIdentity::ConfigRead {
+            path,
+            allow_not_found,
+        } = identity
+        else {
+            return Err(refused("fixture identity does not grant a config read"));
+        };
+        self.check(identity)?;
+        strict_leaf(path, *allow_not_found)
+    }
+
+    /// Check one independently granted sibling metadata operation at this instant.
+    pub fn check_sibling_metadata(
+        &self,
+        identity: &FixtureIdentity,
+        operation: SiblingOperation,
+    ) -> io::Result<()> {
+        let FixtureIdentity::RedbSiblingMetadata {
+            path,
+            no_follow,
+            follow,
+            ..
+        } = identity
+        else {
+            return Err(refused("fixture identity does not grant sibling metadata"));
+        };
+        let grant = match operation {
+            SiblingOperation::NoFollow => no_follow,
+            SiblingOperation::Follow => follow,
+        };
+        if !grant.allowed {
+            return Err(refused("sibling metadata operation is not granted"));
+        }
+        self.check(identity)?;
+        if let FixtureIdentity::RedbSiblingMetadata { redb_path, .. } = identity {
+            self.check(&FixtureIdentity::Store {
+                backend: StoreBackend::Redb,
+                path: redb_path.clone(),
+                access: PathAccess::Existing,
+            })?;
+        }
+        strict_leaf(path, grant.allow_not_found)
     }
 
     /// Check an exact registered store or route creation target at this instant.
@@ -207,6 +319,17 @@ fn validate_identity(root: &Path, identity: &FixtureIdentity) -> io::Result<()> 
             }
             Ok(())
         }
+        FixtureIdentity::ConfigRead { path, .. } => {
+            strict_resource_path(root, path)?;
+            Ok(())
+        }
+        FixtureIdentity::RedbSiblingMetadata {
+            redb_path, path, ..
+        } => {
+            strict_resource_path(root, redb_path)?;
+            strict_resource_path(root, path)?;
+            Ok(())
+        }
         FixtureIdentity::Tcp { purpose, address } => {
             validate_purpose(purpose)?;
             if !address.ip().is_loopback() || address.port() == 0 {
@@ -259,10 +382,75 @@ fn resource_key(identity: &FixtureIdentity) -> io::Result<ResourceKey> {
             }
             Ok(ResourceKey::Path(canonical))
         }
+        FixtureIdentity::ConfigRead { path, .. }
+        | FixtureIdentity::RedbSiblingMetadata { path, .. } => Ok(ResourceKey::Path(path.clone())),
         FixtureIdentity::Tcp { address, .. } => Ok(ResourceKey::Tcp(*address)),
         FixtureIdentity::WindowsPipe { name, .. } => {
             Ok(ResourceKey::WindowsPipe(name.to_ascii_lowercase()))
         }
+    }
+}
+
+fn is_v2_identity(identity: &FixtureIdentity) -> bool {
+    matches!(
+        identity,
+        FixtureIdentity::ConfigRead { .. } | FixtureIdentity::RedbSiblingMetadata { .. }
+    )
+}
+
+// Strict v2 resolution uses an existing immediate parent and distinguishes a
+// genuinely missing leaf from all other errors before deduplication. No leaf
+// symlink is accepted, including dangling links. This is not an ownership proof.
+fn strict_resource_path(root: &Path, path: &Path) -> io::Result<PathBuf> {
+    crate::validate_absolute(path)?;
+    let canonical_root = std::fs::canonicalize(root).map_err(refused)?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| refused("fixture path has no parent"))?;
+    let parent_meta = std::fs::symlink_metadata(parent).map_err(refused)?;
+    if !parent_meta.is_dir() {
+        return Err(refused("fixture parent is not a directory"));
+    }
+    let canonical_parent = std::fs::canonicalize(parent).map_err(refused)?;
+    if !canonical_parent.starts_with(&canonical_root) {
+        return Err(refused("fixture parent is outside root"));
+    }
+    let name = path
+        .file_name()
+        .ok_or_else(|| refused("fixture path has no leaf"))?;
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            return Err(refused("fixture leaf is a symlink"));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(refused(error)),
+    }
+    Ok(canonical_parent.join(name))
+}
+
+fn strict_leaf(path: &Path, allow_not_found: bool) -> io::Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() || !meta.is_file() => {
+            Err(refused("fixture input must be a regular file"))
+        }
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound && allow_not_found => Ok(()),
+        Err(error) => Err(refused(error)),
+    }
+}
+
+fn strict_resource_key(root: &Path, identity: &FixtureIdentity) -> io::Result<ResourceKey> {
+    match identity {
+        FixtureIdentity::Store { path, .. }
+        | FixtureIdentity::Route { path, .. }
+        | FixtureIdentity::UnixSocket { path, .. }
+        | FixtureIdentity::Executable { path, .. }
+        | FixtureIdentity::ConfigRead { path, .. }
+        | FixtureIdentity::RedbSiblingMetadata { path, .. } => {
+            Ok(ResourceKey::Path(strict_resource_path(root, path)?))
+        }
+        _ => resource_key(identity),
     }
 }
 
@@ -302,6 +490,220 @@ mod tests {
             .check_create_snapshot(identity)
             .expect_err("target must be refused");
         assert!(is_fixture_endpoint_refusal(&error), "{error}");
+    }
+
+    fn v2_grant(allowed: bool, allow_not_found: bool) -> MetadataGrant {
+        MetadataGrant {
+            allowed,
+            allow_not_found,
+        }
+    }
+
+    #[test]
+    fn v2_operations_exact_grants_missing_and_order_independent() {
+        let root = tempfile::tempdir().unwrap();
+        let store = root.path().join("data.redb");
+        std::fs::write(&store, b"synthetic").unwrap();
+        let config = FixtureIdentity::ConfigRead {
+            path: root.path().join("config"),
+            allow_not_found: true,
+        };
+        let sibling = FixtureIdentity::RedbSiblingMetadata {
+            redb_path: store.clone(),
+            path: store.with_extension("fls"),
+            no_follow: v2_grant(true, true),
+            follow: v2_grant(false, false),
+        };
+        let store_id = FixtureIdentity::Store {
+            backend: StoreBackend::Redb,
+            path: store.clone(),
+            access: PathAccess::Existing,
+        };
+        let path = manifest(
+            root.path(),
+            json!({"version": 2, "identities": [&sibling, &config, &store_id]}),
+        );
+        let context = FixtureContext::load(root.path(), &path).unwrap();
+        assert!(context.check_config_read(&config).is_ok());
+        assert!(
+            context
+                .check_sibling_metadata(&sibling, SiblingOperation::NoFollow)
+                .is_ok()
+        );
+        assert!(
+            context
+                .check_sibling_metadata(&sibling, SiblingOperation::Follow)
+                .is_err()
+        );
+        assert!(context.check_config_read(&sibling).is_err());
+        assert!(
+            context
+                .check(&FixtureIdentity::Store {
+                    backend: StoreBackend::Ferro,
+                    path: store.with_extension("fls"),
+                    access: PathAccess::Existing
+                })
+                .is_err()
+        );
+        assert!(
+            context
+                .check(&FixtureIdentity::Route {
+                    path: root.path().join("config"),
+                    access: PathAccess::Create
+                })
+                .is_err()
+        );
+        let wrong = FixtureIdentity::ConfigRead {
+            path: root.path().join("config"),
+            allow_not_found: false,
+        };
+        assert!(context.check_config_read(&wrong).is_err());
+        let bad = FixtureIdentity::RedbSiblingMetadata {
+            redb_path: store.clone(),
+            path: store.with_extension("fls"),
+            no_follow: v2_grant(true, false),
+            follow: v2_grant(false, false),
+        };
+        assert!(
+            context
+                .check_sibling_metadata(&bad, SiblingOperation::NoFollow)
+                .is_err()
+        );
+        assert!(!store.with_extension("fls").exists());
+        assert_eq!(std::fs::read(&store).unwrap(), b"synthetic");
+    }
+
+    #[test]
+    fn v2_manifest_rejects_wrong_version_policy_reference_duplicates_and_aliases() {
+        let root = tempfile::tempdir().unwrap();
+        let store = root.path().join("data.redb");
+        std::fs::write(&store, b"fixture").unwrap();
+        let store_id = json!({"kind":"store","backend":"redb","path":store,"access":"existing"});
+        let sibling = json!({"kind":"redb_sibling_metadata","redb_path":store,"path":store.with_extension("fls"),"no_follow":{"allowed":true,"allow_not_found":true},"follow":{"allowed":false,"allow_not_found":false}});
+        let config =
+            json!({"kind":"config_read","path":root.path().join("config"),"allow_not_found":true});
+        let cases = [
+            json!({"version":1,"identities":[config.clone()]}),
+            json!({"version":3,"identities":[]}),
+            json!({"version":2,"identities":[{"kind":"config_read","path":root.path().join("config")}]}),
+            json!({"version":2,"identities":[{"kind":"redb_sibling_metadata","redb_path":store,"path":store.with_extension("fls"),"no_follow":{"allowed":true},"follow":{"allowed":false,"allow_not_found":false}},store_id.clone()]}),
+            json!({"version":2,"identities":[sibling.clone()]}),
+            json!({"version":2,"identities":[sibling.clone(),{"kind":"store","backend":"ferro","path":store,"access":"existing"}]}),
+            json!({"version":2,"identities":[sibling.clone(),store_id.clone(),sibling.clone()]}),
+            json!({"version":2,"identities":[config.clone(),{"kind":"route","path":root.path().join("config"),"access":"create"}]}),
+            json!({"version":2,"identities":[{"kind":"config_read","path":root.path().join("missing/child"),"allow_not_found":true}]}),
+            json!({"version":2,"identities":[{"kind":"config_read","path":"relative","allow_not_found":true}]}),
+            json!({"version":2,"identities":[{"kind":"config_read","path":root.path().join("../escape"),"allow_not_found":true}]}),
+        ];
+        for value in cases {
+            let file = manifest(root.path(), value);
+            assert!(FixtureContext::load(root.path(), &file).is_err());
+        }
+    }
+
+    #[test]
+    fn v2_rejects_normalized_aliases_and_unknown_operation_fields() {
+        let root = tempfile::tempdir().unwrap();
+        let a = root.path().join("config");
+        let alias = root.path().join(".").join("config");
+        for identities in [
+            json!([{"kind":"config_read","path":a,"allow_not_found":true}, {"kind":"route","path":alias,"access":"create"}]),
+            json!([{"kind":"config_read","path":a,"allow_not_found":true,"extra":1}]),
+        ] {
+            let file = manifest(root.path(), json!({"version":2,"identities":identities}));
+            assert!(FixtureContext::load(root.path(), &file).is_err());
+        }
+    }
+
+    #[test]
+    fn v2_operation_policies_are_independent_and_rechecked_without_effects() {
+        let root = tempfile::tempdir().unwrap();
+        let store = root.path().join("state.redb");
+        std::fs::write(&store, b"data").unwrap();
+        let config_path = root.path().join("config");
+        let sibling_path = store.with_extension("fls");
+        let config = FixtureIdentity::ConfigRead {
+            path: config_path.clone(),
+            allow_not_found: false,
+        };
+        let sibling = FixtureIdentity::RedbSiblingMetadata {
+            redb_path: store.clone(),
+            path: sibling_path.clone(),
+            no_follow: v2_grant(true, false),
+            follow: v2_grant(true, true),
+        };
+        let store_id = FixtureIdentity::Store {
+            backend: StoreBackend::Redb,
+            path: store.clone(),
+            access: PathAccess::Existing,
+        };
+        let file = manifest(
+            root.path(),
+            json!({"version":2,"identities":[&config, &sibling, &store_id]}),
+        );
+        let context = FixtureContext::load(root.path(), &file).unwrap();
+        let before: HashSet<_> = std::fs::read_dir(root.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert!(context.check_config_read(&config).is_err());
+        assert!(
+            context
+                .check_sibling_metadata(&sibling, SiblingOperation::NoFollow)
+                .is_err()
+        );
+        assert!(
+            context
+                .check_sibling_metadata(&sibling, SiblingOperation::Follow)
+                .is_ok()
+        );
+        let after: HashSet<_> = std::fs::read_dir(root.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(before, after);
+        std::fs::write(&config_path, b"config").unwrap();
+        std::fs::write(&sibling_path, b"sibling").unwrap();
+        assert!(context.check_config_read(&config).is_ok());
+        assert!(
+            context
+                .check_sibling_metadata(&sibling, SiblingOperation::NoFollow)
+                .is_ok()
+        );
+        std::fs::remove_file(&store).unwrap();
+        assert!(
+            context
+                .check_sibling_metadata(&sibling, SiblingOperation::Follow)
+                .is_err()
+        );
+        assert_eq!(std::fs::read(&sibling_path).unwrap(), b"sibling");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn v2_operations_refuse_symlinks_and_unprovable_parents_before_dedup() {
+        use std::os::unix::fs::symlink;
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        symlink(root.path().join("absent"), root.path().join("leaf")).unwrap();
+        symlink(outside.path(), root.path().join("parent")).unwrap();
+        symlink(root.path().join("loop"), root.path().join("loop")).unwrap();
+        std::fs::write(root.path().join("file"), b"keep").unwrap();
+        for path in [
+            root.path().join("leaf"),
+            root.path().join("parent/config"),
+            root.path().join("file/child"),
+            root.path().join("loop/child"),
+            root.path().join("loop/dir/child"),
+        ] {
+            let file = manifest(
+                root.path(),
+                json!({"version":2,"identities":[{"kind":"config_read","path":path,"allow_not_found":true}]}),
+            );
+            assert!(FixtureContext::load(root.path(), &file).is_err());
+        }
+        assert_eq!(std::fs::read(root.path().join("file")).unwrap(), b"keep");
+        assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 0);
     }
 
     #[test]
@@ -524,7 +926,7 @@ mod tests {
         for bytes in [
             br#"{"version":1,"identities":[],"unknown":true}"#.as_slice(),
             br#"{"version":1,"version":1,"identities":[]}"#,
-            br#"{"version":2,"identities":[]}"#,
+            br#"{"version":3,"identities":[]}"#,
             br#"{"identities":[]}"#,
             br#"{"version":1,"identities":[{"kind":"unknown"}]}"#,
             br#"{"version":1,"identities":[{"kind":"tcp","purpose":"peer","address":"127.0.0.1:1234","extra":true}]}"#,

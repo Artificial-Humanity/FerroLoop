@@ -7,7 +7,9 @@
 
 mod context;
 
-pub use context::{FixtureContext, FixtureIdentity, PathAccess, StoreBackend};
+pub use context::{
+    FixtureContext, FixtureIdentity, MetadataGrant, PathAccess, SiblingOperation, StoreBackend,
+};
 
 use std::io;
 use std::path::{Component, Path, PathBuf};

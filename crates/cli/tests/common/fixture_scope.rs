@@ -12,7 +12,7 @@ use std::path::{Component, Path, PathBuf};
 use std::process::{Child, ExitStatus, Output, Stdio};
 use std::sync::Arc;
 
-use fl_fixture_path::{FixtureContext, FixtureIdentity, PathAccess, StoreBackend};
+use fl_fixture_path::{FixtureContext, FixtureIdentity, MetadataGrant, PathAccess, StoreBackend};
 use tempfile::TempDir;
 
 /// A typed resource that the helper is permitted to declare as a creation
@@ -51,6 +51,7 @@ pub struct FixtureScopeBuilder {
     tcp: Vec<OwnedTcpFixture>,
     files: Vec<File>,
     identities: Vec<FixtureIdentity>,
+    version: u32,
     root: TempDir,
 }
 
@@ -165,6 +166,7 @@ impl FixtureScopeBuilder {
             tcp: Vec::new(),
             files: Vec::new(),
             identities: Vec::new(),
+            version: 1,
             root: tempfile::tempdir()?,
         })
     }
@@ -303,12 +305,104 @@ impl FixtureScopeBuilder {
         Ok(path)
     }
 
+    /// Opt into operation identities explicitly. Existing builders remain v1.
+    pub fn enable_operations_v2(&mut self) {
+        self.version = 2;
+    }
+
+    /// Create and retain an exact helper-owned config input, or retain its
+    /// parent for an explicitly permitted missing config. No child transfer.
+    pub fn v2_config(
+        &mut self,
+        name: &str,
+        contents: Option<&[u8]>,
+        allow_not_found: bool,
+    ) -> io::Result<PathBuf> {
+        if self.version != 2 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "v2 not selected",
+            ));
+        }
+        let path = self.path(name)?;
+        require_absent(&path)?;
+        if let Some(contents) = contents {
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)?;
+            file.write_all(contents)?;
+            file.flush()?;
+            self.files.push(file);
+        }
+        self.identities.push(FixtureIdentity::ConfigRead {
+            path: path.clone(),
+            allow_not_found,
+        });
+        Ok(path)
+    }
+
+    /// Create retained synthetic store bytes and, optionally, its derived
+    /// sibling. These bytes are not a Redb database or authority to open one.
+    pub fn v2_redb_sibling(
+        &mut self,
+        name: &str,
+        contents: Option<&[u8]>,
+        no_follow: MetadataGrant,
+        follow: MetadataGrant,
+    ) -> io::Result<(PathBuf, PathBuf)> {
+        if self.version != 2 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "v2 not selected",
+            ));
+        }
+        let store = self.path(name)?;
+        let sibling = store.with_extension("fls");
+        if store == sibling || sibling.parent() != Some(self.root.path()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid sibling",
+            ));
+        }
+        require_absent(&store)?;
+        require_absent(&sibling)?;
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&store)?;
+        file.write_all(b"synthetic fixture")?;
+        file.flush()?;
+        self.files.push(file);
+        if let Some(contents) = contents {
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&sibling)?;
+            file.write_all(contents)?;
+            file.flush()?;
+            self.files.push(file);
+        }
+        self.identities.push(FixtureIdentity::Store {
+            backend: StoreBackend::Redb,
+            path: store.clone(),
+            access: PathAccess::Existing,
+        });
+        self.identities.push(FixtureIdentity::RedbSiblingMetadata {
+            redb_path: store.clone(),
+            path: sibling.clone(),
+            no_follow,
+            follow,
+        });
+        Ok((store, sibling))
+    }
+
     /// Write a manifest once and validate it with the same strict loader used by
     /// the eventual child. Builder consumption prevents further registrations.
     pub fn finish(self) -> io::Result<FixtureScope> {
         let manifest = self.root.path().join("manifest.json");
         let bytes = serde_json::to_vec(
-            &serde_json::json!({ "version": 1, "identities": self.identities }),
+            &serde_json::json!({ "version": self.version, "identities": self.identities }),
         )?;
         let mut file = OpenOptions::new()
             .write(true)
@@ -332,12 +426,25 @@ impl FixtureScopeBuilder {
     }
 }
 
+fn require_absent(path: &Path) -> io::Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+        Ok(_) => Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "fixture path already exists",
+        )),
+    }
+}
+
 fn identity_path(identity: &FixtureIdentity) -> Option<&Path> {
     match identity {
         FixtureIdentity::Store { path, .. }
         | FixtureIdentity::Route { path, .. }
         | FixtureIdentity::UnixSocket { path, .. }
         | FixtureIdentity::Executable { path, .. } => Some(path),
+        FixtureIdentity::ConfigRead { path, .. }
+        | FixtureIdentity::RedbSiblingMetadata { path, .. } => Some(path),
         FixtureIdentity::Tcp { .. } | FixtureIdentity::WindowsPipe { .. } => None,
     }
 }
@@ -449,6 +556,88 @@ impl Drop for FixtureScope {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn v2_owned_builder_refuses_preexisting_paths_without_adopting_them() {
+        let mut builder = FixtureScopeBuilder::new().unwrap();
+        builder.enable_operations_v2();
+        let root = builder.root.path().to_path_buf();
+        std::fs::write(root.join("config"), b"external").unwrap();
+        let grant = MetadataGrant {
+            allowed: true,
+            allow_not_found: true,
+        };
+        assert!(builder.v2_config("config", None, true).is_err());
+        std::fs::write(root.join("state.fls"), b"external sibling").unwrap();
+        assert!(
+            builder
+                .v2_redb_sibling("state.redb", None, grant.clone(), grant)
+                .is_err()
+        );
+        assert!(!root.join("state.redb").exists());
+        assert_eq!(std::fs::read(root.join("config")).unwrap(), b"external");
+        assert_eq!(
+            std::fs::read(root.join("state.fls")).unwrap(),
+            b"external sibling"
+        );
+        for bad in ["../config", "manifest.json/.", "a/b"] {
+            assert!(builder.v2_config(bad, None, true).is_err());
+        }
+        drop(builder);
+        assert!(!root.exists());
+    }
+
+    #[test]
+    fn v2_owned_roundtrip_retains_files_and_exact_grants_until_last_owner() {
+        use fl_fixture_path::SiblingOperation;
+        let mut builder = FixtureScopeBuilder::new().unwrap();
+        let root = builder.root.path().to_path_buf();
+        assert!(builder.v2_config("config", None, true).is_err());
+        builder.enable_operations_v2();
+        let config = builder.v2_config("config", Some(b"config"), false).unwrap();
+        let allow = MetadataGrant {
+            allowed: true,
+            allow_not_found: true,
+        };
+        let deny = MetadataGrant {
+            allowed: false,
+            allow_not_found: false,
+        };
+        let (store, sibling) = builder
+            .v2_redb_sibling("state.redb", None, allow.clone(), deny.clone())
+            .unwrap();
+        let scope = Arc::new(builder.finish().unwrap());
+        let input = FixtureIdentity::ConfigRead {
+            path: config.clone(),
+            allow_not_found: false,
+        };
+        let metadata = FixtureIdentity::RedbSiblingMetadata {
+            redb_path: store.clone(),
+            path: sibling.clone(),
+            no_follow: allow,
+            follow: deny,
+        };
+        assert!(scope.context().check_config_read(&input).is_ok());
+        assert!(
+            scope
+                .context()
+                .check_sibling_metadata(&metadata, SiblingOperation::NoFollow)
+                .is_ok()
+        );
+        assert!(
+            scope
+                .context()
+                .check_sibling_metadata(&metadata, SiblingOperation::Follow)
+                .is_err()
+        );
+        assert!(!sibling.exists());
+        assert_eq!(std::fs::read(&store).unwrap(), b"synthetic fixture");
+        let owner = Arc::clone(&scope);
+        drop(scope);
+        assert!(config.exists() && store.exists());
+        drop(owner);
+        assert!(!root.exists());
+    }
 
     #[test]
     fn owned_layout_retains_directories_and_refuses_unregistered_descendants() {
