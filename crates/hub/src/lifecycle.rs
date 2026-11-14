@@ -5221,6 +5221,34 @@ pub(crate) fn lookup_route(
     rescan_route(home_override, query).map(RouteLookup::Scanned)
 }
 
+/// Select a reset route without saving discovery or invalidating its cache. Unsupported saved
+/// routes can only refuse, so return them before freshness/liveness checks or host probes.
+/// Supported routes keep the dispatch freshness bound and pin both saved and scanned results
+/// to the resolved native session. The caller must preflight and dispatch this exact route once.
+pub(crate) fn lookup_reset_route_read_only(
+    home_override: Option<&Path>,
+    query: RouteQuery<'_>,
+) -> Option<VendorRoute> {
+    let saved = RouteTable::load(crate::discovery::route_table_path(home_override).as_deref());
+    let serves_query = |route: &VendorRoute| {
+        query
+            .session_id
+            .is_none_or(|id| route_serves_session(route, id))
+    };
+    if let Some(route) = route_in(&saved, query.persona, query.fallback_session_id)
+        && (fl_wire::dispatcher::preflight_session_reset(&route).is_err()
+            || (crate::discovery::saved_routes_fresh(home_override, Instant::now())
+                && serves_query(&route)
+                && route_looks_live(&route, home_override)))
+    {
+        return Some(route);
+    }
+    let scanned = crate::discovery::scan_route_table(home_override);
+    // Like lookup_route's rescan path, let dispatch report transport failures (502). Only
+    // the resolved session identity is a selection constraint on the freshly scanned route.
+    route_in(&scanned, query.persona, query.fallback_session_id).filter(serves_query)
+}
+
 /// Scan the host for the session's route (never from the shared scan cache), save what the scan
 /// learned, and look the route up in it.
 pub(crate) fn rescan_route(
@@ -5358,6 +5386,7 @@ pub(crate) fn dispatch_with_rediscovery<T>(
 /// Run `send` once on the route [`lookup_route`] finds, with no pre-delivery check and no second
 /// route. For a session reset, which is several steps (a `/clear` or `/new`, then the reforge
 /// prompt): once one step lands the session has changed, so a reset is never run again.
+#[cfg(test)]
 pub(crate) fn dispatch_once<T>(
     home_override: Option<&Path>,
     query: RouteQuery<'_>,
