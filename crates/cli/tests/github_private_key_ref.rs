@@ -3,6 +3,9 @@
 //! temp Vault holding a throwaway RSA key made by the `openssl` CLI, a temp config, and the
 //! fake on 127.0.0.1. No real credential, Vault or network is touched.
 
+#[allow(dead_code)]
+mod common;
+
 use assert_cmd::Command;
 use base64::Engine;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
@@ -147,7 +150,7 @@ impl G {
     }
 
     fn fl(&self) -> Command {
-        let mut c = Command::cargo_bin("fl").unwrap();
+        let mut c = Command::from_std(common::isolated_fl(self.home.path()).unwrap());
         c.env("HOME", self.home.path())
             .env("XDG_CONFIG_HOME", self.home.path().join("config"))
             .env("XDG_DATA_HOME", self.home.path().join("data"))
