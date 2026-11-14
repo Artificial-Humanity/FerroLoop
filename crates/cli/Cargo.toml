@@ -16,6 +16,7 @@ fl-exec = { path = "../exec" }
 fl-github = { path = "../github" }
 fl-mcp = { path = "../mcp" }
 fl-wire = { path = "../wire" }
+fl-fixture-path = { path = "../fixture-path" }
 fl-hub = { path = "../hub" }
 fl-install = { path = "../install" }
 fl-gate = { path = "../gate" }

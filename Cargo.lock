@@ -420,6 +420,7 @@ dependencies = [
  "fl-browse",
  "fl-core",
  "fl-exec",
+ "fl-fixture-path",
  "fl-gate",
  "fl-github",
  "fl-host",

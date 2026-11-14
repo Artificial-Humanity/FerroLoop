@@ -1191,6 +1191,17 @@ pub fn parse_message_id(raw: &str) -> Result<MessageId, String> {
     }
 }
 
+/// Preserve offline fallback while refusing a fixture-root boundary violation.
+fn classify_local_connection<T>(connection: std::io::Result<T>) -> Result<Option<T>, String> {
+    match connection {
+        Ok(client) => Ok(Some(client)),
+        Err(error) if fl_fixture_path::is_fixture_endpoint_refusal(&error) => {
+            Err(error.to_string())
+        }
+        Err(_) => Ok(None),
+    }
+}
+
 fn wire_no_daemon_env() -> bool {
     std::env::var("FL_WIRE_NO_DAEMON").as_deref() == Ok("1")
 }
@@ -1218,7 +1229,9 @@ pub fn execute_send_with_options(
         .clone();
     let sock = resolve_socket_path(env, None);
     if !no_daemon {
-        if let Ok(mut client) = LocalClient::connect(&sock, DEFAULT_LOCAL_RPC_TIMEOUT) {
+        if let Some(mut client) =
+            classify_local_connection(LocalClient::connect(&sock, DEFAULT_LOCAL_RPC_TIMEOUT))?
+        {
             let uncertain = |error: String| {
                 format!(
                     "message {message_id} may already be delivered; check its status before retrying: {error}"
@@ -1254,7 +1267,9 @@ pub fn execute_read(
     ack: bool,
 ) -> Result<Vec<WireInboxItem>, String> {
     let sock = resolve_socket_path(env, None);
-    if let Ok(mut client) = LocalClient::connect(&sock, DEFAULT_LOCAL_RPC_TIMEOUT) {
+    if let Some(mut client) =
+        classify_local_connection(LocalClient::connect(&sock, DEFAULT_LOCAL_RPC_TIMEOUT))?
+    {
         match client.request(&LocalRequest::Read { filter, ack })? {
             LocalResponse::Inbox { items } => return Ok(items),
             other => return Err(format!("unexpected daemon response: {other:?}")),
@@ -1287,7 +1302,9 @@ pub fn execute_ack(
     recipient: String,
 ) -> Result<Vec<DeliveryReceipt>, String> {
     let sock = resolve_socket_path(env, None);
-    if let Ok(mut client) = LocalClient::connect(&sock, DEFAULT_LOCAL_RPC_TIMEOUT) {
+    if let Some(mut client) =
+        classify_local_connection(LocalClient::connect(&sock, DEFAULT_LOCAL_RPC_TIMEOUT))?
+    {
         match client.request(&LocalRequest::Ack {
             message_ids,
             recipient,
@@ -1387,7 +1404,8 @@ pub fn wait_for_reply(
     let sock = resolve_socket_path(env, None);
     let deadline = Instant::now() + timeout;
 
-    if let Ok(mut sub_client) = LocalClient::connect(&sock, DEFAULT_LOCAL_RPC_TIMEOUT)
+    if let Some(mut sub_client) =
+        classify_local_connection(LocalClient::connect(&sock, DEFAULT_LOCAL_RPC_TIMEOUT))?
         && sub_client
             .subscribe(Some(recipient.to_string()), Some(ask_id.clone()))
             .is_ok()
@@ -1726,7 +1744,9 @@ pub fn run(env: &StateEnv<'_>, cmd: WireCmd) -> Result<i32, (i32, String)> {
             let deadline = Instant::now() + wait_dur;
             let sock = resolve_socket_path(env, None);
 
-            if let Ok(mut sub) = LocalClient::connect(&sock, DEFAULT_LOCAL_RPC_TIMEOUT)
+            if let Some(mut sub) =
+                classify_local_connection(LocalClient::connect(&sock, DEFAULT_LOCAL_RPC_TIMEOUT))
+                    .map_err(|error| (1, error))?
                 && sub.subscribe(Some(persona.clone()), None).is_ok()
             {
                 while Instant::now() < deadline {
@@ -1810,7 +1830,9 @@ pub fn run(env: &StateEnv<'_>, cmd: WireCmd) -> Result<i32, (i32, String)> {
         }
         WireCmd::Status { json } => {
             let sock = resolve_socket_path(env, None);
-            if let Ok(mut client) = LocalClient::connect(&sock, DEFAULT_LOCAL_RPC_TIMEOUT)
+            if let Some(mut client) =
+                classify_local_connection(LocalClient::connect(&sock, DEFAULT_LOCAL_RPC_TIMEOUT))
+                    .map_err(|error| (1, error))?
                 && let Ok(LocalResponse::Status(st)) = client.request(&LocalRequest::Status {
                     include_codex_queues: true,
                 })
@@ -2652,7 +2674,9 @@ fn execute_register_with_hydration_env(
 fn run_listen_loop(env: &StateEnv<'_>, explicit_from: Option<&str>) -> Result<i32, (i32, String)> {
     let persona = resolve_caller(env, explicit_from, None);
     let sock = resolve_socket_path(env, None);
-    if let Ok(mut sub) = LocalClient::connect(&sock, DEFAULT_LOCAL_RPC_TIMEOUT)
+    if let Some(mut sub) =
+        classify_local_connection(LocalClient::connect(&sock, DEFAULT_LOCAL_RPC_TIMEOUT))
+            .map_err(|error| (1, error))?
         && sub.subscribe(Some(persona.clone()), None).is_ok()
     {
         loop {
@@ -2916,6 +2940,41 @@ fn codex_queues_summary(queues: &[fl_wire::daemon::CodexRouteQueueStatus]) -> St
 
 #[cfg(test)]
 pub(crate) mod tests {
+    #[test]
+    fn fixture_refusal_stops_fallback_but_offline_and_os_permissions_allow_it() {
+        use std::cell::Cell;
+        use std::io;
+        use std::path::Path;
+
+        fn with_fallback(error: io::Error, fallback: &Cell<bool>) -> Result<(), String> {
+            if classify_local_connection::<()>(Err(error))?.is_none() {
+                fallback.set(true);
+            }
+            Ok(())
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let refusal = fl_fixture_path::check_endpoint(Some(root.path()), Path::new("relative"))
+            .expect_err("relative endpoint must be refused");
+        let fallback = Cell::new(false);
+        let error = with_fallback(refusal, &fallback).unwrap_err();
+        assert!(error.contains("fixture endpoint refused"), "{error}");
+        assert!(!fallback.get(), "refusal must stop fallback");
+
+        for error in [
+            io::Error::new(io::ErrorKind::NotFound, "daemon offline"),
+            io::Error::new(io::ErrorKind::PermissionDenied, "OS permission"),
+        ] {
+            let fallback = Cell::new(false);
+            with_fallback(error, &fallback).unwrap();
+            assert!(fallback.get(), "ordinary failure must retain fallback");
+        }
+        assert_eq!(
+            classify_local_connection(Ok::<_, io::Error>(42)).unwrap(),
+            Some(42)
+        );
+    }
+
     fn test_send_args() -> SendWireArgs {
         SendWireArgs {
             id: None,
