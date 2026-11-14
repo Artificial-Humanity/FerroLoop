@@ -492,7 +492,14 @@ fn refuse_if_served_without_file(fls: &Path) -> Result<(), StoreError> {
     if !crate::ferrostore::socket_path_fits(&sock) {
         return Ok(());
     }
-    match std::os::unix::net::UnixStream::connect(&sock) {
+    #[cfg(feature = "wire-test-isolation")]
+    if let Err(err) = crate::test_isolation::validate_unix(&sock) {
+        if err.kind() == std::io::ErrorKind::NotFound {
+            return Ok(());
+        }
+        return Err(backend(err.to_string()));
+    }
+    match crate::guarded_unix_connect(&sock) {
         Ok(_) => Err(backend(format!(
             "a FerroStore server at {} is serving a store whose file {} does not exist: \
              stop that server before migrating, or the migration would write a {} that \

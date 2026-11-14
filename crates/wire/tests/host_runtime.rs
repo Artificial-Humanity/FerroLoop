@@ -1,6 +1,19 @@
 //! Runtime-port behavior over the authenticated host socket, with no live daemon.
 #![cfg(unix)]
 
+#[used]
+#[cfg_attr(
+    target_vendor = "apple",
+    unsafe(link_section = "__DATA,__mod_init_func")
+)]
+#[cfg_attr(not(target_vendor = "apple"), unsafe(link_section = ".init_array"))]
+static INITIALIZE_ISOLATION: extern "C" fn() = {
+    extern "C" fn enable() {
+        fl_wire::test_isolation::enable();
+    }
+    enable
+};
+
 use std::os::unix::fs::PermissionsExt;
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::sync::mpsc;
@@ -47,6 +60,9 @@ fn with_endpoint_host(
             let mut config = HostConfig::new(endpoint);
             config.frame_timeout = Duration::from_secs(2);
             let mut listener = HostListener::bind(config).await.unwrap();
+            let _fixture =
+                fl_wire::test_isolation::register_unix_socket(listener.endpoint().socket_path())
+                    .unwrap();
             ready_tx.send(listener.endpoint().clone()).unwrap();
             let mut conn = tokio::time::timeout(Duration::from_secs(3), listener.accept())
                 .await
@@ -572,50 +588,53 @@ fn capture_can_read_retained_exit_output_and_reports_raw_refusals() {
 
 #[test]
 fn default_port_rediscovers_endpoint_on_each_call_in_isolated_process() {
-    with_endpoint_host(
-        vec![summary("ada.claude", 5, SessionMode::Pty, 0)],
-        vec![],
-        |first| {
-            with_endpoint_host(vec![], vec![], |second| {
-                let child = std::process::Command::new(std::env::current_exe().unwrap())
-                    .args([
-                        "--exact",
-                        "default_discovery_child",
-                        "--nocapture",
-                        "--test-threads=1",
-                    ])
-                    .env("FL_HOST_SOCK", first.socket_path())
-                    .env("FL_WIRE_RUNTIME_DISCOVERY_SECOND", second.socket_path())
-                    .output()
-                    .unwrap();
-                assert!(
-                    child.status.success(),
-                    "{}\n{}",
-                    String::from_utf8_lossy(&child.stdout),
-                    String::from_utf8_lossy(&child.stderr)
-                );
-            });
-        },
+    let child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "default_discovery_child",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env("FL_WIRE_RUNTIME_DISCOVERY_CHILD", "1")
+        .output()
+        .unwrap();
+    assert!(
+        child.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&child.stdout),
+        String::from_utf8_lossy(&child.stderr)
     );
 }
 
 #[test]
 fn default_discovery_child() {
-    let Some(second) = std::env::var_os("FL_WIRE_RUNTIME_DISCOVERY_SECOND") else {
+    if std::env::var_os("FL_WIRE_RUNTIME_DISCOVERY_CHILD").is_none() {
         return;
-    };
-    let port = HostRuntimePort::new();
-    assert_eq!(
-        port.session_readiness(&binding("ada.claude")).unwrap(),
-        AdapterReadiness::ReadyIdle
+    }
+    with_endpoint_host(
+        vec![summary("ada.claude", 5, SessionMode::Pty, 0)],
+        vec![],
+        |first| {
+            with_endpoint_host(vec![], vec![], |second| {
+                let _first =
+                    fl_host_proto::register_hub_test_host_fixture(first.socket_path()).unwrap();
+                let _second =
+                    fl_host_proto::register_hub_test_host_fixture(second.socket_path()).unwrap();
+                let port = HostRuntimePort::new();
+                // This child runs one test, and its servers never read the environment.
+                unsafe { std::env::set_var("FL_HOST_SOCK", first.socket_path()) };
+                assert_eq!(
+                    port.session_readiness(&binding("ada.claude")).unwrap(),
+                    AdapterReadiness::ReadyIdle
+                );
+                unsafe { std::env::set_var("FL_HOST_SOCK", second.socket_path()) };
+                assert_eq!(
+                    port.session_readiness(&binding("ada.claude")).unwrap(),
+                    AdapterReadiness::Exited
+                );
+                unsafe { std::env::set_var("FL_HOST_SOCK", "relative-invalid.sock") };
+                assert_transport(port.session_readiness(&binding("ada.claude")));
+            });
+        },
     );
-    // This test only mutates the environment in a subprocess running this sole test.
-    // Its servers live in the parent process, so no client/server threads share this environment.
-    unsafe { std::env::set_var("FL_HOST_SOCK", second) };
-    assert_eq!(
-        port.session_readiness(&binding("ada.claude")).unwrap(),
-        AdapterReadiness::Exited
-    );
-    unsafe { std::env::set_var("FL_HOST_SOCK", "relative-invalid.sock") };
-    assert_transport(port.session_readiness(&binding("ada.claude")));
 }

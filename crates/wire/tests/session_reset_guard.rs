@@ -1,4 +1,17 @@
 //! Subprocess boundaries use only explicit fixture executables and temporary homes.
+#[used]
+#[cfg_attr(
+    target_vendor = "apple",
+    unsafe(link_section = "__DATA,__mod_init_func")
+)]
+#[cfg_attr(not(target_vendor = "apple"), unsafe(link_section = ".init_array"))]
+static INITIALIZE_ISOLATION: extern "C" fn() = {
+    extern "C" fn enable() {
+        fl_wire::test_isolation::enable();
+    }
+    enable
+};
+
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
@@ -10,22 +23,11 @@ use fl_wire::identity::VendorRoute;
 use tempfile::TempDir;
 
 fn run_fixture(mode: &str) {
-    let tmp = TempDir::new().unwrap();
-    let bin = tmp.path().join("codex-fixture");
-    fs::write(
-        &bin,
-        "#!/bin/sh\nprintf '%s\\n' \"$@\" >> \"$HOME/queue.log\"\n",
-    )
-    .unwrap();
-    fs::set_permissions(&bin, fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(fl_wire::test_isolation::is_enabled());
     let result = Command::new(std::env::current_exe().unwrap())
         .args(["--exact", "fixture_child", "--nocapture"])
         .env_clear()
         .env("PATH", "/usr/bin:/bin")
-        .env("HOME", tmp.path())
-        .env("FL_WIRE_CODEX_BIN", &bin)
-        // Setting an explicit fixture also disables the existing queue-to-host fallback.
-        .env("FL_WIRE_TMUX_BIN", &bin)
         .env("SESSION_RESET_FIXTURE", mode)
         .output()
         .unwrap();
@@ -54,9 +56,32 @@ fn unsupported_resets_never_spawn_queue_or_terminal_commands() {
 
 #[test]
 fn fixture_child() {
+    assert!(fl_wire::test_isolation::is_enabled());
     let Ok(mode) = std::env::var("SESSION_RESET_FIXTURE") else {
         return;
     };
+    // The startup constructor gives each process its own root. Create every fixture
+    // here, after the child constructor, rather than passing parent-owned paths in.
+    let tmp = TempDir::new().unwrap();
+    let bin = tmp.path().join("codex-fixture");
+    fs::write(
+        &bin,
+        "#!/bin/sh\nprintf '%s\\n' \"$@\" >> \"$HOME/queue.log\"\n",
+    )
+    .unwrap();
+    fs::set_permissions(&bin, fs::Permissions::from_mode(0o700)).unwrap();
+    let _executable = fl_wire::test_isolation::register_executable(&bin).unwrap();
+    // This child runs exactly one fixture test, with no inherited vendor endpoints.
+    // Setting an explicit vendor fixture disables control-socket discovery and the
+    // queue-to-host fallback; tmux probes, if any, reach this same private sentinel.
+    unsafe {
+        std::env::set_var("HOME", tmp.path());
+        std::env::set_var("XDG_CACHE_HOME", tmp.path().join(".cache"));
+        std::env::set_var("XDG_CONFIG_HOME", tmp.path().join(".config"));
+        std::env::set_var("XDG_DATA_HOME", tmp.path().join(".local/share"));
+        std::env::set_var("FL_WIRE_CODEX_BIN", &bin);
+        std::env::set_var("FL_WIRE_TMUX_BIN", &bin);
+    }
     let route = VendorRoute::Codex {
         thread_id: "fixture-thread".into(),
         cwd: None,

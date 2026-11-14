@@ -106,6 +106,8 @@ pub(crate) fn compact_thread(
 ) -> Result<(), String> {
     let deadline = Instant::now() + timeout;
     // Known limit: a Unix-socket `connect` has no timeout (it blocks only on a full backlog).
+    #[cfg(feature = "wire-test-isolation")]
+    crate::test_isolation::ensure_socket(sock).map_err(|e| e.to_string())?;
     let stream = UnixStream::connect(sock).map_err(|e| {
         format!(
             "cannot connect to the Codex app-server control socket {}: {e}",
@@ -839,6 +841,8 @@ fn connect_for_steering(sock: &Path, deadline: Instant) -> io::Result<UnixStream
             .ok_or_else(|| io::Error::from(io::ErrorKind::TimedOut))
     };
     remaining()?;
+    #[cfg(feature = "wire-test-isolation")]
+    crate::test_isolation::ensure_socket(sock)?;
     let address = SockAddr::unix(sock)?;
     let socket = Socket::new(Domain::UNIX, Type::STREAM, None)?;
     socket.connect_timeout(&address, remaining()?)?;
@@ -1355,7 +1359,6 @@ fn decode_server_frame(buf: &[u8]) -> Result<Option<(Frame, usize)>, String> {
 #[cfg(test)]
 pub(crate) mod fake_server {
     use super::*;
-    use std::os::unix::net::UnixListener;
     use std::thread::JoinHandle;
 
     /// A client frame as the server saw it.
@@ -1543,7 +1546,8 @@ pub(crate) mod fake_server {
         if let Some(parent) = sock.parent() {
             std::fs::create_dir_all(parent).expect("create fake control socket parent");
         }
-        let listener = UnixListener::bind(sock).expect("bind fake control socket");
+        let listener =
+            crate::test_isolation::bind_unix_fixture(sock).expect("bind fake control socket");
         std::thread::spawn(move || {
             // Bounded, so a client that never connects fails the test instead of hanging it.
             listener
@@ -1597,7 +1601,7 @@ mod tests {
         ] {
             let dir = TempDir::new().unwrap();
             let sock = dir.path().join("no-bytes.sock");
-            let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+            let listener = crate::test_isolation::bind_unix_fixture(&sock).unwrap();
             let result = steer_active_turn(&sock, &thread_id, &text, Duration::from_millis(50));
             assert!(
                 matches!(
@@ -1754,7 +1758,7 @@ mod tests {
     fn steering_connect_refuses_an_expired_deadline_without_connecting() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("expired.sock");
-        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let listener = crate::test_isolation::bind_unix_fixture(&path).unwrap();
         let error = connect_for_steering(&path, Instant::now()).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
         listener.set_nonblocking(true).unwrap();
@@ -1768,7 +1772,10 @@ mod tests {
     fn steering_connect_reports_a_local_refused_socket() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("refused.sock");
-        drop(std::os::unix::net::UnixListener::bind(&path).unwrap());
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let _fixture = crate::test_isolation::register_unix_socket(&path).unwrap();
+        drop(listener);
+        assert!(crate::test_isolation::ensure_socket(&path).is_ok());
         let error = connect_for_steering(&path, Instant::now() + SHORT).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::ConnectionRefused);
     }
@@ -1785,6 +1792,8 @@ mod tests {
         let listener = Socket::new(Domain::UNIX, Type::STREAM, None).unwrap();
         listener.bind(&address).unwrap();
         listener.listen(0).unwrap();
+        let _fixture = crate::test_isolation::register_unix_socket(&path).unwrap();
+        crate::test_isolation::ensure_socket(&path).unwrap();
         let filler = UnixStream::connect(&path).unwrap();
         // Release the backlog eventually even if a regression makes connect block.
         let release = std::thread::spawn(move || {
@@ -2744,6 +2753,16 @@ mod tests {
     fn missing_socket_is_a_clear_error() {
         let dir = TempDir::new().unwrap();
         let sock = dir.path().join("absent.sock");
+        let unregistered = compact_thread(&sock, "t", SHORT).unwrap_err();
+        assert!(
+            unregistered.contains("unregistered wire test socket"),
+            "{unregistered}"
+        );
+        // Retain registration for a closed fixture socket so the connection
+        // reaches the offline error path without contacting any live service.
+        let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        let _fixture = crate::test_isolation::register_unix_socket(&sock).unwrap();
+        drop(listener);
         let err = compact_thread(&sock, "t", SHORT).unwrap_err();
         assert!(
             err.contains("cannot connect") && err.contains("absent.sock"),
@@ -3017,6 +3036,9 @@ mod tests {
         // 1. Missing / offline socket -> Unknown (never embeds socket filesystem path).
         let dir = TempDir::new().unwrap();
         let missing = dir.path().join("missing.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&missing).unwrap();
+        let _fixture = crate::test_isolation::register_unix_socket(&missing).unwrap();
+        drop(listener);
         let out = inspect_thread_queues(&missing, &["thread-1"], now_ms, SHORT);
         assert!(matches!(
             &out[0],
@@ -3031,7 +3053,7 @@ mod tests {
 
         // 2. Route without thread_id -> Unknown without connecting to listener.
         let untouched = dir.path().join("untouched.sock");
-        let listener = std::os::unix::net::UnixListener::bind(&untouched).unwrap();
+        let listener = crate::test_isolation::bind_unix_fixture(&untouched).unwrap();
         let out = inspect_thread_queues(&untouched, &["   "], now_ms, SHORT);
         assert!(matches!(
             &out[0],
