@@ -85,3 +85,20 @@ fn windows_suffix_is_safe_and_different_for_different_roots() {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn store_socket_path_accepts_103_bytes_and_rejects_104() {
+    use std::os::unix::ffi::OsStrExt;
+
+    // These paths are never created; the test only examines command configuration.
+    let valid = PathBuf::from(format!("/{}", "x".repeat(90)));
+    let invalid = PathBuf::from(format!("/{}", "x".repeat(91)));
+    assert_eq!(valid.join("fl.fls.sock").as_os_str().as_bytes().len(), 103);
+    assert_eq!(
+        invalid.join("fl.fls.sock").as_os_str().as_bytes().len(),
+        104
+    );
+    assert!(common::isolated_command("fl", &valid).is_ok());
+    assert!(common::isolated_command("fl", &invalid).is_err());
+}

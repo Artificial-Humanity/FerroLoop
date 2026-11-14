@@ -31,9 +31,10 @@ pub fn isolate_command(command: &mut Command, root: impl AsRef<Path>) -> io::Res
     #[cfg(unix)]
     {
         use std::os::unix::ffi::OsStrExt;
-        // Portable across the Linux and macOS Unix socket path limits. All
-        // default socket names below have one-character basenames.
-        if root.join("h").as_os_str().as_bytes().len() >= 104
+        // The store appends `.sock` to FL_DB, producing the longest socket
+        // path configured here. Reserve its trailing NUL within macOS's
+        // 104-byte sun_path, the smaller of the Linux and macOS limits.
+        if root.join("fl.fls.sock").as_os_str().as_bytes().len() >= 104
             || root.as_os_str().as_bytes().contains(&0)
         {
             return Err(io::Error::new(
