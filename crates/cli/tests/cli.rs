@@ -1,3 +1,6 @@
+#[allow(dead_code)]
+mod common;
+
 use assert_cmd::Command;
 use predicates::prelude::PredicateBooleanExt;
 use predicates::str::contains;
@@ -17,6 +20,23 @@ fn cli(dir: &tempfile::TempDir) -> Command {
         .arg("--db")
         .arg(db(dir));
     c
+}
+
+// These cases exercise only directory validation and store lookups.  Keep
+// their child environment private without creating an unrelated Git repo.
+fn isolated_cli(dir: &tempfile::TempDir) -> Command {
+    let mut command = common::isolated_fl(dir.path()).unwrap();
+    command.current_dir(dir.path()).arg("--db").arg(db(dir));
+    Command::from_std(command)
+}
+
+fn isolated_project(dir: &tempfile::TempDir) -> tempfile::TempDir {
+    let repo = tempfile::tempdir().unwrap();
+    isolated_cli(dir)
+        .args(["project", "add", &repo.path().display().to_string()])
+        .assert()
+        .success();
+    repo
 }
 
 use std::path::Path;
@@ -65,11 +85,11 @@ fn project(d: &tempfile::TempDir) -> tempfile::TempDir {
 #[test]
 fn a_project_can_be_added_and_listed() {
     let d = tempfile::tempdir().unwrap();
-    let repo = project(&d);
+    let repo = isolated_project(&d);
     // `project add` stores the canonical root, not the string it was given,
     // so a gate resolves the same tree from any working directory.
     let canonical = repo.path().canonicalize().unwrap().display().to_string();
-    cli(&d)
+    isolated_cli(&d)
         .args(["project", "list"])
         .assert()
         .success()
@@ -79,8 +99,8 @@ fn a_project_can_be_added_and_listed() {
 #[test]
 fn an_unknown_gate_kind_is_refused_with_an_actionable_message() {
     let d = tempfile::tempdir().unwrap();
-    let _repo = project(&d);
-    cli(&d)
+    let _repo = isolated_project(&d);
+    isolated_cli(&d)
         .args([
             "gate",
             "add",
@@ -103,7 +123,7 @@ fn an_unknown_gate_kind_is_refused_with_an_actionable_message() {
 #[test]
 fn a_missing_project_is_refused_and_names_the_id() {
     let d = tempfile::tempdir().unwrap();
-    cli(&d)
+    isolated_cli(&d)
         .args([
             "gate",
             "add",
@@ -175,12 +195,11 @@ fn a_missing_parent_directory_for_the_db_flag_is_created() {
         "fixture must start absent"
     );
 
-    let mut c = Command::cargo_bin("fl").unwrap();
-    c.env("XDG_CONFIG_HOME", d.path())
-        .env_remove("FL_STORE_BACKEND")
-        .arg("--db")
-        .arg(&nested);
-    let repo = git_repo();
+    let mut command = common::isolated_fl(d.path()).unwrap();
+    command.current_dir(d.path());
+    let mut c = Command::from_std(command);
+    c.env_remove("FL_STORE_BACKEND").arg("--db").arg(&nested);
+    let repo = tempfile::tempdir().unwrap();
     c.args(["project", "add", &repo.path().display().to_string()])
         .assert()
         .success();
@@ -202,19 +221,10 @@ fn a_missing_parent_directory_for_fl_db_is_created_the_same_way_as_the_db_flag()
         "fixture must start absent"
     );
 
-    // `env_clear` scopes the controlled environment to this child process
-    // only; it never touches this test process's own environment, so it
-    // cannot race any other test reading or setting env vars in parallel.
-    let mut c = Command::cargo_bin("fl").unwrap();
-    c.env_clear();
-    c.env("FL_DB", &nested);
-    // PATH survives the clear: `project add` shells out to `git` to check
-    // that the root is a working tree, and a cleared PATH would make this
-    // test fail for a reason that has nothing to do with the store path.
-    if let Ok(path) = std::env::var("PATH") {
-        c.env("PATH", path);
-    }
-    let repo = git_repo();
+    let mut command = common::isolated_fl(d.path()).unwrap();
+    command.current_dir(d.path()).env("FL_DB", &nested);
+    let mut c = Command::from_std(command);
+    let repo = tempfile::tempdir().unwrap();
     c.args(["project", "add", &repo.path().display().to_string()])
         .assert()
         .success();
