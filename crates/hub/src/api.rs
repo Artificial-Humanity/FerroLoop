@@ -6234,7 +6234,6 @@ fn dispatch_operator_prompt_with_intent_for_session(
                 Err(()) => return Err(PushError::NotConnected("ambiguous queued session alias".into())),
                 _ => {}
             }
-            require_intended_vendor(route, intended_vendor)?;
             #[cfg(test)]
             if REFUSE_PROMPT_PUSH.with(|hook| {
                 if let Some(f) = hook.borrow_mut().take() { f(); true } else { false }
@@ -6246,6 +6245,26 @@ fn dispatch_operator_prompt_with_intent_for_session(
                 QUEUED_DELIVERY_CALLS.with(|c| c.set(c.get() + 1));
                 return Ok(OperatorPromptOutcome::TransportAccepted);
             }
+            // A pinned Codex Send Now remains a typed route refusal even if
+            // rediscovery finds a different vendor before reaching its branch.
+            let codex_mismatch = intent == OperatorPromptIntent::OwnerSendNow
+                && match intended_codex_thread_id {
+                    Some(intended) => !matches!(route,
+                        fl_wire::identity::VendorRoute::Codex { thread_id, .. } if thread_id == intended),
+                    None => matches!(route, fl_wire::identity::VendorRoute::Codex { .. })
+                        && !route_matches_session_id(route, session_id),
+                };
+            if codex_mismatch {
+                let error = CodexSteerError::Refused {
+                    stage: fl_wire::dispatcher::CodexSteerStage::Route,
+                    reason: fl_wire::dispatcher::CodexSteerRefusalReason::InvalidResponse,
+                    message: "resolved route does not serve the intended Codex thread".into(),
+                };
+                let message = error.to_string();
+                steering_error = Some(error);
+                return Err(PushError::Failed(message));
+            }
+            require_intended_vendor(route, intended_vendor)?;
             // An unbound owner prompt must never obtain Claude terminal authority by
             // rediscovery. Independently established peer delivery stays peer-only.
             if matches!(route, fl_wire::identity::VendorRoute::Claude { .. }) {
@@ -6256,22 +6275,7 @@ fn dispatch_operator_prompt_with_intent_for_session(
                     .map(|()| OperatorPromptOutcome::TransportAccepted)
                     .map_err(PushError::Failed);
             }
-            let delivery = if intent == OperatorPromptIntent::OwnerSendNow
-                && match intended_codex_thread_id {
-                    Some(intended) => !matches!(route,
-                        fl_wire::identity::VendorRoute::Codex { thread_id, .. } if thread_id == intended),
-                    None => matches!(route, fl_wire::identity::VendorRoute::Codex { .. })
-                        && !route_matches_session_id(route, session_id),
-                }
-            {
-                Err(OperatorPromptError::Steer(CodexSteerError::Refused {
-                    stage: fl_wire::dispatcher::CodexSteerStage::Route,
-                    reason: fl_wire::dispatcher::CodexSteerRefusalReason::InvalidResponse,
-                    message: "resolved route does not serve the intended Codex thread".into(),
-                }))
-            } else {
-                push_operator_prompt_with_intent(route, sender_name, body, intent)
-            };
+            let delivery = push_operator_prompt_with_intent(route, sender_name, body, intent);
             delivery.map_err(|e| match e {
                 OperatorPromptError::Push(e) => e,
                 OperatorPromptError::Steer(e) => {

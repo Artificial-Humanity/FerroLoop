@@ -7061,9 +7061,18 @@ pub fn deliver_to_live_claude_pane(route: &VendorRoute, text: &str) -> Result<()
         }
         return deliver_via_tmux_paste_with_opts(pane, &sanitize_for_paste(text), opts);
     }
-    let target = claude_host_target(discovered.as_deref().unwrap_or(session_id))
-        .ok_or_else(|| "the claude route has no live terminal".to_string())?;
-    let mut host = resolve_claude_host(&target, *pid)?;
+    let target = match claude_host_target(discovered.as_deref().unwrap_or(session_id)) {
+        Some(target) => target,
+        // A busy record cannot establish the background-wait exception when no
+        // terminal can be located. Keep the delivery held without host I/O.
+        None if claude_session_busy(record.as_ref()) => return Err(composer_session_busy_error()),
+        None => return Err("the claude route has no live terminal".to_string()),
+    };
+    let mut host = match resolve_claude_host(&target, *pid) {
+        Ok(host) => host,
+        Err(_) if claude_session_busy(record.as_ref()) => return Err(composer_session_busy_error()),
+        Err(error) => return Err(error),
+    };
     if !claude_session_deliverable(record.as_ref()) {
         let proves_wait = claude_session_busy(record.as_ref())
             && host.is_pty
