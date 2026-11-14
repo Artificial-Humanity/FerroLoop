@@ -35,6 +35,35 @@ Attempt rows from the store have no `quota_usage`. Claude Code, Antigravity, and
 fill `quota_usage` from a direct probe, an override JSON value, or a rate-limit error
 in the transcript.
 
+## Clear and Reforge
+
+Clear and Reforge resolve targets only from saved/registered routes. A single request for
+an unknown or unsaved session returns HTTP 404 with guidance to refresh or register the
+session first; it does not actively discover that target. Bulk Clear/Reforge includes only
+saved routes. Compact keeps its existing discovery behavior. Supported saved reset routes
+retain their normal validation and dispatch checks.
+
+Codex, Muse, Grok and every generic `HostCli` route refuse both actions before reset
+commands, startup prompts, queue/model changes or discovery invalidation. FerroLoop cannot
+confirm a changed native session identity bound to the exact terminal for these routes.
+This also applies to a `HostCli` route whose vendor label is Claude or Codex.
+
+Single-session requests return HTTP 409 with `code: reset_unsupported`, the canonical
+`vendor`, `reason: identity_unconfirmable`, `alternative: remodel_same_vendor` and a plain
+`error` message. Bulk actions retain those fields with `session_id`, `ok: false` and
+`status: 409` per refused session. The alternative is an explicit remodel to the same
+vendor to start a fresh session; FerroLoop does not run it automatically.
+
+Claude Reforge requires a native `sessionId` from its session record before sending
+`/clear`. If that identity is unavailable, it refuses before sending keys or a startup
+prompt. After `/clear`, it waits up to 20 seconds for a changed `sessionId`; timeout returns
+an error without sending the startup prompt or broadcasting `session.cleared`.
+
+Antigravity keeps its in-place cascade rewind described below. It does not establish a new
+native session identity and remains outside this confirmation contract, pending a separate
+audit. Webhook routes remain a deterministic test transport, not evidence of native reset
+confirmation.
+
 ## Host reboot behaviour
 
 A host boot can restore tmux sessions (tmux-resurrect with continuum restore). Hub keeps three

@@ -4883,8 +4883,8 @@ mod tests {
                 .with_json_body(&json!({ "mode": "clear" })),
         );
         assert_eq!(missing_route.status, 404);
-        assert!(state.session_queue("felicia").is_empty());
-        assert!(!state.is_session_busy_from_turns("felicia", &[]));
+        assert_eq!(state.session_queue("felicia").len(), 1);
+        assert!(state.is_session_busy_from_turns("felicia", &[]));
 
         state.enqueue_session_prompt(
             "felicia",
