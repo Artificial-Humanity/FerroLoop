@@ -18,20 +18,18 @@ use std::path::{Path, PathBuf};
 
 struct Env {
     home: tempfile::TempDir,
-    stores: tempfile::TempDir,
 }
 
 impl Env {
     fn new() -> Self {
         Self {
             home: tempfile::tempdir().unwrap(),
-            stores: tempfile::tempdir().unwrap(),
         }
     }
 
     /// The logical store path; the ferro engine keeps `fl.fls` beside it.
     fn logical(&self) -> PathBuf {
-        self.stores.path().join("fl.redb")
+        self.home.path().join("fl.redb")
     }
 
     fn fl(&self, kind: BackendKind) -> Command {
@@ -53,6 +51,14 @@ impl Env {
         c.arg("--db").arg(self.logical());
         c
     }
+}
+
+#[test]
+fn fixture_store_socket_remains_in_fixture_root() {
+    let env = Env::new();
+    let logical = env.logical();
+    let socket = fl_store::ferrostore::default_socket_path_for_store(logical.with_extension("fls"));
+    assert!(socket.starts_with(env.home.path()), "{socket:?}");
 }
 
 fn open(path: &Path, kind: BackendKind) -> AnyStore {
