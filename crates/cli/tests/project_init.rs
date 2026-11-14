@@ -490,7 +490,7 @@ fn create_and_init_are_one_command_and_both_spellings_work() {
 #[test]
 fn a_virtual_group_has_no_directory_store_config_or_git() {
     let env = Env::new();
-    let created = env.run_json(
+    let created = env.isolated_run_json(
         "create",
         &["Council", "--virtual", "--purpose", "the strategists"],
     );
@@ -519,9 +519,9 @@ fn a_virtual_group_has_no_directory_store_config_or_git() {
     );
 
     // Again: nothing changes. The area has no path.
-    let again = env.run_json("create", &["Council", "--virtual"]);
+    let again = env.isolated_run_json("create", &["Council", "--virtual"]);
     assert_eq!(again["registered"], false);
-    env.fl(env.work.path())
+    env.isolated_fl(env.work.path())
         .args(["agent", "area", "list", "--json"])
         .assert()
         .success()
@@ -549,8 +549,8 @@ fn a_virtual_group_takes_no_path_git_or_tracker_flags() {
 #[test]
 fn a_slug_cannot_be_a_project_and_a_virtual_group() {
     let env = Env::new();
-    env.run_json("create", &["Shared", "--virtual"]);
-    env.fl(env.work.path())
+    env.isolated_run_json("create", &["Shared", "--virtual"]);
+    env.isolated_fl(env.work.path())
         .args([
             "project",
             "create",
@@ -564,11 +564,11 @@ fn a_slug_cannot_be_a_project_and_a_virtual_group() {
     assert!(!env.dir("shared").exists());
     assert!(!env.config_path().exists());
 
-    env.run_json(
+    env.isolated_run_json(
         "create",
         &["Solid", "--path", env.dir("solid").to_str().unwrap()],
     );
-    env.fl(env.work.path())
+    env.isolated_fl(env.work.path())
         .args(["project", "create", "Solid", "--virtual"])
         .assert()
         .failure()
