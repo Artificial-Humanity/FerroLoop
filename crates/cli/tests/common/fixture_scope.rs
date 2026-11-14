@@ -9,7 +9,8 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::path::{Component, Path, PathBuf};
-use std::process::Output;
+use std::process::{Child, ExitStatus, Output, Stdio};
+use std::sync::Arc;
 
 use fl_fixture_path::{FixtureContext, FixtureIdentity, PathAccess, StoreBackend};
 use tempfile::TempDir;
@@ -63,6 +64,99 @@ pub struct FixtureScope {
     context: FixtureContext,
     // Fields drop in declaration order, keeping the root until after files.
     root: TempDir,
+}
+
+// The scope is retained until its direct child is proven reaped. Descendant
+// processes, child-created listeners, and pipe ownership are not supported.
+trait FixtureProcess {
+    type Status;
+    fn try_wait(&mut self) -> io::Result<Option<Self::Status>>;
+    fn kill(&mut self) -> io::Result<()>;
+    fn wait(&mut self) -> io::Result<Self::Status>;
+}
+
+impl FixtureProcess for Child {
+    type Status = ExitStatus;
+    fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
+        Child::try_wait(self)
+    }
+    fn kill(&mut self) -> io::Result<()> {
+        Child::kill(self)
+    }
+    fn wait(&mut self) -> io::Result<ExitStatus> {
+        Child::wait(self)
+    }
+}
+
+struct ManagedFixtureChild<P: FixtureProcess, S> {
+    child: Option<P>,
+    scope: Option<S>,
+}
+
+impl<P: FixtureProcess, S> ManagedFixtureChild<P, S> {
+    fn new(child: P, scope: S) -> Self {
+        Self {
+            child: Some(child),
+            scope: Some(scope),
+        }
+    }
+
+    fn wait(&mut self) -> io::Result<P::Status> {
+        let child = self.child.as_mut().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "fixture child already reaped")
+        })?;
+        let status = child.wait()?;
+        self.child.take();
+        Ok(status)
+    }
+
+    fn shutdown(&mut self) -> io::Result<P::Status> {
+        let child = self.child.as_mut().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "fixture child already reaped")
+        })?;
+        if let Some(status) = child.try_wait()? {
+            self.child.take();
+            return Ok(status);
+        }
+        if let Err(kill_error) = child.kill() {
+            if let Some(status) = child.try_wait()? {
+                self.child.take();
+                return Ok(status);
+            }
+            return Err(kill_error);
+        }
+        self.wait()
+    }
+}
+
+impl<P: FixtureProcess, S> Drop for ManagedFixtureChild<P, S> {
+    fn drop(&mut self) {
+        if self.child.is_some() && self.shutdown().is_err() {
+            // Reaping is unproven: preserve both process handle and resources
+            // rather than letting a still-running child outlive its fixtures.
+            if let Some(child) = self.child.take() {
+                std::mem::forget(child);
+            }
+            if let Some(scope) = self.scope.take() {
+                std::mem::forget(scope);
+            }
+        }
+    }
+}
+
+/// Owns a direct child and retains the fixture scope until it is reaped.
+/// No handle extraction or detachment is available.
+pub struct FixtureChild {
+    inner: ManagedFixtureChild<Child, Arc<FixtureScope>>,
+}
+
+impl FixtureChild {
+    pub fn wait(&mut self) -> io::Result<ExitStatus> {
+        self.inner.wait()
+    }
+    pub fn shutdown(&mut self) -> io::Result<ExitStatus> {
+        self.inner.shutdown()
+    }
 }
 
 impl FixtureScopeBuilder {
@@ -255,6 +349,25 @@ impl FixtureScope {
         fixture.listener.accept()
     }
 
+    /// Start a direct child while retaining this scope. This does not activate
+    /// context transfer or guard descendant processes; those remain unsupported.
+    pub fn spawn_fl<I, S>(self: &Arc<Self>, args: I) -> io::Result<FixtureChild>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        self.manifest_for_transfer()?;
+        let child = crate::common::isolated_fl(self.root())?
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()?;
+        Ok(FixtureChild {
+            inner: ManagedFixtureChild::new(child, Arc::clone(self)),
+        })
+    }
+
     /// Run the isolated CLI synchronously while this scope remains borrowed.
     /// No raw Child or Command escapes; context transfer is not wired yet.
     pub fn output_fl<I, S>(&self, args: I) -> io::Result<Output>
@@ -283,6 +396,123 @@ impl Drop for FixtureScope {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Clone)]
+    struct FakeProcess {
+        events: std::rc::Rc<std::cell::RefCell<Vec<&'static str>>>,
+        kill_fails: bool,
+        wait_fails: bool,
+    }
+
+    impl FixtureProcess for FakeProcess {
+        type Status = ();
+        fn try_wait(&mut self) -> io::Result<Option<()>> {
+            self.events.borrow_mut().push("try_wait");
+            Ok(None)
+        }
+        fn kill(&mut self) -> io::Result<()> {
+            self.events.borrow_mut().push("kill");
+            if self.kill_fails {
+                Err(io::Error::other("kill failed"))
+            } else {
+                Ok(())
+            }
+        }
+        fn wait(&mut self) -> io::Result<()> {
+            self.events.borrow_mut().push("wait");
+            if self.wait_fails {
+                Err(io::Error::other("wait failed"))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    struct FakeScope(std::rc::Rc<std::cell::RefCell<Vec<&'static str>>>);
+    impl Drop for FakeScope {
+        fn drop(&mut self) {
+            self.0.borrow_mut().push("scope_dropped");
+        }
+    }
+
+    #[test]
+    fn child_drop_reaps_before_releasing_scope() {
+        let events = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let child = ManagedFixtureChild::new(
+            FakeProcess {
+                events: events.clone(),
+                kill_fails: false,
+                wait_fails: false,
+            },
+            FakeScope(events.clone()),
+        );
+        drop(child);
+        assert_eq!(
+            &*events.borrow(),
+            &["try_wait", "kill", "wait", "scope_dropped"]
+        );
+    }
+
+    #[test]
+    fn child_drop_preserves_scope_when_reap_cannot_be_proven() {
+        let events = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let child = ManagedFixtureChild::new(
+            FakeProcess {
+                events: events.clone(),
+                kill_fails: true,
+                wait_fails: false,
+            },
+            FakeScope(events.clone()),
+        );
+        drop(child);
+        assert_eq!(&*events.borrow(), &["try_wait", "kill", "try_wait"]);
+    }
+
+    #[test]
+    fn child_drop_preserves_scope_if_wait_fails_after_kill() {
+        let events = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let child = ManagedFixtureChild::new(
+            FakeProcess {
+                events: events.clone(),
+                kill_fails: false,
+                wait_fails: true,
+            },
+            FakeScope(events.clone()),
+        );
+        drop(child);
+        assert_eq!(&*events.borrow(), &["try_wait", "kill", "wait"]);
+    }
+
+    #[test]
+    fn explicit_wait_reaps_before_releasing_scope() {
+        let events = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let mut child = ManagedFixtureChild::new(
+            FakeProcess {
+                events: events.clone(),
+                kill_fails: false,
+                wait_fails: false,
+            },
+            FakeScope(events.clone()),
+        );
+        child.wait().unwrap();
+        assert_eq!(&*events.borrow(), &["wait"]);
+        drop(child);
+        assert_eq!(&*events.borrow(), &["wait", "scope_dropped"]);
+    }
+
+    // CI-only: runs the isolated fl child. Local audited filters exclude it.
+    #[test]
+    fn direct_child_retains_scope_until_reaped_ci_only() {
+        let scope = Arc::new(FixtureScopeBuilder::new().unwrap().finish().unwrap());
+        let root = scope.root().to_path_buf();
+        let mut child = scope.spawn_fl(["--help"]).unwrap();
+        drop(scope);
+        assert!(root.exists());
+        assert!(child.wait().unwrap().success());
+        assert!(root.exists());
+        drop(child);
+        assert!(!root.exists());
+    }
 
     #[test]
     fn owns_manifest_and_exact_file_resources_until_drop() {
