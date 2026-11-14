@@ -7119,7 +7119,7 @@ pub enum ClaudeBoundError {
 }
 
 pub fn dispatch_bound_claude_operator_prompt(
-    binding: &crate::claude_registration::ClaudeRegistrationBinding,
+    binding: &crate::vendor_adapter::ClaudeRegistrationBinding,
     sender_name: &str,
     body: &str,
 ) -> Result<(), ClaudeBoundError> {
@@ -7980,8 +7980,8 @@ mod tests {
         // PID evidence may corroborate that target, never pick a different persona.
         #[cfg(target_os = "linux")]
         {
-            use crate::claude_registration::ClaudeRegistrationBinding;
             use crate::identity::{RouteEntry, RouteTable, proc_start_time_ticks};
+            use crate::vendor_adapter::ClaudeRegistrationBinding;
             let pid = std::process::id();
             let native = "dce797a0-d963-4c1b-a06b-7fa6bffda7fa";
             let registered = RouteEntry {

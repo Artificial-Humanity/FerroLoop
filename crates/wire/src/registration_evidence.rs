@@ -1,4 +1,4 @@
-//! Strict, pinned registration evidence for hosted Claude operator paste.
+//! Strict, pinned source-derived registration evidence.
 //!
 //! This deliberately does not use `RouteTable::load`: permissive legacy recovery and
 //! passive discovery cannot establish the provenance needed for terminal mutation.
@@ -10,8 +10,7 @@ use serde::de::{self, Deserialize, Deserializer, MapAccess, SeqAccess, Visitor};
 use serde_json::{Map, Number, Value};
 
 use crate::identity::{
-    RouteEntry, RouteTable, VendorRoute, normalize_persona, parse_hosted_identity,
-    route_entry_proven_live,
+    RouteEntry, RouteTable, normalize_persona, parse_hosted_identity, route_entry_proven_live,
 };
 
 // Unlike Value's normal deserializer, reject duplicate keys at *every* nesting level.
@@ -76,92 +75,86 @@ impl<'de> Deserialize<'de> for UniqueJson {
 
 fn strict_table(source: &Path) -> Result<RouteTable, &'static str> {
     let raw = std::fs::read(source)
-        .map_err(|_| "Claude registration source unavailable; re-register and resubmit")?;
+        .map_err(|_| "registration source unavailable; re-register and resubmit")?;
     let UniqueJson(value) = serde_json::from_slice(&raw)
-        .map_err(|_| "invalid or ambiguous Claude registration source; re-register and resubmit")?;
+        .map_err(|_| "invalid or ambiguous registration source; re-register and resubmit")?;
     let entries = value
         .get("entries")
         .and_then(Value::as_object)
-        .ok_or("invalid Claude registration source; re-register and resubmit")?;
+        .ok_or("invalid registration source; re-register and resubmit")?;
     let mut aliases = BTreeSet::new();
     let mut personas = BTreeSet::new();
     for (key, entry) in entries {
         let alias = normalize_persona(key)
-            .ok_or("invalid Claude registration source; re-register and resubmit")?;
+            .ok_or("invalid registration source; re-register and resubmit")?;
         if !aliases.insert(alias) {
-            return Err("ambiguous Claude registration source; re-register and resubmit");
+            return Err("ambiguous registration source; re-register and resubmit");
         }
         // Modern typed entries only; never reconstruct explicit identity from legacy defaults.
         if !entry.is_object() || entry.get("route").is_none() {
-            return Err("incomplete Claude registration source; re-register and resubmit");
+            return Err("incomplete registration source; re-register and resubmit");
         }
         let persona = entry
             .get("persona")
             .and_then(Value::as_str)
             .and_then(normalize_persona)
-            .ok_or("invalid Claude registration source; re-register and resubmit")?;
+            .ok_or("invalid registration source; re-register and resubmit")?;
         if !personas.insert(persona) {
-            return Err("ambiguous Claude registration source; re-register and resubmit");
+            return Err("ambiguous registration source; re-register and resubmit");
         }
     }
     serde_json::from_value(value)
-        .map_err(|_| "invalid Claude registration source; re-register and resubmit")
+        .map_err(|_| "invalid registration source; re-register and resubmit")
 }
 
 /// A source failure is distinct from a source-backed identity refusal, so an
 /// independently classified non-Claude request can only bypass the former.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ClaudeRegistrationError {
+pub enum RegistrationError {
     Source(&'static str),
     Refused(&'static str),
 }
-impl From<&'static str> for ClaudeRegistrationError {
+impl From<&'static str> for RegistrationError {
     fn from(message: &'static str) -> Self {
         Self::Refused(message)
     }
 }
-impl fmt::Display for ClaudeRegistrationError {
+impl fmt::Display for RegistrationError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Source(message) | Self::Refused(message) => f.write_str(message),
         }
     }
 }
-impl std::error::Error for ClaudeRegistrationError {}
+impl std::error::Error for RegistrationError {}
 
-/// A source-backed registration snapshot. Fields are private; constructors reread evidence.
-/// It is intentionally not serializable: a restored queue item has only untrusted intent.
+/// A source-backed registration snapshot. Only the adapter facade can acquire one;
+/// raw inputs express intent and never constitute authority.
 #[derive(Clone, PartialEq, Eq)]
-pub struct ClaudeRegistrationBinding {
+pub(crate) struct RegistrationBinding {
     source: PathBuf,
     entry: RouteEntry,
     persona: String,
     native_id: String,
 }
-impl fmt::Debug for ClaudeRegistrationBinding {
+impl fmt::Debug for RegistrationBinding {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("ClaudeRegistrationBinding(<redacted>)")
+        f.write_str("RegistrationBinding(<redacted>)")
     }
 }
-
-impl ClaudeRegistrationBinding {
-    /// Validate the selected primary without granting terminal authority. Peer delivery
-    /// still needs its own route authorization; an unclassified alias may not discover
-    /// routes when this source is unavailable or ambiguous.
-    pub fn validate_source(source: &Path) -> Result<(), ClaudeRegistrationError> {
+impl RegistrationBinding {
+    pub(crate) fn validate_source(source: &Path) -> Result<(), RegistrationError> {
         strict_table(source)
             .map(|_| ())
-            .map_err(ClaudeRegistrationError::Source)
+            .map_err(RegistrationError::Source)
     }
-
-    /// Inspect raw admission intent against all entries in the primary source before any
-    /// discovery ordering or deduplication can pick a route. A non-Claude result is not
-    /// authority to deliver; it leaves existing non-Claude handling in charge.
-    pub fn from_intent(
+    pub(crate) fn from_intent(
         source: PathBuf,
         intent: &str,
-    ) -> Result<Option<Self>, ClaudeRegistrationError> {
-        let table = strict_table(&source).map_err(ClaudeRegistrationError::Source)?;
+        policy: &crate::vendor_adapter::HostedPastePolicy,
+    ) -> Result<Option<Self>, RegistrationError> {
+        let adapter = policy.adapter();
+        let table = strict_table(&source).map_err(RegistrationError::Source)?;
         let intent = intent.trim();
         let canonical = parse_hosted_identity(intent).ok();
         let bare = normalize_persona(intent);
@@ -169,7 +162,6 @@ impl ClaudeRegistrationBinding {
         for (key, entry) in &table.entries {
             let entry_persona = normalize_persona(&entry.persona);
             let key_persona = normalize_persona(key);
-            let vendor = entry.route.canonical_vendor();
             let matches = entry
                 .route
                 .session_identity()
@@ -177,48 +169,47 @@ impl ClaudeRegistrationBinding {
                 || bare.as_ref().is_some_and(|name| {
                     key_persona.as_ref() == Some(name) || entry_persona.as_ref() == Some(name)
                 })
-                || canonical.as_ref().is_some_and(|(v, name)| {
-                    v == vendor
-                        && (key_persona.as_ref() == Some(name)
-                            || entry_persona.as_ref() == Some(name))
+                || canonical.as_ref().is_some_and(|(_, name)| {
+                    key_persona.as_ref() == Some(name) || entry_persona.as_ref() == Some(name)
                 });
             if matches {
                 found.push((entry, entry_persona));
             }
         }
-        if !found
-            .iter()
-            .any(|(entry, _)| matches!(entry.route, VendorRoute::Claude { .. }))
+        if found.len() > 1 {
+            return Err("ambiguous registration; re-register and resubmit".into());
+        }
+        if canonical
+            .as_ref()
+            .is_some_and(|(vendor, _)| vendor != adapter.vendor_id())
         {
             return Ok(None);
         }
-        if found.len() != 1 {
-            return Err("ambiguous Claude registration; re-register and resubmit".into());
+        if !found
+            .iter()
+            .any(|(entry, _)| entry.route.canonical_vendor() == adapter.vendor_id())
+        {
+            return Ok(None);
         }
         let (entry, persona) = &found[0];
-        let VendorRoute::Claude { session_id, .. } = &entry.route else {
-            unreachable!()
-        };
         let persona = persona
             .as_deref()
-            .ok_or("invalid Claude registration; re-register and resubmit")?;
-        Self::acquire(source, session_id, persona).map(Some)
+            .ok_or("invalid registration; re-register and resubmit")?;
+        let native_id = adapter
+            .registration_native_id(&entry.route)
+            .ok_or("unsupported registration; re-register and resubmit")?;
+        Self::acquire(source, native_id, persona, policy).map(Some)
     }
-
-    /// Pin an explicitly selected primary source and an intended native session/persona.
-    /// Raw inputs specify intent; this constructor derives authority from the source itself.
-    pub fn acquire(
+    pub(crate) fn acquire(
         source: PathBuf,
         native_id: &str,
         persona: &str,
-    ) -> Result<Self, ClaudeRegistrationError> {
+        policy: &crate::vendor_adapter::HostedPastePolicy,
+    ) -> Result<Self, RegistrationError> {
         let native_id = native_id.trim();
         let persona =
-            normalize_persona(persona).ok_or("invalid Claude target; re-register and resubmit")?;
-        if uuid::Uuid::parse_str(native_id).is_err() {
-            return Err("invalid Claude native session; re-register and resubmit".into());
-        }
-        let entry = Self::select(&source, native_id, &persona)?;
+            normalize_persona(persona).ok_or("invalid target; re-register and resubmit")?;
+        let entry = Self::select(&source, native_id, &persona, policy)?;
         Ok(Self {
             source,
             entry,
@@ -226,69 +217,61 @@ impl ClaudeRegistrationBinding {
             native_id: native_id.to_string(),
         })
     }
-
     fn select(
         source: &Path,
         native_id: &str,
         persona: &str,
-    ) -> Result<RouteEntry, ClaudeRegistrationError> {
-        let table = strict_table(source).map_err(ClaudeRegistrationError::Source)?;
+        policy: &crate::vendor_adapter::HostedPastePolicy,
+    ) -> Result<RouteEntry, RegistrationError> {
+        let adapter = policy.adapter();
+        let table = strict_table(source).map_err(RegistrationError::Source)?;
+        // Find every full-intent collision before checking vendor or invoking policy.
         let mut candidates = table.entries.into_iter().filter(|(key, entry)| {
-            let route_id = match &entry.route {
-                VendorRoute::Claude { session_id, .. } => session_id.trim(),
-                _ => return false,
-            };
             normalize_persona(key).as_deref() == Some(persona)
                 || normalize_persona(&entry.persona).as_deref() == Some(persona)
-                || route_id == native_id
+                || entry
+                    .route
+                    .session_identity()
+                    .is_some_and(|(_, id)| id.trim() == native_id)
         });
         let (key, entry) = candidates
             .next()
-            .ok_or("Claude registration missing; re-register and resubmit")?;
+            .ok_or("registration missing; re-register and resubmit")?;
         if candidates.next().is_some() {
-            return Err("ambiguous Claude registration; re-register and resubmit".into());
+            return Err("ambiguous registration; re-register and resubmit".into());
         }
-        let hosted = entry
-            .hosted_id
-            .as_deref()
-            .and_then(|id| parse_hosted_identity(id).ok());
-        let valid = entry.explicit
+        let valid = entry.route.canonical_vendor() == adapter.vendor_id()
+            && entry.explicit
             && normalize_persona(&key).as_deref() == Some(persona)
             && normalize_persona(&entry.persona).as_deref() == Some(persona)
-            && hosted
-                .as_ref()
-                .is_some_and(|(vendor, name)| vendor == "claude" && name == persona)
             && entry
                 .hydration_generation
                 .as_deref()
                 .is_some_and(|v| !v.trim().is_empty())
-            && matches!(&entry.route, VendorRoute::Claude { session_id, .. } if session_id.trim() == native_id && !session_id.trim().is_empty())
+            && adapter.validate_registration(&entry, persona, native_id)
             && route_entry_proven_live(&entry, None, None);
         if !valid {
             return Err(
-                "Claude registration is incomplete or no longer current; re-register and resubmit"
-                    .into(),
+                "registration is incomplete or no longer current; re-register and resubmit".into(),
             );
         }
         Ok(entry)
     }
-
-    pub(crate) fn revalidate(&self) -> Result<&RouteEntry, ClaudeRegistrationError> {
-        let current = Self::select(&self.source, &self.native_id, &self.persona)?;
+    pub(crate) fn revalidate(
+        &self,
+        policy: &crate::vendor_adapter::HostedPastePolicy,
+    ) -> Result<&RouteEntry, RegistrationError> {
+        let current = Self::select(&self.source, &self.native_id, &self.persona, policy)?;
         if !self.entry.same_registration_identity(&current) || self.entry.persona != current.persona
         {
-            return Err("Claude registration changed; re-register and resubmit".into());
+            return Err("registration changed; re-register and resubmit".into());
         }
         Ok(&self.entry)
     }
-
     pub(crate) fn persona(&self) -> &str {
         &self.persona
     }
-    pub fn persona_name(&self) -> &str {
-        &self.persona
-    }
-    pub fn native_session(&self) -> &str {
+    pub(crate) fn native_session(&self) -> &str {
         &self.native_id
     }
 }
@@ -296,7 +279,9 @@ impl ClaudeRegistrationBinding {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::identity::VendorRoute;
     use crate::identity::proc_start_time_ticks;
+    use crate::vendor_adapter::ClaudeRegistrationBinding;
     use fl_core::at::At;
 
     fn fixture() -> (tempfile::TempDir, PathBuf, RouteEntry) {
@@ -377,6 +362,61 @@ mod tests {
         assert!(strict_table(&source).is_err());
         std::fs::write(&source, r#"{"entries":{},"entries":{}}"#).unwrap();
         assert!(strict_table(&source).is_err());
+    }
+    #[test]
+    fn unsupported_adapter_and_wrong_vendor_cannot_acquire_registration() {
+        use crate::vendor_adapter::{CodexCliAdapter, VendorCliAdapter};
+        let (_dir, source, entry) = fixture();
+        write_entry(&source, &entry);
+        let native = "dce797a0-d963-4c1b-a06b-7fa6bffda7fa";
+        assert!(
+            CodexCliAdapter
+                .registration_native_id(&entry.route)
+                .is_none()
+        );
+        assert!(!CodexCliAdapter.validate_registration(&entry, "ada", native));
+        assert!(
+            ClaudeRegistrationBinding::from_intent(source.clone(), "codex:ada")
+                .unwrap()
+                .is_none()
+        );
+        let mut wrong = entry;
+        wrong.route = VendorRoute::Codex {
+            thread_id: native.into(),
+            cwd: None,
+        };
+        write_entry(&source, &wrong);
+        assert!(ClaudeRegistrationBinding::acquire(source, native, "ada").is_err());
+    }
+    #[test]
+    fn cross_vendor_native_collision_is_refused_before_vendor_filter() {
+        let (_dir, source, entry) = fixture();
+        let mut other = entry.clone();
+        other.persona = "bea".into();
+        other.hosted_id = Some("codex:bea".into());
+        other.route = VendorRoute::Codex {
+            thread_id: "dce797a0-d963-4c1b-a06b-7fa6bffda7fa".into(),
+            cwd: None,
+        };
+        let mut table = RouteTable::default();
+        table.entries.insert("ada".into(), entry);
+        table.entries.insert("bea".into(), other);
+        std::fs::write(&source, serde_json::to_vec(&table).unwrap()).unwrap();
+        assert!(
+            ClaudeRegistrationBinding::from_intent(
+                source.clone(),
+                "dce797a0-d963-4c1b-a06b-7fa6bffda7fa"
+            )
+            .is_err()
+        );
+        assert!(
+            ClaudeRegistrationBinding::acquire(
+                source,
+                "dce797a0-d963-4c1b-a06b-7fa6bffda7fa",
+                "ada"
+            )
+            .is_err()
+        );
     }
     #[test]
     fn duplicate_identity_and_wrong_persona_are_refused_before_selection() {

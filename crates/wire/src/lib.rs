@@ -5,7 +5,6 @@
 #[doc(hidden)]
 pub mod test_isolation;
 
-pub mod claude_registration;
 mod codex_control;
 pub mod daemon;
 pub mod dispatch_diagnostics;
@@ -13,6 +12,7 @@ pub mod dispatcher;
 pub mod host_runtime;
 pub mod identity;
 pub mod peer;
+mod registration_evidence;
 pub mod scanner;
 pub mod vendor_adapter;
 pub mod ws;

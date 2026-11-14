@@ -6175,7 +6175,7 @@ fn dispatch_operator_prompt_with_intent_for_session(
     intent: OperatorPromptIntent,
     intended_codex_thread_id: Option<&str>,
     claude_terminal: bool,
-    claude_binding: Option<&fl_wire::claude_registration::ClaudeRegistrationBinding>,
+    claude_binding: Option<&fl_wire::vendor_adapter::ClaudeRegistrationBinding>,
     intended_vendor: Option<&str>,
     #[cfg(test)] queued: bool,
 ) -> Result<OperatorPromptOutcome, OperatorPromptError> {
@@ -6318,7 +6318,7 @@ fn dispatch_queued_operator_prompt_with_intent_for_session(
     intent: OperatorPromptIntent,
     intended_codex_thread_id: Option<&str>,
     claude_terminal: bool,
-    claude_binding: Option<&fl_wire::claude_registration::ClaudeRegistrationBinding>,
+    claude_binding: Option<&fl_wire::vendor_adapter::ClaudeRegistrationBinding>,
     intended_vendor: Option<&str>,
 ) -> Result<OperatorPromptOutcome, OperatorPromptError> {
     #[cfg(test)]
@@ -6404,7 +6404,7 @@ fn dispatch_operator_prompt_for_session_typed(
     sender_name: &str,
     body: &str,
     claude_terminal: bool,
-    claude_binding: Option<&fl_wire::claude_registration::ClaudeRegistrationBinding>,
+    claude_binding: Option<&fl_wire::vendor_adapter::ClaudeRegistrationBinding>,
     intended_vendor: Option<&str>,
 ) -> Result<OperatorPromptOutcome, PushError> {
     dispatch_queued_operator_prompt_with_intent_for_session(
@@ -7024,7 +7024,7 @@ fn handle_post_session_prompt(
             None,
         )
     });
-    use fl_wire::claude_registration::{ClaudeRegistrationBinding, ClaudeRegistrationError};
+    use fl_wire::vendor_adapter::{ClaudeRegistrationBinding, ClaudeRegistrationError};
     let refuse = |error: &dyn std::fmt::Display| {
         HttpResponse::json(
             409,
@@ -13204,8 +13204,8 @@ mod council_guidance_tests {
 mod claude_registration_binding_tests {
     use super::*;
     use fl_core::at::At;
-    use fl_wire::claude_registration::ClaudeRegistrationBinding;
     use fl_wire::identity::{RouteEntry, RouteTable, VendorRoute, proc_start_time_ticks};
+    use fl_wire::vendor_adapter::ClaudeRegistrationBinding;
 
     fn fixture() -> (
         tempfile::TempDir,

@@ -122,7 +122,7 @@ pub struct QueuedOperatorPrompt {
     #[serde(default)]
     pub(crate) claude_terminal: bool,
     #[serde(skip)]
-    pub(crate) claude_binding: Option<fl_wire::claude_registration::ClaudeRegistrationBinding>,
+    pub(crate) claude_binding: Option<fl_wire::vendor_adapter::ClaudeRegistrationBinding>,
     /// Process-local admission evidence; a deserialized item must not manufacture it.
     #[serde(skip)]
     pub(crate) admitted_current: bool,
@@ -302,7 +302,7 @@ impl Drop for SessionDispatchGuard<'_> {
 pub(crate) struct DirectPromptInput {
     pub queue_target: Option<PromptQueueTarget>,
     pub claude_terminal: bool,
-    pub claude_binding: Option<fl_wire::claude_registration::ClaudeRegistrationBinding>,
+    pub claude_binding: Option<fl_wire::vendor_adapter::ClaudeRegistrationBinding>,
     pub intended_vendor: Option<String>,
     pub intended_codex_thread_id: Option<String>,
     pub persona: Option<String>,

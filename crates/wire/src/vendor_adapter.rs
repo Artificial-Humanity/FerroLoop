@@ -177,6 +177,25 @@ pub trait VendorCliAdapter: Send + Sync + std::fmt::Debug {
     /// `"muse"`, `"lemonade"`, `"ollama"`).
     fn vendor_id(&self) -> &str;
 
+    /// Extract a native identity for source-backed registration. Unsupported by default.
+    fn registration_native_id<'a>(
+        &self,
+        _route: &'a crate::identity::VendorRoute,
+    ) -> Option<&'a str> {
+        None
+    }
+
+    /// Validate vendor-specific route and hosted identity shape. This predicate alone
+    /// never grants authority; the private source loader also checks uniqueness and liveness.
+    fn validate_registration(
+        &self,
+        _entry: &crate::identity::RouteEntry,
+        _persona: &str,
+        _native_id: &str,
+    ) -> bool {
+        false
+    }
+
     /// Whether tool commands execute under the hosted CLI process tree.
     fn tool_processes_descend_from_cli(&self) -> bool {
         true
@@ -685,9 +704,93 @@ fn normalize_claude_resume_effort(level: Option<&str>) -> Result<Option<String>,
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ClaudeCliAdapter;
 
+// Only this module can construct the authority policy. Dynamic or caller-provided
+// adapters may describe policy but cannot mint a source-backed binding.
+pub(crate) struct HostedPastePolicy(ClaudeCliAdapter);
+impl HostedPastePolicy {
+    pub(crate) fn adapter(&self) -> &dyn VendorCliAdapter {
+        &self.0
+    }
+}
+
+/// Source-derived hosted terminal registration. Fields and acquisition policy are private.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct ClaudeRegistrationBinding(crate::registration_evidence::RegistrationBinding);
+
+pub use crate::registration_evidence::RegistrationError as ClaudeRegistrationError;
+
+impl ClaudeRegistrationBinding {
+    pub fn validate_source(source: &Path) -> Result<(), ClaudeRegistrationError> {
+        crate::registration_evidence::RegistrationBinding::validate_source(source)
+    }
+    pub fn from_intent(
+        source: PathBuf,
+        intent: &str,
+    ) -> Result<Option<Self>, ClaudeRegistrationError> {
+        crate::registration_evidence::RegistrationBinding::from_intent(
+            source,
+            intent,
+            &HostedPastePolicy(ClaudeCliAdapter),
+        )
+        .map(|binding| binding.map(Self))
+    }
+    pub fn acquire(
+        source: PathBuf,
+        native_id: &str,
+        persona: &str,
+    ) -> Result<Self, ClaudeRegistrationError> {
+        crate::registration_evidence::RegistrationBinding::acquire(
+            source,
+            native_id,
+            persona,
+            &HostedPastePolicy(ClaudeCliAdapter),
+        )
+        .map(Self)
+    }
+    pub(crate) fn revalidate(
+        &self,
+    ) -> Result<&crate::identity::RouteEntry, ClaudeRegistrationError> {
+        self.0.revalidate(&HostedPastePolicy(ClaudeCliAdapter))
+    }
+    pub(crate) fn persona(&self) -> &str {
+        self.0.persona()
+    }
+    pub fn persona_name(&self) -> &str {
+        self.0.persona()
+    }
+    pub fn native_session(&self) -> &str {
+        self.0.native_session()
+    }
+}
+
 impl VendorCliAdapter for ClaudeCliAdapter {
     fn vendor_id(&self) -> &str {
         "claude"
+    }
+
+    fn registration_native_id<'a>(
+        &self,
+        route: &'a crate::identity::VendorRoute,
+    ) -> Option<&'a str> {
+        match route {
+            crate::identity::VendorRoute::Claude { session_id, .. } => Some(session_id.as_str()),
+            _ => None,
+        }
+    }
+
+    fn validate_registration(
+        &self,
+        entry: &crate::identity::RouteEntry,
+        persona: &str,
+        native_id: &str,
+    ) -> bool {
+        uuid::Uuid::parse_str(native_id).is_ok()
+            && entry
+                .hosted_id
+                .as_deref()
+                .and_then(|id| crate::identity::parse_hosted_identity(id).ok())
+                .is_some_and(|(vendor, name)| vendor == self.vendor_id() && name == persona)
+            && matches!(&entry.route, crate::identity::VendorRoute::Claude { session_id, .. } if session_id.trim() == native_id && !session_id.trim().is_empty())
     }
 
     fn binary_env_var(&self) -> Option<&str> {
