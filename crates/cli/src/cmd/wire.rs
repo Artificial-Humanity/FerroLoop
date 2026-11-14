@@ -944,7 +944,7 @@ pub(crate) fn remove_caller_route(env: &StateEnv<'_>, persona: &str) -> Result<(
     } else {
         vec![rpath]
     };
-    remove_route_at(&sock, &paths, persona)
+    remove_route_at(&sock, &paths, persona).map_err(|error| error.to_string())
 }
 
 pub(crate) fn sync_store_retired_personas<S: AgentRegistry>(store: &S) {
@@ -972,12 +972,9 @@ pub(crate) fn sync_store_retired_personas<S: AgentRegistry>(store: &S) {
     let _ = fl_wire::identity::sync_retired_personas_in_tombstones(None, &retired);
 }
 
-pub(crate) fn evict_persona_route(persona: &str) {
-    #[cfg(test)]
-    if resolve_routes_path().is_none() {
-        return;
-    }
-    let sock = std::env::var_os("FL_WIRE_SOCKET")
+/// Resolve the route-eviction endpoint once, before agent retirement mutates the store.
+pub(crate) fn resolve_retire_socket() -> PathBuf {
+    std::env::var_os("FL_WIRE_SOCKET")
         .map(PathBuf::from)
         .filter(|p| p.is_absolute())
         .or_else(|| {
@@ -986,26 +983,78 @@ pub(crate) fn evict_persona_route(persona: &str) {
                 .and_then(|cfg| cfg.wire)
                 .and_then(|w| w.socket)
         })
-        .unwrap_or_else(default_socket_path);
+        .unwrap_or_else(default_socket_path)
+}
+
+pub(crate) fn evict_persona_route(
+    persona: &str,
+    retained_socket: Option<&Path>,
+) -> std::io::Result<()> {
+    #[cfg(test)]
+    if resolve_routes_path().is_none() {
+        return Ok(());
+    }
+    let fallback;
+    let sock = match retained_socket {
+        Some(sock) => sock,
+        None => {
+            fallback = resolve_retire_socket();
+            &fallback
+        }
+    };
     let paths: Vec<PathBuf> = match resolve_routes_path() {
         Some(path) => vec![path],
         None => std::iter::once(fl_wire::identity::default_routes_path())
             .chain(fl_wire::identity::legacy_routes_path())
             .collect(),
     };
-    let _ = remove_route_at(&sock, &paths, persona);
+    match remove_route_at(sock, &paths, persona) {
+        Err(RemoveRouteError::Fixture(error)) => Err(error),
+        // Route eviction has historically been best effort for other failures.
+        Ok(()) | Err(RemoveRouteError::Other(_)) => Ok(()),
+    }
 }
 
-fn remove_route_at(sock: &Path, paths: &[PathBuf], persona: &str) -> Result<(), String> {
+#[derive(Debug)]
+enum RemoveRouteError {
+    Fixture(std::io::Error),
+    Other(String),
+}
+
+impl std::fmt::Display for RemoveRouteError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Fixture(error) => error.fmt(formatter),
+            Self::Other(error) => error.fmt(formatter),
+        }
+    }
+}
+
+fn remove_route_at(sock: &Path, paths: &[PathBuf], persona: &str) -> Result<(), RemoveRouteError> {
+    remove_route_at_with(sock, paths, persona, |socket| {
+        LocalClient::connect(socket, DEFAULT_LOCAL_RPC_TIMEOUT)
+    })
+}
+
+fn remove_route_at_with(
+    sock: &Path,
+    paths: &[PathBuf],
+    persona: &str,
+    connect: impl FnOnce(&Path) -> std::io::Result<LocalClient>,
+) -> Result<(), RemoveRouteError> {
     let mut daemon_err = None;
-    if let Ok(mut client) = LocalClient::connect(sock, DEFAULT_LOCAL_RPC_TIMEOUT) {
-        match client.request(&LocalRequest::UnregisterRoute {
+    match connect(sock) {
+        Ok(mut client) => match client.request(&LocalRequest::UnregisterRoute {
             persona: persona.into(),
         }) {
             Ok(LocalResponse::RouteUnregistered) => {}
             Ok(other) => daemon_err = Some(format!("unexpected daemon response: {other:?}")),
             Err(e) => daemon_err = Some(e),
+        },
+        Err(error) if fl_fixture_path::is_fixture_endpoint_refusal(&error) => {
+            return Err(RemoveRouteError::Fixture(error));
         }
+        Err(_) => {}
     }
     for path in paths {
         if !path.is_file() {
@@ -1013,11 +1062,13 @@ fn remove_route_at(sock: &Path, paths: &[PathBuf], persona: &str) -> Result<(), 
         }
         let mut routes = RouteTable::load(Some(path));
         if routes.entries.remove(persona).is_some() {
-            routes.save(Some(path)).map_err(|error| error.to_string())?;
+            routes
+                .save(Some(path))
+                .map_err(|error| RemoveRouteError::Other(error.to_string()))?;
         }
     }
     if let Some(err) = daemon_err {
-        return Err(err);
+        return Err(RemoveRouteError::Other(err));
     }
     Ok(())
 }
@@ -2940,6 +2991,30 @@ fn codex_queues_summary(queues: &[fl_wire::daemon::CodexRouteQueueStatus]) -> St
 
 #[cfg(test)]
 pub(crate) mod tests {
+    #[test]
+    fn fixture_refusal_does_not_fall_back_to_route_file() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let route = root.path().join("routes.json");
+        std::fs::write(&route, b"sentinel").unwrap();
+        let socket = outside.path().join("wire.sock");
+        let refusal = fl_fixture_path::check_endpoint(Some(root.path()), &socket).unwrap_err();
+        let error = super::remove_route_at_with(&socket, &[route.clone()], "ada", |_| Err(refusal))
+            .expect_err("fixture refusal must stop route fallback");
+        assert!(matches!(error, super::RemoveRouteError::Fixture(_)));
+        assert_eq!(std::fs::read(route).unwrap(), b"sentinel");
+    }
+
+    #[test]
+    fn ordinary_offline_connection_still_allows_route_fallback() {
+        let error = std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "offline");
+        let result =
+            super::remove_route_at_with(std::path::Path::new("/unused"), &[], "ada", |_| {
+                Err(error)
+            });
+        assert!(result.is_ok());
+    }
+
     #[test]
     fn fixture_refusal_stops_fallback_but_offline_and_os_permissions_allow_it() {
         use std::cell::Cell;

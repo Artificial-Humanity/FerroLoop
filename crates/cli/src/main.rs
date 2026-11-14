@@ -941,6 +941,19 @@ fn run_mcp_entry() -> Result<i32> {
     }
 }
 
+/// Validate a retained retirement endpoint before the action can open a store.
+/// An absent endpoint means the command is unrelated to route retirement.
+fn with_retire_wire_preflight<T>(
+    fixture_root: Option<&Path>,
+    endpoint: Option<&Path>,
+    action: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    if let Some(endpoint) = endpoint {
+        fl_fixture_path::check_endpoint(fixture_root, endpoint)?;
+    }
+    action()
+}
+
 fn run(cli: Cli) -> Result<i32> {
     // Inventory must validate metadata artifacts before even reading config.
     let cli = match cli {
@@ -1050,33 +1063,47 @@ fn run(cli: Cli) -> Result<i32> {
             db,
             command: Command::Agent { cmd },
         } => {
-            let explicit = explicit_db(db);
-            let default_store = default_state_store_path()?;
-            let store_path = match explicit {
-                Some(p) => p,
-                None if matches!(cmd, cmd::agent::AgentCmd::Liveness { .. }) => {
-                    match config::bound_entry(&cfg.projects, &cwd)? {
-                        Some(entry) if fl_store::store_exists(&entry.store) => entry.store,
-                        _ => cfg.workspace_state_store(&default_store),
+            let retire_endpoint = matches!(&cmd, cmd::agent::AgentCmd::Retire { .. })
+                .then(cmd::wire::resolve_retire_socket);
+            let fixture_root = std::env::var_os("FL_TEST_ISOLATION_ROOT").map(PathBuf::from);
+            return with_retire_wire_preflight(
+                fixture_root.as_deref(),
+                retire_endpoint.as_deref(),
+                || {
+                    let explicit = explicit_db(db);
+                    let default_store = default_state_store_path()?;
+                    let store_path = match explicit {
+                        Some(p) => p,
+                        None if matches!(cmd, cmd::agent::AgentCmd::Liveness { .. }) => {
+                            match config::bound_entry(&cfg.projects, &cwd)? {
+                                Some(entry) if fl_store::store_exists(&entry.store) => entry.store,
+                                _ => cfg.workspace_state_store(&default_store),
+                            }
+                        }
+                        None => cfg.workspace_state_store(&default_store),
+                    };
+                    if let Some(dir) = store_path.parent()
+                        && !dir.as_os_str().is_empty()
+                    {
+                        fl_store::private::create_private_dir_all(dir)
+                            .with_context(|| format!("could not create {}", dir.display()))?;
                     }
-                }
-                None => cfg.workspace_state_store(&default_store),
-            };
-            if let Some(dir) = store_path.parent()
-                && !dir.as_os_str().is_empty()
-            {
-                fl_store::private::create_private_dir_all(dir)
-                    .with_context(|| format!("could not create {}", dir.display()))?;
-            }
-            let store = fl_store::open_store(&store_path)
-                .with_context(|| format!("could not open the store at {}", store_path.display()))?;
-            return match cmd::agent::run(&store, cmd) {
-                Ok(()) => Ok(0),
-                Err((code, msg)) => {
-                    eprintln!("error: {msg}");
-                    Ok(code)
-                }
-            };
+                    let store = fl_store::open_store(&store_path).with_context(|| {
+                        format!("could not open the store at {}", store_path.display())
+                    })?;
+                    match cmd::agent::run_with_retire_socket(
+                        &store,
+                        cmd,
+                        retire_endpoint.as_deref(),
+                    ) {
+                        Ok(()) => Ok(0),
+                        Err((code, msg)) => {
+                            eprintln!("error: {msg}");
+                            Ok(code)
+                        }
+                    }
+                },
+            );
         }
         Cli {
             db,
@@ -1681,6 +1708,59 @@ fn run(cli: Cli) -> Result<i32> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn retire_preflight_refusal_precedes_store_and_route_work() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let store_dir = root.path().join("not-created");
+        let registry = root.path().join("registry");
+        let tombstone = root.path().join("tombstone");
+        let route = root.path().join("route");
+        for path in [&registry, &tombstone, &route] {
+            std::fs::write(path, b"unchanged").unwrap();
+        }
+        let mut connects = 0;
+        let mut spawns = 0;
+        let result = super::with_retire_wire_preflight(
+            Some(root.path()),
+            Some(&outside.path().join("wire.sock")),
+            || -> anyhow::Result<()> {
+                connects += 1;
+                spawns += 1;
+                std::fs::create_dir_all(&store_dir)?;
+                for path in [&registry, &tombstone, &route] {
+                    std::fs::write(path, b"modified")?;
+                }
+                Ok(())
+            },
+        );
+        let error = result.expect_err("outside socket must be refused");
+        assert!(error.to_string().contains("fixture endpoint refused"));
+        assert_eq!((connects, spawns), (0, 0));
+        assert!(!store_dir.exists());
+        for path in [&registry, &tombstone, &route] {
+            assert_eq!(std::fs::read(path).unwrap(), b"unchanged");
+        }
+    }
+
+    #[test]
+    fn retire_preflight_allows_private_and_unrelated_actions() {
+        let root = tempfile::tempdir().unwrap();
+        let socket = root.path().join("offline.sock");
+        assert_eq!(
+            super::with_retire_wire_preflight(Some(root.path()), Some(&socket), || Ok(7)).unwrap(),
+            7
+        );
+        // Store-only commands have no wire endpoint, even if the configured root is invalid.
+        assert_eq!(
+            super::with_retire_wire_preflight(Some(std::path::Path::new("relative")), None, || Ok(
+                8
+            ))
+            .unwrap(),
+            8
+        );
+    }
+
     #[test]
     fn a_hook_that_cannot_start_does_not_block_the_agent() {
         assert_eq!(hook_exit_code(Err(anyhow::anyhow!("bad config"))), 1);

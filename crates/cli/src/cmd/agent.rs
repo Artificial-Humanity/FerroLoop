@@ -626,6 +626,16 @@ pub fn run<S: AgentRegistry + Handles + StateStore + Catalog + fl_core::MessageS
     store: &S,
     cmd: AgentCmd,
 ) -> Result<(), (i32, String)> {
+    run_with_retire_socket(store, cmd, None)
+}
+
+pub(crate) fn run_with_retire_socket<
+    S: AgentRegistry + Handles + StateStore + Catalog + fl_core::MessageStore,
+>(
+    store: &S,
+    cmd: AgentCmd,
+    retire_socket: Option<&std::path::Path>,
+) -> Result<(), (i32, String)> {
     match cmd {
         AgentCmd::Area { cmd } => match cmd {
             AreaCmd::Set {
@@ -736,7 +746,8 @@ pub fn run<S: AgentRegistry + Handles + StateStore + Catalog + fl_core::MessageS
                 .retire_agent(&target.id, now_at(), &by)
                 .map_err(|e| (1, e.to_string()))?;
             crate::cmd::wire::sync_store_retired_personas(store);
-            crate::cmd::wire::evict_persona_route(&retired.name_key);
+            crate::cmd::wire::evict_persona_route(&retired.name_key, retire_socket)
+                .map_err(|error| (1, error.to_string()))?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&retired).unwrap());
             } else {
