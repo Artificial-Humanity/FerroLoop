@@ -2,6 +2,9 @@
 //! dual-credential Reviewer App brokering (`fake-user` author + `fake-app[bot]` reviewer),
 //! and FerroWire review/merge notifications over `FakeGithub`.
 
+#[allow(dead_code)]
+mod common;
+
 use assert_cmd::Command;
 use fl_core::agent::AgentRole;
 use fl_core::at::At;
@@ -35,6 +38,53 @@ fn git(dir: &Path, args: &[&str]) {
         out.status.success(),
         "git {args:?}: {}",
         String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// Build an isolated child while keeping the PR fixture's config and fake API.
+fn pr_command(home: &Path, repo: &Path, api_url: &str) -> Sys {
+    let mut c = common::isolated_fl(home).unwrap();
+    c.env("XDG_CONFIG_HOME", home.join("config"))
+        .env("XDG_DATA_HOME", home.join("data"))
+        .env("XDG_STATE_HOME", home.join("state"))
+        .env("XDG_RUNTIME_DIR", home.join("run"))
+        .env("FL_WIRE_SOCKET", home.join("run/wire.sock"))
+        .env("FL_WIRE_ROUTES", home.join("state/routes.json"))
+        .env("FL_GITHUB_TOKEN", "user-token")
+        .env("FL_GITHUB_API_URL", api_url)
+        .env_remove("FL_DB")
+        .current_dir(repo);
+    c
+}
+
+#[test]
+fn pr_command_uses_private_environment_without_starting_a_child() {
+    let home = tempfile::tempdir().unwrap();
+    let cmd = pr_command(home.path(), home.path(), "http://127.0.0.1:0");
+    let env = |key: &str| {
+        cmd.get_envs()
+            .find(|(name, _)| *name == key)
+            .and_then(|(_, value)| value)
+            .map(|value| value.to_os_string())
+    };
+    assert_eq!(env("HOME").as_deref(), Some(home.path().as_os_str()));
+    assert_eq!(
+        env("PATH").as_deref(),
+        Some(home.path().join("no-bin").as_os_str())
+    );
+    assert_eq!(
+        env("FL_WIRE_SOCKET").as_deref(),
+        Some(home.path().join("run/wire.sock").as_os_str())
+    );
+    assert_eq!(
+        env("FL_GITHUB_API_URL").as_deref(),
+        Some(std::ffi::OsStr::new("http://127.0.0.1:0"))
+    );
+    assert_eq!(env("FL_DB"), None);
+    #[cfg(unix)]
+    assert_eq!(
+        env("FL_HOST_SOCK").as_deref(),
+        Some(home.path().join("h").as_os_str())
     );
 }
 
@@ -89,29 +139,11 @@ impl PrFixture {
     }
 
     fn fl(&self) -> Command {
-        let mut c = Command::cargo_bin("fl").unwrap();
-        c.env("HOME", self.home.path())
-            .env("XDG_CONFIG_HOME", self.home.path().join("config"))
-            .env("XDG_DATA_HOME", self.home.path().join("data"))
-            .env("XDG_STATE_HOME", self.home.path().join("state"))
-            .env("XDG_RUNTIME_DIR", self.home.path().join("run"))
-            .env("FL_WIRE_SOCKET", self.home.path().join("run/wire.sock"))
-            .env("FL_WIRE_ROUTES", self.home.path().join("state/routes.json"))
-            .env("FL_WIRE_DISABLE_HOST_DISCOVERY", "1")
-            .env_remove("FL_HOST_SOCK")
-            .env("FL_GITHUB_TOKEN", "user-token")
-            .env("FL_GITHUB_API_URL", self.fake.url())
-            .env_remove("GITHUB_TOKEN")
-            .env_remove("GH_TOKEN")
-            .env_remove("FL_DB")
-            .env_remove("FL_GITHUB_APP_ID")
-            .env_remove("FL_GITHUB_PRIVATE_KEY_PATH")
-            .env_remove("AGENT_PERSONA")
-            .env_remove("CLAUDE_CODE_MESSAGING_SOCKET")
-            .env_remove("ANTIGRAVITY_CONVERSATION_ID")
-            .env_remove("CODEX_THREAD_ID")
-            .current_dir(self.repo.path());
-        c
+        Command::from_std(pr_command(
+            self.home.path(),
+            self.repo.path(),
+            &self.fake.url(),
+        ))
     }
 
     fn seed_roster(&self) {
