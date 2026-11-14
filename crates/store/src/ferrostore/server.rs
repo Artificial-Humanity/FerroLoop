@@ -291,6 +291,11 @@ impl FerroStoreServer {
         store: FerroStore,
         auth: ServerAuth,
     ) -> Result<Self, StoreError> {
+        if let super::Inner::Disk(disk) = &store.inner {
+            disk.fs
+                .check_restore_admission(&disk.path)
+                .map_err(|e| backend(e.to_string()))?;
+        }
         if auth.has_tokens() {
             return Err(backend(
                 "a token file is for ws:// and wss:// connections; a Unix socket checks the peer uid \
@@ -421,6 +426,11 @@ impl FerroStoreServer {
         store: FerroStore,
         auth: ServerAuth,
     ) -> Result<Self, StoreError> {
+        if let super::Inner::Disk(disk) = &store.inner {
+            disk.fs
+                .check_restore_admission(&disk.path)
+                .map_err(|e| backend(e.to_string()))?;
+        }
         let checked = Self::check_tcp_bind(addr, &auth)?;
         // As `TcpListener::bind` does: the first address that binds. A
         // plaintext bind on a named interface's address is pinned to that
