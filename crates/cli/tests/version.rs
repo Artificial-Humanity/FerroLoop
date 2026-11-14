@@ -1,16 +1,20 @@
 //! `fl --version`, `fl --version --json` and `fl version [--json]`.
 
+#[allow(dead_code)]
+mod common;
+
 use assert_cmd::Command;
 use serde_json::Value;
 
-fn fl() -> Command {
-    let mut c = Command::cargo_bin("fl").unwrap();
+fn fl(root: &tempfile::TempDir) -> Command {
+    let mut c = Command::from_std(common::isolated_fl(root.path()).unwrap());
     c.env_remove("FL_DB");
     c
 }
 
 fn stdout(args: &[&str]) -> String {
-    let out = fl().args(args).assert().success().get_output().clone();
+    let root = tempfile::tempdir().unwrap();
+    let out = fl(&root).args(args).assert().success().get_output().clone();
     String::from_utf8(out.stdout).unwrap()
 }
 
@@ -109,7 +113,8 @@ fn version_needs_no_store_and_no_valid_config() {
         &["version", "--json"][..],
         &["--version", "--json"][..],
     ] {
-        fl().env("XDG_CONFIG_HOME", tmp.path())
+        fl(&tmp)
+            .env("XDG_CONFIG_HOME", tmp.path())
             .env("XDG_DATA_HOME", tmp.path().join("no-such-dir"))
             .args(args)
             .assert()
@@ -121,7 +126,8 @@ fn version_needs_no_store_and_no_valid_config() {
 
 #[test]
 fn json_is_one_line_on_stdout_with_nothing_on_stderr() {
-    let out = fl()
+    let root = tempfile::tempdir().unwrap();
+    let out = fl(&root)
         .args(["--version", "--json"])
         .assert()
         .success()
@@ -139,5 +145,28 @@ fn only_the_exact_json_pair_is_json() {
     let line = stdout(&["--version"]);
     assert_eq!(stdout(&["--version", "--json", "extra"]), line);
     // An unknown flag of `fl version` is an error.
-    fl().args(["version", "--nope"]).assert().failure();
+    let root = tempfile::tempdir().unwrap();
+    fl(&root).args(["version", "--nope"]).assert().failure();
+}
+
+#[test]
+fn fl_fixture_uses_private_environment_without_launching() {
+    let root = tempfile::tempdir().unwrap();
+    let command = common::isolated_fl(root.path()).unwrap();
+    let env: std::collections::HashMap<_, _> = command.get_envs().collect();
+    assert_eq!(
+        env.get(std::ffi::OsStr::new("HOME")),
+        Some(&Some(root.path().as_os_str()))
+    );
+    let db = root.path().join("fl.fls");
+    assert_eq!(
+        env.get(std::ffi::OsStr::new("FL_DB")),
+        Some(&Some(db.as_os_str()))
+    );
+    let path = root.path().join("no-bin");
+    assert_eq!(
+        env.get(std::ffi::OsStr::new("PATH")),
+        Some(&Some(path.as_os_str()))
+    );
+    assert!(std::path::Path::new(command.get_program()).is_absolute());
 }

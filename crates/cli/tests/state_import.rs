@@ -1,3 +1,6 @@
+#[allow(dead_code)]
+mod common;
+
 use std::path::Path;
 
 use assert_cmd::Command;
@@ -9,14 +12,17 @@ fn write(path: &Path, text: &str) {
 }
 
 fn fl(cfg: &tempfile::TempDir, db: &Path) -> Command {
-    let mut c = Command::cargo_bin("fl").unwrap();
-    c.env("XDG_CONFIG_HOME", cfg.path()).arg("--db").arg(db);
+    let mut c = Command::from_std(common::isolated_fl(cfg.path()).unwrap());
+    c.env_remove("FL_DB")
+        .env("XDG_CONFIG_HOME", cfg.path())
+        .arg("--db")
+        .arg(db);
     c
 }
 
 fn fl_no_db(cfg: &tempfile::TempDir) -> Command {
-    let mut c = Command::cargo_bin("fl").unwrap();
-    c.env("XDG_CONFIG_HOME", cfg.path());
+    let mut c = Command::from_std(common::isolated_fl(cfg.path()).unwrap());
+    c.env_remove("FL_DB").env("XDG_CONFIG_HOME", cfg.path());
     c
 }
 

@@ -3,6 +3,9 @@
 //! The same ledger goes into a redb store and a ferro store; the totals must be equal, the
 //! source must name the path that produced them, and the plain `fl stats` output must not move.
 
+#[allow(dead_code)]
+mod common;
+
 use assert_cmd::Command;
 use fl_core::ids::{GateId, ProjectId, RecordId, seq_iri};
 use fl_core::log::{Attempt, AttemptStatus, GateRun, PathsTouched};
@@ -32,7 +35,7 @@ impl Env {
     }
 
     fn fl(&self, kind: BackendKind) -> Command {
-        let mut c = Command::cargo_bin("fl").unwrap();
+        let mut c = Command::from_std(common::isolated_fl(self.home.path()).unwrap());
         c.env("HOME", self.home.path())
             .env("XDG_CONFIG_HOME", self.home.path().join("config"))
             .env("XDG_DATA_HOME", self.home.path().join("data"))

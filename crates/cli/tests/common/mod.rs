@@ -94,3 +94,14 @@ pub fn isolated_command(program: impl AsRef<OsStr>, root: impl AsRef<Path>) -> i
     isolate_command(&mut command, root)?;
     Ok(command)
 }
+
+/// Construct an isolated command for this package's `fl` binary.
+pub fn isolated_fl(root: impl AsRef<Path>) -> io::Result<Command> {
+    let program = option_env!("CARGO_BIN_EXE_fl").ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "Cargo did not provide the fl binary",
+        )
+    })?;
+    isolated_command(program, root)
+}
