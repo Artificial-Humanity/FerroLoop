@@ -3,6 +3,9 @@
 //! Hermetic: a temporary home and working directory, no store, no real browser, and no network
 //! beyond 127.0.0.1.
 
+#[allow(dead_code)]
+mod common;
+
 use assert_cmd::Command;
 use serde_json::Value;
 use std::os::unix::fs::PermissionsExt;
@@ -40,8 +43,8 @@ impl Env {
     }
 
     /// `fl` with a private home and working directory, no engine unless a test sets one.
-    fn fl(&self) -> Command {
-        let mut c = Command::cargo_bin("fl").unwrap();
+    fn fl_command(&self) -> std::process::Command {
+        let mut c = common::isolated_fl(self.dir.path()).unwrap();
         c.current_dir(self.dir.path())
             .env("HOME", self.dir.path())
             .env("XDG_CONFIG_HOME", self.path("config"))
@@ -51,6 +54,38 @@ impl Env {
             .env("FL_BROWSE_ENGINE_BIN", "none");
         c
     }
+
+    fn fl(&self) -> Command {
+        Command::from_std(self.fl_command())
+    }
+}
+
+#[test]
+fn browse_command_uses_private_fixture_environment() {
+    let env = Env::new();
+    let command = env.fl_command();
+    let setting = |name: &str| {
+        command
+            .get_envs()
+            .find(|(key, _)| *key == name)
+            .and_then(|(_, value)| value)
+            .map(|value| value.to_os_string())
+    };
+    assert_eq!(setting("HOME").as_deref(), Some(env.dir.path().as_os_str()));
+    assert_eq!(setting("PATH").as_deref(), Some(env.dir.path().as_os_str()));
+    assert_eq!(
+        setting("XDG_RUNTIME_DIR").as_deref(),
+        Some(env.dir.path().as_os_str())
+    );
+    assert_eq!(
+        setting("FL_WIRE_SOCKET").as_deref(),
+        Some(env.path("w").as_os_str())
+    );
+    assert_eq!(setting("FL_DB"), None);
+    assert_eq!(
+        setting("FL_BROWSE_ENGINE_BIN").as_deref(),
+        Some(std::ffi::OsStr::new("none"))
+    );
 }
 
 const GOOD: &str = r#"<!doctype html><html lang=en><head><title>Shop</title>
