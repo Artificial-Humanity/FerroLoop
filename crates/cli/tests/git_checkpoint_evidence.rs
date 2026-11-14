@@ -175,7 +175,11 @@ fn validate(manifest: &Manifest, observed: &Observation, repo: &Path) -> Result<
                 }
                 if executable == &manifest.git.path {
                     commands.push(args.clone());
-                } else if !helpers.contains(executable) {
+                } else if helpers.contains(executable) {
+                    // A declared helper identity does not establish which of its
+                    // operations are permitted. Refuse until a reviewed policy exists.
+                    return Err("helper execution has no reviewed policy");
+                } else {
                     return Err("unexpected executable");
                 }
             }
@@ -308,6 +312,54 @@ mod tests {
             args.push("--unexpected".into());
         }
         assert!(validate(&manifest, &observed, &repo).is_err());
+    }
+
+    #[test]
+    #[ignore = "opt-in synthetic evidence contract; no real CI fixture is provisioned"]
+    fn refuses_registered_helper_execution_without_a_reviewed_policy() {
+        let (mut manifest, mut observed, repo) = sample();
+        let helper = Resource {
+            path: "/fixture/kit/git-helper".into(),
+            sha256: "d".repeat(64),
+        };
+        manifest.helpers.push(helper.clone());
+        observed.helpers.push(helper.clone());
+        // Merely declaring a helper is not evidence of an allowed operation.
+        assert_eq!(validate(&manifest, &observed, &repo), Ok(()));
+        for args in [vec![], vec!["--unexpected".into()]] {
+            let mut with_helper = observed.clone();
+            with_helper.trace.events.extend([
+                Event::Exec {
+                    pid: 99,
+                    executable: helper.path.clone(),
+                    args,
+                },
+                Event::Exit {
+                    pid: 99,
+                    success: true,
+                },
+            ]);
+            assert_eq!(
+                validate(&manifest, &with_helper, &repo),
+                Err("helper execution has no reviewed policy")
+            );
+            // A second invocation must not make helper execution permissible either.
+            with_helper.trace.events.extend([
+                Event::Exec {
+                    pid: 100,
+                    executable: helper.path.clone(),
+                    args: vec![],
+                },
+                Event::Exit {
+                    pid: 100,
+                    success: true,
+                },
+            ]);
+            assert_eq!(
+                validate(&manifest, &with_helper, &repo),
+                Err("helper execution has no reviewed policy")
+            );
+        }
     }
 
     #[test]
