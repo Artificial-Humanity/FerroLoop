@@ -5,6 +5,9 @@
 //! These drive the real binary, because "implemented and tested in the
 //! library" was exactly the state that hid the gap.
 
+#[allow(dead_code)]
+mod common;
+
 use assert_cmd::Command;
 use predicates::prelude::PredicateBooleanExt;
 use predicates::str::contains;
@@ -262,13 +265,23 @@ fn a_population_argument_without_a_population_program_is_refused() {
 // path that was wrong.
 #[test]
 fn a_project_root_that_is_not_a_directory_is_refused_at_registration() {
-    let f = fixture();
-    let missing = f.repo.path().join("no-such-directory");
-    f.cli()
+    let root = tempfile::tempdir().unwrap();
+    let missing = root.path().join("no-such-directory");
+    let mut command = Command::from_std(common::isolated_fl(root.path()).unwrap());
+    command
+        .current_dir(root.path())
         .args(["project", "add", &missing.display().to_string()])
         .assert()
         .failure()
         .stderr(contains("does not exist"));
+    assert!(
+        !missing.exists(),
+        "registration must not create the missing root"
+    );
+    assert!(
+        !root.path().join(".git").exists(),
+        "registration must not create a Git repository"
+    );
 }
 
 #[test]
