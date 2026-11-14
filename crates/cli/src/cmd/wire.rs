@@ -1948,8 +1948,14 @@ pub fn run(env: &StateEnv<'_>, cmd: WireCmd) -> Result<i32, (i32, String)> {
             for_agent,
             json,
         } => {
-            let persona = resolve_caller(env, for_agent.as_deref(), None);
-            let items = execute_read(
+            // Keep one checked endpoint throughout caller capture and polling.
+            let sock = resolve_socket_path(env, None);
+            let fixture_root = std::env::var_os("FL_TEST_ISOLATION_ROOT").map(PathBuf::from);
+            fl_fixture_path::check_endpoint(fixture_root.as_deref(), &sock)
+                .map_err(|error| (1, error.to_string()))?;
+            let persona = resolve_caller_at(env, for_agent.as_deref(), None, &sock)
+                .map_err(|error| (1, error))?;
+            let items = execute_read_at(
                 env,
                 WireFilter {
                     recipient: Some(persona.clone()),
@@ -1959,6 +1965,7 @@ pub fn run(env: &StateEnv<'_>, cmd: WireCmd) -> Result<i32, (i32, String)> {
                     limit: None,
                 },
                 ack,
+                &sock,
             )
             .map_err(|e| (1, e))?;
 
@@ -1987,8 +1994,6 @@ pub fn run(env: &StateEnv<'_>, cmd: WireCmd) -> Result<i32, (i32, String)> {
 
             let wait_dur = Duration::from_secs(timeout.unwrap_or(300));
             let deadline = Instant::now() + wait_dur;
-            let sock = resolve_socket_path(env, None);
-
             if let Some(mut sub) =
                 classify_local_connection(LocalClient::connect(&sock, DEFAULT_LOCAL_RPC_TIMEOUT))
                     .map_err(|error| (1, error))?
@@ -1999,7 +2004,7 @@ pub fn run(env: &StateEnv<'_>, cmd: WireCmd) -> Result<i32, (i32, String)> {
                     if let Some(LocalEvent::Message { .. }) =
                         sub.wait_for_event(rem).map_err(|e| (1, e))?
                     {
-                        let arrived = execute_read(
+                        let arrived = execute_read_at(
                             env,
                             WireFilter {
                                 recipient: Some(persona),
@@ -2009,6 +2014,7 @@ pub fn run(env: &StateEnv<'_>, cmd: WireCmd) -> Result<i32, (i32, String)> {
                                 limit: None,
                             },
                             ack,
+                            &sock,
                         )
                         .map_err(|e| (1, e))?;
                         print_inbox_items(&arrived, json);
@@ -2019,7 +2025,7 @@ pub fn run(env: &StateEnv<'_>, cmd: WireCmd) -> Result<i32, (i32, String)> {
             }
 
             while Instant::now() < deadline {
-                let arrived = execute_read(
+                let arrived = execute_read_at(
                     env,
                     WireFilter {
                         recipient: Some(persona.clone()),
@@ -2029,6 +2035,7 @@ pub fn run(env: &StateEnv<'_>, cmd: WireCmd) -> Result<i32, (i32, String)> {
                         limit: None,
                     },
                     ack,
+                    &sock,
                 )
                 .map_err(|e| (1, e))?;
                 if !arrived.is_empty() {

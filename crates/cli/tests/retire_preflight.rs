@@ -30,6 +30,9 @@ enum Invocation {
     WireAck,
     LegacyAck,
     LegacyExecutableAck,
+    WireWait,
+    LegacyWait,
+    LegacyExecutableWait,
 }
 
 fn run_refused_command(root: &Path, outside_socket: &Path, db: &Path, invocation: Invocation) {
@@ -40,6 +43,7 @@ fn run_refused_command(root: &Path, outside_socket: &Path, db: &Path, invocation
             | Invocation::LegacyExecutableSend
             | Invocation::LegacyExecutableRead
             | Invocation::LegacyExecutableAck
+            | Invocation::LegacyExecutableWait
     ) {
         let alias = root.join("agent-msg");
         if !alias.exists() {
@@ -69,6 +73,9 @@ fn run_refused_command(root: &Path, outside_socket: &Path, db: &Path, invocation
             | Invocation::WireAck
             | Invocation::LegacyAck
             | Invocation::LegacyExecutableAck
+            | Invocation::WireWait
+            | Invocation::LegacyWait
+            | Invocation::LegacyExecutableWait
     ) {
         // Exercise the hydration and route-capture entry path; refusal must
         // happen before either can open a store or touch a route.
@@ -185,6 +192,15 @@ fn run_refused_command(root: &Path, outside_socket: &Path, db: &Path, invocation
         Invocation::LegacyExecutableRead => {
             command.args(["--db", db.to_str().unwrap(), "read", "--ack"]);
         }
+        Invocation::WireWait => {
+            command.args(["--db", db.to_str().unwrap(), "wire", "wait"]);
+        }
+        Invocation::LegacyWait => {
+            command.args(["agent-msg", "--db", db.to_str().unwrap(), "wait"]);
+        }
+        Invocation::LegacyExecutableWait => {
+            command.args(["--db", db.to_str().unwrap(), "wait"]);
+        }
         Invocation::WireAck => {
             command.args([
                 "--db",
@@ -296,6 +312,51 @@ fn legacy_ack_refuses_before_store_or_route_mutation() {
 #[test]
 fn legacy_executable_ack_refuses_before_store_or_route_mutation() {
     assert_outside_socket_refusal(Invocation::LegacyExecutableAck);
+}
+
+#[test]
+fn wire_wait_refuses_before_store_or_route_mutation() {
+    assert_outside_socket_refusal(Invocation::WireWait);
+}
+
+#[test]
+fn legacy_wait_refuses_before_store_or_route_mutation() {
+    assert_outside_socket_refusal(Invocation::LegacyWait);
+}
+
+#[test]
+fn legacy_executable_wait_refuses_before_store_or_route_mutation() {
+    assert_outside_socket_refusal(Invocation::LegacyExecutableWait);
+}
+
+#[test]
+fn wire_wait_private_offline_socket_keeps_nonblocking_behavior() {
+    let root = tempfile::tempdir().unwrap();
+    let db = root.path().join("offline.redb");
+    let output = common::isolated_fl(root.path())
+        .unwrap()
+        .current_dir(root.path())
+        .env("FL_TEST_ISOLATION_ROOT", root.path())
+        .env("FL_WIRE_SOCKET", root.path().join("missing.sock"))
+        .args([
+            "--db",
+            db.to_str().unwrap(),
+            "wire",
+            "wait",
+            "--for",
+            "felicia",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["status"], "dispatcher_active");
+    assert_eq!(result["persona"], "felicia");
 }
 
 #[test]
