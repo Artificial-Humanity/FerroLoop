@@ -342,6 +342,39 @@ impl FixtureScopeBuilder {
         Ok(path)
     }
 
+    /// Create the exact config selected by the fixture's XDG_CONFIG_HOME.
+    /// The exclusively created `fl` parent and config are owned by this scope;
+    /// no other descendant is registered and no child context is transferred.
+    pub fn v2_selected_config(
+        &mut self,
+        contents: Option<&[u8]>,
+        allow_not_found: bool,
+    ) -> io::Result<PathBuf> {
+        if self.version != 2 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "v2 not selected",
+            ));
+        }
+        let parent = self.create_directory("fl")?;
+        let path = parent.join("config.toml");
+        require_absent(&path)?;
+        if let Some(contents) = contents {
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)?;
+            file.write_all(contents)?;
+            file.flush()?;
+            self.files.push(file);
+        }
+        self.identities.push(FixtureIdentity::ConfigRead {
+            path: path.clone(),
+            allow_not_found,
+        });
+        Ok(path)
+    }
+
     /// Create retained synthetic store bytes and, optionally, its derived
     /// sibling. These bytes are not a Redb database or authority to open one.
     pub fn v2_redb_sibling(
@@ -556,6 +589,138 @@ impl Drop for FixtureScope {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn selected_config_owned_exact_identity_and_lifetime() {
+        let mut builder = FixtureScopeBuilder::new().unwrap();
+        let root = builder.root.path().to_path_buf();
+        assert!(builder.v2_selected_config(Some(b"data"), false).is_err());
+        assert!(!root.join("fl").exists());
+        builder.enable_operations_v2();
+        let config = builder.v2_selected_config(Some(b"data"), false).unwrap();
+        assert_eq!(config, root.join("fl/config.toml"));
+        assert!(builder.v2_selected_config(None, true).is_err());
+        let scope = Arc::new(builder.finish().unwrap());
+        let exact = FixtureIdentity::ConfigRead {
+            path: config.clone(),
+            allow_not_found: false,
+        };
+        assert!(scope.context().check_config_read(&exact).is_ok());
+        let wrong_policy = FixtureIdentity::ConfigRead {
+            path: config.clone(),
+            allow_not_found: true,
+        };
+        assert!(scope.context().check_config_read(&wrong_policy).is_err());
+        let wrong_path = FixtureIdentity::ConfigRead {
+            path: root.join("config.toml"),
+            allow_not_found: false,
+        };
+        assert!(scope.context().check_config_read(&wrong_path).is_err());
+        assert_eq!(std::fs::read(&config).unwrap(), b"data");
+        let retained = Arc::clone(&scope);
+        drop(scope);
+        assert_eq!(std::fs::read(&config).unwrap(), b"data");
+        drop(retained);
+        assert!(!root.exists());
+    }
+
+    #[test]
+    fn selected_config_missing_policy_is_exact_and_does_not_create_file() {
+        for allow in [false, true] {
+            let mut builder = FixtureScopeBuilder::new().unwrap();
+            builder.enable_operations_v2();
+            let root = builder.root.path().to_path_buf();
+            let config = builder.v2_selected_config(None, allow).unwrap();
+            assert!(root.join("fl").is_dir());
+            assert!(!config.exists());
+            let scope = builder.finish().unwrap();
+            let exact = FixtureIdentity::ConfigRead {
+                path: config.clone(),
+                allow_not_found: allow,
+            };
+            assert_eq!(scope.context().check_config_read(&exact).is_ok(), allow);
+            let other = FixtureIdentity::ConfigRead {
+                path: config.clone(),
+                allow_not_found: !allow,
+            };
+            assert!(scope.context().check_config_read(&other).is_err());
+            assert!(!config.exists());
+            drop(scope);
+            assert!(!root.exists());
+        }
+    }
+
+    #[test]
+    fn selected_config_refuses_existing_parent_and_declared_resource() {
+        let mut builder = FixtureScopeBuilder::new().unwrap();
+        builder.enable_operations_v2();
+        let root = builder.root.path().to_path_buf();
+        builder
+            .creation_target("FL", CreationTarget::Route)
+            .unwrap();
+        assert!(builder.v2_selected_config(Some(b"data"), false).is_err());
+        assert!(!root.join("fl").exists());
+        drop(builder);
+        assert!(!root.exists());
+
+        let mut builder = FixtureScopeBuilder::new().unwrap();
+        builder.enable_operations_v2();
+        let root = builder.root.path().to_path_buf();
+        std::fs::create_dir(root.join("fl")).unwrap();
+        std::fs::write(root.join("fl/config.toml"), b"unchanged").unwrap();
+        assert!(builder.v2_selected_config(Some(b"data"), false).is_err());
+        assert_eq!(
+            std::fs::read(root.join("fl/config.toml")).unwrap(),
+            b"unchanged"
+        );
+        drop(builder);
+        assert!(!root.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn selected_config_refuses_symlink_parent_and_later_leaf() {
+        use std::os::unix::fs::symlink;
+        let mut builder = FixtureScopeBuilder::new().unwrap();
+        builder.enable_operations_v2();
+        let root = builder.root.path().to_path_buf();
+        symlink(root.join("absent"), root.join("fl")).unwrap();
+        assert!(builder.v2_selected_config(None, true).is_err());
+        assert!(
+            std::fs::symlink_metadata(root.join("fl"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        drop(builder);
+        assert!(!root.exists());
+
+        let mut builder = FixtureScopeBuilder::new().unwrap();
+        builder.enable_operations_v2();
+        let root = builder.root.path().to_path_buf();
+        std::fs::create_dir(root.join("fl")).unwrap();
+        symlink(root.join("absent"), root.join("fl/config.toml")).unwrap();
+        assert!(builder.v2_selected_config(None, true).is_err());
+        assert!(
+            std::fs::symlink_metadata(root.join("fl/config.toml"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        drop(builder);
+        assert!(!root.exists());
+
+        let mut builder = FixtureScopeBuilder::new().unwrap();
+        builder.enable_operations_v2();
+        let config = builder.v2_selected_config(None, true).unwrap();
+        let scope = builder.finish().unwrap();
+        symlink(scope.root().join("absent"), &config).unwrap();
+        let exact = FixtureIdentity::ConfigRead {
+            path: config,
+            allow_not_found: true,
+        };
+        assert!(scope.context().check_config_read(&exact).is_err());
+    }
 
     #[test]
     fn v2_owned_builder_refuses_preexisting_paths_without_adopting_them() {
