@@ -198,7 +198,19 @@ impl RegistrationBinding {
         let native_id = adapter
             .registration_native_id(&entry.route)
             .ok_or("unsupported registration; re-register and resubmit")?;
-        Self::acquire(source, native_id, persona, policy).map(Some)
+        #[cfg(test)]
+        AFTER_INTENT_SELECTION.with(|hook| {
+            if let Some(hook) = hook.borrow_mut().take() {
+                hook();
+            }
+        });
+        let acquired = Self::acquire(source, native_id, persona, policy)?;
+        if !entry.same_registration_identity(&acquired.entry)
+            || entry.persona != acquired.entry.persona
+        {
+            return Err("registration changed; re-register and resubmit".into());
+        }
+        Ok(Some(acquired))
     }
     pub(crate) fn acquire(
         source: PathBuf,
@@ -277,6 +289,12 @@ impl RegistrationBinding {
 }
 
 #[cfg(test)]
+thread_local! {
+    static AFTER_INTENT_SELECTION: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        std::cell::RefCell::new(None);
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::identity::VendorRoute;
@@ -338,6 +356,78 @@ mod tests {
         std::fs::create_dir(&source).unwrap();
         assert!(binding.revalidate().is_err());
     }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn intent_acquisition_refuses_replaced_registration_but_accepts_restamp() {
+        let (_dir, source, original) = fixture();
+        write_entry(&source, &original);
+        let mut replacement = original.clone();
+        replacement.hydration_generation = Some("replacement".into());
+        let hook_source = source.clone();
+        AFTER_INTENT_SELECTION.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || write_entry(&hook_source, &replacement)));
+        });
+        assert!(matches!(
+            ClaudeRegistrationBinding::from_intent(source.clone(), "ada"),
+            Err(RegistrationError::Refused(_))
+        ));
+
+        write_entry(&source, &original);
+        let mut restamped = original;
+        restamped.updated_at = At::from_unix_millis(2);
+        restamped.identity_at = Some(At::from_unix_millis(2));
+        let hook_source = source.clone();
+        AFTER_INTENT_SELECTION.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || write_entry(&hook_source, &restamped)));
+        });
+        let binding = ClaudeRegistrationBinding::from_intent(source, "ada")
+            .unwrap()
+            .unwrap();
+        assert!(binding.revalidate().is_ok());
+
+        let (_dir, source, original) = fixture();
+        write_entry(&source, &original);
+        let hook_source = source.clone();
+        AFTER_INTENT_SELECTION.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                std::fs::remove_file(hook_source).unwrap();
+            }));
+        });
+        assert!(matches!(
+            ClaudeRegistrationBinding::from_intent(source.clone(), "ada"),
+            Err(RegistrationError::Source(_))
+        ));
+
+        write_entry(&source, &original);
+        let hook_source = source.clone();
+        AFTER_INTENT_SELECTION.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                std::fs::write(hook_source, r#"{"entries":{}}"#).unwrap();
+            }));
+        });
+        assert!(matches!(
+            ClaudeRegistrationBinding::from_intent(source.clone(), "ada"),
+            Err(RegistrationError::Refused(_))
+        ));
+
+        write_entry(&source, &original);
+        let encoded = serde_json::to_string(&original).unwrap();
+        let hook_source = source.clone();
+        AFTER_INTENT_SELECTION.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                std::fs::write(
+                    hook_source,
+                    format!(r#"{{"entries":{{"ada":{encoded},"ada":{encoded}}}}}"#),
+                )
+                .unwrap();
+            }));
+        });
+        assert!(matches!(
+            ClaudeRegistrationBinding::from_intent(source, "ada"),
+            Err(RegistrationError::Source(_))
+        ));
+    }
+
     #[test]
     fn strict_primary_rejects_duplicate_keys_and_normalized_aliases() {
         let (_dir, source, entry) = fixture();
