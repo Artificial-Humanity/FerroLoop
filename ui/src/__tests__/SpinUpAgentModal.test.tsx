@@ -2,6 +2,7 @@ import { act, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import { describe, expect, it, vi } from "vitest";
 import { App } from "../App";
 import { HubApiClient } from "../lib/api";
+import { getVendorModelOptions } from "../components/ChatPane";
 import type { HubWsClient } from "../api/ws";
 import {
   resolveSpinUpProject,
@@ -45,6 +46,7 @@ describe("SpinUpAgentModal", () => {
         onClose={onClose}
         onSpinUp={onSpinUp}
         projects={TEST_PROJECTS}
+        defaultNodeId="ai-lab-0"
       />,
     );
 
@@ -69,7 +71,7 @@ describe("SpinUpAgentModal", () => {
       Array.from(roleSelect.options).map((o) => o.value),
     ).toContain("strategist");
     expect(vendorSelect.value).toBe("claude");
-    expect(nodeSelect.value).toBe("");
+    expect(nodeSelect.value).toBe("ai-lab-0");
     expect(hostedCheckbox.checked).toBe(true);
 
     // Submitting without persona shows validation error
@@ -135,8 +137,8 @@ describe("SpinUpAgentModal", () => {
 
     const nodeSelect = screen.getByTestId("spin-up-node-select") as HTMLInputElement;
     expect(nodeSelect.value).toBe("");
-    const emptyDatalist = document.getElementById("fd-spin-up-node-options");
-    expect(emptyDatalist?.querySelectorAll("option").length ?? 0).toBe(0);
+    expect(nodeSelect.tagName).toBe("SELECT");
+    expect(screen.getByRole("option", { name: /hub default/i })).toHaveValue("");
 
     fireEvent.change(screen.getByTestId("spin-up-persona-input"), {
       target: { value: "kacey" },
@@ -209,16 +211,15 @@ describe("SpinUpAgentModal", () => {
 
     const seededNodeSelect = screen.getByTestId("spin-up-node-select") as HTMLInputElement;
     expect(seededNodeSelect.value).toBe("hub-local-0");
-    const populatedDatalist = document.getElementById("fd-spin-up-node-options");
-    expect(
-      Array.from(populatedDatalist?.querySelectorAll("option") ?? []).map((o) =>
-        o.getAttribute("value"),
-      ),
-    ).toEqual(["worker-mac-1", "hub-local-0"]);
+    const nodeChoices = Array.from((seededNodeSelect as unknown as HTMLSelectElement).options);
+    expect(nodeChoices.map((o) => o.value)).toEqual(["", "worker-mac-1", "hub-local-0"]);
+    expect(nodeChoices.find((o) => o.value === "worker-mac-1")).toHaveTextContent("Mac Worker");
+    expect(nodeChoices.find((o) => o.value === "hub-local-0")).toHaveTextContent("Local Hub");
 
     fireEvent.change(screen.getByTestId("spin-up-persona-input"), {
       target: { value: "felix" },
     });
+    fireEvent.change(seededNodeSelect, { target: { value: "worker-mac-1" } });
     fireEvent.click(screen.getByTestId("spin-up-submit-btn"));
 
     await waitFor(() => {
@@ -230,7 +231,7 @@ describe("SpinUpAgentModal", () => {
       role: "assistant",
       vendor: "claude",
       posture: "auto",
-      node_id: "hub-local-0",
+      node_id: "worker-mac-1",
       hosted: true,
     });
 
@@ -262,6 +263,55 @@ describe("SpinUpAgentModal", () => {
     unmount();
   });
 
+  it("offers a native vendor model select and clears a previous vendor model", () => {
+    render(<SpinUpAgentModal isOpen onClose={() => {}} />);
+    const vendor = screen.getByTestId("spin-up-vendor-select");
+    const model = screen.getByTestId("spin-up-model-input") as HTMLSelectElement;
+    expect(model.tagName).toBe("SELECT");
+    expect(model.value).toBe("");
+    fireEvent.change(vendor, { target: { value: "grok" } });
+    expect(Array.from(model.options).map((option) => option.value)).toEqual([
+      "", ...getVendorModelOptions("grok"),
+    ]);
+    fireEvent.change(model, { target: { value: "grok-4.7" } });
+    expect(model.value).toBe("grok-4.7");
+    fireEvent.change(vendor, { target: { value: "claude" } });
+    expect(model.value).toBe("");
+    expect(Array.from(model.options).some((option) => option.value === "grok-4.7")).toBe(false);
+  });
+
+  it("selects a node arriving late unless the operator chose the hub default", () => {
+    const node: EnrolledNode = { node_id: "late-hub", display_name: "Late Hub", role: "hub", hostname: "late", os: "linux", arch: "x86_64", capabilities: [], labels: [], status: "online", enrolled_at_ms: 1, last_seen_at_ms: 2 };
+    const { rerender } = render(<SpinUpAgentModal isOpen onClose={() => {}} />);
+    const select = screen.getByTestId("spin-up-node-select") as HTMLSelectElement;
+    expect(select.tagName).toBe("SELECT");
+    rerender(<SpinUpAgentModal isOpen onClose={() => {}} nodes={[node]} />);
+    expect(select.value).toBe("late-hub");
+    expect(screen.getByRole("option", { name: "Late Hub" })).toHaveValue("late-hub");
+    fireEvent.change(select, { target: { value: "" } });
+    rerender(<SpinUpAgentModal isOpen onClose={() => {}} nodes={[node]} defaultNodeId="other" />);
+    expect(select.value).toBe("");
+  });
+
+  it("clears a node removed from the registry and omits it from the submitted request", async () => {
+    const node: EnrolledNode = { node_id: "removed-node", display_name: "Removed Node", role: "hub", hostname: "test", os: "linux", arch: "x86_64", capabilities: [], labels: [], status: "online", enrolled_at_ms: 1, last_seen_at_ms: 2 };
+    const onSpinUp = vi.fn(async (req: SpinUpSessionRequest): Promise<SpinUpSessionResponse> => ({ session_id: "fixture", persona: req.persona, project: req.project, role: req.role, vendor: req.vendor, model: req.model ?? null, node_id: req.node_id ?? "", hosted: true, status: "running", hydration_dispatched: true }));
+    const common = { isOpen: true, onClose: vi.fn(), initialProject: "ai-lab-amd", projects: TEST_PROJECTS, onSpinUp };
+    const { rerender } = render(<SpinUpAgentModal {...common} nodes={[node]} />);
+    const select = screen.getByTestId("spin-up-node-select") as HTMLSelectElement;
+    expect(select.value).toBe("removed-node");
+    rerender(<SpinUpAgentModal {...common} nodes={[]} />);
+    expect(select.value).toBe("");
+    expect(Array.from(select.options).map((option) => option.value)).toEqual([""]);
+    fireEvent.change(screen.getByTestId("spin-up-persona-input"), { target: { value: "fixture-persona" } });
+    fireEvent.change(screen.getByTestId("spin-up-vendor-select"), { target: { value: "grok" } });
+    fireEvent.change(screen.getByTestId("spin-up-model-input"), { target: { value: "grok-4.7" } });
+    fireEvent.click(screen.getByTestId("spin-up-submit-btn"));
+    await waitFor(() => expect(onSpinUp).toHaveBeenCalledTimes(1));
+    expect(onSpinUp.mock.calls[0][0]).toMatchObject({ vendor: "grok", model: "grok-4.7" });
+    expect(onSpinUp.mock.calls[0][0]).not.toHaveProperty("node_id");
+  });
+
   it("clears validation/API errors when closed and reopened", async () => {
     const onClose = vi.fn();
     const { rerender } = render(<SpinUpAgentModal isOpen onClose={onClose} />);
@@ -281,8 +331,8 @@ describe("SpinUpAgentModal", () => {
     const vendorSelect = screen.getByTestId("spin-up-vendor-select") as HTMLSelectElement;
     fireEvent.change(vendorSelect, { target: { value: "muse" } });
 
-    const datalist = screen.getByTestId("spin-up-model-options");
-    const options = Array.from(datalist.querySelectorAll("option")).map((opt) => ({
+    const datalist = screen.getByTestId("spin-up-model-input");
+    const options = Array.from(datalist.querySelectorAll("option")).slice(1).map((opt) => ({
       value: opt.getAttribute("value"),
       label: opt.getAttribute("label"),
       text: opt.textContent,
@@ -352,8 +402,8 @@ describe("SpinUpAgentModal", () => {
     const vendorSelect = screen.getByTestId("spin-up-vendor-select") as HTMLSelectElement;
     fireEvent.change(vendorSelect, { target: { value: "codex" } });
 
-    const datalist = screen.getByTestId("spin-up-model-options");
-    const codexOptions = Array.from(datalist.querySelectorAll("option")).map((opt) => ({
+    const datalist = screen.getByTestId("spin-up-model-input");
+    const codexOptions = Array.from(datalist.querySelectorAll("option")).slice(1).map((opt) => ({
       value: opt.getAttribute("value"),
       label: opt.getAttribute("label"),
       text: opt.textContent,
