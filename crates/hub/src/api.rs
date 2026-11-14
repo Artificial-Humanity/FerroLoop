@@ -6332,6 +6332,7 @@ fn dispatch_queued_operator_prompt_with_intent_for_session(
     }
     #[cfg(test)]
     if !claude_terminal
+        && intent != OperatorPromptIntent::OwnerSendNow
         && intended_codex_thread_id.is_none()
         && intended_vendor.is_none()
         && QUEUED_TEST_DELIVERY.with(|flag| flag.get())
@@ -13379,6 +13380,45 @@ mod claude_registration_binding_tests {
             matches!(vendor, Err(OperatorPromptError::Push(PushError::Failed(ref error)))
             if error.contains("requested vendor"))
         );
+        assert_eq!(queued_delivery_calls(), 0);
+    }
+
+    #[test]
+    fn queued_success_stub_rejects_implicit_codex_thread_replacement() {
+        let (tmp, state, _source, mut entry, _binding) = fixture();
+        let primary = tmp.path().join(".cache/agent-bus/routes.json");
+        std::fs::create_dir_all(primary.parent().unwrap()).unwrap();
+        entry.hosted_id = Some("codex:ada".into());
+        entry.route = VendorRoute::Codex {
+            thread_id: "replacement-thread".into(),
+            cwd: None,
+        };
+        write(&primary, &entry);
+        crate::discovery::note_route_file_scan(Some(tmp.path()), std::time::Instant::now());
+        let _stub = stub_queued_delivery_success();
+        reset_queued_delivery_calls();
+
+        // No optional thread/vendor metadata is retained. Send Now must still
+        // compare the resolved Codex thread to the requested session.
+        let result = dispatch_queued_operator_prompt_with_intent_for_session(
+            &state,
+            Some("ada"),
+            "original-thread",
+            "owner",
+            "hello",
+            OperatorPromptIntent::OwnerSendNow,
+            None,
+            false,
+            None,
+            None,
+        );
+        assert!(matches!(
+            result,
+            Err(OperatorPromptError::Steer(CodexSteerError::Refused {
+                stage: fl_wire::dispatcher::CodexSteerStage::Route,
+                ..
+            }))
+        ));
         assert_eq!(queued_delivery_calls(), 0);
     }
 
