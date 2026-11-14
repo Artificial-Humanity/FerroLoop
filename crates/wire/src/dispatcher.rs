@@ -9963,9 +9963,11 @@ mod tests {
         serve: impl FnOnce(TcpStream) + Send + 'static,
     ) -> (u16, std::thread::JoinHandle<()>) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let _listener_fixture = crate::test_isolation::register_tcp_listener(&listener).unwrap();
+        let listener_fixture = crate::test_isolation::register_tcp_listener(&listener).unwrap();
         let port = listener.local_addr().unwrap().port();
         let handle = std::thread::spawn(move || {
+            // Keep the listener registered until this fixture finishes serving its request.
+            let _listener_fixture = listener_fixture;
             let (stream, _) = listener.accept().unwrap();
             let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
             loop {
@@ -9977,6 +9979,38 @@ mod tests {
             serve(stream);
         });
         (port, handle)
+    }
+
+    #[test]
+    fn raw_agy_stub_retains_its_tcp_registration_until_request_finishes() {
+        assert!(crate::test_isolation::is_enabled());
+        let (port, handle) = spawn_raw_agy_stub(|mut stream| {
+            let address = stream.local_addr().unwrap();
+            assert!(crate::test_isolation::ensure_tcp(&address).is_ok());
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .unwrap();
+        });
+        let address = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
+        assert!(crate::test_isolation::ensure_tcp(&address).is_ok());
+        let (_, _, body) = post_agy_connect_rpc_with_deadline(
+            port,
+            "csrf",
+            "/p",
+            "{}",
+            Duration::from_secs(1),
+            1024,
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        assert_eq!(body, "ok");
+        handle.join().unwrap();
+        assert_eq!(
+            crate::test_isolation::ensure_tcp(&address)
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
     }
 
     #[test]
