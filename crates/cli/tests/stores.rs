@@ -283,16 +283,16 @@ fn an_iri_no_store_holds_is_not_owned_and_names_every_store_searched() {
 #[test]
 fn a_store_that_cannot_be_opened_during_an_iri_search_is_an_error_not_a_skip() {
     let env = Env::new();
-    let (ra, rb) = (git_repo(), git_repo());
+    let (ra, rb) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
     let stores = tempfile::tempdir().unwrap();
     let (a, b) = (stores.path().join("a.redb"), stores.path().join("b.redb"));
     std::fs::write(&b, b"this is not a database").unwrap();
     env.write_config(&format!("{}{}", bind(ra.path(), &a), bind(rb.path(), &b)));
-    env.fl(ra.path())
+    env.isolated_fl(ra.path())
         .args(["project", "add", ra.path().to_str().unwrap()])
         .assert()
         .success();
-    env.fl(ra.path())
+    env.isolated_fl(ra.path())
         .args(["gate", "show", STRANGER])
         .assert()
         .code(2)
@@ -462,20 +462,20 @@ fn a_handle_mixed_with_an_iri_held_by_a_different_store_is_refused() {
 #[test]
 fn searching_for_an_iri_never_creates_a_candidate_store_that_does_not_exist() {
     let env = Env::new();
-    let ra = git_repo();
-    let rb = git_repo();
+    let ra = tempfile::tempdir().unwrap();
+    let rb = tempfile::tempdir().unwrap();
     let stores = tempfile::tempdir().unwrap();
     let a = stores.path().join("a.redb");
     let b = stores.path().join("b.redb"); // never created
     env.write_config(&format!("{}{}", bind(ra.path(), &a), bind(rb.path(), &b)));
-    env.fl(ra.path())
+    env.isolated_fl(ra.path())
         .args(["project", "add", ra.path().to_str().unwrap()])
         .assert()
         .success();
     assert!(a.exists());
     assert!(!b.exists(), "fixture must start absent");
 
-    env.fl(ra.path())
+    env.isolated_fl(ra.path())
         .args(["gate", "show", STRANGER])
         .assert()
         .code(2);
