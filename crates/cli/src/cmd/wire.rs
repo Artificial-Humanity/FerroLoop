@@ -1516,8 +1516,17 @@ pub fn execute_ack(
     recipient: String,
 ) -> Result<Vec<DeliveryReceipt>, String> {
     let sock = resolve_socket_path(env, None);
+    execute_ack_at(env, message_ids, recipient, &sock)
+}
+
+fn execute_ack_at(
+    env: &StateEnv<'_>,
+    message_ids: Vec<MessageId>,
+    recipient: String,
+    sock: &Path,
+) -> Result<Vec<DeliveryReceipt>, String> {
     if let Some(mut client) =
-        classify_local_connection(LocalClient::connect(&sock, DEFAULT_LOCAL_RPC_TIMEOUT))?
+        classify_local_connection(LocalClient::connect(sock, DEFAULT_LOCAL_RPC_TIMEOUT))?
     {
         match client.request(&LocalRequest::Ack {
             message_ids,
@@ -1906,12 +1915,18 @@ pub fn run(env: &StateEnv<'_>, cmd: WireCmd) -> Result<i32, (i32, String)> {
             for_agent,
             json,
         } => {
-            let recipient = resolve_caller(env, for_agent.as_deref(), None);
+            // Retain the preflighted endpoint through caller capture and ack.
+            let sock = resolve_socket_path(env, None);
+            let fixture_root = std::env::var_os("FL_TEST_ISOLATION_ROOT").map(PathBuf::from);
+            fl_fixture_path::check_endpoint(fixture_root.as_deref(), &sock)
+                .map_err(|error| (1, error.to_string()))?;
+            let recipient = resolve_caller_at(env, for_agent.as_deref(), None, &sock)
+                .map_err(|error| (1, error))?;
             let mut ids = Vec::with_capacity(message_ids.len());
             for raw in &message_ids {
                 ids.push(parse_message_id(raw).map_err(|e| (1, e))?);
             }
-            let receipts = execute_ack(env, ids, recipient).map_err(|e| (1, e))?;
+            let receipts = execute_ack_at(env, ids, recipient, &sock).map_err(|e| (1, e))?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&receipts).unwrap());
             } else {
