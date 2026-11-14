@@ -1,3 +1,6 @@
+#[allow(dead_code)]
+mod common;
+
 use assert_cmd::Command;
 use predicates::prelude::PredicateBooleanExt;
 use predicates::str::contains;
@@ -79,6 +82,40 @@ impl F {
     }
 }
 
+// These local finding cases do not run gates and need no Git repository.
+struct LocalFixture {
+    root: tempfile::TempDir,
+}
+
+impl LocalFixture {
+    fn new() -> Self {
+        let root = tempfile::tempdir().unwrap();
+        let project = root.path().join("project");
+        fs::create_dir(&project).unwrap();
+        let fixture = Self { root };
+        fixture
+            .cli()
+            .args(["project", "add"])
+            .arg(project)
+            .assert()
+            .success();
+        fixture
+            .cli()
+            .args(["record", "add", "--project", "1", "--title", "work"])
+            .assert()
+            .success();
+        fixture
+    }
+
+    fn cli(&self) -> Command {
+        let mut c = common::isolated_fl(self.root.path()).unwrap();
+        c.current_dir(self.root.path())
+            .arg("--db")
+            .arg(self.root.path().join("t.redb"));
+        c.into()
+    }
+}
+
 // REQUIRED TEST 5 (spec §10), at the CLI.
 #[test]
 fn a_passing_gate_is_refused_as_a_reproduction() {
@@ -106,8 +143,7 @@ fn a_passing_gate_is_refused_as_a_reproduction() {
 // REQUIRED TEST 6 (spec §10), at the CLI.
 #[test]
 fn a_raised_finding_cannot_be_assigned() {
-    let f = fixture();
-    f.setup();
+    let f = LocalFixture::new();
     f.cli()
         .args([
             "finding", "raise", "--record", "1", "--claim", "c", "--by", "rev",
@@ -201,8 +237,7 @@ fn a_clean_repair_closes_the_finding() {
 // REQUIRED TEST 8 (spec §10), at the CLI.
 #[test]
 fn a_withdrawal_is_counted_against_the_reviewer_and_is_readable() {
-    let f = fixture();
-    f.setup();
+    let f = LocalFixture::new();
     for claim in ["a", "b"] {
         f.cli()
             .args([
