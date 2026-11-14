@@ -1800,11 +1800,55 @@ fn dead_explicit_route_with_held_mail_surfaces_dead_explicit_route_in_fl_wire_st
     );
 }
 
+// All hosted registration participants share one private multi-process store.
+fn hosted_replace_command(env: &TestEnv) -> Command {
+    let mut command = codex_queue_command(env);
+    command.env("FL_DB", env.root.join("hosted-replace.fls"));
+    command
+}
+
+#[test]
+fn hosted_replace_command_uses_private_fixtures() {
+    let env = TestEnv::new();
+    let command = hosted_replace_command(&env);
+    let get = |key: &str| {
+        command
+            .get_envs()
+            .find(|(name, _)| *name == key)
+            .and_then(|(_, value)| value)
+            .map(|v| v.to_os_string())
+    };
+    for (name, path) in [
+        ("FL_DB", env.root.join("hosted-replace.fls")),
+        ("FL_WIRE_SOCKET", env.sock_file.clone()),
+        ("FL_WIRE_ROUTES", env.routes_file.clone()),
+        ("FL_WIRE_CODEX_CONTROL_SOCK", env.root.join("c")),
+        ("PATH", env.root.join("no-bin")),
+    ] {
+        assert_eq!(get(name).as_deref(), Some(path.as_os_str()), "{name}");
+    }
+    assert_eq!(
+        get("FL_STORE_BACKEND").as_deref(),
+        Some(std::ffi::OsStr::new("ferro"))
+    );
+    assert_eq!(
+        get("FL_WIRE_DISABLE_HOST_DISCOVERY").as_deref(),
+        Some(std::ffi::OsStr::new("1"))
+    );
+}
+
 #[test]
 fn daemon_hosted_replace_operator_replace_and_foreign_child_replace_e2e() {
     let env = TestEnv::new();
-    let store_path = env.data_dir.join("fl/fl.redb");
-    let store = std::sync::Arc::new(fl_store::open_store(&store_path).unwrap());
+    let store_path = env.root.join("hosted-replace.fls");
+    let store = fl_store::open_store_with(
+        &store_path,
+        &fl_store::StoreOptions {
+            backend: Some(fl_store::BackendKind::Ferro),
+            ..Default::default()
+        },
+    )
+    .unwrap();
     let g1 = fl_hub::lifecycle::next_hydration_generation();
     let g2 = fl_hub::lifecycle::next_hydration_generation();
 
@@ -1840,26 +1884,19 @@ fn daemon_hosted_replace_operator_replace_and_foreign_child_replace_e2e() {
         updated_at_ms: 1,
         decommission_prepared_at_ms: None,
     };
-    fl_hub::lifecycle::persist_hosted_session(&*store, &hosted_agy, "owner").unwrap();
+    fl_hub::lifecycle::persist_hosted_session(&store, &hosted_agy, "owner").unwrap();
+    drop(store);
 
-    let mut daemon = fl_wire::daemon::spawn_daemon(
-        std::sync::Arc::clone(&store),
-        fl_wire::daemon::DaemonConfig {
-            node_id: "node-rep".into(),
-            host: "host-rep".into(),
-            socket_path: env.sock_file.clone(),
-            routes_path: Some(env.routes_file.clone()),
-            home_override: Some(env.root.clone()),
-            listen_addr: None,
-            peers: vec![],
-            psk: vec![],
-        },
-    )
-    .unwrap();
+    let mut daemon_command = hosted_replace_command(&env);
+    daemon_command
+        .args(["wire", "daemon"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let daemon = FixtureDaemon::start_command(&env, daemon_command);
 
     // 1. Hosted session's own `--replace` succeeds.
-    let reg1 = env
-        .fl()
+    let reg1 = hosted_replace_command(&env)
         .args([
             "wire",
             "register",
@@ -1884,8 +1921,7 @@ fn daemon_hosted_replace_operator_replace_and_foreign_child_replace_e2e() {
 
     // 2. Foreign-vendor child with `FL_HOSTED_ID=antigravity:feira` attempting `claude --replace` is refused!
     let spike_sock = env.root.join(format!("{}.sock", std::process::id()));
-    let foreign = env
-        .fl()
+    let foreign = hosted_replace_command(&env)
         .args([
             "wire",
             "register",
@@ -1911,10 +1947,18 @@ fn daemon_hosted_replace_operator_replace_and_foreign_child_replace_e2e() {
     remodeled.vendor = "claude".into();
     remodeled.hydration_status = fl_hub::lifecycle::HydrationStatus::Unconfirmed;
     remodeled.hydration_generation = Some(g2.clone());
-    fl_hub::lifecycle::persist_hosted_session(&*store, &remodeled, "owner").unwrap();
+    let store = fl_store::open_store_with(
+        &store_path,
+        &fl_store::StoreOptions {
+            backend: Some(fl_store::BackendKind::Ferro),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    fl_hub::lifecycle::persist_hosted_session(&store, &remodeled, "owner").unwrap();
+    drop(store);
 
-    let reg2 = env
-        .fl()
+    let reg2 = hosted_replace_command(&env)
         .args([
             "wire",
             "register",
@@ -1939,8 +1983,7 @@ fn daemon_hosted_replace_operator_replace_and_foreign_child_replace_e2e() {
     );
 
     // 4. Operator `--replace` (no `FL_HOSTED_ID`) switches to Codex and records `Replaced`.
-    let op_reg = env
-        .fl()
+    let op_reg = hosted_replace_command(&env)
         .args([
             "wire",
             "register",
@@ -1960,10 +2003,10 @@ fn daemon_hosted_replace_operator_replace_and_foreign_child_replace_e2e() {
         String::from_utf8_lossy(&op_reg.stderr)
     );
 
-    let mut st_cmd = env.fl();
+    let mut st_cmd = hosted_replace_command(&env);
     st_cmd.args(["wire", "status", "--json"]);
     let st = run_json(st_cmd);
-    daemon.stop();
+    drop(daemon);
     assert_eq!(st["routes"][0]["route"]["kind"], "codex");
     assert_eq!(st["routes"][0]["route"]["thread_id"], "codex-op-e2e");
     let diags = st["registration_diagnostics"].as_array().unwrap();
