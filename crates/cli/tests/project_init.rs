@@ -2,6 +2,9 @@
 //! to a registered, routed project or a virtual group. Every test runs `fl` with private config
 //! and data homes, so none reads or writes the developer's own.
 
+#[allow(dead_code)]
+mod common;
+
 use assert_cmd::Command;
 use assert_cmd::assert::OutputAssertExt;
 use predicates::prelude::PredicateBooleanExt;
@@ -49,6 +52,19 @@ impl Env {
             .env_remove("FL_WIRE_ROUTES")
             .env_remove("FL_DB")
             .env_remove("FL_STORE_BACKEND")
+            .env("FL_TEST_SPINUP_NO_SPAWN", "1")
+            .current_dir(cwd);
+        c
+    }
+
+    // Used only by the independently audited, no-Git cases below.
+    fn isolated_fl(&self, cwd: &Path) -> Command {
+        let mut c = Command::from_std(common::isolated_fl(self.home.path()).unwrap());
+        c.env("HOME", self.home.path())
+            .env("XDG_RUNTIME_DIR", self.home.path())
+            .env("XDG_CONFIG_HOME", self.home.path().join("config"))
+            .env("XDG_DATA_HOME", self.home.path().join("data"))
+            .env_remove("FL_DB")
             .env("FL_TEST_SPINUP_NO_SPAWN", "1")
             .current_dir(cwd);
         c
@@ -311,7 +327,7 @@ fn bad_input_is_refused_with_a_reason_and_makes_nothing() {
     let env = Env::new();
     let root = env.dir("never");
     let init = |args: &[&str]| {
-        let mut cmd = env.fl(env.work.path());
+        let mut cmd = env.isolated_fl(env.work.path());
         cmd.args(["project", "init"]).args(args);
         cmd.assert().failure()
     };
@@ -496,7 +512,7 @@ fn a_virtual_group_takes_no_path_git_or_tracker_flags() {
         &["--github", "a/b"][..],
         &["--credential", "env"][..],
     ] {
-        let mut cmd = env.fl(env.work.path());
+        let mut cmd = env.isolated_fl(env.work.path());
         cmd.args(["project", "create", "Nope", "--virtual"])
             .args(flags);
         cmd.assert().failure().stderr(contains("cannot be used"));
@@ -540,7 +556,7 @@ fn add_registers_a_directory_that_is_not_a_git_repository() {
     let plain = env.dir("plain-add");
     std::fs::create_dir_all(&plain).unwrap();
     let db = env.home.path().join("add.fls");
-    env.fl(env.work.path())
+    env.isolated_fl(env.work.path())
         .args([
             "--db",
             db.to_str().unwrap(),
@@ -552,7 +568,7 @@ fn add_registers_a_directory_that_is_not_a_git_repository() {
         .success()
         .stdout(contains(plain.to_str().unwrap()));
     assert!(!plain.join(".git").exists(), "add never runs git");
-    env.fl(env.work.path())
+    env.isolated_fl(env.work.path())
         .args([
             "--db",
             db.to_str().unwrap(),
