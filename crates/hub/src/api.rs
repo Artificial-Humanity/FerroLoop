@@ -6240,11 +6240,6 @@ fn dispatch_operator_prompt_with_intent_for_session(
             }) {
                 return Err(PushError::NotConnected("synthetic connect refusal".into()));
             }
-            #[cfg(test)]
-            if queued && QUEUED_TEST_DELIVERY.with(|flag| flag.get()) {
-                QUEUED_DELIVERY_CALLS.with(|c| c.set(c.get() + 1));
-                return Ok(OperatorPromptOutcome::TransportAccepted);
-            }
             // A pinned Codex Send Now remains a typed route refusal even if
             // rediscovery finds a different vendor before reaching its branch.
             let codex_mismatch = intent == OperatorPromptIntent::OwnerSendNow
@@ -6265,6 +6260,11 @@ fn dispatch_operator_prompt_with_intent_for_session(
                 return Err(PushError::Failed(message));
             }
             require_intended_vendor(route, intended_vendor)?;
+            #[cfg(test)]
+            if queued && QUEUED_TEST_DELIVERY.with(|flag| flag.get()) {
+                QUEUED_DELIVERY_CALLS.with(|c| c.set(c.get() + 1));
+                return Ok(OperatorPromptOutcome::TransportAccepted);
+            }
             // An unbound owner prompt must never obtain Claude terminal authority by
             // rediscovery. Independently established peer delivery stays peer-only.
             if matches!(route, fl_wire::identity::VendorRoute::Claude { .. }) {
@@ -6332,6 +6332,8 @@ fn dispatch_queued_operator_prompt_with_intent_for_session(
     }
     #[cfg(test)]
     if !claude_terminal
+        && intended_codex_thread_id.is_none()
+        && intended_vendor.is_none()
         && QUEUED_TEST_DELIVERY.with(|flag| flag.get())
         && matches!(state.prompt_queue_target(session_id), Ok(None))
     {
@@ -13326,6 +13328,58 @@ mod claude_registration_binding_tests {
             cwd: None,
         };
         assert!(require_intended_vendor(&codex, Some("codex")).is_ok());
+    }
+
+    #[test]
+    fn queued_success_stub_does_not_bypass_pinned_route_fences() {
+        let (tmp, state, _source, entry, binding) = fixture();
+        let primary = tmp.path().join(".cache/agent-bus/routes.json");
+        std::fs::create_dir_all(primary.parent().unwrap()).unwrap();
+        write(&primary, &entry);
+        crate::discovery::note_route_file_scan(Some(tmp.path()), std::time::Instant::now());
+        let _stub = stub_queued_delivery_success();
+        reset_queued_delivery_calls();
+
+        // The queue has no Antigravity target, so this exercises the wrapper's
+        // fast path as well as the synthetic-success hook at the route boundary.
+        let codex = dispatch_queued_operator_prompt_with_intent_for_session(
+            &state,
+            Some("ada"),
+            binding.native_session(),
+            "owner",
+            "hello",
+            OperatorPromptIntent::OwnerSendNow,
+            Some("original-codex-thread"),
+            false,
+            None,
+            None,
+        );
+        assert!(matches!(
+            codex,
+            Err(OperatorPromptError::Steer(CodexSteerError::Refused {
+                stage: fl_wire::dispatcher::CodexSteerStage::Route,
+                ..
+            }))
+        ));
+        assert_eq!(queued_delivery_calls(), 0);
+
+        let vendor = dispatch_queued_operator_prompt_with_intent_for_session(
+            &state,
+            Some("ada"),
+            binding.native_session(),
+            "owner",
+            "hello",
+            OperatorPromptIntent::Ordinary,
+            None,
+            false,
+            None,
+            Some("codex"),
+        );
+        assert!(
+            matches!(vendor, Err(OperatorPromptError::Push(PushError::Failed(ref error)))
+            if error.contains("requested vendor"))
+        );
+        assert_eq!(queued_delivery_calls(), 0);
     }
 
     #[test]
