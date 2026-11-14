@@ -64,6 +64,10 @@ pub fn isolate_command(command: &mut Command, root: impl AsRef<Path>) -> io::Res
     command.env("FL_WIRE_CODEX_CONTROL_SOCK", root.join("c"));
     command.env("FL_TEST_RUN_USER_DIR", root.join("run-user"));
     command.env("FL_DB", root.join("fl.fls"));
+    command.env(
+        "FL_TEST_AGENT_HYDRATE_BIN",
+        root.join("no-bin/agent-hydrate"),
+    );
     command.env("FL_HUB_URL", "http://127.0.0.1:0");
     command.env("FL_WIRE_DISABLE_HOST_DISCOVERY", "1");
     #[cfg(unix)]

@@ -294,6 +294,20 @@ fn hydrate_program() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("agent-hydrate"))
 }
 
+/// Select the executable for an isolated fixture without consulting ambient PATH.
+/// The selected absolute path is checked again immediately before spawn.
+fn fixture_hydrate_program(
+    root: &Path,
+    program: Option<&std::ffi::OsStr>,
+) -> Result<PathBuf, String> {
+    let program = program
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .ok_or_else(|| "fixture agent-hydrate executable is not configured".to_string())?;
+    fl_fixture_path::check_endpoint(Some(root), &program).map_err(|error| error.to_string())?;
+    Ok(program)
+}
+
 pub fn resolve_socket_path(env: &StateEnv<'_>, explicit: Option<&Path>) -> PathBuf {
     fl_wire::daemon::resolve_socket_path(
         explicit,
@@ -2780,7 +2794,20 @@ pub fn run_agent_msg(env: &StateEnv<'_>, cli: AgentMsgCli) -> Result<i32, (i32, 
             Ok(0)
         }
         AgentMsgCmd::Hydrate { args } => {
-            let status = std::process::Command::new(hydrate_program())
+            let fixture_root = std::env::var_os("FL_TEST_ISOLATION_ROOT").map(PathBuf::from);
+            let program = match fixture_root.as_deref() {
+                Some(root) => fixture_hydrate_program(
+                    root,
+                    std::env::var_os("FL_TEST_AGENT_HYDRATE_BIN").as_deref(),
+                )
+                .map_err(|error| (1, error))?,
+                None => hydrate_program(),
+            };
+            // Check at the process boundary too; do not resolve a different executable
+            // through PATH after accepting the fixture path.
+            fl_fixture_path::check_endpoint(fixture_root.as_deref(), &program)
+                .map_err(|error| (1, error.to_string()))?;
+            let status = std::process::Command::new(&program)
                 .args(&args)
                 .status()
                 .map_err(|e| (1, format!("failed to run agent-hydrate: {e}")))?;
@@ -3296,6 +3323,33 @@ fn codex_queues_summary(queues: &[fl_wire::daemon::CodexRouteQueueStatus]) -> St
 
 #[cfg(test)]
 pub(crate) mod tests {
+    #[test]
+    fn fixture_hydrate_selection_requires_explicit_private_absolute_path() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let private = root.path().join("agent-hydrate");
+        std::fs::write(&private, b"fixture").unwrap();
+        assert_eq!(
+            super::fixture_hydrate_program(root.path(), Some(private.as_os_str())).unwrap(),
+            private
+        );
+        assert!(super::fixture_hydrate_program(root.path(), None).is_err());
+        assert!(
+            super::fixture_hydrate_program(
+                root.path(),
+                Some(std::ffi::OsStr::new("agent-hydrate"))
+            )
+            .is_err()
+        );
+        assert!(
+            super::fixture_hydrate_program(
+                root.path(),
+                Some(outside.path().join("agent-hydrate").as_os_str())
+            )
+            .is_err()
+        );
+    }
+
     #[test]
     fn fixture_refusal_does_not_fall_back_to_route_file() {
         let root = tempfile::tempdir().unwrap();
