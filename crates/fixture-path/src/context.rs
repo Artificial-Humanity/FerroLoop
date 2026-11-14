@@ -129,6 +129,43 @@ impl FixtureContext {
         }
         Ok(())
     }
+
+    /// Check an exact registered store or route creation target at this instant.
+    ///
+    /// Success is only a filesystem snapshot: it neither authorizes nor performs
+    /// creation or a later open. Paths can change immediately afterwards; a
+    /// future I/O boundary must retain helper ownership and recheck its target.
+    pub fn check_create_snapshot(&self, identity: &FixtureIdentity) -> io::Result<()> {
+        let path = match identity {
+            FixtureIdentity::Store {
+                path,
+                access: PathAccess::Create,
+                ..
+            }
+            | FixtureIdentity::Route {
+                path,
+                access: PathAccess::Create,
+            } => path,
+            _ => {
+                return Err(refused(
+                    "fixture identity is not a store or route creation target",
+                ));
+            }
+        };
+        self.check(identity)?;
+        let parent = path
+            .parent()
+            .ok_or_else(|| refused("fixture target has no parent"))?;
+        check_endpoint(Some(&self.root), parent)?;
+        if !std::fs::metadata(parent).map_err(refused)?.is_dir() {
+            return Err(refused("fixture target parent is not a directory"));
+        }
+        match std::fs::symlink_metadata(path) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(refused(error)),
+            Ok(_) => Err(refused("fixture creation target already exists")),
+        }
+    }
 }
 
 fn validate_identity(root: &Path, identity: &FixtureIdentity) -> io::Result<()> {
@@ -246,6 +283,171 @@ mod tests {
         let path = root.join("fixtures.json");
         std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
         path
+    }
+
+    fn create_snapshot_context(root: &Path, identities: &[FixtureIdentity]) -> FixtureContext {
+        let file = manifest(root, json!({"version": 1, "identities": identities}));
+        FixtureContext::load(root, &file).unwrap()
+    }
+
+    fn route_target(path: PathBuf) -> FixtureIdentity {
+        FixtureIdentity::Route {
+            path,
+            access: PathAccess::Create,
+        }
+    }
+
+    fn assert_snapshot_refused(context: &FixtureContext, identity: &FixtureIdentity) {
+        let error = context
+            .check_create_snapshot(identity)
+            .expect_err("target must be refused");
+        assert!(is_fixture_endpoint_refusal(&error), "{error}");
+    }
+
+    #[test]
+    fn create_snapshot_accepts_only_exact_registered_store_and_route_without_effects() {
+        let root = tempfile::tempdir().unwrap();
+        let route = route_target(root.path().join("route"));
+        let store = FixtureIdentity::Store {
+            backend: StoreBackend::Ferro,
+            path: root.path().join("store"),
+            access: PathAccess::Create,
+        };
+        let socket = FixtureIdentity::UnixSocket {
+            path: root.path().join("socket"),
+            access: PathAccess::Create,
+        };
+        let context =
+            create_snapshot_context(root.path(), &[route.clone(), store.clone(), socket.clone()]);
+        let before: HashSet<_> = std::fs::read_dir(root.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        context.check_create_snapshot(&route).unwrap();
+        context.check_create_snapshot(&store).unwrap();
+        assert_snapshot_refused(&context, &socket);
+        assert_snapshot_refused(&context, &route_target(root.path().join("unregistered")));
+        assert_snapshot_refused(
+            &context,
+            &FixtureIdentity::Store {
+                backend: StoreBackend::Redb,
+                path: root.path().join("store"),
+                access: PathAccess::Create,
+            },
+        );
+        assert_snapshot_refused(
+            &context,
+            &FixtureIdentity::Store {
+                backend: StoreBackend::Ferro,
+                path: root.path().join("store"),
+                access: PathAccess::Existing,
+            },
+        );
+        assert_snapshot_refused(
+            &context,
+            &FixtureIdentity::Route {
+                path: root.path().join("store"),
+                access: PathAccess::Create,
+            },
+        );
+        let outside = tempfile::tempdir().unwrap();
+        assert_snapshot_refused(&context, &route_target(outside.path().join("unregistered")));
+        assert_snapshot_refused(&context, &route_target(PathBuf::from("relative")));
+        assert_snapshot_refused(&context, &route_target(root.path().join("a/../route")));
+        let after: HashSet<_> = std::fs::read_dir(root.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(before, after);
+        assert!(!root.path().join("route").exists());
+        assert!(!root.path().join("store").exists());
+    }
+
+    #[test]
+    fn create_snapshot_refuses_existing_leaves_and_parent_failures_after_load() {
+        let root = tempfile::tempdir().unwrap();
+        let missing_parent = route_target(root.path().join("missing/target"));
+        let non_directory = route_target(root.path().join("file-parent/target"));
+        let file_target = route_target(root.path().join("arrived-file"));
+        let dir_target = route_target(root.path().join("arrived-dir"));
+        let identities = [
+            missing_parent.clone(),
+            non_directory.clone(),
+            file_target.clone(),
+            dir_target.clone(),
+        ];
+        let context = create_snapshot_context(root.path(), &identities);
+        std::fs::write(root.path().join("file-parent"), b"parent").unwrap();
+        std::fs::write(root.path().join("arrived-file"), b"payload").unwrap();
+        std::fs::create_dir(root.path().join("arrived-dir")).unwrap();
+        let before: HashSet<_> = std::fs::read_dir(root.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        for identity in &identities {
+            assert_snapshot_refused(&context, identity);
+        }
+        let after: HashSet<_> = std::fs::read_dir(root.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(before, after);
+        assert_eq!(
+            std::fs::read(root.path().join("arrived-file")).unwrap(),
+            b"payload"
+        );
+        assert!(!root.path().join("missing").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn create_snapshot_refuses_dangling_and_escaping_symlinks_without_effects() {
+        use std::os::unix::fs::symlink;
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let dangling_parent = route_target(root.path().join("dangling-parent/target"));
+        let escape_parent = route_target(root.path().join("escape-parent/target"));
+        let dangling_leaf = route_target(root.path().join("dangling-leaf"));
+        let existing_leaf = route_target(root.path().join("existing-leaf"));
+        let looping_leaf = route_target(root.path().join("looping-leaf"));
+        let identities = [
+            dangling_parent.clone(),
+            escape_parent.clone(),
+            dangling_leaf.clone(),
+            existing_leaf.clone(),
+            looping_leaf.clone(),
+        ];
+        let context = create_snapshot_context(root.path(), &identities);
+        symlink(
+            root.path().join("missing"),
+            root.path().join("dangling-parent"),
+        )
+        .unwrap();
+        symlink(outside.path(), root.path().join("escape-parent")).unwrap();
+        symlink(
+            root.path().join("missing"),
+            root.path().join("dangling-leaf"),
+        )
+        .unwrap();
+        symlink(outside.path(), root.path().join("existing-leaf")).unwrap();
+        symlink(
+            root.path().join("looping-leaf"),
+            root.path().join("looping-leaf"),
+        )
+        .unwrap();
+        let before: HashSet<_> = std::fs::read_dir(root.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        for identity in &identities {
+            assert_snapshot_refused(&context, identity);
+        }
+        let after: HashSet<_> = std::fs::read_dir(root.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(before, after);
+        assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 0);
     }
 
     #[test]
