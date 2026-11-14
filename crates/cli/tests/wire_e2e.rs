@@ -1462,11 +1462,55 @@ fn wire_status_active_and_inactive_daemon_fail_codex_queue_to_unknown_when_offli
     );
 }
 
+// Keep the hook test's daemon and all clients on the same private store.
+fn hook_hijack_command(env: &TestEnv) -> Command {
+    let mut command = codex_queue_command(env);
+    command.env("FL_DB", env.root.join("hook-hijack.fls"));
+    command
+}
+
+#[test]
+fn hook_hijack_command_uses_private_fixtures() {
+    let env = TestEnv::new();
+    let command = hook_hijack_command(&env);
+    let get = |key: &str| {
+        command
+            .get_envs()
+            .find(|(name, _)| *name == key)
+            .and_then(|(_, value)| value)
+            .map(|v| v.to_os_string())
+    };
+    for (name, path) in [
+        ("FL_DB", env.root.join("hook-hijack.fls")),
+        ("FL_WIRE_SOCKET", env.sock_file.clone()),
+        ("FL_WIRE_ROUTES", env.routes_file.clone()),
+        ("FL_WIRE_CODEX_CONTROL_SOCK", env.root.join("c")),
+        ("PATH", env.root.join("no-bin")),
+    ] {
+        assert_eq!(get(name).as_deref(), Some(path.as_os_str()), "{name}");
+    }
+    assert_eq!(
+        get("FL_STORE_BACKEND").as_deref(),
+        Some(std::ffi::OsStr::new("ferro"))
+    );
+    assert_eq!(
+        get("FL_WIRE_DISABLE_HOST_DISCOVERY").as_deref(),
+        Some(std::ffi::OsStr::new("1"))
+    );
+}
+
 #[test]
 fn daemon_hook_hijack_blocked_records_diagnostic_and_leaves_mail_unacked() {
     let env = TestEnv::new();
-    let store_path = env.data_dir.join("fl/fl.redb");
-    let store = std::sync::Arc::new(fl_store::open_store(&store_path).unwrap());
+    let store_path = env.root.join("hook-hijack.fls");
+    let store = fl_store::open_store_with(
+        &store_path,
+        &fl_store::StoreOptions {
+            backend: Some(fl_store::BackendKind::Ferro),
+            ..Default::default()
+        },
+    )
+    .unwrap();
 
     let mut routes = fl_wire::identity::RouteTable::default();
     routes.upsert_explicit_with_meta(
@@ -1474,7 +1518,7 @@ fn daemon_hook_hijack_blocked_records_diagnostic_and_leaves_mail_unacked() {
         fl_wire::identity::VendorRoute::Agy {
             conversation_id: "conv-hosted-feira".into(),
             ls_pid: Some(std::process::id()),
-            ls_address: Some("127.0.0.1:1".into()),
+            ls_address: Some("127.0.0.1:0".into()),
             csrf_token: Some("SECRET_CSRF".into()),
             agentapi_exe: Some(env.root.join("nonexistent-agy")),
         },
@@ -1509,27 +1553,22 @@ fn daemon_hook_hijack_blocked_records_diagnostic_and_leaves_mail_unacked() {
             .unwrap();
     }
 
-    let mut daemon = fl_wire::daemon::spawn_daemon(
-        std::sync::Arc::clone(&store),
-        fl_wire::daemon::DaemonConfig {
-            node_id: "node-460".into(),
-            host: "host-460".into(),
-            socket_path: env.sock_file.clone(),
-            routes_path: Some(env.routes_file.clone()),
-            home_override: Some(env.root.clone()),
-            listen_addr: None,
-            peers: vec![],
-            psk: vec![],
-        },
-    )
-    .unwrap();
+    // Release the seeding handle before the isolated child opens this store.
+    drop(store);
+    let mut daemon_command = hook_hijack_command(&env);
+    daemon_command
+        .args(["wire", "daemon"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let daemon = FixtureDaemon::start_command(&env, daemon_command);
 
     let spike_sock = env.root.join("999999.sock");
     for (idx, hosted_env) in [Some("antigravity:feira"), Some("Feira.antigravity"), None]
         .into_iter()
         .enumerate()
     {
-        let mut cmd = env.fl();
+        let mut cmd = hook_hijack_command(&env);
         cmd.args(["wire", "hook", "claude"])
             .env("AGENT_PERSONA", "feira")
             .env("CLAUDE_CODE_MESSAGING_SOCKET", &spike_sock)
@@ -1562,7 +1601,7 @@ fn daemon_hook_hijack_blocked_records_diagnostic_and_leaves_mail_unacked() {
 
     // Check daemon status: route is still Agy, registration_diagnostics recorded 3 refusals,
     // and unread mail for `feira` is still unacked!
-    let mut st_cmd = env.fl();
+    let mut st_cmd = hook_hijack_command(&env);
     st_cmd.args(["wire", "status", "--json"]);
     let st = run_json(st_cmd);
     assert_eq!(st["routes"].as_array().unwrap().len(), 1);
@@ -1582,7 +1621,10 @@ fn daemon_hook_hijack_blocked_records_diagnostic_and_leaves_mail_unacked() {
     assert_eq!(reg_diags[1]["reason"], "vendor_mismatch");
     assert_eq!(reg_diags[1]["count"], 1);
 
-    let text_out = env.fl().args(["wire", "status"]).output().unwrap();
+    let text_out = hook_hijack_command(&env)
+        .args(["wire", "status"])
+        .output()
+        .unwrap();
     assert!(text_out.status.success());
     let text = String::from_utf8(text_out.stdout).unwrap();
     assert!(
@@ -1592,10 +1634,10 @@ fn daemon_hook_hijack_blocked_records_diagnostic_and_leaves_mail_unacked() {
         "{text}"
     );
 
-    let mut read_cmd = env.fl();
+    let mut read_cmd = hook_hijack_command(&env);
     read_cmd.args(["wire", "read", "--for", "feira", "--json"]);
     let inbox = run_json(read_cmd);
-    daemon.stop();
+    drop(daemon);
     let arr = inbox.as_array().unwrap();
     assert_eq!(arr.len(), 1);
     assert_eq!(arr[0]["subject"], "Hosted inbox message");
