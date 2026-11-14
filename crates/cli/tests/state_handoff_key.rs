@@ -1,6 +1,9 @@
 //! Agents that share a scope write their handoffs under their own `--key`, so one agent's
 //! handoff never overwrites another's; the default key stays `current`.
 
+#[allow(dead_code)]
+mod common;
+
 use std::path::Path;
 
 use assert_cmd::Command;
@@ -9,7 +12,8 @@ use serde_json::Value;
 const SCOPE: &str = "project:demo";
 
 fn fl(cfg: &tempfile::TempDir, db: &Path) -> Command {
-    let mut c = Command::cargo_bin("fl").unwrap();
+    let mut c =
+        Command::from_std(common::isolated_command(env!("CARGO_BIN_EXE_fl"), cfg.path()).unwrap());
     c.env("XDG_CONFIG_HOME", cfg.path())
         .env_remove("FL_DB")
         .arg("--db")
@@ -153,4 +157,28 @@ fn handoff_get_ignores_a_memory_entry_with_the_same_key() {
     let h = json(&mut get(&cfg, &db, Some("alpha")));
     assert_eq!(h["concern"], "handoff", "{h}");
     assert_eq!(h["payload"]["handoff"]["summary"], "alpha handoff");
+}
+
+#[test]
+fn handoff_command_uses_private_fixture_environment() {
+    let cfg = tempfile::tempdir().unwrap();
+    let db = cfg.path().join("t.redb");
+    let cmd = fl(&cfg, &db);
+    let env = |name: &str| {
+        cmd.get_envs()
+            .find_map(|(key, value)| (key == name).then_some(value).flatten())
+    };
+    assert_eq!(env("HOME"), Some(cfg.path().as_os_str()));
+    assert_eq!(env("XDG_RUNTIME_DIR"), Some(cfg.path().as_os_str()));
+    assert_eq!(env("XDG_CONFIG_HOME"), Some(cfg.path().as_os_str()));
+    assert_eq!(
+        env("FL_WIRE_SOCKET"),
+        Some(cfg.path().join("w").as_os_str())
+    );
+    assert_eq!(env("PATH"), Some(cfg.path().join("no-bin").as_os_str()));
+    let args: Vec<_> = cmd.get_args().collect();
+    assert!(
+        args.windows(2)
+            .any(|pair| pair == [std::ffi::OsStr::new("--db"), db.as_os_str()])
+    );
 }

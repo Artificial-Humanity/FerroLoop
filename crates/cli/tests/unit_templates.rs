@@ -3,6 +3,9 @@
 //! must answer `--help`, and every flag the unit passes must be in that help. Nothing is
 //! started, and nothing reads a config, a store or the real systemd.
 
+#[allow(dead_code)]
+mod common;
+
 use assert_cmd::Command;
 use std::fs;
 use std::path::PathBuf;
@@ -41,6 +44,7 @@ const FL_UNITS: [(&str, &[&str]); 3] = [
 
 #[test]
 fn an_fl_unit_runs_a_real_subcommand_with_real_flags() {
+    let root = tempfile::tempdir().unwrap();
     for (name, path) in FL_UNITS {
         let exec = exec_start(&unit(name));
         let words: Vec<&str> = exec.split_whitespace().collect();
@@ -52,13 +56,13 @@ fn an_fl_unit_runs_a_real_subcommand_with_real_flags() {
             .collect();
         assert_eq!(sub, path, "{name}: {exec}");
 
-        let out = Command::cargo_bin("fl")
-            .unwrap()
-            .env_clear()
-            .args(&sub)
-            .arg("--help")
-            .output()
-            .unwrap();
+        let out = Command::from_std(
+            common::isolated_command(env!("CARGO_BIN_EXE_fl"), root.path()).unwrap(),
+        )
+        .args(&sub)
+        .arg("--help")
+        .output()
+        .unwrap();
         let help = String::from_utf8_lossy(&out.stdout).into_owned();
         assert!(out.status.success(), "{name}: fl {sub:?} --help\n{help}");
         for flag in words.iter().filter(|w| w.starts_with("--")) {
@@ -74,12 +78,12 @@ fn an_fl_unit_runs_a_real_subcommand_with_real_flags() {
 #[test]
 fn the_hub_unit_ui_dir_is_the_flag_the_hub_reads() {
     // the unit's `--ui-dir` is the flag `fl hub serve` takes, ahead of `[hub] ui_dir`
-    let help = Command::cargo_bin("fl")
-        .unwrap()
-        .env_clear()
-        .args(["hub", "serve", "--help"])
-        .output()
-        .unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let help =
+        Command::from_std(common::isolated_command(env!("CARGO_BIN_EXE_fl"), root.path()).unwrap())
+            .args(["hub", "serve", "--help"])
+            .output()
+            .unwrap();
     let help = String::from_utf8_lossy(&help.stdout).into_owned();
     assert!(help.contains("--ui-dir <UI_DIR>"), "{help}");
     // the repository a bound hub names is `--repo-root`, which the unit's comment points at
