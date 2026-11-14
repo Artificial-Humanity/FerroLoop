@@ -151,7 +151,7 @@ fn status_on_redb_reports_a_store_that_does_not_exist_and_creates_nothing() {
 fn status_on_redb_reports_size_and_format_version() {
     let env = Env::new();
     open_with(&env.logical(), BackendKind::Redb);
-    let v = status_json(env.redb(), &env.logical());
+    let v = status_json(env.isolated_redb(), &env.logical());
     assert_eq!(v["engine"], "redb");
     assert_eq!(v["exists"], true);
     assert_eq!(
@@ -165,7 +165,7 @@ fn status_on_redb_reports_size_and_format_version() {
 fn status_in_text_names_each_field() {
     let env = Env::new();
     open_with(&env.logical(), BackendKind::Redb);
-    env.redb()
+    env.isolated_redb()
         .arg("--db")
         .arg(env.logical())
         .args(["store", "status"])
@@ -179,7 +179,7 @@ fn status_in_text_names_each_field() {
 #[test]
 fn status_on_ferro_maps_the_logical_path_and_says_the_format_version_is_not_available() {
     let env = Env::new();
-    let v = status_json(env.ferro(), &env.logical());
+    let v = status_json(env.isolated_ferro(), &env.logical());
     assert_eq!(v["engine"], "ferro");
     assert_eq!(v["exists"], false);
     assert_eq!(v["logical_path"], env.logical().display().to_string());
@@ -191,7 +191,7 @@ fn status_on_ferro_maps_the_logical_path_and_says_the_format_version_is_not_avai
     assert!(env.files().is_empty(), "{:?}", env.files());
 
     open_with(&env.logical(), BackendKind::Ferro);
-    let v = status_json(env.ferro(), &env.logical());
+    let v = status_json(env.isolated_ferro(), &env.logical());
     assert_eq!(v["exists"], true);
     assert_eq!(
         v["size_bytes"].as_u64().unwrap(),
