@@ -1,3 +1,6 @@
+#[allow(dead_code)]
+mod common;
+
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -978,24 +981,121 @@ fn wire_status_diagnostics_old_and_offline_are_unavailable() {
     assert!(!output.contains("holds="));
 }
 
+// The daemon must run in the scrubbed child environment; a daemon thread in
+// this integration-test process would still observe the parent's live routes.
+fn diagnostics_command(env: &TestEnv) -> Command {
+    let mut cmd = common::isolated_fl(&env.root).unwrap();
+    cmd.current_dir(&env.work_dir)
+        .env("XDG_CONFIG_HOME", &env.cfg_dir)
+        .env("XDG_DATA_HOME", &env.data_dir)
+        .env("FL_DB", env.root.join("active.redb"))
+        .env("FL_STORE_BACKEND", "redb")
+        .env("FL_WIRE_SOCKET", &env.sock_file)
+        .env("FL_WIRE_ROUTES", &env.routes_file)
+        .env("HOSTNAME", "fixture-node");
+    cmd
+}
+
+fn diagnostics_daemon_command(env: &TestEnv) -> Command {
+    let mut cmd = diagnostics_command(env);
+    cmd.args(["wire", "daemon"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    cmd
+}
+
+struct FixtureDaemon(std::process::Child);
+
+impl FixtureDaemon {
+    fn start(env: &TestEnv) -> Self {
+        let mut daemon = Self(diagnostics_daemon_command(env).spawn().unwrap());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if let Ok(mut client) = fl_wire::daemon::LocalClient::connect(
+                &env.sock_file,
+                std::time::Duration::from_millis(100),
+            ) && matches!(
+                client.request(&fl_wire::daemon::LocalRequest::Status {
+                    include_codex_queues: false,
+                }),
+                Ok(fl_wire::daemon::LocalResponse::Status(_))
+            ) {
+                return daemon;
+            }
+            assert!(
+                daemon.0.try_wait().unwrap().is_none(),
+                "private wire daemon exited before becoming ready"
+            );
+            assert!(
+                std::time::Instant::now() < deadline,
+                "private wire daemon did not become ready"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+}
+
+impl Drop for FixtureDaemon {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+#[test]
+fn diagnostics_daemon_command_uses_private_fixtures() {
+    let env = TestEnv::new();
+    let cmd = diagnostics_daemon_command(&env);
+    let get = |key: &str| {
+        cmd.get_envs()
+            .find(|(name, _)| *name == key)
+            .and_then(|(_, value)| value)
+            .map(|v| v.to_os_string())
+    };
+    for (name, path) in [
+        ("FL_DB", env.root.join("active.redb")),
+        ("FL_WIRE_SOCKET", env.sock_file.clone()),
+        ("FL_WIRE_ROUTES", env.routes_file.clone()),
+        ("FL_WIRE_CODEX_CONTROL_SOCK", env.root.join("c")),
+    ] {
+        assert_eq!(get(name).as_deref(), Some(path.as_os_str()), "{name}");
+    }
+    #[cfg(unix)]
+    assert_eq!(
+        get("FL_HOST_SOCK").as_deref(),
+        Some(env.root.join("h").as_os_str())
+    );
+    #[cfg(windows)]
+    assert_eq!(
+        get("FL_HOST_SOCK").as_deref(),
+        Some(std::ffi::OsStr::new(&common::windows_pipe_suffix(
+            &env.root
+        )))
+    );
+    assert_eq!(
+        get("FL_STORE_BACKEND").as_deref(),
+        Some(std::ffi::OsStr::new("redb"))
+    );
+    assert_eq!(
+        get("FL_WIRE_DISABLE_HOST_DISCOVERY").as_deref(),
+        Some(std::ffi::OsStr::new("1"))
+    );
+    assert_eq!(
+        get("HOSTNAME").as_deref(),
+        Some(std::ffi::OsStr::new("fixture-node"))
+    );
+    assert_eq!(
+        get("PATH").as_deref(),
+        Some(env.root.join("no-bin").as_os_str())
+    );
+}
+
 #[test]
 fn wire_status_diagnostics_active_daemon_is_supported_empty() {
     let env = TestEnv::new();
-    let _daemon = fl_wire::daemon::spawn_daemon(
-        std::sync::Arc::new(fl_store::RedbStore::open(&env.root.join("active.redb")).unwrap()),
-        fl_wire::daemon::DaemonConfig {
-            node_id: "fixture-node".into(),
-            host: "fixture-host".into(),
-            socket_path: env.sock_file.clone(),
-            routes_path: Some(env.routes_file.clone()),
-            home_override: Some(env.root.clone()),
-            listen_addr: None,
-            peers: vec![],
-            psk: vec![],
-        },
-    )
-    .unwrap();
-    let mut command = env.fl();
+    let _daemon = FixtureDaemon::start(&env);
+    let mut command = diagnostics_command(&env);
     command.args(["wire", "status", "--json"]);
     let value = run_json(command);
     assert_eq!(value["node_id"], "fixture-node");
@@ -1013,7 +1113,10 @@ fn wire_status_diagnostics_active_daemon_is_supported_empty() {
     } else {
         assert!(snapshot["instance_nonce"].is_null());
     }
-    let output = env.fl().args(["wire", "status"]).output().unwrap();
+    let output = diagnostics_command(&env)
+        .args(["wire", "status"])
+        .output()
+        .unwrap();
     assert!(output.status.success());
     assert!(
         String::from_utf8(output.stdout)
