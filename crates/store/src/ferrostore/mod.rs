@@ -122,7 +122,6 @@ pub use state::MqRecord;
 use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
 use std::io;
-use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender};
@@ -1989,7 +1988,7 @@ impl FerroStore {
         if !socket_path_fits(&sock) {
             return Self::open(path);
         }
-        match UnixStream::connect(&sock) {
+        match crate::guarded_unix_connect(&sock) {
             Ok(stream) => {
                 let remote = server::client_from_unix(stream, &auth::ClientCred::None)
                     .map_err(|err| naming_socket(&sock, err))?;

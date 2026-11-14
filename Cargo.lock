@@ -669,6 +669,7 @@ dependencies = [
  "fl-core",
  "fl-host-proto",
  "fl-store",
+ "fl-wire",
  "libc",
  "ring",
  "rustls",

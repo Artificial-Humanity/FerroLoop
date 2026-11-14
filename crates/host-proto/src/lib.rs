@@ -21,6 +21,8 @@ pub use client::{
     AsyncHostClient, BlockingHostClient, ConnectOptions, ExtensionEventStream, HostEventStream,
     ReliableControllerGrant, ReliableEventStream, events,
 };
+#[cfg(feature = "hub-test-isolation")]
+pub use client::{install_test_bind_validator, install_test_endpoint_validator};
 pub use endpoint::HostEndpoint;
 #[cfg(feature = "hub-test-isolation")]
 pub use endpoint::enable_hub_test_isolation;

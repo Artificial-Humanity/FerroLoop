@@ -13,6 +13,20 @@ use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition, TableHand
 use std::collections::BTreeSet;
 use std::path::Path;
 
+#[cfg(feature = "wire-test-isolation")]
+#[doc(hidden)]
+pub mod test_isolation;
+
+#[cfg(unix)]
+pub(crate) fn guarded_unix_connect(
+    path: impl AsRef<Path>,
+) -> std::io::Result<std::os::unix::net::UnixStream> {
+    let path = path.as_ref();
+    #[cfg(feature = "wire-test-isolation")]
+    test_isolation::validate_unix(path)?;
+    std::os::unix::net::UnixStream::connect(path)
+}
+
 pub mod any;
 pub mod cli;
 pub mod code_knowledge;
