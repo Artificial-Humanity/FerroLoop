@@ -37,8 +37,9 @@ use crate::cmd::state::{
     search_and_record_in,
 };
 use crate::cmd::wire::{
-    execute_ack, execute_read, execute_reply, execute_send, inbox_item_to_json, now_millis,
-    parse_message_id, resolve_caller, wait_for_reply,
+    execute_ack_at, execute_read_at, execute_reply_with_options_at, execute_send_with_options_at,
+    inbox_item_to_json, now_millis, parse_message_id, resolve_caller_at, resolve_socket_path,
+    wait_for_reply_at, wire_no_daemon_env,
 };
 use crate::refs::{self, Ref};
 
@@ -548,6 +549,33 @@ fn resolve_optional_project_filter(
 }
 
 fn dispatch_tool(env: &StateEnv<'_>, name: &str, args: &Value) -> Result<String, String> {
+    let fixture_root = std::env::var_os("FL_TEST_ISOLATION_ROOT").map(PathBuf::from);
+    dispatch_tool_with_endpoint(env, name, args, fixture_root.as_deref(), || {
+        resolve_socket_path(env, None)
+    })
+}
+
+fn dispatch_tool_with_endpoint(
+    env: &StateEnv<'_>,
+    name: &str,
+    args: &Value,
+    fixture_root: Option<&std::path::Path>,
+    resolve_endpoint: impl FnOnce() -> PathBuf,
+) -> Result<String, String> {
+    let wire_socket = matches!(
+        name,
+        "send_message"
+            | "broadcast_message"
+            | "ask_message"
+            | "reply_message"
+            | "get_messages"
+            | "ack_message"
+    )
+    .then(resolve_endpoint);
+    let wire_socket = wire_socket.as_deref();
+    if let Some(sock) = wire_socket {
+        fl_fixture_path::check_endpoint(fixture_root, sock).map_err(|error| error.to_string())?;
+    }
     match name {
         "agent_roster" => {
             let project = args.get("project").and_then(Value::as_str);
@@ -963,13 +991,14 @@ fn dispatch_tool(env: &StateEnv<'_>, name: &str, args: &Value) -> Result<String,
                 .map(parse_message_id)
                 .transpose()?;
             let from_agent = args.get("from_agent").and_then(Value::as_str);
-            let sender_name = resolve_caller(env, from_agent, None);
+            let sender_name =
+                resolve_caller_at(env, from_agent, None, wire_socket.expect("wire endpoint"))?;
             let urgency = if urgent {
                 MessageUrgency::Urgent
             } else {
                 MessageUrgency::Normal
             };
-            let (msg, receipts) = execute_send(
+            let (msg, receipts) = execute_send_with_options_at(
                 env,
                 SendWireArgs {
                     id: None,
@@ -987,6 +1016,8 @@ fn dispatch_tool(env: &StateEnv<'_>, name: &str, args: &Value) -> Result<String,
                     deadline_at: None,
                     at: now_at(),
                 },
+                wire_no_daemon_env(),
+                wire_socket.expect("wire endpoint"),
             )?;
             Ok(serde_json::to_string_pretty(&json!({
                 "status": "sent",
@@ -1004,13 +1035,14 @@ fn dispatch_tool(env: &StateEnv<'_>, name: &str, args: &Value) -> Result<String,
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
             let from_agent = args.get("from_agent").and_then(Value::as_str);
-            let sender_name = resolve_caller(env, from_agent, None);
+            let sender_name =
+                resolve_caller_at(env, from_agent, None, wire_socket.expect("wire endpoint"))?;
             let urgency = if urgent {
                 MessageUrgency::Urgent
             } else {
                 MessageUrgency::Normal
             };
-            let (msg, receipts) = execute_send(
+            let (msg, receipts) = execute_send_with_options_at(
                 env,
                 SendWireArgs {
                     id: None,
@@ -1028,6 +1060,8 @@ fn dispatch_tool(env: &StateEnv<'_>, name: &str, args: &Value) -> Result<String,
                     deadline_at: None,
                     at: now_at(),
                 },
+                wire_no_daemon_env(),
+                wire_socket.expect("wire endpoint"),
             )?;
             Ok(serde_json::to_string_pretty(&json!({
                 "status": "broadcast",
@@ -1042,11 +1076,12 @@ fn dispatch_tool(env: &StateEnv<'_>, name: &str, args: &Value) -> Result<String,
             let body = req_str(args, "body")?.to_string();
             let timeout_secs = args.get("timeout_secs").and_then(Value::as_u64);
             let from_agent = args.get("from_agent").and_then(Value::as_str);
-            let sender_name = resolve_caller(env, from_agent, None);
+            let sender_name =
+                resolve_caller_at(env, from_agent, None, wire_socket.expect("wire endpoint"))?;
             let now_ms = now_millis();
             let now = At::from_unix_millis(now_ms);
             let deadline_at = timeout_secs.map(|s| At::from_unix_millis(now_ms + s * 1000));
-            let (ask_msg, receipts) = execute_send(
+            let (ask_msg, receipts) = execute_send_with_options_at(
                 env,
                 SendWireArgs {
                     id: None,
@@ -1064,10 +1099,17 @@ fn dispatch_tool(env: &StateEnv<'_>, name: &str, args: &Value) -> Result<String,
                     deadline_at,
                     at: now,
                 },
+                wire_no_daemon_env(),
+                wire_socket.expect("wire endpoint"),
             )?;
             if let Some(secs) = timeout_secs {
-                let reply =
-                    wait_for_reply(env, &ask_msg.id, &sender_name, Duration::from_secs(secs))?;
+                let reply = wait_for_reply_at(
+                    env,
+                    &ask_msg.id,
+                    &sender_name,
+                    Duration::from_secs(secs),
+                    wire_socket.expect("wire endpoint"),
+                )?;
                 Ok(serde_json::to_string_pretty(&json!({
                     "ask": ask_msg,
                     "receipts": receipts,
@@ -1090,8 +1132,17 @@ fn dispatch_tool(env: &StateEnv<'_>, name: &str, args: &Value) -> Result<String,
                 .and_then(Value::as_str)
                 .map(ToOwned::to_owned);
             let from_agent = args.get("from_agent").and_then(Value::as_str);
-            let sender_name = resolve_caller(env, from_agent, None);
-            let (msg, receipts) = execute_reply(env, &parent_id, subject, body, sender_name)?;
+            let sender_name =
+                resolve_caller_at(env, from_agent, None, wire_socket.expect("wire endpoint"))?;
+            let (msg, receipts) = execute_reply_with_options_at(
+                env,
+                &parent_id,
+                subject,
+                body,
+                sender_name,
+                wire_no_daemon_env(),
+                wire_socket.expect("wire endpoint"),
+            )?;
             Ok(serde_json::to_string_pretty(&json!({
                 "status": "replied",
                 "message": msg,
@@ -1106,13 +1157,14 @@ fn dispatch_tool(env: &StateEnv<'_>, name: &str, args: &Value) -> Result<String,
                 .unwrap_or(true);
             let ack = args.get("ack").and_then(Value::as_bool).unwrap_or(false);
             let agent = args.get("agent").and_then(Value::as_str);
-            let recipient = resolve_caller(env, agent, None);
+            let recipient =
+                resolve_caller_at(env, agent, None, wire_socket.expect("wire endpoint"))?;
             let thread_id = args
                 .get("thread_id")
                 .and_then(Value::as_str)
                 .map(parse_message_id)
                 .transpose()?;
-            let items = execute_read(
+            let items = execute_read_at(
                 env,
                 WireFilter {
                     recipient: Some(recipient),
@@ -1122,6 +1174,7 @@ fn dispatch_tool(env: &StateEnv<'_>, name: &str, args: &Value) -> Result<String,
                     limit: None,
                 },
                 ack,
+                wire_socket.expect("wire endpoint"),
             )?;
             let out: Vec<Value> = items.iter().map(inbox_item_to_json).collect();
             Ok(serde_json::to_string_pretty(&out).unwrap())
@@ -1129,8 +1182,14 @@ fn dispatch_tool(env: &StateEnv<'_>, name: &str, args: &Value) -> Result<String,
         "ack_message" => {
             let mid = parse_message_id(req_str(args, "message_id")?)?;
             let agent = args.get("agent").and_then(Value::as_str);
-            let recipient = resolve_caller(env, agent, None);
-            let receipts = execute_ack(env, vec![mid], recipient)?;
+            let recipient =
+                resolve_caller_at(env, agent, None, wire_socket.expect("wire endpoint"))?;
+            let receipts = execute_ack_at(
+                env,
+                vec![mid],
+                recipient,
+                wire_socket.expect("wire endpoint"),
+            )?;
             Ok(serde_json::to_string_pretty(&json!({
                 "status": "acknowledged",
                 "receipts": receipts,
@@ -1757,6 +1816,56 @@ fn tool_definitions() -> Value {
 mod tests {
     use super::*;
     use fl_core::MemStore;
+
+    #[test]
+    fn wire_tools_refuse_outside_endpoint_before_store_creation() {
+        let dir = tempfile::tempdir().unwrap();
+        let fixture_root = dir.path().join("fixture");
+        std::fs::create_dir(&fixture_root).unwrap();
+        let outside = dir.path().join("outside").join("wire.sock");
+        let store_path = dir.path().join("uncreated").join("store.fls");
+        let cfg = crate::config::Config::default();
+        let env = StateEnv {
+            explicit_db: None,
+            default_store: &store_path,
+            cfg: &cfg,
+            cwd: dir.path(),
+        };
+        let args = json!({"to": "someone", "subject": "s", "body": "b", "message_id": "01900000-0000-7000-8000-000000000000"});
+        for name in [
+            "send_message",
+            "broadcast_message",
+            "ask_message",
+            "reply_message",
+            "get_messages",
+            "ack_message",
+        ] {
+            let err = dispatch_tool_with_endpoint(&env, name, &args, Some(&fixture_root), || {
+                outside.clone()
+            })
+            .unwrap_err();
+            assert!(err.contains("fixture endpoint refused"), "{name}: {err}");
+            assert!(
+                !store_path.parent().unwrap().exists(),
+                "{name} opened the store"
+            );
+            assert!(
+                !outside.parent().unwrap().exists(),
+                "{name} touched the endpoint"
+            );
+        }
+        // Tools unrelated to wire are not given an endpoint to preflight.
+        let err = dispatch_tool_with_endpoint(
+            &env,
+            "not_a_tool",
+            &json!({}),
+            Some(&fixture_root),
+            || panic!("non-wire tool resolved a socket"),
+        )
+        .unwrap_err();
+        assert!(!err.contains("fixture endpoint refused"));
+        assert!(!store_path.parent().unwrap().exists());
+    }
 
     fn alias_entry(
         dir: &std::path::Path,

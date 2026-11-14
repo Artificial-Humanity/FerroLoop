@@ -336,7 +336,7 @@ pub fn resolve_caller_with_source(
 }
 
 /// Resolve a caller while retaining the already preflighted wire endpoint.
-fn resolve_caller_at(
+pub(super) fn resolve_caller_at(
     env: &StateEnv<'_>,
     explicit: Option<&str>,
     transcript: Option<&Path>,
@@ -1395,7 +1395,7 @@ fn classify_local_connection_typed<T>(
     }
 }
 
-fn wire_no_daemon_env() -> bool {
+pub(super) fn wire_no_daemon_env() -> bool {
     std::env::var("FL_WIRE_NO_DAEMON").as_deref() == Ok("1")
 }
 
@@ -1415,7 +1415,7 @@ pub fn execute_send_with_options(
     execute_send_with_options_at(env, args, no_daemon, &sock)
 }
 
-fn execute_send_with_options_at(
+pub(super) fn execute_send_with_options_at(
     env: &StateEnv<'_>,
     mut args: SendWireArgs,
     no_daemon: bool,
@@ -1472,7 +1472,7 @@ pub fn execute_read(
     execute_read_at(env, filter, ack, &sock)
 }
 
-fn execute_read_at(
+pub(super) fn execute_read_at(
     env: &StateEnv<'_>,
     filter: WireFilter,
     ack: bool,
@@ -1551,7 +1551,7 @@ pub fn execute_ack(
     execute_ack_at(env, message_ids, recipient, &sock)
 }
 
-fn execute_ack_at(
+pub(super) fn execute_ack_at(
     env: &StateEnv<'_>,
     message_ids: Vec<MessageId>,
     recipient: String,
@@ -1582,23 +1582,6 @@ fn execute_ack_at(
     Ok(out)
 }
 
-pub fn execute_reply(
-    env: &StateEnv<'_>,
-    parent_id: &MessageId,
-    subject_override: Option<String>,
-    body: String,
-    sender_name: String,
-) -> Result<(WireMessage, Vec<DeliveryReceipt>), String> {
-    execute_reply_with_options(
-        env,
-        parent_id,
-        subject_override,
-        body,
-        sender_name,
-        wire_no_daemon_env(),
-    )
-}
-
 pub fn execute_reply_with_options(
     env: &StateEnv<'_>,
     parent_id: &MessageId,
@@ -1606,6 +1589,27 @@ pub fn execute_reply_with_options(
     body: String,
     sender_name: String,
     no_daemon: bool,
+) -> Result<(WireMessage, Vec<DeliveryReceipt>), String> {
+    let sock = resolve_socket_path(env, None);
+    execute_reply_with_options_at(
+        env,
+        parent_id,
+        subject_override,
+        body,
+        sender_name,
+        no_daemon,
+        &sock,
+    )
+}
+
+pub(super) fn execute_reply_with_options_at(
+    env: &StateEnv<'_>,
+    parent_id: &MessageId,
+    subject_override: Option<String>,
+    body: String,
+    sender_name: String,
+    no_daemon: bool,
+    sock: &Path,
 ) -> Result<(WireMessage, Vec<DeliveryReceipt>), String> {
     let parent = {
         let store = env.open_for_scope(Some(&StateScope::Workspace))?;
@@ -1628,7 +1632,7 @@ pub fn execute_reply_with_options(
         Some(id) => WireAddress::AgentId(id),
         None => WireAddress::AgentName(parent.sender_name.clone()),
     };
-    execute_send_with_options(
+    execute_send_with_options_at(
         env,
         SendWireArgs {
             id: None,
@@ -1647,6 +1651,7 @@ pub fn execute_reply_with_options(
             at: now_at(),
         },
         no_daemon,
+        sock,
     )
 }
 
@@ -1657,10 +1662,20 @@ pub fn wait_for_reply(
     timeout: Duration,
 ) -> Result<Option<WireMessage>, String> {
     let sock = resolve_socket_path(env, None);
+    wait_for_reply_at(env, ask_id, recipient, timeout, &sock)
+}
+
+pub(super) fn wait_for_reply_at(
+    env: &StateEnv<'_>,
+    ask_id: &MessageId,
+    recipient: &str,
+    timeout: Duration,
+    sock: &Path,
+) -> Result<Option<WireMessage>, String> {
     let deadline = Instant::now() + timeout;
 
     if let Some(mut sub_client) =
-        classify_local_connection(LocalClient::connect(&sock, DEFAULT_LOCAL_RPC_TIMEOUT))?
+        classify_local_connection(LocalClient::connect(sock, DEFAULT_LOCAL_RPC_TIMEOUT))?
         && sub_client
             .subscribe(Some(recipient.to_string()), Some(ask_id.clone()))
             .is_ok()
