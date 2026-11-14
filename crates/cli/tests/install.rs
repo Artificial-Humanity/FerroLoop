@@ -2,6 +2,9 @@
 //! plans and prints; these tests check that it is deterministic, that it
 //! refuses with the documented exit codes, and that it creates NOTHING.
 
+#[allow(dead_code)]
+mod common;
+
 use assert_cmd::Command;
 use fl_core::install::{ArchitectureCheck, default_manifest};
 use predicates::prelude::PredicateBooleanExt;
@@ -61,12 +64,14 @@ impl World {
         c
     }
 
-    fn bare(&self) -> Command {
-        let mut c = Command::cargo_bin("fl").unwrap();
-        c.env_clear()
-            .env("HOME", self.home.path())
-            .current_dir(self.cwd.path());
+    fn bare_command(&self) -> std::process::Command {
+        let mut c = common::isolated_fl(self.home.path()).unwrap();
+        c.current_dir(self.cwd.path());
         c
+    }
+
+    fn bare(&self) -> Command {
+        Command::from_std(self.bare_command())
     }
 
     fn prefix(&self) -> PathBuf {
@@ -91,6 +96,28 @@ fn stdout(c: &mut Command) -> String {
         String::from_utf8_lossy(&out.stderr)
     );
     String::from_utf8(out.stdout).unwrap()
+}
+
+#[test]
+fn dry_run_fixture_uses_private_runtime_paths() {
+    let w = World::new();
+    let c = w.bare_command();
+    let env = |name: &str| {
+        c.get_envs()
+            .find(|(k, _)| *k == name)
+            .and_then(|(_, v)| v)
+            .map(|v| v.to_os_string())
+    };
+    assert_eq!(env("HOME").as_deref(), Some(w.home.path().as_os_str()));
+    assert_eq!(
+        env("PATH").as_deref(),
+        Some(w.home.path().join("no-bin").as_os_str())
+    );
+    #[cfg(unix)]
+    assert_eq!(
+        env("FL_HOST_SOCK").as_deref(),
+        Some(w.home.path().join("h").as_os_str())
+    );
 }
 
 #[test]
@@ -651,8 +678,8 @@ fn install_manifest_matches_the_code() {
 fn without_a_home_the_default_prefix_cannot_be_located() {
     let w = World::new();
     for home in [None, Some("")] {
-        let mut c = Command::cargo_bin("fl").unwrap();
-        c.env_clear().current_dir(w.cwd.path());
+        let mut c = w.bare();
+        c.env_remove("HOME");
         if let Some(h) = home {
             c.env("HOME", h);
         }
@@ -665,8 +692,8 @@ fn without_a_home_the_default_prefix_cannot_be_located() {
             ));
     }
     // an explicit prefix or an isolated root needs no HOME
-    let mut c = Command::cargo_bin("fl").unwrap();
-    c.env_clear()
+    let mut c = w.bare();
+    c.env_remove("HOME")
         .env("FL_INSTALL_ROOT", w.root.path())
         .args(["install", "--dry-run"])
         .assert()
