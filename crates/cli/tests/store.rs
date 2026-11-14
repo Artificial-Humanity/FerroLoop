@@ -595,7 +595,7 @@ fn ferro_with_neither_file_present_an_iri_lookup_is_not_owned_and_creates_nothin
     let env = Env::new();
     let proj = bind_project(&env, &env.logical());
     let before = snapshot(&[env.home.path(), env.stores.path(), proj.path()]);
-    env.ferro()
+    env.isolated_ferro()
         .current_dir(proj.path())
         .args(["gate", "show", STRANGER])
         .assert()
@@ -613,7 +613,7 @@ fn ferro_with_neither_file_present_an_iri_lookup_is_not_owned_and_creates_nothin
 fn ferro_with_an_explicit_db_an_iri_lookup_is_not_owned_and_creates_nothing() {
     let env = Env::new();
     let before = snapshot(&[env.home.path(), env.stores.path()]);
-    env.ferro()
+    env.isolated_ferro()
         .arg("--db")
         .arg(env.logical())
         .args(["gate", "show", STRANGER])

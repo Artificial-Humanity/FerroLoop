@@ -743,7 +743,7 @@ fn an_empty_or_relative_xdg_data_home_falls_back_to_home_not_the_cwd() {
 fn an_iri_on_a_fresh_install_says_no_store_exists_yet() {
     let env = Env::new();
     let cwd = tempfile::tempdir().unwrap();
-    env.fl(cwd.path())
+    env.isolated_fl(cwd.path())
         .args(["gate", "show", STRANGER])
         .assert()
         .code(2)
