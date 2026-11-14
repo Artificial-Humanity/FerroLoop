@@ -2222,6 +2222,52 @@ fn mcp_and_cli_discover_daemon_via_run_user_fallback_without_xdg_runtime_dir_and
 }
 
 #[cfg(unix)]
+fn queued_delivery_command(env: &TestEnv) -> Command {
+    let mut command = common::isolated_fl(&env.root).unwrap();
+    command
+        .current_dir(&env.work_dir)
+        .env("XDG_CONFIG_HOME", &env.cfg_dir)
+        .env("XDG_DATA_HOME", &env.data_dir)
+        .env("FL_DB", env.root.join("queued.fls"))
+        .env("FL_STORE_BACKEND", "ferro")
+        .env("FL_WIRE_SOCKET", &env.sock_file)
+        .env("FL_WIRE_ROUTES", &env.routes_file)
+        .env("HOSTNAME", "node-delayed");
+    command
+}
+
+#[cfg(unix)]
+#[test]
+fn queued_delivery_command_uses_private_fixtures() {
+    let env = TestEnv::new();
+    let command = queued_delivery_command(&env);
+    let get = |key: &str| {
+        command
+            .get_envs()
+            .find(|(name, _)| *name == key)
+            .and_then(|(_, value)| value)
+            .map(|v| v.to_os_string())
+    };
+    for (name, path) in [
+        ("FL_DB", env.root.join("queued.fls")),
+        ("FL_WIRE_SOCKET", env.sock_file.clone()),
+        ("FL_WIRE_ROUTES", env.routes_file.clone()),
+        ("FL_HOST_SOCK", env.root.join("h")),
+        ("FL_WIRE_CODEX_CONTROL_SOCK", env.root.join("c")),
+    ] {
+        assert_eq!(get(name).as_deref(), Some(path.as_os_str()), "{name}");
+    }
+    assert_eq!(
+        get("FL_STORE_BACKEND").as_deref(),
+        Some(std::ffi::OsStr::new("ferro"))
+    );
+    assert_eq!(
+        get("FL_WIRE_DISABLE_HOST_DISCOVERY").as_deref(),
+        Some(std::ffi::OsStr::new("1"))
+    );
+}
+
+#[cfg(unix)]
 #[test]
 fn cli_queues_when_daemon_unreachable_and_daemon_delivers_on_startup() {
     use fl_core::MessageStore;
@@ -2230,14 +2276,14 @@ fn cli_queues_when_daemon_unreachable_and_daemon_delivers_on_startup() {
     use std::time::{Duration, Instant};
 
     let env = TestEnv::new();
-    let store_path = env.data_dir.join("fl/fl.redb");
+    let store_path = env.root.join("queued.fls");
     let sock = env.root.join("delayed-daemon.sock");
     let hook_sock = env.root.join("felicia-hook.sock");
     let listener = UnixListener::bind(&hook_sock).unwrap();
     listener.set_nonblocking(true).unwrap();
 
     // Register felicia in store and save her webhook route in routes.json.
-    let mut reg_cmd = env.fl();
+    let mut reg_cmd = queued_delivery_command(&env);
     reg_cmd.args([
         "wire",
         "register",
@@ -2261,7 +2307,7 @@ fn cli_queues_when_daemon_unreachable_and_daemon_delivers_on_startup() {
 
     // 0. If the store write fails while the daemon is unreachable, the client returns an error
     //    and never claims it queued anything.
-    let mut bad_send = env.fl();
+    let mut bad_send = queued_delivery_command(&env);
     bad_send.env("FL_WIRE_SOCKET", &sock).args([
         "wire",
         "send",
@@ -2281,7 +2327,7 @@ fn cli_queues_when_daemon_unreachable_and_daemon_delivers_on_startup() {
 
     // 1. Send with no daemon running at `sock` (and without `--no-daemon`):
     //    must queue for the daemon (`Pending`, `attempts == 0`), print notice on stderr, and NOT push in-process.
-    let mut send_cmd = env.fl();
+    let mut send_cmd = queued_delivery_command(&env);
     send_cmd.env("FL_WIRE_SOCKET", &sock).args([
         "wire",
         "send",
@@ -2312,21 +2358,15 @@ fn cli_queues_when_daemon_unreachable_and_daemon_delivers_on_startup() {
     );
 
     // 2. Start the daemon at `sock`: it drains the queued message and delivers it to `felicia`!
-    let store = std::sync::Arc::new(fl_store::open_store(&store_path).unwrap());
-    let mut daemon = fl_wire::daemon::spawn_daemon(
-        std::sync::Arc::clone(&store),
-        fl_wire::daemon::DaemonConfig {
-            node_id: "node-delayed".into(),
-            host: "host-delayed".into(),
-            socket_path: sock.clone(),
-            routes_path: Some(env.routes_file.clone()),
-            home_override: Some(env.root.clone()),
-            listen_addr: None,
-            peers: vec![],
-            psk: vec![],
-        },
-    )
-    .unwrap();
+    let mut daemon_command = queued_delivery_command(&env);
+    daemon_command
+        .env("FL_WIRE_SOCKET", &sock)
+        .args(["wire", "daemon"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let daemon = FixtureDaemon::start_command_at(&sock, daemon_command);
+    let store = fl_store::open_store(&store_path).unwrap();
 
     let deadline = Instant::now() + Duration::from_secs(3);
     let mut delivered = None;
@@ -2347,7 +2387,7 @@ fn cli_queues_when_daemon_unreachable_and_daemon_delivers_on_startup() {
     //    (`wrong-client.sock`) writes to the shared store and the running daemon picks it up
     //    via the store-backed awaiting-daemon marker and delivers it!
     let wrong_sock = env.root.join("wrong-client.sock");
-    let mut wrong_sock_cmd = env.fl();
+    let mut wrong_sock_cmd = queued_delivery_command(&env);
     wrong_sock_cmd.env("FL_WIRE_SOCKET", &wrong_sock).args([
         "wire",
         "send",
@@ -2381,7 +2421,7 @@ fn cli_queues_when_daemon_unreachable_and_daemon_delivers_on_startup() {
             std::thread::sleep(Duration::from_millis(25));
         }
     }
-    daemon.stop();
+    drop(daemon);
     let payload_2 = delivered_wrong_sock
         .expect("running daemon must pick up message from client with wrong socket path");
     assert!(payload_2.contains("wrong-sock-subj"));
