@@ -2,6 +2,9 @@
 //! report (the seven ids, the statuses, the JSON contract), the exit codes (0 no failure, 1 a
 //! failure, 3 a refused repair) and, above all, that NOTHING was written, anywhere.
 
+#[allow(dead_code)]
+mod common;
+
 use assert_cmd::Command;
 use fl_core::install::{
     InstallReceipt, OwnedAlias, OwnedPath, OwnedPathKind, OwnedUnit, Product, Profile,
@@ -77,13 +80,19 @@ impl World {
         }
     }
 
-    fn fl(&self) -> Command {
-        let mut c = Command::cargo_bin("fl").unwrap();
-        c.env_clear()
-            .env("HOME", self.home.path())
+    fn fl_command(&self) -> std::process::Command {
+        let mut c = common::isolated_fl(self.home.path()).unwrap();
+        // Doctor checks HOME's default store and config, not an explicit FL_DB.
+        c.env_remove("FL_DB")
+            .env("XDG_CONFIG_HOME", self.home.path().join(".config"))
+            .env("XDG_DATA_HOME", self.home.path().join(".local/share"))
             .env("FL_INSTALL_ROOT", self.root.path())
             .current_dir(self.cwd.path());
         c
+    }
+
+    fn fl(&self) -> Command {
+        Command::from_std(self.fl_command())
     }
 
     fn prefix(&self) -> PathBuf {
@@ -240,6 +249,38 @@ impl World {
     }
 }
 
+#[test]
+fn doctor_command_uses_private_defaults() {
+    let w = World::new();
+    let command = w.fl_command();
+    let env = |name: &str| {
+        command
+            .get_envs()
+            .find(|(key, _)| *key == name)
+            .and_then(|(_, value)| value)
+            .map(|value| value.to_os_string())
+    };
+    assert_eq!(env("HOME").as_deref(), Some(w.home.path().as_os_str()));
+    assert_eq!(
+        env("XDG_CONFIG_HOME").as_deref(),
+        Some(w.home.path().join(".config").as_os_str())
+    );
+    assert_eq!(
+        env("XDG_DATA_HOME").as_deref(),
+        Some(w.home.path().join(".local/share").as_os_str())
+    );
+    assert_eq!(
+        env("FL_WIRE_SOCKET").as_deref(),
+        Some(w.home.path().join("w").as_os_str())
+    );
+    assert_eq!(env("FL_DB"), None);
+    assert_eq!(
+        env("FL_INSTALL_ROOT").as_deref(),
+        Some(w.root.path().as_os_str())
+    );
+    assert_eq!(command.get_current_dir(), Some(w.cwd.path()));
+}
+
 fn status<'a>(v: &'a Value, id: &str) -> &'a str {
     v["checks"]
         .as_array()
@@ -264,10 +305,9 @@ fn detail<'a>(v: &'a Value, id: &str) -> &'a str {
 
 /// What this binary says about itself: (the full commit, whether it is clean).
 fn this_build() -> (String, bool) {
-    let out = Command::cargo_bin("fl")
-        .unwrap()
+    let home = tempfile::tempdir().unwrap();
+    let out = Command::from_std(common::isolated_fl(home.path()).unwrap())
         .args(["--version", "--json"])
-        .env_clear()
         .output()
         .unwrap();
     let v: Value = serde_json::from_slice(&out.stdout).unwrap();
@@ -594,16 +634,14 @@ fn a_broken_config_does_not_stop_the_doctor_but_keeps_the_store_check_honest() {
 
 #[test]
 fn doctor_spawns_nothing_and_needs_no_network_or_path() {
-    // An empty environment: no PATH to find a helper on, no proxy, no HOME-wide tools. If the
+    // No PATH to find a helper on, no proxy, no HOME-wide tools. If the
     // command ran a subprocess or reached the network it would fail or hang here.
     let w = World::new();
     w.install();
     let out = w
         .fl()
         .args(["doctor", "--json"])
-        .env_clear()
-        .env("HOME", w.home.path())
-        .env("FL_INSTALL_ROOT", w.root.path())
+        .env_remove("PATH")
         .timeout(std::time::Duration::from_secs(20))
         .output()
         .unwrap();
