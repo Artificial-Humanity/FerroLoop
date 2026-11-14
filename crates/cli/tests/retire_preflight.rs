@@ -18,10 +18,16 @@ enum Invocation {
     LegacySubcommand,
     LegacyExecutable,
     WireStatus,
+    WireRegister,
+    LegacyRegister,
+    LegacyExecutableRegister,
 }
 
 fn run_refused_command(root: &Path, outside_socket: &Path, db: &Path, invocation: Invocation) {
-    let mut command = if matches!(invocation, Invocation::LegacyExecutable) {
+    let mut command = if matches!(
+        invocation,
+        Invocation::LegacyExecutable | Invocation::LegacyExecutableRegister
+    ) {
         let alias = root.join("agent-msg");
         if !alias.exists() {
             let binary = common::isolated_fl(root).unwrap();
@@ -36,6 +42,18 @@ fn run_refused_command(root: &Path, outside_socket: &Path, db: &Path, invocation
         .env("FL_TEST_ISOLATION_ROOT", root)
         .env("FL_WIRE_SOCKET", outside_socket)
         .env("FL_TEST_SPAWN_MARKER", root.join("vendor-spawned"));
+    if matches!(
+        invocation,
+        Invocation::WireRegister
+            | Invocation::LegacyRegister
+            | Invocation::LegacyExecutableRegister
+    ) {
+        // Exercise the hydration and route-capture entry path; refusal must
+        // happen before either can open a store or touch a route.
+        command
+            .env("AGENT_HYDRATION_GENERATION", "fixture-generation")
+            .env("CLAUDE_SESSION_ID", "fixture-session");
+    }
     match invocation {
         Invocation::Retire => {
             command.args([
@@ -62,6 +80,47 @@ fn run_refused_command(root: &Path, outside_socket: &Path, db: &Path, invocation
         }
         Invocation::WireStatus => {
             command.args(["--db", db.to_str().unwrap(), "wire", "status", "--json"]);
+        }
+        Invocation::WireRegister => {
+            command.args([
+                "--db",
+                db.to_str().unwrap(),
+                "wire",
+                "register",
+                "Felicia",
+                "--project",
+                "ferroloop",
+                "--role",
+                "assistant",
+                "--replace",
+            ]);
+        }
+        Invocation::LegacyRegister => {
+            command.args([
+                "agent-msg",
+                "--db",
+                db.to_str().unwrap(),
+                "register",
+                "Felicia",
+                "--project",
+                "ferroloop",
+                "--role",
+                "assistant",
+                "--replace",
+            ]);
+        }
+        Invocation::LegacyExecutableRegister => {
+            command.args([
+                "--db",
+                db.to_str().unwrap(),
+                "register",
+                "Felicia",
+                "--project",
+                "ferroloop",
+                "--role",
+                "assistant",
+                "--replace",
+            ]);
         }
     }
     let output = command.output().unwrap();
@@ -91,6 +150,21 @@ fn wire_status_outside_socket_refuses_before_store_or_route_fallback() {
 }
 
 #[test]
+fn wire_register_refuses_before_store_or_route_mutation() {
+    assert_outside_socket_refusal(Invocation::WireRegister);
+}
+
+#[test]
+fn legacy_register_refuses_before_store_or_route_mutation() {
+    assert_outside_socket_refusal(Invocation::LegacyRegister);
+}
+
+#[test]
+fn legacy_executable_register_refuses_before_store_or_route_mutation() {
+    assert_outside_socket_refusal(Invocation::LegacyExecutableRegister);
+}
+
+#[test]
 fn wire_status_private_offline_socket_keeps_offline_fallback() {
     let root = tempfile::tempdir().unwrap();
     let db = root.path().join("offline.redb");
@@ -109,6 +183,41 @@ fn wire_status_private_offline_socket_keeps_offline_fallback() {
     );
     let status: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(status["daemon"], "inactive");
+}
+
+#[test]
+fn wire_register_private_offline_socket_keeps_offline_behavior() {
+    let root = tempfile::tempdir().unwrap();
+    let db = root.path().join("offline.redb");
+    let output = common::isolated_fl(root.path())
+        .unwrap()
+        .current_dir(root.path())
+        .env("FL_TEST_ISOLATION_ROOT", root.path())
+        .env("FL_WIRE_SOCKET", root.path().join("missing.sock"))
+        .args([
+            "--db",
+            db.to_str().unwrap(),
+            "wire",
+            "register",
+            "Felicia",
+            "--project",
+            "ferroloop",
+            "--role",
+            "assistant",
+            "--replace",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let store = fl_store::RedbStore::open(&db).unwrap();
+    assert_eq!(
+        store.agent_by_name("felicia").unwrap().unwrap().status,
+        AgentStatus::Active
+    );
 }
 
 fn assert_outside_socket_refusal(invocation: Invocation) {

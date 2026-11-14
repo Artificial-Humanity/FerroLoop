@@ -365,10 +365,18 @@ fn cli_host_probes_allowed() -> bool {
 }
 
 fn record_registration_diagnostic(env: &StateEnv<'_>, diagnostic: RouteRegistrationDiagnostic) {
-    let diagnostic = diagnostic.sanitized();
     let sock = resolve_socket_path(env, None);
-    match LocalClient::connect(&sock, DEFAULT_LOCAL_RPC_TIMEOUT) {
-        Ok(mut client) => {
+    let _ = record_registration_diagnostic_at(env, diagnostic, &sock);
+}
+
+fn record_registration_diagnostic_at(
+    env: &StateEnv<'_>,
+    diagnostic: RouteRegistrationDiagnostic,
+    sock: &Path,
+) -> Result<(), String> {
+    let diagnostic = diagnostic.sanitized();
+    match classify_local_connection(LocalClient::connect(sock, DEFAULT_LOCAL_RPC_TIMEOUT))? {
+        Some(mut client) => {
             match client.request(&LocalRequest::RecordRegistrationDiagnostic { diagnostic }) {
                 Ok(LocalResponse::RegistrationDiagnosticRecorded) => {}
                 Ok(other) => {
@@ -381,13 +389,14 @@ fn record_registration_diagnostic(env: &StateEnv<'_>, diagnostic: RouteRegistrat
                 }
             }
         }
-        Err(_) => {
+        None => {
             let rpath = resolve_routes_path_for(env);
             let mut table = RouteTable::load(Some(&rpath));
             table.push_registration_diagnostic(diagnostic);
             let _ = table.save(Some(&rpath));
         }
     }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -587,6 +596,13 @@ fn evaluate_registration_guard<S: fl_core::StateStore>(
     args: RegistrationGuardArgs<'_, S>,
 ) -> Result<RegistrationGuardVerdict, RegistrationGuardRefusal> {
     let existing_entry = existing_route_entry_for(args.env, args.persona);
+    evaluate_registration_guard_with_existing(args, existing_entry)
+}
+
+fn evaluate_registration_guard_with_existing<S: fl_core::StateStore>(
+    args: RegistrationGuardArgs<'_, S>,
+    existing_entry: Option<RouteEntry>,
+) -> Result<RegistrationGuardVerdict, RegistrationGuardRefusal> {
     let make_refusal = |reason: RegistrationConflictReason,
                         chal_hid: Option<String>,
                         chal_gen: Option<String>,
@@ -849,9 +865,22 @@ fn record_caller_route_with_provenance_meta(
     explicit: bool,
     meta: RouteRegistrationMeta<'_>,
 ) -> Result<(), String> {
-    let prune_roster = explicit && !matches!(route, VendorRoute::Muse { .. });
     let sock = resolve_socket_path(env, None);
-    if let Ok(mut client) = LocalClient::connect(&sock, DEFAULT_LOCAL_RPC_TIMEOUT) {
+    record_caller_route_with_provenance_meta_at(env, persona, route, explicit, meta, &sock)
+}
+
+fn record_caller_route_with_provenance_meta_at(
+    env: &StateEnv<'_>,
+    persona: &str,
+    route: VendorRoute,
+    explicit: bool,
+    meta: RouteRegistrationMeta<'_>,
+    sock: &Path,
+) -> Result<(), String> {
+    let prune_roster = explicit && !matches!(route, VendorRoute::Muse { .. });
+    if let Some(mut client) =
+        classify_local_connection(LocalClient::connect(sock, DEFAULT_LOCAL_RPC_TIMEOUT))?
+    {
         let response = client.request(&LocalRequest::RegisterRoute {
             persona: persona.to_string(),
             route,
@@ -1157,18 +1186,29 @@ fn process_exists(pid: u32) -> bool {
 /// the routes file.
 fn existing_route_entry_for(env: &StateEnv<'_>, persona: &str) -> Option<RouteEntry> {
     let sock = resolve_socket_path(env, None);
-    if let Ok(mut client) = LocalClient::connect(&sock, DEFAULT_LOCAL_RPC_TIMEOUT)
+    existing_route_entry_for_at(env, persona, &sock)
+        .ok()
+        .flatten()
+}
+
+fn existing_route_entry_for_at(
+    env: &StateEnv<'_>,
+    persona: &str,
+    sock: &Path,
+) -> Result<Option<RouteEntry>, String> {
+    if let Some(mut client) =
+        classify_local_connection(LocalClient::connect(sock, DEFAULT_LOCAL_RPC_TIMEOUT))?
         && let Ok(LocalResponse::Status(st)) = client.request(&LocalRequest::Status {
             include_codex_queues: false,
         })
     {
-        return st
+        return Ok(st
             .routes
             .into_iter()
-            .find(|r| r.persona.eq_ignore_ascii_case(persona));
+            .find(|r| r.persona.eq_ignore_ascii_case(persona)));
     }
     let rpath = resolve_routes_path_for(env);
-    RouteTable::load(Some(&rpath)).get(persona).cloned()
+    Ok(RouteTable::load(Some(&rpath)).get(persona).cloned())
 }
 
 /// The route currently on file for `persona`: the daemon's table when it answers, else the
@@ -2571,6 +2611,12 @@ fn execute_register_with_hydration_env(
     caller_generation: Option<&str>,
     hosted_id: Option<&str>,
 ) -> Result<i32, (i32, String)> {
+    // Resolve and validate once before capturing a route or opening the store.
+    // All registration route operations use this same endpoint.
+    let sock = resolve_socket_path(env, None);
+    let fixture_root = std::env::var_os("FL_TEST_ISOLATION_ROOT").map(PathBuf::from);
+    fl_fixture_path::check_endpoint(fixture_root.as_deref(), &sock)
+        .map_err(|error| (1, error.to_string()))?;
     let parsed_role = parse_role_selector(&role).map_err(|e| (1, e.to_string()))?;
     let extras: Vec<String> = extra_areas
         .as_deref()
@@ -2630,31 +2676,36 @@ fn execute_register_with_hydration_env(
         .and_then(VendorRoute::session_identity)
         .map(|(_kind, sid)| sid);
     let captured_route_pid = captured_route.as_ref().and_then(VendorRoute::route_pid);
-    let verdict = match evaluate_registration_guard(RegistrationGuardArgs {
-        env,
-        store: Some(&store),
-        persona: &by,
-        challenger_vendor: challenger_vendor_from_env,
-        challenger_adapter: chal_adapter,
-        challenger_session_identity: captured_route
-            .as_ref()
-            .and_then(VendorRoute::session_identity),
-        challenger_pid: captured_route_pid,
-        raw_hosted_id: trimmed_hid,
-        raw_generation: caller_generation,
-        env_persona: env_persona.as_deref(),
-        has_foreign_agy_env,
-        ignore_process_hosted_env: false,
-        replace,
-        proc_ctx: CallerProcessContext::Register {
-            self_pid: std::process::id(),
-            captured_route_pid,
-            session_id: captured_session_id,
+    let existing_entry = existing_route_entry_for_at(env, &by, &sock).map_err(|e| (1, e))?;
+    let verdict = match evaluate_registration_guard_with_existing(
+        RegistrationGuardArgs {
+            env,
+            store: Some(&store),
+            persona: &by,
+            challenger_vendor: challenger_vendor_from_env,
+            challenger_adapter: chal_adapter,
+            challenger_session_identity: captured_route
+                .as_ref()
+                .and_then(VendorRoute::session_identity),
+            challenger_pid: captured_route_pid,
+            raw_hosted_id: trimmed_hid,
+            raw_generation: caller_generation,
+            env_persona: env_persona.as_deref(),
+            has_foreign_agy_env,
+            ignore_process_hosted_env: false,
+            replace,
+            proc_ctx: CallerProcessContext::Register {
+                self_pid: std::process::id(),
+                captured_route_pid,
+                session_id: captured_session_id,
+            },
         },
-    }) {
+        existing_entry,
+    ) {
         Ok(verdict) => verdict,
         Err(refusal) => {
-            record_registration_diagnostic(env, *refusal.diagnostic);
+            record_registration_diagnostic_at(env, *refusal.diagnostic, &sock)
+                .map_err(|error| (1, error))?;
             return Err((1, refusal.message));
         }
     };
@@ -2667,7 +2718,7 @@ fn execute_register_with_hydration_env(
         fl_hub::lifecycle::fence_hydration_register(&store, &by, fence_generation)
             .map_err(|msg| (1, msg))?;
         if let Some(route) = captured_route {
-            record_caller_route_with_provenance_meta(
+            record_caller_route_with_provenance_meta_at(
                 env,
                 &by,
                 route,
@@ -2679,6 +2730,7 @@ fn execute_register_with_hydration_env(
                     hosted_session_verified: verdict.hosted_session_verified,
                     unverified_process: verdict.unverified_process,
                 },
+                &sock,
             )
             .map_err(|error| (1, format!("route registration failed: {error}")))?;
         }
