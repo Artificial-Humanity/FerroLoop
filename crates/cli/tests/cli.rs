@@ -165,12 +165,12 @@ fn a_record_moves_between_states() {
 #[test]
 fn an_unknown_state_name_is_refused_and_lists_the_valid_ones() {
     let d = tempfile::tempdir().unwrap();
-    let _repo = project(&d);
-    cli(&d)
+    let _repo = isolated_project(&d);
+    isolated_cli(&d)
         .args(["record", "add", "--project", "1", "--title", "t"])
         .assert()
         .success();
-    cli(&d)
+    isolated_cli(&d)
         .args(["record", "move", "1", "--to", "sideways"])
         .assert()
         .failure()
@@ -252,8 +252,8 @@ fn a_missing_parent_directory_for_fl_db_is_created_the_same_way_as_the_db_flag()
 #[test]
 fn a_transition_can_be_added_and_shown() {
     let d = tempfile::tempdir().unwrap();
-    let _repo = project(&d);
-    cli(&d)
+    let _repo = isolated_project(&d);
+    isolated_cli(&d)
         .args([
             "transition",
             "add",
@@ -271,7 +271,7 @@ fn a_transition_can_be_added_and_shown() {
         .assert()
         .success()
         .stdout(contains("launch"));
-    let output = cli(&d)
+    let output = isolated_cli(&d)
         .args(["transition", "show", "--project", "1", "--name", "launch"])
         .assert()
         .success()
@@ -290,8 +290,8 @@ fn a_transition_can_be_added_and_shown() {
 #[test]
 fn a_transition_naming_a_nonexistent_gate_is_refused_and_names_the_id() {
     let d = tempfile::tempdir().unwrap();
-    let _repo = project(&d);
-    cli(&d)
+    let _repo = isolated_project(&d);
+    isolated_cli(&d)
         .args([
             "transition",
             "add",
@@ -345,7 +345,7 @@ fn an_iri_typed_in_uppercase_names_the_same_item() {
 #[test]
 fn handle_input_at_the_edges_is_refused_by_name() {
     let d = tempfile::tempdir().unwrap();
-    let _repo = project(&d);
+    let _repo = isolated_project(&d);
     // The whole refusal phrase, not the bare input: `0` or `7` alone would
     // also match the temp directory in the store's path.
     for (bad, refusal) in [
@@ -357,7 +357,7 @@ fn handle_input_at_the_edges_is_refused_by_name() {
         ),
         ("3abc", "`3abc` is neither a handle"),
     ] {
-        cli(&d)
+        isolated_cli(&d)
             .args(["gate", "show", bad])
             .assert()
             .code(2)
@@ -368,9 +368,9 @@ fn handle_input_at_the_edges_is_refused_by_name() {
 #[test]
 fn a_list_over_a_project_that_does_not_exist_is_refused_not_empty() {
     let d = tempfile::tempdir().unwrap();
-    let _repo = project(&d);
+    let _repo = isolated_project(&d);
     // A handle that does not exist is refused at the edge, by `resolve`.
-    cli(&d)
+    isolated_cli(&d)
         .args(["record", "list", "--project", "9"])
         .assert()
         .code(2)
@@ -378,7 +378,7 @@ fn a_list_over_a_project_that_does_not_exist_is_refused_not_empty() {
     // An IRI goes through to the store, whose list refuses a project it
     // never held — it must not print an empty list and exit 0.
     let stranger = "urn:uuid:0190a1b2-c3d4-7e5f-8a6b-7c8d9e0f1a2b";
-    cli(&d)
+    isolated_cli(&d)
         .args(["record", "list", "--project", stranger])
         .assert()
         .code(2)
