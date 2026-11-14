@@ -1605,8 +1605,10 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
-        assert!(select_claude_host_session(&[one.clone()], "Ada.codex").is_err());
-        assert!(select_claude_host_session(&[one.clone()], "Ada.claude.extra").is_err());
+        assert!(select_claude_host_session(std::slice::from_ref(&one), "Ada.codex").is_err());
+        assert!(
+            select_claude_host_session(std::slice::from_ref(&one), "Ada.claude.extra").is_err()
+        );
         assert!(select_claude_host_session(&[one.clone(), one], "ada").is_err());
     }
 

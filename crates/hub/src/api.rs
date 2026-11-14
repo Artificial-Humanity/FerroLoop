@@ -6106,9 +6106,7 @@ fn queued_non_claude_vendor(item: &crate::QueuedOperatorPrompt) -> Option<&str> 
 }
 
 fn legacy_owner_unclassified(item: &crate::QueuedOperatorPrompt) -> bool {
-    !item.admitted_current
-        && fl_wire::dispatcher::is_owner_sender(&item.by)
-        && queued_non_claude_vendor(item).is_none()
+    !item.admitted_current && queued_non_claude_vendor(item).is_none()
 }
 
 fn drain_composer_probe(
@@ -6167,7 +6165,7 @@ fn require_intended_vendor(
     }
 }
 
-#[cfg_attr(test, allow(clippy::too_many_arguments))] // Keep test transport scoped to queued calls.
+#[allow(clippy::too_many_arguments)]
 fn dispatch_operator_prompt_with_intent_for_session(
     state: &HubState,
     persona: Option<&str>,
@@ -6310,6 +6308,7 @@ fn dispatch_operator_prompt_with_intent_for_session(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn dispatch_queued_operator_prompt_with_intent_for_session(
     state: &HubState,
     persona: Option<&str>,
@@ -6397,6 +6396,7 @@ fn with_operator_delivery(
     data
 }
 
+#[allow(clippy::too_many_arguments)]
 fn dispatch_operator_prompt_for_session_typed(
     state: &HubState,
     persona: Option<&str>,
@@ -13542,6 +13542,7 @@ mod claude_registration_binding_tests {
         let mut legacy: crate::QueuedOperatorPrompt =
             serde_json::from_value(serde_json::to_value(&original).unwrap()).unwrap();
         legacy.claude_terminal = false;
+        legacy.by = "alice".into();
         legacy.persona = None;
         assert!(legacy_owner_unclassified(&legacy));
         let mut classified = legacy.clone();
@@ -13566,9 +13567,11 @@ mod claude_registration_binding_tests {
             .unwrap()
             .queues
             .insert(legacy.session_id.clone(), vec![legacy.clone()]);
+        reset_queued_delivery_calls();
         let (_, costs) =
             crate::discovery::cost_counters::measure(|| drain_ready_session_queues(&state));
         assert_eq!(costs.route_scans, 0);
+        assert_eq!(queued_delivery_calls(), 0);
         let held = &state.session_queue(&legacy.session_id)[0];
         assert_eq!(held.delivery_state, crate::QueuedDeliveryState::Refused);
         assert!(
@@ -13603,6 +13606,7 @@ mod claude_registration_binding_tests {
         let mut legacy: crate::QueuedOperatorPrompt =
             serde_json::from_value(serde_json::to_value(&original).unwrap()).unwrap();
         legacy.claude_terminal = false;
+        legacy.by = "alice".into();
         state
             .prompt_queues
             .lock()
@@ -13612,10 +13616,12 @@ mod claude_registration_binding_tests {
         let owner = HubAuthority::Owner {
             login: "owner".into(),
         };
+        reset_queued_delivery_calls();
         let (_, costs) = crate::discovery::cost_counters::measure(|| {
             handle_post_queued_prompt_send_now(&state, &owner, &legacy.session_id, &legacy.id)
         });
         assert_eq!(costs.route_scans, 0);
+        assert_eq!(queued_delivery_calls(), 0);
         let held = &state.session_queue(&legacy.session_id)[0];
         assert_eq!(held.delivery_state, crate::QueuedDeliveryState::Refused);
         assert!(
@@ -13624,6 +13630,26 @@ mod claude_registration_binding_tests {
                 .unwrap()
                 .contains("re-register and resubmit")
         );
+        for status in [
+            crate::QueuedDeliveryState::Sending,
+            crate::QueuedDeliveryState::Unconfirmed,
+        ] {
+            legacy.delivery_state = status;
+            state
+                .prompt_queues
+                .lock()
+                .unwrap()
+                .queues
+                .insert(legacy.session_id.clone(), vec![legacy.clone()]);
+            let (_, costs) = crate::discovery::cost_counters::measure(|| {
+                handle_post_queued_prompt_send_now(&state, &owner, &legacy.session_id, &legacy.id)
+            });
+            assert_eq!(costs.route_scans, 0);
+            assert_eq!(
+                state.session_queue(&legacy.session_id)[0].delivery_state,
+                status
+            );
+        }
     }
 
     #[test]
