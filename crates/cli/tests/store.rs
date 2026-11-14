@@ -4,6 +4,9 @@
 //! Every run gets private HOME, XDG and `$FL_DB` so nothing reads the
 //! developer's own stores, and none of these commands may create a store.
 
+#[allow(dead_code)]
+mod common;
+
 use assert_cmd::Command;
 use fl_store::{BackendKind, StoreOptions};
 use predicates::str::contains;
@@ -26,6 +29,18 @@ impl Env {
     /// `fl` with no engine selected in the environment: the default engine, FerroStore.
     fn fl(&self) -> Command {
         let mut c = Command::cargo_bin("fl").unwrap();
+        c.env("HOME", self.home.path())
+            .env("XDG_CONFIG_HOME", self.home.path().join("config"))
+            .env("XDG_DATA_HOME", self.home.path().join("data"))
+            .env_remove("FL_DB")
+            .env_remove("FL_STORE_BACKEND")
+            .current_dir(self.home.path());
+        c
+    }
+
+    /// Construct an environment-cleared CLI command with fixture-owned paths.
+    fn isolated_fl(&self) -> Command {
+        let mut c = Command::from_std(common::isolated_fl(self.home.path()).unwrap());
         c.env("HOME", self.home.path())
             .env("XDG_CONFIG_HOME", self.home.path().join("config"))
             .env("XDG_DATA_HOME", self.home.path().join("data"))
@@ -108,7 +123,9 @@ fn status_json(mut cmd: Command, db: &Path) -> Value {
 #[test]
 fn status_on_redb_reports_a_store_that_does_not_exist_and_creates_nothing() {
     let env = Env::new();
-    let v = status_json(env.redb(), &env.logical());
+    let mut cmd = env.isolated_fl();
+    cmd.env("FL_STORE_BACKEND", "redb");
+    let v = status_json(cmd, &env.logical());
     assert_eq!(v["engine"], "redb");
     assert_eq!(v["exists"], false);
     assert_eq!(v["size_bytes"], Value::Null);
@@ -174,7 +191,7 @@ fn status_on_ferro_maps_the_logical_path_and_says_the_format_version_is_not_avai
 #[test]
 fn status_on_an_fls_path_is_ferro_without_the_environment() {
     let env = Env::new();
-    let v = status_json(env.fl(), &env.physical_ferro());
+    let v = status_json(env.isolated_fl(), &env.physical_ferro());
     assert_eq!(v["engine"], "ferro");
     assert_eq!(
         v["physical_path"],
@@ -186,7 +203,9 @@ fn status_on_an_fls_path_is_ferro_without_the_environment() {
 fn status_flags_a_redb_beside_a_ferro_selection() {
     let env = Env::new();
     open_with(&env.logical(), BackendKind::Redb);
-    let v = status_json(env.ferro(), &env.logical());
+    let mut cmd = env.isolated_fl();
+    cmd.env("FL_STORE_BACKEND", "ferro");
+    let v = status_json(cmd, &env.logical());
     assert_eq!(v["exists"], false);
     assert_eq!(v["redb_beside_ferro"], true);
     assert_eq!(env.files(), vec!["fl.redb".to_string()]);
@@ -195,7 +214,7 @@ fn status_flags_a_redb_beside_a_ferro_selection() {
 #[test]
 fn status_refuses_an_unknown_engine() {
     let env = Env::new();
-    let mut c = env.fl();
+    let mut c = env.isolated_fl();
     c.env("FL_STORE_BACKEND", "sqlite")
         .arg("--db")
         .arg(env.logical())
