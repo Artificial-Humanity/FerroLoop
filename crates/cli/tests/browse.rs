@@ -933,8 +933,8 @@ fn doctor_finds_an_engine_on_path_by_name() {
     let env = Env::new();
     let bin_dir = env.path("bin");
     std::fs::create_dir(&bin_dir).unwrap();
-    let p = bin_dir.join("chromium-headless-shell");
-    std::fs::write(&p, "#!/bin/sh\necho 'Headless Shell 1'\n").unwrap();
+    let p = bin_dir.join("lightpanda");
+    std::fs::write(&p, "#!/bin/sh\necho 'Fixture Lightpanda 1'\n").unwrap();
     std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
     let out = env
         .fl()
@@ -944,8 +944,10 @@ fn doctor_finds_an_engine_on_path_by_name() {
         .output()
         .unwrap();
     let t = &json_out(&out)["tiers"][1];
-    // A real browser in a standard directory may rank earlier; a detected engine is the claim.
+    // The first candidate in the private PATH wins before any standard directory.
     assert_eq!(t["status"], "detected", "{t}");
+    assert_eq!(t["path"], p.to_str().unwrap());
+    assert_eq!(t["version"], "Fixture Lightpanda 1");
 }
 
 #[test]
