@@ -8,10 +8,36 @@
 use std::io;
 use std::path::{Component, Path, PathBuf};
 
+/// An endpoint was refused by the fixture-root check.
+///
+/// Callers can distinguish this from an operating-system permission failure
+/// by inspecting the payload of the returned [`io::Error`].
+#[derive(Debug)]
+pub struct FixtureEndpointRefusal {
+    reason: String,
+}
+
+impl std::fmt::Display for FixtureEndpointRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "fixture endpoint refused: {}", self.reason)
+    }
+}
+
+impl std::error::Error for FixtureEndpointRefusal {}
+
+/// True when an I/O error carries a fixture-endpoint refusal payload.
+pub fn is_fixture_endpoint_refusal(error: &io::Error) -> bool {
+    error
+        .get_ref()
+        .is_some_and(|cause| cause.is::<FixtureEndpointRefusal>())
+}
+
 fn refused(reason: impl std::fmt::Display) -> io::Error {
     io::Error::new(
         io::ErrorKind::PermissionDenied,
-        format!("fixture endpoint refused: {reason}"),
+        FixtureEndpointRefusal {
+            reason: reason.to_string(),
+        },
     )
 }
 
@@ -94,12 +120,44 @@ mod tests {
     }
 
     #[test]
+    fn fixture_refusal_has_distinct_error_payload() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let refusal = check_endpoint(Some(root.path()), &outside.path().join("wire.sock"))
+            .expect_err("outside endpoint must be refused");
+        assert_eq!(refusal.kind(), io::ErrorKind::PermissionDenied);
+        assert!(is_fixture_endpoint_refusal(&refusal));
+        assert!(refusal.get_ref().unwrap().is::<FixtureEndpointRefusal>());
+        assert!(
+            refusal
+                .to_string()
+                .contains("endpoint is outside the fixture root")
+        );
+        let ordinary = io::Error::new(io::ErrorKind::PermissionDenied, "ordinary denial");
+        assert!(!is_fixture_endpoint_refusal(&ordinary));
+        assert!(!is_fixture_endpoint_refusal(&io::Error::from(
+            io::ErrorKind::PermissionDenied
+        )));
+    }
+
+    #[test]
     fn outside_endpoint_is_refused() {
         let root = tempfile::tempdir().unwrap();
         let other = tempfile::tempdir().unwrap();
         let error = check_endpoint(Some(root.path()), &other.path().join("wire.sock"))
             .expect_err("outside endpoint must be refused");
         assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    fn filesystem_failure_is_a_typed_refusal_with_its_reason() {
+        let root = tempfile::tempdir().unwrap();
+        let missing = root.path().join("missing-root");
+        let cause = std::fs::canonicalize(&missing).unwrap_err();
+        let refusal = check_endpoint(Some(&missing), &missing.join("socket")).unwrap_err();
+        assert!(is_fixture_endpoint_refusal(&refusal));
+        assert_eq!(refusal.kind(), io::ErrorKind::PermissionDenied);
+        assert!(refusal.to_string().contains(&cause.to_string()));
     }
 
     #[test]
