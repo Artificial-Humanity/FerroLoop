@@ -2160,6 +2160,33 @@ pub fn clear_or_reforge_session(
     } else {
         None
     };
+    // Production Claude Reforge must prove the pre-`/clear` session id before
+    // any slash or hydration dispatch; without a confirmable id it refuses
+    // with zero keys. The only bypass is the explicit `FL_WIRE_TMUX_BIN`
+    // fixture seam (test fakes cannot produce a real session record).
+    let claude_before_session_id: Option<String> = if mode == SessionResetMode::Reforge
+        && matches!(route, VendorRoute::Claude { .. })
+        && std::env::var_os("FL_WIRE_TMUX_BIN").is_none()
+    {
+        let before = match route {
+            VendorRoute::Claude { pid, key_path, .. } if *pid != 0 => {
+                let record = read_claude_session_record(*pid, key_path.as_deref());
+                claude_record_session_id(record.as_ref())
+            }
+            _ => None,
+        };
+        match before {
+                Some(id) => Some(id),
+                None => {
+                    return Err(
+                        "reforge unconfirmed: Claude session record/session id unavailable before /clear; refusing to reset or send the reforge prompt"
+                            .to_string(),
+                    )
+                }
+            }
+    } else {
+        None
+    };
     if let VendorRoute::Agy {
         conversation_id,
         ls_address,
@@ -2184,22 +2211,6 @@ pub fn clear_or_reforge_session(
         }
         return Ok(());
     }
-    // For a Claude reforge, capture the session id before `/clear` so the prompt is
-    // only dispatched after the reset lands (#544-2). `pid == 0`, a missing record, or
-    // a record without a session id gives nothing to compare, so no wait happens.
-    let claude_before_session_id = if mode == SessionResetMode::Reforge {
-        match route {
-            VendorRoute::Claude { pid, key_path, .. }
-                if *pid != 0 && std::env::var_os("FL_WIRE_TMUX_BIN").is_none() =>
-            {
-                let record = read_claude_session_record(*pid, key_path.as_deref());
-                claude_record_session_id(record.as_ref())
-            }
-            _ => None,
-        }
-    } else {
-        None
-    };
     dispatch_operator_prompt_to_route(route, sender_name, slash)?;
     if let Some(prompt) = prompt {
         if let Some(before_id) = claude_before_session_id.as_deref() {
@@ -4826,6 +4837,24 @@ fn composer_shows_target_placeholder_with_raw(
     is_raw_fallback: bool,
 ) -> bool {
     if is_raw_fallback {
+        // A Claude `[Pasted text #N +M lines]` placeholder in a raw capture is
+        // untrusted: it counts only when target ownership is proven — `M` must
+        // be a target line count (full/body, incl. raw variant, via the
+        // descriptor) and the composer must equal exactly that placeholder
+        // (plus prompt prefix), with no appended text. `[Pasted Content`
+        // keeps its existing raw-fallback behaviour.
+        let cleaned = normalize_terminal_screen(screen);
+        let lines: Vec<&str> = cleaned.lines().collect();
+        let placeholder_lines = composer_placeholder_lines(&lines);
+        let has_claude = placeholder_lines.iter().any(|l| l.contains("[Pasted text"));
+        let has_pasted_content = placeholder_lines
+            .iter()
+            .any(|l| l.contains("[Pasted Content"));
+        if has_claude && !has_pasted_content {
+            let d_target = build_delivery_descriptor("", trimmed, raw_text);
+            let (matches_target, is_placeholder) = composer_equals_single_target(screen, &d_target);
+            return matches_target && is_placeholder;
+        }
         return composer_shows_pasted_placeholder(screen);
     }
     if !screen.contains("[Pasted Content") && !screen.contains("[Pasted text") {
@@ -20367,6 +20396,107 @@ exit 1"#,
             target,
             false
         ));
+    }
+
+    #[test]
+    fn raw_fallback_claude_placeholder_requires_target_ownership_550() {
+        let rule = "─".repeat(120);
+        let target = "line one\nline two\nline three";
+        let exact = format!("◆ Ready.\n{rule}\n❯ [Pasted text #1 +3 lines]\n{rule}\n  status");
+        assert!(composer_shows_target_placeholder_with_raw(
+            &exact, target, None, true
+        ));
+        // Raw-text variant line count also proves ownership.
+        let raw = "line one\nline two\nline three\nline four";
+        assert!(composer_shows_target_placeholder_with_raw(
+            &format!("◆ Ready.\n{rule}\n❯ [Pasted text #1 +4 lines]\n{rule}\n  status"),
+            target,
+            Some(raw),
+            true
+        ));
+        for bad in [
+            format!("◆ Ready.\n{rule}\n❯ [Pasted text #1 +4 lines]\n{rule}\n  status"),
+            format!("◆ Ready.\n{rule}\n❯ [Pasted text #1 +3 lines] hold on\n{rule}\n  status"),
+        ] {
+            assert!(!composer_shows_target_placeholder_with_raw(
+                &bad, target, None, true
+            ));
+            let mut retries = 0u32;
+            confirm_paste_submission(
+                target,
+                |_| {},
+                || Some(ScreenCapture::RawFallback(bad.clone())),
+                || false,
+                || {
+                    retries += 1;
+                    Ok(())
+                },
+            )
+            .expect("raw mismatched/appended placeholder must not error");
+            assert_eq!(
+                retries, 0,
+                "raw fallback must not Enter-retry unproven placeholder"
+            );
+        }
+        // `[Pasted Content` raw behaviour unchanged.
+        let pc = format!("◆ Ready.\n{rule}\n❯ [Pasted Content 999 chars]\n{rule}\n  status");
+        assert!(composer_shows_target_placeholder_with_raw(
+            &pc, target, None, true
+        ));
+    }
+
+    #[test]
+    fn claude_reforge_refuses_unconfirmed_before_dispatch_550() {
+        let _lock = TMUX_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _no_tmux = EnvGuard::remove("FL_WIRE_TMUX_BIN");
+        let tmp = TempDir::new().unwrap();
+        let key_path = tmp.path().join("12345.key");
+        fs::write(&key_path, r#"{"peerToken":"tok"}"#).unwrap();
+        for pid in [12345u32, 0] {
+            let route = VendorRoute::Claude {
+                pid,
+                session_id: "s-x".into(),
+                socket_path: tmp.path().join("gone.sock"),
+                key_path: Some(key_path.clone()),
+            };
+            let err = clear_or_reforge_session(
+                &route,
+                SessionResetMode::Reforge,
+                "owner",
+                Some("hydrate me"),
+            )
+            .unwrap_err();
+            assert_eq!(
+                err,
+                "reforge unconfirmed: Claude session record/session id unavailable before /clear; refusing to reset or send the reforge prompt",
+                "pid={pid}"
+            );
+        }
+    }
+
+    #[test]
+    fn claude_reforge_with_tmux_seam_keeps_fixture_behaviour_550() {
+        let _lock = TMUX_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = TempDir::new().unwrap();
+        let (tmux_bin, tmux_out, tmux_stdin) = write_fake_tmux(tmp.path(), true);
+        let _env = EnvGuard::set("FL_WIRE_TMUX_BIN", &tmux_bin);
+        let route = claude_route_with_record(
+            tmp.path(),
+            tmp.path().join("gone.sock"),
+            "idle",
+            "Wendy:@6.%12",
+        );
+        clear_or_reforge_session(
+            &route,
+            SessionResetMode::Reforge,
+            "owner",
+            Some("hydrate me"),
+        )
+        .unwrap();
+        let cmds = fs::read_to_string(&tmux_out).unwrap();
+        assert!(cmds.contains("paste-buffer"), "{cmds}");
+        let pasted = fs::read_to_string(&tmux_stdin).unwrap();
+        assert!(pasted.contains("hydrate me"), "{pasted}");
     }
 
     #[test]
