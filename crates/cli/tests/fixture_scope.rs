@@ -1,4 +1,4 @@
-//! Process-free tests for the opt-in fixture scope builder.
+//! Fixture scope tests include process-free cases and ignored CI-only positive coverage.
 #[allow(dead_code)]
 mod common;
 

@@ -1074,6 +1074,9 @@ mod tests {
         let root = builder.root.path().to_path_buf();
         let path = builder.v2_wire_prune_redb().unwrap();
         let scope = Arc::new(builder.finish().unwrap());
+        // Verify the schema without repairing a missing or uninitialized store.
+        let read_only = fl_store::RedbStore::open_read_only(&path, 0).unwrap();
+        drop(read_only);
         let reopened = fl_store::RedbStore::open_with_retries(&path, 0).unwrap();
         drop(reopened);
         assert!(
