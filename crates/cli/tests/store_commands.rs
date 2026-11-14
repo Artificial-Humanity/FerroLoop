@@ -7,6 +7,9 @@
 //! XDG_RUNTIME_DIR and TMPDIR inside the sandbox, with FL_DB and
 //! FL_STORE_BACKEND removed from the environment it inherits.
 
+#[allow(dead_code)]
+mod common;
+
 use assert_cmd::Command;
 use serde_json::Value;
 use std::io::{BufRead, BufReader};
@@ -34,9 +37,9 @@ impl Sandbox {
         self.dir("stores").join("fl.fls")
     }
 
-    /// `fl store <args>`, no `--db`: the bound store is the default one.
-    fn fl_unbound(&self, args: &[&str]) -> Command {
-        let mut c = Command::cargo_bin("fl").unwrap();
+    /// Configure every fl child, including the store server, with one private environment.
+    fn fl_command(&self) -> std::process::Command {
+        let mut c = common::isolated_fl(self.root.path()).unwrap();
         c.env("HOME", self.dir("home"))
             .env("XDG_CONFIG_HOME", self.dir("config"))
             .env("XDG_DATA_HOME", self.dir("data"))
@@ -44,24 +47,21 @@ impl Sandbox {
             .env("TMPDIR", self.dir("tmp"))
             .env_remove("FL_DB")
             .env_remove("FL_STORE_BACKEND")
-            .current_dir(self.dir("home"))
-            .arg("store")
-            .args(args);
+            .current_dir(self.dir("home"));
+        c
+    }
+
+    /// `fl store <args>`, no `--db`: the bound store is the default one.
+    fn fl_unbound(&self, args: &[&str]) -> Command {
+        let mut c = Command::from_std(self.fl_command());
+        c.arg("store").args(args);
         c
     }
 
     /// `fl --db <stores/fl.redb> store <args>`.
     fn fl(&self, args: &[&str]) -> Command {
-        let mut c = Command::cargo_bin("fl").unwrap();
-        c.env("HOME", self.dir("home"))
-            .env("XDG_CONFIG_HOME", self.dir("config"))
-            .env("XDG_DATA_HOME", self.dir("data"))
-            .env("XDG_RUNTIME_DIR", self.dir("run"))
-            .env("TMPDIR", self.dir("tmp"))
-            .env_remove("FL_DB")
-            .env_remove("FL_STORE_BACKEND")
-            .current_dir(self.dir("home"))
-            .arg("--db")
+        let mut c = Command::from_std(self.fl_command());
+        c.arg("--db")
             .arg(self.dir("stores").join("fl.redb"))
             .arg("store")
             .args(args);
@@ -77,6 +77,32 @@ impl Sandbox {
         );
         serde_json::from_slice(&out.stdout).unwrap()
     }
+}
+
+#[test]
+fn store_commands_use_private_runtime_and_store_defaults() {
+    let sb = Sandbox::new();
+    let command = sb.fl_command();
+    let env = |name: &str| {
+        command
+            .get_envs()
+            .find(|(key, _)| *key == name)
+            .and_then(|(_, value)| value)
+            .map(|value| value.to_os_string())
+    };
+    for (key, path) in [
+        ("HOME", sb.dir("home")),
+        ("XDG_CONFIG_HOME", sb.dir("config")),
+        ("XDG_DATA_HOME", sb.dir("data")),
+        ("XDG_RUNTIME_DIR", sb.dir("run")),
+        ("TMPDIR", sb.dir("tmp")),
+        ("FL_WIRE_SOCKET", sb.root.path().join("w")),
+        ("PATH", sb.root.path().join("no-bin")),
+    ] {
+        assert_eq!(env(key).as_deref(), Some(path.as_os_str()), "{key}");
+    }
+    assert_eq!(env("FL_DB"), None);
+    assert_eq!(env("FL_STORE_BACKEND"), None);
 }
 
 fn s(p: &Path) -> &str {
@@ -191,15 +217,8 @@ impl Drop for Server {
 #[test]
 fn serve_serves_the_bound_store_to_get_and_put_over_connect() {
     let sb = Sandbox::new();
-    let mut cmd = std::process::Command::new(assert_cmd::cargo::cargo_bin("fl"));
-    cmd.env("HOME", sb.dir("home"))
-        .env("XDG_CONFIG_HOME", sb.dir("config"))
-        .env("XDG_DATA_HOME", sb.dir("data"))
-        .env("XDG_RUNTIME_DIR", sb.dir("run"))
-        .env("TMPDIR", sb.dir("tmp"))
-        .env_remove("FL_DB")
-        .env_remove("FL_STORE_BACKEND")
-        .arg("--db")
+    let mut cmd = sb.fl_command();
+    cmd.arg("--db")
         .arg(sb.dir("stores").join("fl.redb"))
         .args(["store", "serve", "--json"])
         .stdout(Stdio::piped())
@@ -269,15 +288,8 @@ fn put_and_serve_never_create_a_fls_beside_a_lone_redb() {
     fl_store::RedbStore::open(&sb.dir("stores").join("fl.redb")).unwrap();
     for db in ["fl.fls", "fl.redb"] {
         for args in [vec!["put", "docs", "a", "1"], vec!["serve"]] {
-            let out = std::process::Command::new(assert_cmd::cargo::cargo_bin("fl"))
-                .env("HOME", sb.dir("home"))
-                .env("XDG_CONFIG_HOME", sb.dir("config"))
-                .env("XDG_DATA_HOME", sb.dir("data"))
-                .env("XDG_RUNTIME_DIR", sb.dir("run"))
-                .env("TMPDIR", sb.dir("tmp"))
-                .env_remove("FL_DB")
-                .env_remove("FL_STORE_BACKEND")
-                .current_dir(sb.dir("home"))
+            let out = sb
+                .fl_command()
                 .arg("--db")
                 .arg(sb.dir("stores").join(db))
                 .arg("store")
