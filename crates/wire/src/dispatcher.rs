@@ -10005,12 +10005,24 @@ mod tests {
         .unwrap();
         assert_eq!(body, "ok");
         handle.join().unwrap();
+    }
+
+    #[test]
+    fn tcp_registration_is_revoked_while_listener_still_reserves_port() {
+        assert!(crate::test_isolation::is_enabled());
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let fixture = crate::test_isolation::register_tcp_listener(&listener).unwrap();
+        assert!(crate::test_isolation::ensure_tcp(&address).is_ok());
+        drop(fixture);
         assert_eq!(
             crate::test_isolation::ensure_tcp(&address)
                 .unwrap_err()
                 .kind(),
             std::io::ErrorKind::PermissionDenied
         );
+        // Keep the listener alive through the assertion so no other test can reuse its port.
+        drop(listener);
     }
 
     #[test]
