@@ -6,7 +6,7 @@
 
 use std::ffi::{OsStr, OsString};
 use std::fs::{File, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Child, ExitStatus, Output, Stdio};
@@ -90,6 +90,14 @@ struct SelectedConfig {
 struct PruneRedb {
     store: PathBuf,
     sibling: PathBuf,
+    // Retaining the opened provisioned inode prevents reuse after unlink.
+    file: Arc<File>,
+}
+
+#[cfg(unix)]
+fn same_file(a: &std::fs::Metadata, b: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    a.dev() == b.dev() && a.ino() == b.ino()
 }
 
 const PRUNE_ENVELOPE_NAME: &str = "prune-context.json";
@@ -117,6 +125,23 @@ struct PreparedPruneFixture {
 struct PreparedEnvelope {
     file: File,
     scope: Arc<FixtureScope>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EnvelopeFault {
+    None,
+    Write,
+    Flush,
+    Readonly,
+    Postcheck,
+}
+
+fn inject_envelope_fault(actual: EnvelopeFault, phase: EnvelopeFault) -> io::Result<()> {
+    if actual == phase {
+        Err(io::Error::other("injected envelope failure"))
+    } else {
+        Ok(())
+    }
 }
 
 fn prune_refusal(message: &str) -> io::Error {
@@ -630,6 +655,7 @@ impl FixtureScopeBuilder {
                         format!("exclusive Redb creation (private writes may have occurred): {e}"),
                     )
                 })?;
+            let original = file.metadata()?;
             drop(file);
             let database = fl_store::RedbStore::open_with_retries(&store, 0).map_err(|e| {
                 io::Error::other(format!(
@@ -655,15 +681,22 @@ impl FixtureScopeBuilder {
                     "post-initialization store is not a contained regular file; private writes occurred",
                 ));
             }
+            if !same_file(&original, &metadata) {
+                return Err(prune_refusal("Redb fixture replaced during initialization"));
+            }
+            let retained = File::open(&store)?;
+            if !same_file(&original, &retained.metadata()?) {
+                return Err(prune_refusal("Redb fixture replaced while retaining"));
+            }
             require_absent(&sibling).map_err(|e| {
                 io::Error::new(
                     e.kind(),
                     format!("post-initialization sibling check (private writes occurred): {e}"),
                 )
             })?;
-            Ok(())
+            Ok(retained)
         })();
-        result?;
+        let retained = result?;
         let grant = MetadataGrant {
             allowed: true,
             allow_not_found: true,
@@ -684,6 +717,7 @@ impl FixtureScopeBuilder {
         self.prune_redb = Some(PruneRedb {
             store: store.clone(),
             sibling,
+            file: Arc::new(retained),
         });
         self.poisoned = false;
         Ok(store)
@@ -840,6 +874,7 @@ impl FixtureScope {
             self.context.check(&store)?;
             let meta = std::fs::symlink_metadata(&redb.store)?;
             if !meta.file_type().is_file()
+                || !same_file(&meta, &redb.file.metadata()?)
                 || redb.store.canonicalize()?.parent() != Some(root.canonicalize()?.as_path())
             {
                 return Err(prune_refusal("Redb fixture changed"));
@@ -991,6 +1026,10 @@ fn preflight_prune_envelope(scope: &FixtureScope) -> io::Result<(PathBuf, PathBu
 
 impl PreparedPruneFixture {
     fn write_envelope(&self) -> io::Result<PreparedEnvelope> {
+        self.write_envelope_with_fault(EnvelopeFault::None)
+    }
+
+    fn write_envelope_with_fault(&self, fault: EnvelopeFault) -> io::Result<PreparedEnvelope> {
         #[cfg(not(unix))]
         return Err(io::Error::new(
             io::ErrorKind::Unsupported,
@@ -1031,18 +1070,30 @@ impl PreparedPruneFixture {
                     .create_new(true)
                     .mode(0o600)
                     .open(&path)?;
+                inject_envelope_fault(fault, EnvelopeFault::Write)?;
                 file.write_all(&bytes)?;
+                inject_envelope_fault(fault, EnvelopeFault::Flush)?;
                 file.flush()?;
+                inject_envelope_fault(fault, EnvelopeFault::Readonly)?;
                 file.set_permissions(std::fs::Permissions::from_mode(0o400))?;
+                let opened = file.metadata()?;
+                drop(file);
+                let mut reader = File::open(&path)?;
+                let retained = reader.metadata()?;
+                let mut actual = Vec::new();
+                reader.read_to_end(&mut actual)?;
+                inject_envelope_fault(fault, EnvelopeFault::Postcheck)?;
                 let meta = std::fs::symlink_metadata(&path)?;
                 if !meta.file_type().is_file()
                     || !meta.permissions().readonly()
+                    || !same_file(&meta, &opened)
+                    || !same_file(&meta, &retained)
                     || path.canonicalize()?.parent() != Some(root_canonical.as_path())
-                    || std::fs::read(&path)? != bytes
+                    || actual != bytes
                 {
                     return Err(prune_refusal("envelope postcheck failed"));
                 }
-                Ok(file)
+                Ok(reader)
             })()
             .map_err(|e| {
                 io::Error::new(
@@ -1101,7 +1152,7 @@ mod tests {
         assert!(
             validate_prune_envelope(
                 text.replacen("{", "{\"version\":1,", 1).as_bytes(),
-                b"original",
+                original,
                 root
             )
             .is_err()
@@ -1109,7 +1160,7 @@ mod tests {
         assert!(
             validate_prune_envelope(
                 text.replacen("{", "{\"unknown\":1,", 1).as_bytes(),
-                b"original",
+                original,
                 root
             )
             .is_err()
@@ -1154,6 +1205,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn stage2_collision_preflight_refuses_without_redb_initialization() {
+        use std::os::unix::fs::symlink;
         for name in [
             "prune-context.json",
             "PRUNE-CONTEXT.JSON",
@@ -1171,6 +1223,40 @@ mod tests {
             assert!(preflight_prune_envelope(&scope).is_err());
             assert!(!scope.root().join(PRUNE_ENVELOPE_NAME).exists());
         }
+        let builder = FixtureScopeBuilder::new().unwrap();
+        let mut scope = builder.finish().unwrap();
+        let alias = scope.root().join("PRUNE-CONTEXT.JSON");
+        // Exercise a declared Redb reference separately from a root entry; this
+        // synthetic declaration is only a preflight input, never provenance.
+        scope.identities.push(FixtureIdentity::RedbSiblingMetadata {
+            redb_path: alias,
+            path: scope.root().join("other.fls"),
+            no_follow: MetadataGrant {
+                allowed: true,
+                allow_not_found: true,
+            },
+            follow: MetadataGrant {
+                allowed: true,
+                allow_not_found: true,
+            },
+        });
+        let manifest = std::fs::read(&scope.manifest).unwrap();
+        assert!(preflight_prune_envelope(&scope).is_err());
+        assert_eq!(std::fs::read(&scope.manifest).unwrap(), manifest);
+        assert!(!scope.root().join(PRUNE_ENVELOPE_NAME).exists());
+
+        let builder = FixtureScopeBuilder::new().unwrap();
+        let scope = builder.finish().unwrap();
+        let link = scope.root().join("PRUNE-CONTEXT.JSON");
+        symlink(scope.root().join("missing"), &link).unwrap();
+        assert!(preflight_prune_envelope(&scope).is_err());
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(!scope.root().join(PRUNE_ENVELOPE_NAME).exists());
     }
 
     // This is a genuine Redb initializer and may run only after a separate CI ruling.
@@ -1214,6 +1300,101 @@ mod tests {
         let left = b.write_envelope();
         let right = worker.join().unwrap();
         assert_ne!(left.is_ok(), right.is_ok());
+    }
+
+    // Every case below provisions a real Redb. These remain unrun until an
+    // exact-head CI-only execution is separately authorized.
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "CI-only genuine Redb fixture; separate execution ruling required"]
+    fn stage2_envelope_failures_are_terminal_and_report_partial_effects_ci_only() {
+        for fault in [
+            EnvelopeFault::Write,
+            EnvelopeFault::Flush,
+            EnvelopeFault::Readonly,
+            EnvelopeFault::Postcheck,
+        ] {
+            let mut builder = FixtureScopeBuilder::new().unwrap();
+            builder.enable_operations_v2();
+            builder.v2_selected_config(Some(b"fixture"), false).unwrap();
+            builder.v2_wire_prune_redb().unwrap();
+            let scope = Arc::new(builder.finish().unwrap());
+            let first = scope.prepare_prune().unwrap();
+            let second = scope.prepare_prune().unwrap();
+            let error = match first.write_envelope_with_fault(fault) {
+                Err(error) => error,
+                Ok(_) => panic!("fault returned a capability"),
+            };
+            assert!(
+                error
+                    .to_string()
+                    .contains("private partial effects may remain")
+            );
+            assert!(scope.root().join(PRUNE_ENVELOPE_NAME).exists());
+            // Even if a caller removes the partial file, the shared attempt
+            // state must keep another scope clone from creating a capability.
+            std::fs::remove_file(scope.root().join(PRUNE_ENVELOPE_NAME)).unwrap();
+            assert!(second.write_envelope().is_err());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "CI-only genuine Redb fixture; separate execution ruling required"]
+    fn stage2_changed_fixture_inputs_refuse_ci_only() {
+        use std::os::unix::fs::PermissionsExt;
+        for changed in ["config", "manifest", "store", "sibling"] {
+            let mut builder = FixtureScopeBuilder::new().unwrap();
+            builder.enable_operations_v2();
+            builder.v2_selected_config(Some(b"fixture"), false).unwrap();
+            builder.v2_wire_prune_redb().unwrap();
+            let scope = Arc::new(builder.finish().unwrap());
+            let prep = scope.prepare_prune().unwrap();
+            match changed {
+                "config" => {
+                    std::fs::write(scope.root().join("fl/config.toml"), b"changed").unwrap()
+                }
+                "manifest" => {
+                    std::fs::set_permissions(
+                        &scope.manifest,
+                        std::fs::Permissions::from_mode(0o600),
+                    )
+                    .unwrap();
+                    std::fs::write(&scope.manifest, b"{\"version\":2,\"identities\":[]}").unwrap();
+                    std::fs::set_permissions(
+                        &scope.manifest,
+                        std::fs::Permissions::from_mode(0o400),
+                    )
+                    .unwrap();
+                }
+                "store" => {
+                    let store = scope.root().join("wire-prune.redb");
+                    std::fs::rename(&store, scope.root().join("old.redb")).unwrap();
+                    std::fs::write(store, b"not the provisioned file").unwrap();
+                }
+                "sibling" => {
+                    std::fs::write(scope.root().join("wire-prune.fls"), b"unexpected").unwrap()
+                }
+                _ => unreachable!(),
+            }
+            assert!(scope.prepare_prune().is_err(), "{changed}");
+            assert!(prep.write_envelope().is_err(), "{changed}");
+            assert!(!scope.root().join(PRUNE_ENVELOPE_NAME).exists());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "CI-only genuine Redb fixture; separate execution ruling required"]
+    fn stage2_envelope_retains_read_only_handle_ci_only() {
+        let mut builder = FixtureScopeBuilder::new().unwrap();
+        builder.enable_operations_v2();
+        builder.v2_selected_config(Some(b"fixture"), false).unwrap();
+        builder.v2_wire_prune_redb().unwrap();
+        let scope = Arc::new(builder.finish().unwrap());
+        let envelope = scope.prepare_prune().unwrap().write_envelope().unwrap();
+        let mut handle = &envelope.file;
+        assert!(handle.write_all(b"unexpected").is_err());
     }
 
     #[test]
