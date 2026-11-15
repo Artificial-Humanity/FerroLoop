@@ -150,6 +150,33 @@ fn post_initialization_error(operation: &'static str, source: io::Error) -> io::
 }
 
 #[cfg(unix)]
+#[derive(Debug)]
+struct ExclusiveCreationMetadataError(io::Error);
+
+#[cfg(unix)]
+impl std::fmt::Display for ExclusiveCreationMetadataError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "exclusive Redb creation metadata (private writes may have occurred): {}",
+            self.0
+        )
+    }
+}
+
+#[cfg(unix)]
+impl std::error::Error for ExclusiveCreationMetadataError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.0)
+    }
+}
+
+#[cfg(unix)]
+fn exclusive_creation_metadata_error(source: io::Error) -> io::Error {
+    io::Error::new(source.kind(), ExclusiveCreationMetadataError(source))
+}
+
+#[cfg(unix)]
 fn same_file(a: &std::fs::Metadata, b: &std::fs::Metadata) -> bool {
     use std::os::unix::fs::MetadataExt;
     a.dev() == b.dev() && a.ino() == b.ino()
@@ -158,6 +185,17 @@ fn same_file(a: &std::fs::Metadata, b: &std::fs::Metadata) -> bool {
 const PRUNE_ENVELOPE_NAME: &str = "prune-context.json";
 const MAX_ENVELOPE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_RETAINED_MANIFEST_BYTES: usize = 1024 * 1024;
+
+fn read_bounded_envelope(reader: &mut impl Read) -> io::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    reader
+        .take((MAX_ENVELOPE_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > MAX_ENVELOPE_BYTES {
+        return Err(prune_refusal("envelope exceeds size limit"));
+    }
+    Ok(bytes)
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -710,7 +748,7 @@ impl FixtureScopeBuilder {
                         format!("exclusive Redb creation (private writes may have occurred): {e}"),
                     )
                 })?;
-            let original = file.metadata()?;
+            let original = file.metadata().map_err(exclusive_creation_metadata_error)?;
             drop(file);
             let database = fl_store::RedbStore::open_with_retries(&store, 0).map_err(|e| {
                 io::Error::other(format!(
@@ -1161,8 +1199,7 @@ impl PreparedPruneFixture {
                 drop(file);
                 let mut reader = File::open(&path)?;
                 let retained = reader.metadata()?;
-                let mut actual = Vec::new();
-                reader.read_to_end(&mut actual)?;
+                let actual = read_bounded_envelope(&mut reader)?;
                 inject_envelope_fault(fault, EnvelopeFault::Postcheck)?;
                 let meta = std::fs::symlink_metadata(&path)?;
                 if !meta.file_type().is_file()
@@ -1206,6 +1243,44 @@ impl Drop for FixtureScope {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Pure error wrapping; no fixture or database is opened.
+    #[cfg(unix)]
+    #[test]
+    fn stage2_exclusive_creation_metadata_error_keeps_kind_and_source() {
+        use std::error::Error;
+        let original = io::Error::new(io::ErrorKind::PermissionDenied, "synthetic metadata cause");
+        let error = exclusive_creation_metadata_error(original);
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(
+            error
+                .to_string()
+                .contains("exclusive Redb creation metadata")
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("private writes may have occurred")
+        );
+        assert_eq!(
+            error.source().unwrap().to_string(),
+            "synthetic metadata cause"
+        );
+    }
+
+    // In-memory input only: exercises the actual postcheck reader and its limit.
+    #[test]
+    fn stage2_bounded_envelope_reader_rejects_overflow() {
+        let mut exact = io::Cursor::new(vec![0x5a; MAX_ENVELOPE_BYTES]);
+        assert_eq!(
+            read_bounded_envelope(&mut exact).unwrap().len(),
+            MAX_ENVELOPE_BYTES
+        );
+        let mut oversized = io::Cursor::new(vec![0x5a; MAX_ENVELOPE_BYTES + 2]);
+        let error = read_bounded_envelope(&mut oversized).unwrap_err();
+        assert!(error.to_string().contains("envelope exceeds size limit"));
+        assert_eq!(oversized.position(), (MAX_ENVELOPE_BYTES + 1) as u64);
+    }
 
     // Pure error wrapping; no fixture or database is opened.
     #[cfg(unix)]
