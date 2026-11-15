@@ -363,6 +363,7 @@ pub fn doctor(probe: &HeadlessEngineProbe) -> DoctorReport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
     fn vp(s: &str) -> Result<Viewport, BrowseError> {
@@ -424,6 +425,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     fn fake_engine(dir: &Path) -> PathBuf {
         let p = dir.join("chromium");
         std::fs::write(
@@ -481,6 +483,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn auto_and_cdp_use_the_engine_when_present() {
         let dir = tempfile::tempdir().unwrap();
         let bin = fake_engine(dir.path());
@@ -512,20 +515,23 @@ mod tests {
             run_snapshot(p.to_str().unwrap(), &o),
             Err(BrowseError::Usage(_))
         ));
-        // With an engine, the default mode uses it.
-        let bin = fake_engine(dir.path());
-        let mut o = opts(Some(&bin));
-        o.screenshot = Some(shot.clone());
-        let out = run_snapshot(p.to_str().unwrap(), &o).unwrap();
-        assert_eq!(out.engine, "headless:chromium");
-        assert_eq!(out.screenshot.as_deref(), Some(shot.as_path()));
-        assert_eq!(std::fs::read(&shot).unwrap(), b"png");
+        #[cfg(unix)]
+        {
+            // With an engine, the default mode uses it.
+            let bin = fake_engine(dir.path());
+            let mut o = opts(Some(&bin));
+            o.screenshot = Some(shot.clone());
+            let out = run_snapshot(p.to_str().unwrap(), &o).unwrap();
+            assert_eq!(out.engine, "headless:chromium");
+            assert_eq!(out.screenshot.as_deref(), Some(shot.as_path()));
+            assert_eq!(std::fs::read(&shot).unwrap(), b"png");
+        }
     }
 
     #[test]
     fn a_screenshot_directory_that_does_not_exist_is_refused_before_anything_runs() {
         let dir = tempfile::tempdir().unwrap();
-        let bin = fake_engine(dir.path());
+        let bin = dir.path().join("unused-engine");
         let mut o = opts(Some(&bin));
         o.screenshot = Some(dir.path().join("nope/s.png"));
         let e = run_snapshot(page(dir.path()).to_str().unwrap(), &o).unwrap_err();
@@ -542,6 +548,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn the_engine_is_given_a_file_url_for_a_path_and_the_url_for_http() {
         let dir = tempfile::tempdir().unwrap();
         let bin = dir.path().join("chromium");
@@ -574,6 +581,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn doctor_reports_both_tiers() {
         let dir = tempfile::tempdir().unwrap();
         let none = doctor(&HeadlessEngineProbe::default());
