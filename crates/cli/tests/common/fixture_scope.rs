@@ -120,6 +120,36 @@ fn read_bounded_store(file: &File) -> io::Result<Vec<u8>> {
 }
 
 #[cfg(unix)]
+#[derive(Debug)]
+struct PostInitializationError {
+    operation: &'static str,
+    source: io::Error,
+}
+
+#[cfg(unix)]
+impl std::fmt::Display for PostInitializationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "post-initialization {} (private writes occurred): {}",
+            self.operation, self.source
+        )
+    }
+}
+
+#[cfg(unix)]
+impl std::error::Error for PostInitializationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+#[cfg(unix)]
+fn post_initialization_error(operation: &'static str, source: io::Error) -> io::Error {
+    io::Error::new(source.kind(), PostInitializationError { operation, source })
+}
+
+#[cfg(unix)]
 fn same_file(a: &std::fs::Metadata, b: &std::fs::Metadata) -> bool {
     use std::os::unix::fs::MetadataExt;
     a.dev() == b.dev() && a.ino() == b.ino()
@@ -707,15 +737,31 @@ impl FixtureScopeBuilder {
                 ));
             }
             if !same_file(&original, &metadata) {
-                return Err(prune_refusal("Redb fixture replaced during initialization"));
+                return Err(post_initialization_error(
+                    "identity check",
+                    prune_refusal("Redb fixture replaced during initialization"),
+                ));
             }
-            let retained = File::open(&store)?;
-            if !same_file(&original, &retained.metadata()?) {
-                return Err(prune_refusal("Redb fixture replaced while retaining"));
+            let retained =
+                File::open(&store).map_err(|e| post_initialization_error("retain store", e))?;
+            let retained_metadata = retained
+                .metadata()
+                .map_err(|e| post_initialization_error("retained identity check", e))?;
+            if !same_file(&original, &retained_metadata) {
+                return Err(post_initialization_error(
+                    "retained identity check",
+                    prune_refusal("Redb fixture replaced while retaining"),
+                ));
             }
-            let contents = read_bounded_store(&retained)?;
-            if !same_file(&metadata, &std::fs::symlink_metadata(&store)?) {
-                return Err(prune_refusal("Redb fixture replaced during snapshot"));
+            let contents = read_bounded_store(&retained)
+                .map_err(|e| post_initialization_error("store snapshot", e))?;
+            let snapshot_metadata = std::fs::symlink_metadata(&store)
+                .map_err(|e| post_initialization_error("snapshot identity check", e))?;
+            if !same_file(&metadata, &snapshot_metadata) {
+                return Err(post_initialization_error(
+                    "snapshot identity check",
+                    prune_refusal("Redb fixture replaced during snapshot"),
+                ));
             }
             require_absent(&sibling).map_err(|e| {
                 io::Error::new(
@@ -1160,6 +1206,23 @@ impl Drop for FixtureScope {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Pure error wrapping; no fixture or database is opened.
+    #[cfg(unix)]
+    #[test]
+    fn stage2_post_initialization_error_keeps_kind_and_source() {
+        use std::error::Error;
+        let original = io::Error::new(io::ErrorKind::UnexpectedEof, "synthetic cause");
+        let error = post_initialization_error("store snapshot", original);
+        assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+        assert!(
+            error
+                .to_string()
+                .contains("post-initialization store snapshot")
+        );
+        assert!(error.to_string().contains("private writes occurred"));
+        assert_eq!(error.source().unwrap().to_string(), "synthetic cause");
+    }
 
     // Synthetic regular file only: this cannot invoke Redb initialization.
     #[cfg(unix)]
