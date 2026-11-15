@@ -92,6 +92,31 @@ struct PruneRedb {
     sibling: PathBuf,
     // Retaining the opened provisioned inode prevents reuse after unlink.
     file: Arc<File>,
+    contents: Arc<Vec<u8>>,
+}
+
+// This helper provisions an empty fixture only. Refuse unbounded or changed
+// input rather than retaining arbitrarily large files as provenance.
+#[cfg(unix)]
+const MAX_PRUNE_STORE_BYTES: usize = 64 * 1024 * 1024;
+
+#[cfg(unix)]
+fn read_bounded_store(file: &File) -> io::Result<Vec<u8>> {
+    use std::os::unix::fs::FileExt;
+    let mut bytes = Vec::new();
+    let mut chunk = [0u8; 64 * 1024];
+    loop {
+        let remaining = MAX_PRUNE_STORE_BYTES + 1 - bytes.len();
+        let amount = chunk.len().min(remaining);
+        let count = file.read_at(&mut chunk[..amount], bytes.len() as u64)?;
+        if count == 0 {
+            return Ok(bytes);
+        }
+        bytes.extend_from_slice(&chunk[..count]);
+        if bytes.len() > MAX_PRUNE_STORE_BYTES {
+            return Err(prune_refusal("Redb fixture exceeds size limit"));
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -688,15 +713,19 @@ impl FixtureScopeBuilder {
             if !same_file(&original, &retained.metadata()?) {
                 return Err(prune_refusal("Redb fixture replaced while retaining"));
             }
+            let contents = read_bounded_store(&retained)?;
+            if !same_file(&metadata, &std::fs::symlink_metadata(&store)?) {
+                return Err(prune_refusal("Redb fixture replaced during snapshot"));
+            }
             require_absent(&sibling).map_err(|e| {
                 io::Error::new(
                     e.kind(),
                     format!("post-initialization sibling check (private writes occurred): {e}"),
                 )
             })?;
-            Ok(retained)
+            Ok((retained, contents))
         })();
-        let retained = result?;
+        let (retained, contents) = result?;
         let grant = MetadataGrant {
             allowed: true,
             allow_not_found: true,
@@ -718,6 +747,7 @@ impl FixtureScopeBuilder {
             store: store.clone(),
             sibling,
             file: Arc::new(retained),
+            contents: Arc::new(contents),
         });
         self.poisoned = false;
         Ok(store)
@@ -875,6 +905,7 @@ impl FixtureScope {
             let meta = std::fs::symlink_metadata(&redb.store)?;
             if !meta.file_type().is_file()
                 || !same_file(&meta, &redb.file.metadata()?)
+                || read_bounded_store(&redb.file)? != *redb.contents
                 || redb.store.canonicalize()?.parent() != Some(root.canonicalize()?.as_path())
             {
                 return Err(prune_refusal("Redb fixture changed"));
@@ -1070,7 +1101,11 @@ impl PreparedPruneFixture {
                     .create_new(true)
                     .mode(0o600)
                     .open(&path)?;
-                inject_envelope_fault(fault, EnvelopeFault::Write)?;
+                if fault == EnvelopeFault::Write {
+                    // Exercise an honest partial write before the injected error.
+                    file.write_all(&bytes[..bytes.len().min(16)])?;
+                    inject_envelope_fault(fault, EnvelopeFault::Write)?;
+                }
                 file.write_all(&bytes)?;
                 inject_envelope_fault(fault, EnvelopeFault::Flush)?;
                 file.flush()?;
@@ -1125,6 +1160,21 @@ impl Drop for FixtureScope {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Synthetic regular file only: this cannot invoke Redb initialization.
+    #[cfg(unix)]
+    #[test]
+    fn stage2_store_snapshot_detects_in_place_content_change() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("plain-file");
+        std::fs::write(&path, b"first").unwrap();
+        let file = File::open(&path).unwrap();
+        let original_metadata = file.metadata().unwrap();
+        let original = read_bounded_store(&file).unwrap();
+        std::fs::write(&path, b"other").unwrap();
+        assert!(same_file(&original_metadata, &file.metadata().unwrap()));
+        assert_ne!(read_bounded_store(&file).unwrap(), original);
+    }
 
     // These negatives use only synthetic bytes and never call the Redb initializer.
     #[test]
@@ -1330,7 +1380,13 @@ mod tests {
                     .to_string()
                     .contains("private partial effects may remain")
             );
-            assert!(scope.root().join(PRUNE_ENVELOPE_NAME).exists());
+            let partial_path = scope.root().join(PRUNE_ENVELOPE_NAME);
+            assert!(partial_path.exists());
+            if fault == EnvelopeFault::Write {
+                let partial = std::fs::read(&partial_path).unwrap();
+                assert!(!partial.is_empty());
+                assert!(partial.len() < 32, "write failure retained only a prefix");
+            }
             // Even if a caller removes the partial file, the shared attempt
             // state must keep another scope clone from creating a capability.
             std::fs::remove_file(scope.root().join(PRUNE_ENVELOPE_NAME)).unwrap();
@@ -1343,7 +1399,7 @@ mod tests {
     #[ignore = "CI-only genuine Redb fixture; separate execution ruling required"]
     fn stage2_changed_fixture_inputs_refuse_ci_only() {
         use std::os::unix::fs::PermissionsExt;
-        for changed in ["config", "manifest", "store", "sibling"] {
+        for changed in ["config", "manifest", "store", "store_in_place", "sibling"] {
             let mut builder = FixtureScopeBuilder::new().unwrap();
             builder.enable_operations_v2();
             builder.v2_selected_config(Some(b"fixture"), false).unwrap();
@@ -1371,6 +1427,12 @@ mod tests {
                     let store = scope.root().join("wire-prune.redb");
                     std::fs::rename(&store, scope.root().join("old.redb")).unwrap();
                     std::fs::write(store, b"not the provisioned file").unwrap();
+                }
+                "store_in_place" => {
+                    let store = scope.root().join("wire-prune.redb");
+                    let before = std::fs::metadata(&store).unwrap();
+                    std::fs::write(&store, b"in-place mutation").unwrap();
+                    assert!(same_file(&before, &std::fs::metadata(&store).unwrap()));
                 }
                 "sibling" => {
                     std::fs::write(scope.root().join("wire-prune.fls"), b"unexpected").unwrap()
