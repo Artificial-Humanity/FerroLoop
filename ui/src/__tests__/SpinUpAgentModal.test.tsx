@@ -424,7 +424,7 @@ describe("SpinUpAgentModal", () => {
   });
 
   it("clears transcript state and avoids re-fetching torn-down session transcript in App on teardown", async () => {
-    type Phase = "initial" | "pre-submit" | "pending" | "after-success";
+    type Phase = "initial" | "pre-submit" | "submitting" | "pending" | "after-success";
     const transcriptFetches: Array<{ phase: Phase; url: string }> = [];
     let phase: Phase = "initial";
     let deferNextTranscript = false;
@@ -495,9 +495,9 @@ describe("SpinUpAgentModal", () => {
       fireEvent.click(screen.getByTestId("decommission-teardown-btn"));
       expect(screen.getByTestId("decommission-confirm-dialog")).toBeInTheDocument();
       expect(screen.getByText("Active session turn before teardown")).toBeInTheDocument();
+      phase = "submitting";
       await act(async () => { fireEvent.click(screen.getByTestId("decommission-confirm-submit-btn")); });
       expect(phase).toBe("pending");
-      const atSubmission = transcriptFetches.length;
       await act(async () => {
         await vi.advanceTimersByTimeAsync(5000);
         fireEvent.focus(window);
@@ -506,7 +506,11 @@ describe("SpinUpAgentModal", () => {
         await vi.advanceTimersByTimeAsync(50);
         fireEvent(document, new Event("visibilitychange"));
       });
-      expect(transcriptFetches.slice(atSubmission)).toEqual([]);
+      expect(
+        transcriptFetches.filter(
+          (call) => call.phase === "submitting" || call.phase === "pending" || call.phase === "after-success",
+        ),
+      ).toEqual([]);
       expect(screen.getByText("Active session turn before teardown")).toBeInTheDocument();
 
       phase = "after-success";
@@ -525,7 +529,11 @@ describe("SpinUpAgentModal", () => {
         fireEvent(document, new Event("visibilitychange"));
       });
       expect(screen.queryByText("Active session turn before teardown")).toBeNull();
-      expect(transcriptFetches.slice(atSubmission)).toEqual([]);
+      expect(
+        transcriptFetches.filter(
+          (call) => call.phase === "submitting" || call.phase === "pending" || call.phase === "after-success",
+        ),
+      ).toEqual([]);
     } finally {
       unmount?.();
       vi.useRealTimers();
