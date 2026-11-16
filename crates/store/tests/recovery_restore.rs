@@ -2834,17 +2834,19 @@ fn restore_tail_unauthenticated_header_and_plausible_length_use_one_frame_window
     let last = frames.last().unwrap();
     let window_end = last.start + original.len() / 96;
     assert!(last.end < window_end && window_end < original.len());
-    for kind in 0..4 {
+    for kind in 0..5 {
         let mut damaged = original.clone();
         match kind {
             0 => damaged[last.start..last.start + 72].fill(0),
             1 => damaged[last.start + 4..last.start + 8].copy_from_slice(&u32::MAX.to_le_bytes()),
-            // A partly lost length remains plausible and in-range.
-            2 => {
-                damaged[last.start + 5..last.start + 8].fill(0);
-                assert_ne!(damaged[last.start + 4], 0);
+            // Explicit plausible lengths cover zero and nonzero low bytes without
+            // depending on the genuine serialized payload length modulo 256.
+            2 | 3 => {
+                let length = if kind == 2 { 0x0100_u32 } else { 0x0101_u32 };
+                assert!(length > 0 && (length as usize) < last.len() - 72);
+                damaged[last.start + 4..last.start + 8].copy_from_slice(&length.to_le_bytes());
             }
-            3 => damaged[last.start + 40] ^= 1,
+            4 => damaged[last.start + 40] ^= 1,
             _ => unreachable!(),
         }
         damaged[window_end - 1] = 1;
