@@ -609,6 +609,8 @@ pub const CLAUDE_RESUME_POLL_INTERVAL: std::time::Duration = std::time::Duration
 thread_local! {
     static TEST_CLAUDE_RESUME_SURVIVAL_WINDOW: std::cell::Cell<Option<std::time::Duration>> =
         const { std::cell::Cell::new(None) };
+    static TEST_CLAUDE_RESUME_WATCH_HOOK: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 /// `true` when `pid` is a live (non-zombie) OS process.
@@ -823,6 +825,13 @@ fn resume_launch_survived(
     ) {
         return (true, true);
     }
+
+    #[cfg(test)]
+    TEST_CLAUDE_RESUME_WATCH_HOOK.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().as_mut() {
+            hook();
+        }
+    });
 
     #[cfg(test)]
     let settle = env.runtime.settle_delay();
@@ -18113,53 +18122,123 @@ mod tests {
             false,
         );
 
-        let watch_window = Duration::from_millis(300);
-        let (concurrent_done_tx, concurrent_done_rx) = std::sync::mpsc::channel();
-        std::thread::scope(|s| {
+        // The hook executes on this thread inside the actual watch, after its caller has
+        // dropped the store guard.  Its bounded wait is a deadlock escape, not a latency
+        // requirement: success means the reader completed before the watch was released.
+        const DEADLOCK_TIMEOUT: Duration = Duration::from_secs(10);
+        struct RestoreWatchHook(Option<Box<dyn FnMut()>>);
+        impl Drop for RestoreWatchHook {
+            fn drop(&mut self) {
+                TEST_CLAUDE_RESUME_WATCH_HOOK.with(|hook| *hook.borrow_mut() = self.0.take());
+            }
+        }
+        struct RestoreWindow(Option<Duration>);
+        impl Drop for RestoreWindow {
+            fn drop(&mut self) {
+                TEST_CLAUDE_RESUME_SURVIVAL_WINDOW.with(|window| window.set(self.0));
+            }
+        }
+        fn wait_before_release<T>(
+            completion: &std::sync::mpsc::Receiver<T>,
+        ) -> Result<T, std::sync::mpsc::RecvTimeoutError> {
+            completion.recv_timeout(DEADLOCK_TIMEOUT)
+        }
+
+        // Negative control: a reader blocked on a held lock cannot report completion
+        // before release.  Release the lock before joining, even when the assertion fails.
+        let lock = std::sync::Mutex::new(());
+        std::thread::scope(|scope| {
+            let guard = lock.lock().unwrap();
+            let (started_tx, started_rx) = std::sync::mpsc::channel();
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            let lock_ref = &lock;
+            let reader = scope.spawn(move || {
+                let _ = started_tx.send(());
+                let _guard = lock_ref.lock().unwrap();
+                let _ = done_tx.send(());
+            });
+            let started = started_rx.recv_timeout(DEADLOCK_TIMEOUT);
+            let before_release = wait_before_release(&done_rx);
+            drop(guard);
+            let joined = reader.join();
+            assert!(started.is_ok(), "negative-control reader did not start");
+            assert!(
+                matches!(
+                    before_release,
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                ),
+                "a reader blocked on a held lock must not complete before release"
+            );
+            assert!(joined.is_ok(), "negative-control reader panicked");
+        });
+
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let observed = std::rc::Rc::new(std::cell::RefCell::new(None));
+        std::thread::scope(|scope| {
             let state_ref = &state;
-            let reader = s.spawn(move || {
-                // Wait 50ms so the main thread is mid-watch inside `resume_launch_survived`.
-                std::thread::sleep(Duration::from_millis(50));
-                let t0 = Instant::now();
-                let guard = state_ref.open_store().unwrap();
-                let sessions = list_hosted_sessions(&*guard).unwrap();
-                drop(guard);
-                let elapsed = t0.elapsed();
-                concurrent_done_tx.send((sessions.len(), elapsed)).unwrap();
+            let reader = scope.spawn(move || {
+                if entered_rx.recv_timeout(DEADLOCK_TIMEOUT).is_err() {
+                    return;
+                }
+                let result = state_ref
+                    .open_store()
+                    .map_err(|error| error.to_string())
+                    .and_then(|guard| {
+                        list_hosted_sessions(&*guard)
+                            .map(|sessions| sessions.len())
+                            .map_err(|error| error.to_string())
+                    });
+                let _ = done_tx.send(result);
             });
 
-            TEST_CLAUDE_RESUME_SURVIVAL_WINDOW.with(|c| c.set(Some(watch_window)));
+            let observed_by_hook = observed.clone();
+            let previous = TEST_CLAUDE_RESUME_WATCH_HOOK.with(|hook| {
+                hook.borrow_mut().replace(Box::new(move || {
+                    let result = if entered_tx.send(()).is_err() {
+                        Err("reader did not await watch entry".to_string())
+                    } else {
+                        wait_before_release(&done_rx)
+                            .map_err(|error| {
+                                format!("reader did not complete during watch: {error}")
+                            })
+                            .and_then(|result| result)
+                    };
+                    *observed_by_hook.borrow_mut() = Some(result);
+                }))
+            });
+            let _restore_hook = RestoreWatchHook(previous);
+            let previous_window = TEST_CLAUDE_RESUME_SURVIVAL_WINDOW.with(|window| {
+                let previous = window.get();
+                window.set(Some(Duration::ZERO));
+                previous
+            });
+            let _restore_window = RestoreWindow(previous_window);
             let fake_restart = FakeRuntime::default();
             let env_restart = fake_restart.env(hub_home.path());
-            let restart_t0 = Instant::now();
             let guard = state.open_store().unwrap();
-            let restarted_c = restart_hosted_session_with_store(
+            let restarted = restart_hosted_session_with_store(
                 guard,
                 || state.open_store().map_err(LifecycleError::from),
                 &env_restart,
                 "claude:ada",
                 "owner",
-            )
-            .unwrap();
-            let restart_elapsed = restart_t0.elapsed();
-            TEST_CLAUDE_RESUME_SURVIVAL_WINDOW.with(|c| c.set(None));
-
+            );
+            let joined = reader.join();
+            assert!(joined.is_ok(), "concurrent reader panicked");
+            let restarted = restarted.unwrap();
             assert_eq!(
-                restarted_c.record.vendor_session_id.as_deref(),
+                restarted.record.vendor_session_id.as_deref(),
                 Some(sid_concurrent.as_str())
             );
-            assert!(
-                restart_elapsed >= Duration::from_millis(250),
-                "expected resume watch to run for ~300ms, got {restart_elapsed:?}"
-            );
-            reader.join().unwrap();
         });
-
-        let (count, reader_elapsed) = concurrent_done_rx.recv().unwrap();
-        assert_eq!(count, 1);
-        assert!(
-            reader_elapsed < Duration::from_millis(120),
-            "R2: concurrent store-backed hub request must finish during the 300ms resume watch without waiting for it to end (took {reader_elapsed:?})"
+        let result = observed
+            .borrow_mut()
+            .take()
+            .expect("resume watch hook was not reached");
+        assert_eq!(
+            result.expect("reader must complete before watch release"),
+            1
         );
     }
 
