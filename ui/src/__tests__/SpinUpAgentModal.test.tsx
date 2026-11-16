@@ -423,102 +423,124 @@ describe("SpinUpAgentModal", () => {
     ]);
   });
 
-  it("clears transcript state and avoids re-fetching torn-down session transcript in App on teardown", async () => {
-    const transcriptFetches: string[] = [];
-
+  it.each([false, true])("clears transcript and avoids teardown refetches (stale response in flight: %s)", async (holdStaleResponse) => {
+    type Phase = "initial" | "pre-submit" | "submitting" | "pending" | "after-success";
+    const transcriptFetches: Array<{ phase: Phase; url: string }> = [];
+    let phase: Phase = "initial";
+    let deferNextTranscript = false;
+    let resolveStaleTranscript!: (response: Response) => void;
+    const staleTranscript = new Promise<Response>((resolve) => { resolveStaleTranscript = resolve; });
+    let resolveDecommission!: (response: Response) => void;
+    const decommission = new Promise<Response>((resolve) => { resolveDecommission = resolve; });
+    const json = (body: unknown) => new Response(JSON.stringify(body), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    });
+    const oldTranscript = () => json({
+      turns: [{ index: 0, role: "assistant", content: "Active session turn before teardown", thinking: null, tool_calls: [] }],
+      is_busy: true,
+    });
     const fetchImpl = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input);
       const method = init?.method ?? "GET";
-      const json = (body: unknown) =>
-        new Response(JSON.stringify(body), {
-          status: 200,
-          headers: { "Content-Type": "application/json" },
-        });
-
       if (url.includes("/api/v1/auth/session")) {
-        return json({
-          authenticated: true,
-          authority: { tier: "owner", login: "lmcfarlin" },
-        });
+        return json({ authenticated: true, authority: { tier: "owner", login: "lmcfarlin" } });
       }
       if (url.endsWith("/api/v1/sessions")) {
-        return json({
-          sessions: [
-            {
-              id: "sess-ferris-live",
-              persona: "ferris",
-              adapter: "claude",
-              status: "running",
-            },
-          ],
-        });
+        // Discovery remains stale even after the teardown has succeeded.
+        return json({ sessions: [{ id: "sess-ferris-live", persona: "ferris", adapter: "claude", status: "running" }] });
       }
       if (url.includes("/api/v1/sessions/") && url.endsWith("/transcript")) {
-        transcriptFetches.push(url);
-        return json({
-          turns: [
-            {
-              index: 0,
-              role: "assistant",
-              content: "Active session turn before teardown",
-              thinking: null,
-              tool_calls: [],
-            },
-          ],
-          is_busy: true,
-        });
+        transcriptFetches.push({ phase, url });
+        if (deferNextTranscript) {
+          deferNextTranscript = false;
+          return staleTranscript;
+        }
+        return oldTranscript();
       }
       if (url.endsWith("/api/v1/sessions/sess-ferris-live/decommission") && method === "POST") {
-        return json({
-          session_id: "sess-ferris-live",
-          persona: "ferris",
-          mode: "teardown",
-          status: "decommissioned",
-          unregistered: true,
-          runtime_stopped: true,
-        });
+        phase = "pending";
+        return decommission;
       }
-      if (url.endsWith("/api/v1/projects")) {
-        return json({ projects: TEST_PROJECTS });
-      }
+      if (url.endsWith("/api/v1/projects")) return json({ projects: TEST_PROJECTS });
       return json({});
     });
-
-    const apiClient = new HubApiClient({
-      fetchImpl: fetchImpl as unknown as typeof fetch,
-    });
+    const apiClient = new HubApiClient({ fetchImpl: fetchImpl as unknown as typeof fetch });
     const wsStub = {
-      setToken: vi.fn(),
-      connect: vi.fn(),
-      disconnect: vi.fn(),
-      onStatusChange: () => () => {},
-      subscribe: () => () => {},
+      setToken: vi.fn(), connect: vi.fn(), disconnect: vi.fn(),
+      onStatusChange: () => () => {}, subscribe: () => () => {},
     } as unknown as HubWsClient;
 
-    const { unmount } = render(<App apiClient={apiClient} wsClient={wsStub} />);
+    vi.useFakeTimers();
+    let unmount: (() => void) | undefined;
+    try {
+      await act(async () => { ({ unmount } = render(<App apiClient={apiClient} wsClient={wsStub} />)); });
+      expect(screen.getByText("Active session turn before teardown")).toBeInTheDocument();
+      expect(transcriptFetches.some((call) => call.phase === "initial")).toBe(true);
 
-    expect(
-      await screen.findByText("Active session turn before teardown"),
-    ).toBeInTheDocument();
+      // Foreground refresh is legitimate before submission. In one case the poll
+      // completes before submission, so it cannot mask a pending teardown fetch.
+      // The other case retains a stale response across successful teardown.
+      phase = "pre-submit";
+      const beforeFocus = transcriptFetches.length;
+      await act(async () => { fireEvent.focus(window); });
+      expect(transcriptFetches.length).toBeGreaterThan(beforeFocus);
+      deferNextTranscript = holdStaleResponse;
+      const beforePoll = transcriptFetches.length;
+      await act(async () => { await vi.advanceTimersByTimeAsync(3500); });
+      expect(transcriptFetches.length).toBeGreaterThan(beforePoll);
+      expect(deferNextTranscript).toBe(false);
 
-    transcriptFetches.length = 0;
-
-    fireEvent.click(screen.getByTestId("agent-settings-btn-ferris"));
-    fireEvent.click(screen.getByTestId("open-decommission-modal-btn"));
-    fireEvent.click(screen.getByTestId("decommission-teardown-btn"));
-    // Decommission asks for a second confirmation before it stops the session (Record #128).
-    expect(screen.getByTestId("decommission-confirm-dialog")).toBeInTheDocument();
-    expect(screen.getByText("Active session turn before teardown")).toBeInTheDocument();
-    fireEvent.click(screen.getByTestId("decommission-confirm-submit-btn"));
-
-    await waitFor(() => {
+      fireEvent.click(screen.getByTestId("agent-settings-btn-ferris"));
+      fireEvent.click(screen.getByTestId("open-decommission-modal-btn"));
+      fireEvent.click(screen.getByTestId("decommission-teardown-btn"));
+      expect(screen.getByTestId("decommission-confirm-dialog")).toBeInTheDocument();
+      expect(screen.getByText("Active session turn before teardown")).toBeInTheDocument();
+      phase = "submitting";
+      await act(async () => { fireEvent.click(screen.getByTestId("decommission-confirm-submit-btn")); });
+      expect(phase).toBe("pending");
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(5000);
+        fireEvent.focus(window);
+      });
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(50);
+        fireEvent(document, new Event("visibilitychange"));
+      });
       expect(
-        screen.queryByText("Active session turn before teardown"),
-      ).toBeNull();
-    });
-    expect(transcriptFetches).toEqual([]);
+        transcriptFetches.filter(
+          (call) => call.phase === "submitting" || call.phase === "pending" || call.phase === "after-success",
+        ),
+      ).toEqual([]);
+      expect(screen.getByText("Active session turn before teardown")).toBeInTheDocument();
 
-    unmount();
+      phase = "after-success";
+      await act(async () => {
+        resolveDecommission(json({ session_id: "sess-ferris-live", persona: "ferris", mode: "teardown", status: "decommissioned", unregistered: true, runtime_stopped: true }));
+      });
+      expect(screen.queryByText("Active session turn before teardown")).toBeNull();
+      if (holdStaleResponse) {
+        await act(async () => { resolveStaleTranscript(oldTranscript()); });
+        expect(screen.queryByText("Active session turn before teardown")).toBeNull();
+      }
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(5000);
+        fireEvent.focus(window);
+      });
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(50);
+        fireEvent(document, new Event("visibilitychange"));
+      });
+      expect(screen.queryByText("Active session turn before teardown")).toBeNull();
+      expect(
+        transcriptFetches.filter(
+          (call) => call.phase === "submitting" || call.phase === "pending" || call.phase === "after-success",
+        ),
+      ).toEqual([]);
+    } finally {
+      unmount?.();
+      vi.useRealTimers();
+    }
   });
 
   it("opens from the sidebar + Spin Up button in App and dispatches POST /api/v1/sessions/spin-up", async () => {
