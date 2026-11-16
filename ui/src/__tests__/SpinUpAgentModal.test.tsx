@@ -423,7 +423,7 @@ describe("SpinUpAgentModal", () => {
     ]);
   });
 
-  it("clears transcript state and avoids re-fetching torn-down session transcript in App on teardown", async () => {
+  it.each([false, true])("clears transcript and avoids teardown refetches (stale response in flight: %s)", async (holdStaleResponse) => {
     type Phase = "initial" | "pre-submit" | "submitting" | "pending" | "after-success";
     const transcriptFetches: Array<{ phase: Phase; url: string }> = [];
     let phase: Phase = "initial";
@@ -478,13 +478,14 @@ describe("SpinUpAgentModal", () => {
       expect(screen.getByText("Active session turn before teardown")).toBeInTheDocument();
       expect(transcriptFetches.some((call) => call.phase === "initial")).toBe(true);
 
-      // Foreground refresh is legitimate before submission. Leave a later poll in
-      // flight so its stale response can be released after successful teardown.
+      // Foreground refresh is legitimate before submission. In one case the poll
+      // completes before submission, so it cannot mask a pending teardown fetch.
+      // The other case retains a stale response across successful teardown.
       phase = "pre-submit";
       const beforeFocus = transcriptFetches.length;
       await act(async () => { fireEvent.focus(window); });
       expect(transcriptFetches.length).toBeGreaterThan(beforeFocus);
-      deferNextTranscript = true;
+      deferNextTranscript = holdStaleResponse;
       const beforePoll = transcriptFetches.length;
       await act(async () => { await vi.advanceTimersByTimeAsync(3500); });
       expect(transcriptFetches.length).toBeGreaterThan(beforePoll);
@@ -518,8 +519,10 @@ describe("SpinUpAgentModal", () => {
         resolveDecommission(json({ session_id: "sess-ferris-live", persona: "ferris", mode: "teardown", status: "decommissioned", unregistered: true, runtime_stopped: true }));
       });
       expect(screen.queryByText("Active session turn before teardown")).toBeNull();
-      await act(async () => { resolveStaleTranscript(oldTranscript()); });
-      expect(screen.queryByText("Active session turn before teardown")).toBeNull();
+      if (holdStaleResponse) {
+        await act(async () => { resolveStaleTranscript(oldTranscript()); });
+        expect(screen.queryByText("Active session turn before teardown")).toBeNull();
+      }
       await act(async () => {
         await vi.advanceTimersByTimeAsync(5000);
         fireEvent.focus(window);
