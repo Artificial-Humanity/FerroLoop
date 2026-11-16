@@ -2346,6 +2346,40 @@ mod tests {
             .map(|(_, v)| v.clone())
     }
 
+    /// Check the remaining wait against the interval in which the handler read its clock.
+    fn login_while_locked(
+        state: &HubState,
+        key: &str,
+        request: impl FnOnce() -> HttpResponse,
+    ) -> HttpResponse {
+        let until = state.login_guard.throttle().users[key]
+            .locked_until
+            .expect("the fixture locked this name");
+        // Do not hold the throttle mutex while the request takes it.
+        let before = Instant::now();
+        assert!(
+            until > before,
+            "the fixture lockout expired before the request"
+        );
+        let response = request();
+        let after = Instant::now();
+        let wait = header(&response, "Retry-After")
+            .expect("a locked login includes Retry-After")
+            .parse::<u64>()
+            .expect("Retry-After is a number of seconds");
+        assert!((1..=LOCKOUT.as_secs()).contains(&wait));
+        // The deadline can pass after the handler observes it. Saturating here
+        // retains the minimum one-second response from that earlier observation.
+        let minimum = ceil_secs(until.saturating_duration_since(after));
+        let maximum = ceil_secs(until.saturating_duration_since(before));
+        assert!(
+            (minimum..=maximum).contains(&wait),
+            "Retry-After {wait} is outside the observed remaining-time interval {minimum}..={maximum}"
+        );
+        assert!(set_cookie(&response).is_none());
+        response
+    }
+
     /// The session behind a login response's cookie, as `GET /auth/session` sees it.
     fn session_via_cookie(state: &HubState, login_resp: &HttpResponse) -> HttpResponse {
         let cookie = set_cookie(login_resp).expect("a session cookie");
@@ -2557,6 +2591,11 @@ mod tests {
             t.retry_after("alice", t0 + Duration::from_secs(30)),
             Some(30)
         );
+        assert_eq!(
+            t.retry_after("alice", t0 + Duration::from_secs(59)),
+            Some(1)
+        );
+        assert_eq!(t.retry_after("alice", t0 + Duration::from_secs(60)), None);
         // Another name is unaffected.
         assert_eq!(t.retry_after("bob", t0), None);
         // The lockout ends after 60 s, but the count is kept: one more failure locks again.
@@ -3531,9 +3570,10 @@ mod tests {
             );
         }
         // Even the right password is refused while locked, and without a cookie.
-        let locked = password_login(&state, "alice", PASSWORD);
+        let locked = login_while_locked(&state, "alice", || {
+            password_login(&state, "alice", PASSWORD)
+        });
         assert_eq!(locked.status, 429);
-        assert_eq!(header(&locked, "Retry-After").as_deref(), Some("60"));
         assert!(set_cookie(&locked).is_none());
         // Another account is unaffected.
         create_operator(&state, "bert", "owner", Some(PASSWORD));
@@ -3572,9 +3612,10 @@ mod tests {
                 401
             );
         }
-        let locked = password_login(&state, "ghost", "whatever password");
+        let locked = login_while_locked(&state, "ghost", || {
+            password_login(&state, "ghost", "whatever password")
+        });
         assert_eq!(locked.status, 429);
-        assert_eq!(header(&locked, "Retry-After").as_deref(), Some("60"));
         // The name is case-folded for the count, so a spelling change does not escape it.
         assert_eq!(
             password_login(&state, "GHOST", "whatever password").status,
@@ -4709,9 +4750,13 @@ mod tests {
             for i in 0..5 {
                 assert_eq!(login(&fx.state, &bare).status, 401, "known={known} {i}");
             }
-            let locked = login(&fx.state, &bare);
+            let key = if known {
+                fx.username.to_ascii_lowercase()
+            } else {
+                format!("passkey:{}", cred.chars().take(64).collect::<String>())
+            };
+            let locked = login_while_locked(&fx.state, &key, || login(&fx.state, &bare));
             assert_eq!(locked.status, 429, "known={known}");
-            assert_eq!(header(&locked, "Retry-After").as_deref(), Some("60"));
             if known {
                 // The lock is on the owner's name: a perfect assertion is refused too.
                 assert_eq!(passkey_login(&fx, &opts(&fx.state, 1)).status, 429);
