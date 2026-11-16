@@ -18147,6 +18147,9 @@ mod tests {
             let (held_tx, held_rx) = std::sync::mpsc::channel();
             let (release_tx, release_rx) = std::sync::mpsc::channel();
             let observed = std::rc::Rc::new(std::cell::RefCell::new(None));
+            // Unwind out of restart on probe failure so even a regressed caller-held
+            // store guard is dropped before the reader is joined or the store reopened.
+            struct WatchProbeAbort;
             std::thread::scope(|scope| {
                 let state_ref = &state;
                 let blocker = scope.spawn(move || {
@@ -18198,10 +18201,14 @@ mod tests {
                                 })
                                 .and_then(|result| result)
                         };
+                        let abort = result.is_err();
                         *observed_by_hook.borrow_mut() = Some(result);
-                        // Release before watch return, so restart's store reopen and the
-                        // blocked reader cannot deadlock. Sender drop also releases on unwind.
+                        // Release before returning or unwinding. Sender drop also releases
+                        // the blocker on an unexpected panic.
                         let _ = release_tx.send(());
+                        if abort {
+                            std::panic::panic_any(WatchProbeAbort);
+                        }
                     }))
                 });
                 let _restore_hook = RestoreWatchHook(previous);
@@ -18214,22 +18221,31 @@ mod tests {
                 let fake_restart = FakeRuntime::default();
                 let env_restart = fake_restart.env(hub_home.path());
                 let guard = state.open_store().unwrap();
-                let restarted = restart_hosted_session_with_store(
-                    guard,
-                    || state.open_store().map_err(LifecycleError::from),
-                    &env_restart,
-                    "claude:ada",
-                    "owner",
-                );
+                let restarted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    restart_hosted_session_with_store(
+                        guard,
+                        || state.open_store().map_err(LifecycleError::from),
+                        &env_restart,
+                        "claude:ada",
+                        "owner",
+                    )
+                }));
                 let blocker_joined = blocker.join();
                 let reader_joined = reader.join();
                 assert!(blocker_joined.is_ok(), "store blocker panicked");
                 assert!(reader_joined.is_ok(), "concurrent reader panicked");
-                let restarted = restarted.unwrap();
-                assert_eq!(
-                    restarted.record.vendor_session_id.as_deref(),
-                    Some(sid_concurrent.as_str())
-                );
+                if hold_store {
+                    let panic = restarted.expect_err("held store must abort the watch probe");
+                    assert!(panic.is::<WatchProbeAbort>(), "unexpected restart panic");
+                } else {
+                    let restarted = restarted
+                        .expect("watch probe unexpectedly aborted")
+                        .unwrap();
+                    assert_eq!(
+                        restarted.record.vendor_session_id.as_deref(),
+                        Some(sid_concurrent.as_str())
+                    );
+                }
             });
             let result = observed
                 .borrow_mut()
