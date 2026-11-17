@@ -26,7 +26,9 @@ environment and closes inherited descriptors. It gives the command private
 home, XDG, runtime and temporary directories, proc and devices. System tools,
 libraries, the selected Rust sysroot, cargo registry and a source snapshot are
 read-only; the only writable host-backed mount is an ephemeral target directory
-under `/var/tmp`. The snapshot omits Git metadata, sockets and target trees;
+under `/var/tmp`. The snapshot includes only Git-tracked files (including
+tracked edits), omits Git metadata, untracked files and submodules, and refuses
+nested mounts in the source tree or any host bind;
 the sandbox and target are removed on exit. The runner rejects unsafe bind
 inputs or missing bubblewrap flags rather than falling back to host execution.
 
@@ -39,3 +41,6 @@ canary again after changing the host or runner. The snapshot has no `.git`, so
 tests requiring repository metadata may fail; offline dependencies must
 already be present. A passing canary alone does not prove the full workspace
 suite can build or pass unchanged, and it does not lift the local-test hold.
+The canary checks configured project and state store sockets, configured and
+database-derived Wire paths, and relevant environment overrides. It cannot
+discover arbitrary per-command socket and store paths in other sessions.

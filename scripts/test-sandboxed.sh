@@ -17,32 +17,42 @@ registry=$(realpath -e -- "${CARGO_HOME:-$HOME/.cargo}/registry")
 
 # No bind may expose a socket, even through a read-only mount. Refuse nested
 # mounts too: their contents can change independently of the checked tree.
-mounts=$(findmnt -rn -o TARGET) || die 'cannot enumerate host mounts'
+python3 "$root/scripts/test-sandbox-mounts.py" --check /usr/bin /usr/lib /usr/lib64 /usr/include "$toolchain" "$registry" "$root" || die 'mount inspection failed'
 for path in /usr/bin /usr/lib /usr/lib64 /usr/include "$toolchain" "$registry"; do
     [[ -d $path && ! -L $path ]] || die "invalid bind directory: $path"
     sockets=$(find "$path" -xdev -type s -print -quit) || die "cannot inspect bind directory: $path"
     [[ -z $sockets ]] || die "socket in bind directory: $path"
-    if printf '%s\n' "$mounts" | awk -v p="$path/" 'index($0,p)==1 {found=1} END {exit !found}'; then die "nested mount in bind directory: $path"; fi
 done
 
 scratch=$(mktemp -d /var/tmp/ferroloop-test-sandbox.XXXXXXXX)
 trap 'rm -rf -- "$scratch"' EXIT
 mkdir "$scratch/source" "$scratch/target"
-# Snapshot without VCS metadata, sockets, or build outputs. Never follow links.
+# Snapshot only Git-tracked files, without VCS metadata or runtime data. Never
+# traverse untracked files or submodules; tracked changes are included.
 python3 - "$root" "$scratch/source" <<'PY'
-import os, shutil, stat, sys
+import os, shutil, stat, subprocess, sys
 src, dst = sys.argv[1:]
-def ignore(directory, names):
-    omitted = []
-    for name in names:
-        path = os.path.join(directory, name)
-        mode = os.lstat(path).st_mode
-        if name in ('.git', 'target') or stat.S_ISSOCK(mode):
-            omitted.append(name)
-        elif not (stat.S_ISDIR(mode) or stat.S_ISREG(mode) or stat.S_ISLNK(mode)):
-            raise RuntimeError('unsupported source entry: ' + path)
-    return omitted
-shutil.copytree(src, dst, symlinks=True, ignore=ignore, dirs_exist_ok=True)
+records = subprocess.check_output(['git', '-C', src, 'ls-files', '--stage', '-z']).split(b'\0')
+for record in filter(None, records):
+    metadata, raw_path = record.split(b'\t', 1)
+    mode, _, stage = metadata.split()
+    if stage != b'0': raise RuntimeError('unmerged source entry')
+    name = os.fsdecode(raw_path)
+    parts = name.split('/')
+    if any(p in ('', '.', '..', '.git', 'target') for p in parts):
+        raise RuntimeError('unsafe tracked source path: ' + name)
+    if mode == b'160000': continue  # Submodules are not workspace members.
+    source = os.path.join(src, name)
+    destination = os.path.join(dst, name)
+    for i in range(1, len(parts)):
+        if os.path.islink(os.path.join(src, *parts[:i])):
+            raise RuntimeError('symlinked parent of tracked source: ' + name)
+    try: info = os.lstat(source)
+    except FileNotFoundError: continue  # A tracked deletion is intentional.
+    os.makedirs(os.path.dirname(destination), exist_ok=True)
+    if stat.S_ISLNK(info.st_mode): os.symlink(os.readlink(source), destination)
+    elif stat.S_ISREG(info.st_mode): shutil.copy2(source, destination, follow_symlinks=False)
+    else: raise RuntimeError('unsupported tracked source entry: ' + name)
 PY
 
 args=(--unshare-user --unshare-pid --unshare-net --unshare-ipc --unshare-uts

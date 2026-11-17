@@ -2,7 +2,7 @@
 set -euo pipefail
 here=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
 exec /usr/bin/python3 - "$here" "$@" <<'PY'
-import errno, os, secrets, signal, socket, subprocess, sys, tempfile, time
+import errno, os, secrets, signal, socket, subprocess, sys, tempfile, time, tomllib
 
 here, *args = sys.argv[1:]
 
@@ -49,10 +49,50 @@ if args and args[0] == '--inside':
     raise SystemExit(0)
 
 require(not args, 'unexpected arguments')
+subprocess.run(['/usr/bin/python3', os.path.join(here, 'test-sandbox-mounts.py'), '--self-test'], check=True)
 nonce = secrets.token_hex(16)
 home = os.path.expanduser('~')
 uid = os.getuid()
 host_net = os.readlink('/proc/self/ns/net')
+
+# Read configuration without opening a store or connecting to a socket. Cover
+# each configured project and state store, FL_DB, and Wire's configured and
+# database-derived socket paths. Explicit command-line paths in other sessions
+# cannot be discovered here; this is a bounded assertion, not an inventory.
+config_home = os.environ.get('XDG_CONFIG_HOME', '')
+if not os.path.isabs(config_home): config_home = os.path.join(home, '.config')
+config_path = os.path.join(config_home, 'fl/config.toml')
+try:
+    with open(config_path, 'rb') as f: config = tomllib.load(f)
+except FileNotFoundError:
+    config = {}
+except (OSError, tomllib.TOMLDecodeError) as e:
+    raise SystemExit('FAIL: cannot inspect FerroLoop config: ' + str(e))
+require(isinstance(config.get('project', []), list), 'invalid project config')
+wire = config.get('wire', {})
+state = config.get('state', {})
+require(isinstance(wire, dict) and isinstance(state, dict), 'invalid wire/state config')
+configured = []
+def add_path(value):
+    require(isinstance(value, str) and value != '', 'invalid configured path')
+    configured.append(os.path.abspath(value))
+if wire.get('socket') is not None: add_path(wire['socket'])
+stores = []
+for entry in config.get('project', []):
+    require(isinstance(entry, dict) and isinstance(entry.get('store'), str), 'invalid project store')
+    stores.append(entry['store'])
+if state.get('store') is not None: stores.append(state['store'])
+if os.environ.get('FL_DB'): stores.append(os.environ['FL_DB'])
+data_home = os.environ.get('XDG_DATA_HOME', '')
+if not os.path.isabs(data_home): data_home = os.path.join(home, '.local/share')
+stores.append(os.path.join(data_home, 'fl/fl.redb'))
+for store in stores:
+    require(isinstance(store, str) and store != '', 'invalid store path')
+    store = os.path.abspath(store)
+    stem, extension = os.path.splitext(store)
+    ferro = stem + '.fls' if extension else store + '.fls'
+    for path in (store + '.sock', ferro + '.sock', os.path.join(os.path.dirname(store), 'fl-wire.sock')):
+        add_path(path)
 with tempfile.TemporaryDirectory(prefix='ferroloop-canary-', dir='/var/tmp') as directory:
     unix_path = os.path.join(directory, 's-' + nonce)
     abstract_name = 'ferroloop-canary-' + nonce
@@ -103,6 +143,9 @@ with tempfile.TemporaryDirectory(prefix='ferroloop-canary-', dir='/var/tmp') as 
             if codex_home:
                 absent.append(os.path.join(codex_home, 'app-server-control/app-server-control.sock'))
             absent += [os.environ[k] for k in ('FL_HOST_SOCK', 'FL_WIRE_SOCKET', 'CODEX_APP_SERVER_CONTROL_SOCKET') if os.environ.get(k)]
+            absent += configured
+            absent = sorted({p for name in absent for p in (os.path.abspath(name), os.path.realpath(name))})
+            print('Checking', len(absent), 'configured, default and resolved socket paths by existence only', flush=True)
             print('PASS: host positive controls; sentinel nonce', nonce, flush=True)
             command = [os.path.join(here, 'test-sandboxed.sh'), '--', '/usr/bin/bash',
                        '/source/scripts/test-sandbox-canary.sh', '--inside', host_net, unix_path,
