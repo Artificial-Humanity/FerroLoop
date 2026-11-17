@@ -7801,6 +7801,74 @@ pub struct RestartResponse {
     pub prompt: String,
 }
 
+/// Select one saved hosted session without silently choosing between live personas.
+/// Exact session identifiers take precedence over persona matches and historical siblings.
+pub fn select_restart_target(
+    records: &[HostedSessionRecord],
+    target: &str,
+) -> Result<String, LifecycleError> {
+    let target = target.trim();
+    let record = if let Some(exact) = records.iter().find(|r| r.session_id == target) {
+        exact
+    } else {
+        let matching: Vec<_> = records
+            .iter()
+            .filter(|r| {
+                r.persona.eq_ignore_ascii_case(target)
+                    || target.split_once(':').is_some_and(|(vendor, persona)| {
+                        r.vendor.eq_ignore_ascii_case(vendor)
+                            && r.persona.eq_ignore_ascii_case(persona)
+                    })
+            })
+            .collect();
+        let mut live = matching.iter().copied().filter(|r| !is_decommissioned(r));
+        let first = live.next();
+        if live.next().is_some() {
+            return Err(LifecycleError::Conflict(format!(
+                "multiple saved sessions match `{target}`; use an exact session id"
+            )));
+        }
+        first
+            .or_else(|| matching.first().copied())
+            .ok_or_else(|| LifecycleError::NotFound(format!("no hosted session `{target}`")))?
+    };
+    require_restartable_cli_record(record)?;
+    Ok(record.session_id.clone())
+}
+
+fn require_restartable_cli_record(record: &HostedSessionRecord) -> Result<(), LifecycleError> {
+    if !record.hosted || is_decommissioned(record) || record.status == STATUS_DECOMMISSIONING {
+        return Err(LifecycleError::Conflict(format!(
+            "saved session `{}` cannot be restarted while hosted={} and status={}",
+            record.session_id, record.hosted, record.status
+        )));
+    }
+    Ok(())
+}
+
+fn require_manual_restart_authority(caller: Caller, by: &str) -> Result<(), LifecycleError> {
+    if caller != Caller::Owner || by.trim() == AUTO_RESPAWN_ACTOR {
+        return Err(LifecycleError::Forbidden(
+            "saved-record restart requires Owner authority and a manual audit actor".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Restart a saved hosted record with Owner authority and no configuration overrides.
+/// Selection is repeated under the lifecycle lock before any restart effects.
+pub fn restart_agent_session<S: StateStore + AgentRegistry + Catalog + MessageStore>(
+    store: &S,
+    env: &LifecycleEnv<'_>,
+    target: &str,
+    by: &str,
+    caller: Caller,
+) -> Result<RestartResponse, LifecycleError> {
+    require_manual_restart_authority(caller, by)?;
+    let id = select_restart_target(&list_hosted_sessions(store)?, target)?;
+    restart_hosted_session_with_options(store, || Ok(store), env, &id, by, Some(target))
+}
+
 /// Count a restart: reopen a missing tmux session, redeliver the reforge prompt, mark running.
 /// A `decommissioned` session is refused (409); spin it up again instead.
 pub fn restart_hosted_session<S: StateStore + AgentRegistry + Catalog + MessageStore>(
@@ -7817,10 +7885,28 @@ pub fn restart_hosted_session<S: StateStore + AgentRegistry + Catalog + MessageS
 /// survival watch.
 pub fn restart_hosted_session_with_store<S, G, F>(
     store_guard: G,
+    reopen_store: F,
+    env: &LifecycleEnv<'_>,
+    id: &str,
+    by: &str,
+) -> Result<RestartResponse, LifecycleError>
+where
+    S: StateStore + AgentRegistry + Catalog + MessageStore,
+    G: std::ops::Deref<Target = S>,
+    F: FnMut() -> Result<G, LifecycleError>,
+{
+    restart_hosted_session_with_options(store_guard, reopen_store, env, id, by, None)
+}
+
+// `strict_target` belongs only to the saved-record CLI. The HTTP helper intentionally keeps
+// its existing ability to revive a prepared record.
+fn restart_hosted_session_with_options<S, G, F>(
+    store_guard: G,
     mut reopen_store: F,
     env: &LifecycleEnv<'_>,
     id: &str,
     by: &str,
+    strict_target: Option<&str>,
 ) -> Result<RestartResponse, LifecycleError>
 where
     S: StateStore + AgentRegistry + Catalog + MessageStore,
@@ -7845,6 +7931,24 @@ where
     };
     let mut record = get_hosted_session_by_id(store, &initial_record.session_id)?
         .ok_or_else(|| LifecycleError::NotFound(format!("no hosted session `{id}`")))?;
+    if let Some(target) = strict_target {
+        let selected = select_restart_target(&list_hosted_sessions(store)?, target)?;
+        if selected != record.session_id {
+            return Err(LifecycleError::Conflict(
+                "restart target changed during selection".into(),
+            ));
+        }
+        require_restartable_cli_record(&record)?;
+        if !store
+            .agent_by_name(&record.persona)?
+            .is_some_and(|a| a.status == AgentStatus::Active)
+        {
+            return Err(LifecycleError::Conflict(format!(
+                "saved session `{}` has no active registered agent",
+                record.session_id
+            )));
+        }
+    }
     if is_decommissioned(&record) {
         // Its agent is retired; restarting would mark it running with no agent behind it.
         return Err(decommissioned_conflict(&record.session_id));
@@ -12912,6 +13016,75 @@ mod tests {
         assert_eq!(rec.restart_policy, "never");
     }
 
+    // CI-only under #539: these tests use the lifecycle store/runtime fixture.
+    #[test]
+    fn cli_restart_revalidates_selected_record_after_prepare_and_retirement() {
+        let store = MemStore::default();
+        let home = TempDir::new().unwrap();
+        let env = env(&home);
+        spin_up(
+            &store,
+            &env,
+            &req("felicity", "assistant", "claude"),
+            "owner",
+            Caller::Owner,
+        )
+        .unwrap();
+        let selected =
+            select_restart_target(&list_hosted_sessions(&store).unwrap(), "felicity").unwrap();
+        let target = SessionTarget::resolve(&store, &selected, None).unwrap();
+        prepare_decommission(&store, &env, &target, "owner", Caller::Owner).unwrap();
+        let before = find_hosted_session(&store, &[&selected]).unwrap().unwrap();
+        assert!(matches!(
+            restart_hosted_session_with_options(
+                &store,
+                || Ok(&store),
+                &env,
+                &selected,
+                "owner",
+                Some("felicity")
+            ),
+            Err(LifecycleError::Conflict(_))
+        ));
+        assert_eq!(
+            find_hosted_session(&store, &[&selected]).unwrap().unwrap(),
+            before
+        );
+        // The original HTTP helper still explicitly revives prepared records.
+        restart_hosted_session(&store, &env, &selected, "owner").unwrap();
+        let agent = store.agent_by_name("felicity").unwrap().unwrap();
+        store
+            .retire_agent(&agent.id, fl_exec::stamp::now(), "owner")
+            .unwrap();
+        assert!(matches!(
+            restart_agent_session(&store, &env, "felicity", "owner", Caller::Owner),
+            Err(LifecycleError::Conflict(_))
+        ));
+    }
+
+    #[test]
+    fn cli_restart_peer_refusal_leaves_the_saved_record_unchanged() {
+        let store = MemStore::default();
+        let home = TempDir::new().unwrap();
+        let env = env(&home);
+        spin_up(
+            &store,
+            &env,
+            &req("felicity", "assistant", "claude"),
+            "owner",
+            Caller::Owner,
+        )
+        .unwrap();
+        let before = list_hosted_sessions(&store).unwrap();
+        for (by, caller) in [("owner", Caller::Peer), (AUTO_RESPAWN_ACTOR, Caller::Owner)] {
+            assert!(matches!(
+                restart_agent_session(&store, &env, "felicity", by, caller),
+                Err(LifecycleError::Forbidden(_))
+            ));
+            assert_eq!(list_hosted_sessions(&store).unwrap(), before);
+        }
+    }
+
     #[test]
     fn restart_counts_and_revives_a_prepared_record() {
         let store = MemStore::default();
@@ -14062,6 +14235,62 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(rec.runtime_spawned);
+    }
+
+    #[test]
+    fn restart_selection_requires_unique_live_target_and_exact_ids_win() {
+        let live = hosted_record("codex", "ada", STATUS_STOPPED, false);
+        let other = hosted_record("claude", "ada", STATUS_RUNNING, false);
+        let history = hosted_record("muse", "ada", STATUS_DECOMMISSIONED, false);
+        assert_eq!(
+            select_restart_target(&[history.clone(), live.clone()], "ada").unwrap(),
+            live.session_id
+        );
+        assert!(matches!(
+            select_restart_target(&[live.clone(), other.clone()], "ada"),
+            Err(LifecycleError::Conflict(_))
+        ));
+        assert_eq!(
+            select_restart_target(&[live.clone(), other], "codex:ada").unwrap(),
+            live.session_id
+        );
+        assert!(matches!(
+            select_restart_target(&[history], "muse:ada"),
+            Err(LifecycleError::Conflict(_))
+        ));
+        assert!(matches!(
+            select_restart_target(&[live], "missing"),
+            Err(LifecycleError::NotFound(_))
+        ));
+    }
+
+    #[test]
+    fn restart_selection_refuses_nonhosted_and_decommissioning_records() {
+        let mut record = hosted_record("codex", "ada", STATUS_STOPPED, false);
+        record.hosted = false;
+        assert!(matches!(
+            select_restart_target(std::slice::from_ref(&record), "ada"),
+            Err(LifecycleError::Conflict(_))
+        ));
+        record.hosted = true;
+        record.status = STATUS_DECOMMISSIONING.into();
+        assert!(matches!(
+            select_restart_target(&[record], "ada"),
+            Err(LifecycleError::Conflict(_))
+        ));
+    }
+
+    #[test]
+    fn restart_authority_rejects_peers_and_reserved_automatic_actor() {
+        assert!(matches!(
+            require_manual_restart_authority(Caller::Peer, "owner"),
+            Err(LifecycleError::Forbidden(_))
+        ));
+        assert!(matches!(
+            require_manual_restart_authority(Caller::Owner, AUTO_RESPAWN_ACTOR),
+            Err(LifecycleError::Forbidden(_))
+        ));
+        assert!(require_manual_restart_authority(Caller::Owner, "fiona").is_ok());
     }
 
     #[test]

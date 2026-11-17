@@ -123,6 +123,16 @@ pub enum AgentCmd {
         #[arg(long)]
         json: bool,
     },
+    /// Restart a hosted session using its saved settings.
+    Restart {
+        /// Persona or exact hosted session id (`codex:ada`).
+        session: String,
+        /// Author recording this manual restart.
+        #[arg(long, default_value = "owner")]
+        by: String,
+        #[arg(long)]
+        json: bool,
+    },
     /// Decommission a session in two phases: `prepare` asks it to hand off, `teardown` removes it.
     Decommission {
         /// Session id (`claude:felicity`) or persona.
@@ -797,6 +807,34 @@ pub fn run<S: AgentRegistry + Handles + StateStore + Catalog + fl_core::MessageS
             }
             Ok(())
         }
+        AgentCmd::Restart { session, by, json } => {
+            let _ = composed_vendor_host_adapters();
+            let ws_root =
+                fl_core::resolve_workspace_root(&std::env::current_dir().unwrap_or_default());
+            let mut env = LifecycleEnv::new(None);
+            env.workspace_root = Some(&ws_root);
+            env.log_hydration_warnings = false;
+            let out = lifecycle::restart_agent_session(
+                store,
+                &env,
+                &session,
+                &by,
+                lifecycle::Caller::Owner,
+            )
+            .map_err(lifecycle_failure)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&out).unwrap());
+            } else {
+                println!(
+                    "{}\t{}\trestart_count={}",
+                    out.record.session_id, out.record.status, out.record.restart_count
+                );
+                for warning in &out.warnings {
+                    eprintln!("warning: {warning}");
+                }
+            }
+            Ok(())
+        }
         AgentCmd::Decommission {
             session,
             mode,
@@ -1161,6 +1199,43 @@ mod tests {
     struct AgentTestCli {
         #[command(subcommand)]
         cmd: AgentCmd,
+    }
+
+    #[test]
+    fn restart_parser_uses_saved_settings_without_override_flags() {
+        use clap::Parser;
+        let AgentCmd::Restart { session, by, json } =
+            AgentTestCli::try_parse_from(["fl", "restart", "ada"])
+                .unwrap()
+                .cmd
+        else {
+            panic!("restart command expected")
+        };
+        assert_eq!(session, "ada");
+        assert_eq!(by, "owner");
+        assert!(!json);
+        assert!(matches!(
+            AgentTestCli::try_parse_from(["fl", "restart", "codex:ada", "--by", "fiona", "--json"]).unwrap().cmd,
+            AgentCmd::Restart { by, json: true, .. } if by == "fiona"
+        ));
+        for flag in [
+            "--model",
+            "--thinking-level",
+            "--effort",
+            "--role",
+            "--project",
+            "--vendor",
+            "--posture",
+            "--cwd",
+            "--node-id",
+            "--hosted",
+            "--context-window",
+        ] {
+            assert!(
+                AgentTestCli::try_parse_from(["fl", "restart", "ada", flag, "override"]).is_err(),
+                "{flag}"
+            );
+        }
     }
 
     #[test]

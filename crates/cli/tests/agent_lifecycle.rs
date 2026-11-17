@@ -1040,3 +1040,76 @@ fn area_set_preserves_nested_competition_path() {
         .unwrap();
     assert_eq!(area["path"], "Kaggle/Competition/");
 }
+
+// CI-only under #539: isolated subprocess/store regression, never a local pure filter.
+#[test]
+fn restart_reuses_saved_configuration_and_changes_only_selected_session() {
+    let e = Env::new();
+    let cwd = e.path().join("saved-worktree");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let mut spin = e.spin_up("ada", "assistant", "claude");
+    spin.args([
+        "--model",
+        "claude-opus-4-6",
+        "--thinking-level",
+        "high",
+        "--posture",
+        "plan",
+        "--node-id",
+        "saved-node",
+        "--cwd",
+    ])
+    .arg(&cwd);
+    Env::json_of(spin);
+    Env::json_of(e.spin_up("bea", "assistant", "claude"));
+    let untouched = e
+        .hosted_records()
+        .into_iter()
+        .find(|r| r["persona"] == "bea")
+        .unwrap();
+    let saved = {
+        let store = fl_store::open_store(&e.store()).unwrap();
+        let mut record = fl_hub::lifecycle::find_hosted_session(&store, &["claude:ada"])
+            .unwrap()
+            .unwrap();
+        record.context_window = Some(200_000);
+        record.status = "stopped".into();
+        fl_hub::lifecycle::persist_hosted_session(&store, &record, "test").unwrap();
+        serde_json::to_value(record).unwrap()
+    };
+    let mut restart = e.fl();
+    restart.args(["agent", "restart", "ada", "--json"]);
+    let out = Env::json_of(restart);
+    for key in [
+        "session_id",
+        "persona",
+        "project",
+        "role",
+        "vendor",
+        "model",
+        "thinking_level",
+        "posture",
+        "node_id",
+        "cwd",
+        "context_window",
+        "hosted",
+    ] {
+        assert_eq!(out[key], saved[key], "{key}");
+    }
+    assert_eq!(
+        out["restart_count"],
+        saved["restart_count"].as_u64().unwrap() + 1
+    );
+    assert_eq!(out["status"], "running");
+    assert_eq!(
+        e.hosted_records()
+            .into_iter()
+            .find(|r| r["persona"] == "bea")
+            .unwrap(),
+        untouched
+    );
+    e.fl()
+        .args(["agent", "restart", "ada", "--model", "other"])
+        .assert()
+        .failure();
+}
