@@ -23,6 +23,17 @@ compile-only `cargo test --workspace --offline --no-run` was separately
 authorized; it compiles test executables but does not run them. Cargo build
 scripts and procedural macros can execute during compilation.
 
+On 2026-11-17, this compile-only command completed successfully on ai-lab-0
+in 1 minute 40 seconds (exit status 0):
+
+```sh
+FL_SANDBOX_TARGET_DIR=/var/tmp/felix-sandbox-target-539 scripts/test-sandboxed.sh -- /toolchain/bin/cargo test --workspace --offline --no-run
+```
+
+The local command log was `/tmp/felix-sandbox-build.log` (a temporary file).
+This proves that the workspace test executables compiled in that environment;
+it does not prove that the tests pass or authorize executing them.
+
 The runner builds a new mount namespace from explicit binds, uses separate
 user, PID, network, IPC and UTS namespaces, drops capabilities, clears the
 environment and closes inherited descriptors. It gives the command private
@@ -64,8 +75,8 @@ against a malicious process running as the same host user or a kernel escape.
 Read-only toolchain and registry mounts may become stale during a run; run the
 canary again after changing the host or runner. The snapshot has no `.git`, so
 tests requiring repository metadata may fail; offline dependencies must
-already be present. A passing canary alone does not prove the full workspace
-suite can build or pass unchanged, and it does not lift the local-test hold.
+already be present. The compile-only result above does not prove the suite
+passes, and neither it nor a passing canary lifts the local-test hold.
 The canary checks configured project and state store sockets, configured and
 database-derived Wire paths, and relevant environment overrides. It cannot
 discover arbitrary per-command socket and store paths in other sessions.

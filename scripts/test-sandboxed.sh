@@ -17,7 +17,7 @@ registry=$(realpath -e -- "${CARGO_HOME:-$HOME/.cargo}/registry")
 [[ -x $toolchain/bin/cargo && -x $toolchain/bin/rustc ]] || die 'Rust toolchain missing cargo or rustc'
 cc=$(realpath -e -- "$(command -v cc)") || die 'C compiler unavailable'
 [[ $cc == /usr/bin/* && ${cc#/usr/bin/} != */* && -x $cc ]] || die 'C compiler must resolve to an executable directly in /usr/bin'
-host=$($toolchain/bin/rustc -vV | sed -n 's/^host: //p')
+host=$("$toolchain/bin/rustc" -vV | sed -n 's/^host: //p')
 [[ $host =~ ^[A-Za-z0-9_-]+$ ]] || die 'invalid Rust host triple'
 linker_var=CARGO_TARGET_$(printf '%s' "$host" | tr '[:lower:]-' '[:upper:]_')_LINKER
 python3 "$root/scripts/test-sandbox-source.py" --check "$root" || die 'stage intended source inputs before launching'
