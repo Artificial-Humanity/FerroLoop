@@ -18,18 +18,22 @@ scripts/test-sandbox-canary.sh
 The default command of `scripts/test-sandboxed.sh` is
 `cargo test --workspace --offline`; a command may instead follow `--`.
 **The current #539 hold still prohibits running product tests in this runner.**
-The owner must separately authorize a bounded full-suite experiment.
+The owner must separately authorize a bounded full-suite experiment. A
+compile-only `cargo test --workspace --offline --no-run` was separately
+authorized; it compiles test executables but does not run them. Cargo build
+scripts and procedural macros can execute during compilation.
 
 The runner builds a new mount namespace from explicit binds, uses separate
 user, PID, network, IPC and UTS namespaces, drops capabilities, clears the
 environment and closes inherited descriptors. It gives the command private
 home, XDG, runtime and temporary directories, proc and devices. System tools,
 libraries, the selected Rust sysroot, cargo registry and a source snapshot are
-read-only; the only writable host-backed mount is an ephemeral target directory
-under `/var/tmp`. The snapshot includes only Git-tracked files (including
+read-only; `/usr/libexec` supplies compiler internals and the resolved host C
+compiler is selected explicitly for C builds and the Rust host linker. The only
+writable host-backed mount is a target directory under `/var/tmp`. The snapshot includes only Git-tracked files (including
 tracked edits), omits Git metadata, untracked files and submodules, and refuses
 nested mounts in the source tree or any host bind;
-the sandbox and target are removed on exit. The runner rejects unsafe bind
+the snapshot and default target are removed on exit. The runner rejects unsafe bind
 inputs or missing bubblewrap flags rather than falling back to host execution.
 It refuses to launch when non-ignored untracked files or ignored files in
 source/test/build locations would be omitted. Stage intended inputs first;
@@ -38,6 +42,20 @@ files out of those locations rather than staging runtime data or secrets. Known 
 and build directories such as `target/` are excluded from this check and the
 snapshot. The source-input policy is conservative, so it can require cleanup
 of unrelated files before launch.
+
+To retain build outputs across invocations, set `FL_SANDBOX_TARGET_DIR` to a
+direct child of `/var/tmp`, for example `/var/tmp/my-sandbox-target`. The
+directory is created with mode 0700 and must remain owned by the current user
+with that mode. The runner rejects symlinks, sockets, other special entries,
+and nested mounts before launch and checks again after the sandbox exits, even
+if the command fails. A failed post-run check makes the runner fail; inspect
+or remove the persistent directory yourself before reusing it. The runner does
+not remove a persistent target.
+
+The sandbox receives `/dev/null` on standard input by default. To pass the
+launcher's input through deliberately, use `scripts/test-sandboxed.sh --stdin --
+COMMAND ...`. Bubblewrap attempts a private cgroup namespace when supported;
+the other listed namespaces are mandatory.
 
 This protects against accidental access to live endpoints, files and
 processes by tests and their children. The canary demonstrates the selected

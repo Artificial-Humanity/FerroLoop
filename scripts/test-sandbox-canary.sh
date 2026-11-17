@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
+if [[ ${1:-} == --inside && $(readlink /proc/self/fd/0) != /dev/null ]]; then
+    printf 'FAIL: sandbox standard input is not /dev/null\n' >&2
+    exit 1
+fi
 here=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
 exec /usr/bin/python3 - "$here" "$@" <<'PY'
 import errno, os, secrets, signal, socket, subprocess, sys, tempfile, time, tomllib
@@ -51,6 +55,7 @@ if args and args[0] == '--inside':
 require(not args, 'unexpected arguments')
 subprocess.run(['/usr/bin/python3', os.path.join(here, 'test-sandbox-mounts.py'), '--self-test'], check=True)
 subprocess.run(['/usr/bin/python3', os.path.join(here, 'test-sandbox-source.py'), '--self-test'], check=True)
+subprocess.run(['/usr/bin/python3', os.path.join(here, 'test-sandbox-target.py'), '--self-test'], check=True)
 nonce = secrets.token_hex(16)
 home = os.path.expanduser('~')
 uid = os.getuid()
