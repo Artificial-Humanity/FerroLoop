@@ -25,9 +25,9 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use fl_core::vendor_adapter::{
     AdapterIdentityBinding, AdapterReadiness, AttachOrResumeOutcome, AttachOrResumeRequest,
-    ConfigEffectiveScope, NormalizedSessionTurn, TeardownOutcome, TeardownTarget,
-    TranscriptNormalizeReport, TurnDeliveryOutcome, TurnDeliveryRequest, VendorAdapterError,
-    VendorConfigSpec, VendorHostAdapter, VendorLaunchPlan, VendorLaunchRequest,
+    ConfigEffectiveScope, LaunchPrerequisiteRefusal, NormalizedSessionTurn, TeardownOutcome,
+    TeardownTarget, TranscriptNormalizeReport, TurnDeliveryOutcome, TurnDeliveryRequest,
+    VendorAdapterError, VendorConfigSpec, VendorHostAdapter, VendorLaunchPlan, VendorLaunchRequest,
     VendorStartupPromptRule,
 };
 #[cfg(unix)]
@@ -216,7 +216,58 @@ fn build_codex_launch_env(home_dir: Option<&Path>) -> Vec<(String, String)> {
     env
 }
 
+/// Only the configuration directory pinned into the launch selects its remote socket.
+/// Delivery's FL_WIRE_CODEX_CONTROL_SOCK override does not select a --remote unix:// endpoint.
+fn codex_launch_control_socket(config_home: &Path) -> PathBuf {
+    config_home.join(CODEX_CONTROL_SOCKET_REL)
+}
+
+fn codex_prerequisite_refusal(socket: &Path, result: &str) -> LaunchPrerequisiteRefusal {
+    // Keep the probe result visible even for a very long path. Do not carry arbitrary peer
+    // response/error text, CLI output or environment contents into a durable record.
+    let path: String = socket
+        .to_string_lossy()
+        .chars()
+        .filter(|c| !c.is_control())
+        .collect();
+    let suffix = format!(": {result}");
+    let max_path = 512usize.saturating_sub(suffix.len());
+    let mut end = path.len().min(max_path);
+    while !path.is_char_boundary(end) {
+        end -= 1;
+    }
+    LaunchPrerequisiteRefusal {
+        code: "codex_app_server_unavailable".into(),
+        detail: format!("{}{suffix}", &path[..end]),
+    }
+}
+
 impl VendorHostAdapter for CodexHostAdapter {
+    fn preflight_launch(
+        &self,
+        config_home: Option<&Path>,
+    ) -> Result<(), LaunchPrerequisiteRefusal> {
+        let config_home = config_home.ok_or_else(|| {
+            codex_prerequisite_refusal(
+                Path::new("<unresolved CODEX_HOME>"),
+                "configuration home unavailable",
+            )
+        })?;
+        let socket = codex_launch_control_socket(config_home);
+        #[cfg(unix)]
+        {
+            connect_unix_with_deadline(&socket, Instant::now() + Duration::from_millis(250))
+                .map(drop)
+                .map_err(|e| codex_prerequisite_refusal(&socket, &format!("{:?}", e.kind())))
+        }
+        #[cfg(not(unix))]
+        {
+            Err(codex_prerequisite_refusal(
+                &socket,
+                "unix remote sockets unsupported on this platform",
+            ))
+        }
+    }
     fn vendor_id(&self) -> &str {
         "codex"
     }
@@ -2278,5 +2329,97 @@ mod tests {
             .map(|f| f.json()["method"].as_str().unwrap().to_string())
             .collect();
         assert_eq!(methods, ["initialize", "initialized", "thread/archive"]);
+    }
+    #[test]
+    fn launch_prerequisite_endpoint_is_pinned_not_delivery_override() {
+        let pinned = Path::new("/isolated/codex");
+        let delivery = resolve_codex_control_socket(
+            Some(OsStr::new("/unrelated/delivery.sock")),
+            Some(pinned.as_os_str()),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            codex_launch_control_socket(pinned),
+            pinned.join(CODEX_CONTROL_SOCKET_REL)
+        );
+        assert_ne!(codex_launch_control_socket(pinned), delivery);
+    }
+
+    #[test]
+    fn launch_prerequisite_detail_is_bounded_and_single_line() {
+        let refusal = codex_prerequisite_refusal(Path::new(&"é\n".repeat(400)), "PermissionDenied");
+        assert_eq!(refusal.code, "codex_app_server_unavailable");
+        assert!(refusal.detail.len() <= 512);
+        assert!(!refusal.detail.chars().any(char::is_control));
+        assert!(refusal.detail.ends_with("PermissionDenied"));
+    }
+
+    // CI only: private Unix socket; never run under the local #539 restriction.
+    #[test]
+    fn launch_prerequisite_refuses_missing_and_stale_socket_and_accepts_listener() {
+        let home = tempfile::tempdir().unwrap();
+        let adapter = CodexHostAdapter::default();
+        let socket = codex_launch_control_socket(home.path());
+        std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+        let missing = adapter.preflight_launch(Some(home.path())).unwrap_err();
+        assert_eq!(missing.code, "codex_app_server_unavailable");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        adapter.preflight_launch(Some(home.path())).unwrap();
+        drop(listener);
+        assert_eq!(
+            adapter
+                .preflight_launch(Some(home.path()))
+                .unwrap_err()
+                .code,
+            missing.code
+        );
+    }
+    #[test]
+    fn launch_prerequisite_expired_deadline_refuses_before_socket_io() {
+        let deadline = Instant::now() - Duration::from_millis(1);
+        let err = connect_unix_with_deadline(Path::new("/not-opened/control.sock"), deadline)
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+    }
+
+    // CI only: Linux enforces write permission on a pathname Unix socket.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn launch_prerequisite_refuses_socket_without_connect_permission() {
+        use std::os::unix::fs::PermissionsExt;
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let home = tempfile::tempdir().unwrap();
+        let socket = codex_launch_control_socket(home.path());
+        std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+        let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let refusal = CodexHostAdapter::default()
+            .preflight_launch(Some(home.path()))
+            .unwrap_err();
+        assert!(refusal.detail.ends_with("PermissionDenied"));
+    }
+
+    // CI only: an occupied listener backlog must not hang launch preflight.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn launch_prerequisite_full_backlog_is_bounded() {
+        use socket2::{Domain, SockAddr, Socket, Type};
+        let home = tempfile::tempdir().unwrap();
+        let socket = codex_launch_control_socket(home.path());
+        std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+        let listener = Socket::new(Domain::UNIX, Type::STREAM, None).unwrap();
+        listener.bind(&SockAddr::unix(&socket).unwrap()).unwrap();
+        listener.listen(0).unwrap();
+        let _queued = UnixStream::connect(&socket).unwrap();
+        let start = Instant::now();
+        assert!(
+            CodexHostAdapter::default()
+                .preflight_launch(Some(home.path()))
+                .is_err()
+        );
+        assert!(start.elapsed() < Duration::from_secs(2));
     }
 }
