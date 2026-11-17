@@ -44,10 +44,6 @@ pub struct WatchHostedSession {
     pub node_id: String,
     /// `running`, `decommissioning` or `decommissioned` (the hub's words).
     pub status: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub stop_reason: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub launch_prerequisite_detail: Option<String>,
     pub restart_count: u64,
     pub updated_at_ms: u64,
 }
@@ -77,14 +73,6 @@ impl WatchHostedSession {
             model: obj.get("model").and_then(Value::as_str).map(str::to_string),
             node_id: text("node_id"),
             status: text("status"),
-            stop_reason: obj
-                .get("stop_reason")
-                .and_then(Value::as_str)
-                .map(str::to_string),
-            launch_prerequisite_detail: obj
-                .get("launch_prerequisite_detail")
-                .and_then(Value::as_str)
-                .map(str::to_string),
             restart_count: number("restart_count"),
             updated_at_ms: number("updated_at_ms"),
         })
@@ -289,21 +277,5 @@ mod tests {
             latest.values().next().unwrap().heartbeat_at,
             newer.heartbeat_at
         );
-    }
-    #[test]
-    fn hosted_prerequisite_fields_survive_watch_decode_and_json() {
-        let value = serde_json::json!({"session_id":"codex:ada", "status":"stopped",
-            "stop_reason":"prerequisite_unavailable", "launch_prerequisite_detail":"/private/control.sock: NotFound"});
-        let hosted = WatchHostedSession::from_value(&value).unwrap();
-        let json = serde_json::to_value(&hosted).unwrap();
-        assert_eq!(json["stop_reason"], value["stop_reason"]);
-        assert_eq!(
-            json["launch_prerequisite_detail"],
-            value["launch_prerequisite_detail"]
-        );
-        let old =
-            WatchHostedSession::from_value(&serde_json::json!({"session_id":"codex:ada"})).unwrap();
-        assert_eq!(old.stop_reason, None);
-        assert_eq!(old.launch_prerequisite_detail, None);
     }
 }
