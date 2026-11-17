@@ -8697,13 +8697,8 @@ where
     };
     let mut respawned = Vec::new();
     for record in candidates {
-        let session_mutex = hosted_session_lifecycle_mutex(env, &record.session_id);
-        // Keep classification and crash-loop writes serialized with manual lifecycle work.
-        let reconcile_lifecycle_guard = match session_mutex.try_lock() {
-            Ok(guard) => guard,
-            Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
-            Err(std::sync::TryLockError::WouldBlock) => continue,
-        };
+        // Reopening may interleave with manual lifecycle work; do it before taking the
+        // non-reentrant session mutex, then reload and classify the record under the lock.
         let guard = match reopen_store() {
             Ok(g) => g,
             Err(err) => {
@@ -8713,6 +8708,13 @@ where
                 );
                 continue;
             }
+        };
+        let session_mutex = hosted_session_lifecycle_mutex(env, &record.session_id);
+        // Never wait for the session mutex while holding the reopened store guard.
+        let reconcile_lifecycle_guard = match session_mutex.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => continue,
         };
         let mut fresh = match get_hosted_session_by_id(&*guard, &record.session_id) {
             Ok(Some(r)) => r,
@@ -19462,6 +19464,13 @@ mod tests {
                 let call = reopen_calls.get() + 1;
                 reopen_calls.set(call);
                 if call == 2 {
+                    // Fail promptly if reconcile holds the non-reentrant mutex here:
+                    // the synchronous manual restart below would otherwise deadlock.
+                    let mutex = hosted_session_lifecycle_mutex(&env, "claude:race");
+                    assert!(
+                        mutex.try_lock().is_ok(),
+                        "reopen_store must run before locking the candidate lifecycle mutex"
+                    );
                     let manual_guard = state.open_store().map_err(LifecycleError::from)?;
                     let manual = restart_hosted_session_with_store(
                         manual_guard,

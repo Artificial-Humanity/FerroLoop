@@ -12,7 +12,7 @@
 - Base origin/main c17f210359d90fa64e64afe2ce13de38720383d0.
 - #539: local compile checks and exact source-audited pure filters only; full/live-capable/host/child/service/store suites CI-only.
 - No deployment, session/service restart, terminal probe, reset, backup/restore/purge/activation or stage2 proof.
-- No UI edits. Report unknown stop_reason rendering/filter gaps to Ferris for Felix.
+- No Watch projection or UI edits. Felix owns those changes in PR #580 (#577); this branch supplies the raw hosted-record API fields with the agreed names.
 - No daemon auto-start. Reference clean systemd user daemon environment, Before=ferroloop-hub.service, due #576.
 - Keep serialized records compatible, no fl-host protocol/schema changes.
 - Co-authored-by: Fiona <fiona@artificialhumanity.io>.
@@ -52,8 +52,8 @@ Saved-record fl agent restart <persona-or-session-id> [--by owner] [--json] unde
 
 ## A1 implementation evidence
 
-Implemented adapter preflight, persisted prerequisite retry and API/Watch projection fields. Private-socket, fake-runtime lifecycle and isolated-store API regressions are authored for CI only under #539. The failed-save regression uses a scoped test-only respawn-save fault and checks zero prerequisite calls, runtime launches and accounting changes. Existing per-session lifecycle locks also fence reconciler classification writes.
+Implemented adapter preflight, persisted prerequisite retry and raw hosted-session API fields. Per Ferris's scope adjustment (wire urn:uuid:01a1ebe6-91c5-73fe-b121-c86f0d30536f), this branch drops its Watch projection and associated test; Felix's PR #580 (#577) owns the Watch and UI changes. HostedSessionRecord.launch_prerequisite_detail and stop_reason prerequisite_unavailable remain the integration contract. Private-socket, fake-runtime lifecycle and isolated-store API regressions are authored for CI only under #539. The failed-save regression uses a scoped test-only respawn-save fault and checks zero prerequisite calls, runtime launches and accounting changes. Existing per-session lifecycle locks also fence reconciler classification writes.
 
-Linux all-target compilation and strict clippy passed for fl-core/fl-hub/fl-cli/fl-vendor-adapters/fl-watch. Six independently audited exact pure filters each executed one passing test: endpoint choice, bounded detail, Watch JSON, retry policy, old-record compatibility and typed HTTP refusal. Their call graphs use only path/string/numeric/JSON transformations; no store, process, service or socket calls execute. Final test-only additions receive compile/lint checks without runtime execution.
+Linux all-target compilation and strict clippy passed for fl-core/fl-hub/fl-cli/fl-vendor-adapters/fl-watch. Six independently audited exact pure filters initially executed one passing test each: endpoint choice, bounded detail, Watch JSON, retry policy, old-record compatibility and typed HTTP refusal. The Watch JSON test was subsequently removed with the projection scope transfer to PR #580; the other five remain in this branch. Their call graphs use only path/string/numeric/JSON transformations; no store, process, service or socket calls execute. Final test-only additions receive compile/lint checks without runtime execution.
 
 Windows GNU broad touched-library compilation remains blocked by existing fl-exec/fl-store platform diagnostics under #560. fl-core library compilation passed; coordinator compares identical base/head broad diagnostics and verifies compiling host leaves separately. No #560 production changes are included. Native platform CI, fresh review and publication remain coordinator-owned.
