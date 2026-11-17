@@ -14,6 +14,7 @@ toolchain=$(rustc --print sysroot)
 toolchain=$(realpath -e -- "$toolchain")
 registry=$(realpath -e -- "${CARGO_HOME:-$HOME/.cargo}/registry")
 [[ -x $toolchain/bin/cargo && -x $toolchain/bin/rustc ]] || die 'Rust toolchain missing cargo or rustc'
+python3 "$root/scripts/test-sandbox-source.py" --check "$root" || die 'stage intended source inputs before launching'
 
 # No bind may expose a socket, even through a read-only mount. Refuse nested
 # mounts too: their contents can change independently of the checked tree.

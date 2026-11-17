@@ -31,6 +31,13 @@ tracked edits), omits Git metadata, untracked files and submodules, and refuses
 nested mounts in the source tree or any host bind;
 the sandbox and target are removed on exit. The runner rejects unsafe bind
 inputs or missing bubblewrap flags rather than falling back to host execution.
+It refuses to launch when non-ignored untracked files or ignored files in
+source/test/build locations would be omitted. Stage intended inputs first;
+review ignored files individually before using `git add -f`. Move unrelated
+files out of those locations rather than staging runtime data or secrets. Known runtime
+and build directories such as `target/` are excluded from this check and the
+snapshot. The source-input policy is conservative, so it can require cleanup
+of unrelated files before launch.
 
 This protects against accidental access to live endpoints, files and
 processes by tests and their children. The canary demonstrates the selected

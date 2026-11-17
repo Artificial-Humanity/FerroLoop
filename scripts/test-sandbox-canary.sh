@@ -50,6 +50,7 @@ if args and args[0] == '--inside':
 
 require(not args, 'unexpected arguments')
 subprocess.run(['/usr/bin/python3', os.path.join(here, 'test-sandbox-mounts.py'), '--self-test'], check=True)
+subprocess.run(['/usr/bin/python3', os.path.join(here, 'test-sandbox-source.py'), '--self-test'], check=True)
 nonce = secrets.token_hex(16)
 home = os.path.expanduser('~')
 uid = os.getuid()
