@@ -609,6 +609,8 @@ pub const CLAUDE_RESUME_POLL_INTERVAL: std::time::Duration = std::time::Duration
 thread_local! {
     static TEST_CLAUDE_RESUME_SURVIVAL_WINDOW: std::cell::Cell<Option<std::time::Duration>> =
         const { std::cell::Cell::new(None) };
+    static TEST_CLAUDE_RESUME_WATCH_HOOK: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 /// `true` when `pid` is a live (non-zombie) OS process.
@@ -823,6 +825,13 @@ fn resume_launch_survived(
     ) {
         return (true, true);
     }
+
+    #[cfg(test)]
+    TEST_CLAUDE_RESUME_WATCH_HOOK.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().as_mut() {
+            hook();
+        }
+    });
 
     #[cfg(test)]
     let settle = env.runtime.settle_delay();
@@ -18072,95 +18081,189 @@ mod tests {
         // R2: Concurrent store-backed hub request (`state.open_store()` + `list_hosted_sessions`)
         // finishes *during* a resume watch (`restart_hosted_session_with_store`) because the
         // hub store guard is released across `resume_launch_survived`.
-        let hub_dir = TempDir::new().unwrap();
-        let hub_home = TempDir::new().unwrap();
-        let state = crate::HubState::new(crate::HubServerConfig {
-            store_path: hub_dir.path().join("store.redb"),
-            repo_root: hub_dir.path().to_path_buf(),
-            home_override: Some(hub_home.path().to_path_buf()),
-            ..crate::HubServerConfig::default()
-        });
-
-        let sid_concurrent = {
-            let fake_init = FakeRuntime::default();
-            let env_init = fake_init.env(hub_home.path());
-            let guard = state.open_store().unwrap();
-            let spun_c = spin_up_with_store(
-                guard,
-                || state.open_store().map_err(LifecycleError::from),
-                &env_init,
-                &req("ada", "assistant", "claude"),
-                "owner",
-                Caller::Owner,
-            )
-            .unwrap();
-            let g_c = spun_c.hydration_generation.unwrap();
-            let guard = state.open_store().unwrap();
-            let sid_c = find_hosted_session(&*guard, &["claude:ada"])
-                .unwrap()
-                .unwrap()
-                .vendor_session_id
-                .unwrap();
-            record_hydration_ack(&*guard, "ada", true, Some(&g_c), Some("claude:ada")).unwrap();
-            sid_c
-        };
-        write_claude_transcript(
-            hub_home.path(),
-            false,
-            &sid_concurrent,
-            "claude-opus-5-5",
-            10_000,
-            false,
-        );
-
-        let watch_window = Duration::from_millis(300);
-        let (concurrent_done_tx, concurrent_done_rx) = std::sync::mpsc::channel();
-        std::thread::scope(|s| {
-            let state_ref = &state;
-            let reader = s.spawn(move || {
-                // Wait 50ms so the main thread is mid-watch inside `resume_launch_survived`.
-                std::thread::sleep(Duration::from_millis(50));
-                let t0 = Instant::now();
-                let guard = state_ref.open_store().unwrap();
-                let sessions = list_hosted_sessions(&*guard).unwrap();
-                drop(guard);
-                let elapsed = t0.elapsed();
-                concurrent_done_tx.send((sessions.len(), elapsed)).unwrap();
+        // Exercise both the actual released-store path and a negative control in which
+        // another thread retains the same hub store guard while the watch is held.
+        // Each case gets a fresh hosted session and store.
+        for hold_store in [false, true] {
+            let hub_dir = TempDir::new().unwrap();
+            let hub_home = TempDir::new().unwrap();
+            let state = crate::HubState::new(crate::HubServerConfig {
+                store_path: hub_dir.path().join("store.redb"),
+                repo_root: hub_dir.path().to_path_buf(),
+                home_override: Some(hub_home.path().to_path_buf()),
+                ..crate::HubServerConfig::default()
             });
 
-            TEST_CLAUDE_RESUME_SURVIVAL_WINDOW.with(|c| c.set(Some(watch_window)));
-            let fake_restart = FakeRuntime::default();
-            let env_restart = fake_restart.env(hub_home.path());
-            let restart_t0 = Instant::now();
-            let guard = state.open_store().unwrap();
-            let restarted_c = restart_hosted_session_with_store(
-                guard,
-                || state.open_store().map_err(LifecycleError::from),
-                &env_restart,
-                "claude:ada",
-                "owner",
-            )
-            .unwrap();
-            let restart_elapsed = restart_t0.elapsed();
-            TEST_CLAUDE_RESUME_SURVIVAL_WINDOW.with(|c| c.set(None));
-
-            assert_eq!(
-                restarted_c.record.vendor_session_id.as_deref(),
-                Some(sid_concurrent.as_str())
+            let sid_concurrent = {
+                let fake_init = FakeRuntime::default();
+                let env_init = fake_init.env(hub_home.path());
+                let guard = state.open_store().unwrap();
+                let spun_c = spin_up_with_store(
+                    guard,
+                    || state.open_store().map_err(LifecycleError::from),
+                    &env_init,
+                    &req("ada", "assistant", "claude"),
+                    "owner",
+                    Caller::Owner,
+                )
+                .unwrap();
+                let g_c = spun_c.hydration_generation.unwrap();
+                let guard = state.open_store().unwrap();
+                let sid_c = find_hosted_session(&*guard, &["claude:ada"])
+                    .unwrap()
+                    .unwrap()
+                    .vendor_session_id
+                    .unwrap();
+                record_hydration_ack(&*guard, "ada", true, Some(&g_c), Some("claude:ada")).unwrap();
+                sid_c
+            };
+            write_claude_transcript(
+                hub_home.path(),
+                false,
+                &sid_concurrent,
+                "claude-opus-5-5",
+                10_000,
+                false,
             );
-            assert!(
-                restart_elapsed >= Duration::from_millis(250),
-                "expected resume watch to run for ~300ms, got {restart_elapsed:?}"
-            );
-            reader.join().unwrap();
-        });
 
-        let (count, reader_elapsed) = concurrent_done_rx.recv().unwrap();
-        assert_eq!(count, 1);
-        assert!(
-            reader_elapsed < Duration::from_millis(120),
-            "R2: concurrent store-backed hub request must finish during the 300ms resume watch without waiting for it to end (took {reader_elapsed:?})"
-        );
+            // A bounded wait is a deadlock escape, not a latency requirement.
+            const DEADLOCK_TIMEOUT: Duration = Duration::from_secs(10);
+            struct RestoreWatchHook(Option<Box<dyn FnMut()>>);
+            impl Drop for RestoreWatchHook {
+                fn drop(&mut self) {
+                    TEST_CLAUDE_RESUME_WATCH_HOOK.with(|hook| *hook.borrow_mut() = self.0.take());
+                }
+            }
+            struct RestoreWindow(Option<Duration>);
+            impl Drop for RestoreWindow {
+                fn drop(&mut self) {
+                    TEST_CLAUDE_RESUME_SURVIVAL_WINDOW.with(|window| window.set(self.0));
+                }
+            }
+            let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            let (reader_started_tx, reader_started_rx) = std::sync::mpsc::channel();
+            let (hold_tx, hold_rx) = std::sync::mpsc::channel();
+            let (held_tx, held_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let observed = std::rc::Rc::new(std::cell::RefCell::new(None));
+            // Unwind out of restart on probe failure so even a regressed caller-held
+            // store guard is dropped before the reader is joined or the store reopened.
+            struct WatchProbeAbort;
+            std::thread::scope(|scope| {
+                let state_ref = &state;
+                let blocker = scope.spawn(move || {
+                    if !hold_store || hold_rx.recv_timeout(DEADLOCK_TIMEOUT).is_err() {
+                        return;
+                    }
+                    let guard = state_ref.open_store();
+                    let acquired = guard.is_ok();
+                    let _ = held_tx.send(acquired);
+                    if acquired {
+                        // Sender drop also releases the guard if the hook unwinds.
+                        let _ = release_rx.recv_timeout(DEADLOCK_TIMEOUT * 2);
+                    }
+                    drop(guard);
+                });
+                let reader = scope.spawn(move || {
+                    if entered_rx.recv_timeout(DEADLOCK_TIMEOUT * 2).is_err() {
+                        return;
+                    }
+                    let _ = reader_started_tx.send(());
+                    let result = state_ref
+                        .open_store()
+                        .map_err(|error| error.to_string())
+                        .and_then(|guard| {
+                            list_hosted_sessions(&*guard)
+                                .map(|sessions| sessions.len())
+                                .map_err(|error| error.to_string())
+                        });
+                    let _ = done_tx.send(result);
+                });
+
+                let observed_by_hook = observed.clone();
+                let previous = TEST_CLAUDE_RESUME_WATCH_HOOK.with(|hook| {
+                    hook.borrow_mut().replace(Box::new(move || {
+                        let blocker_ready = !hold_store
+                            || (hold_tx.send(()).is_ok()
+                                && matches!(held_rx.recv_timeout(DEADLOCK_TIMEOUT), Ok(true)));
+                        let result = if !blocker_ready {
+                            Err("negative-control store guard was not acquired".to_string())
+                        } else if entered_tx.send(()).is_err() {
+                            Err("reader did not await watch entry".to_string())
+                        } else if reader_started_rx.recv_timeout(DEADLOCK_TIMEOUT).is_err() {
+                            Err("reader did not start its store operation".to_string())
+                        } else {
+                            done_rx
+                                .recv_timeout(DEADLOCK_TIMEOUT)
+                                .map_err(|error| {
+                                    format!("reader did not complete during watch: {error}")
+                                })
+                                .and_then(|result| result)
+                        };
+                        let abort = result.is_err();
+                        *observed_by_hook.borrow_mut() = Some(result);
+                        // Release before returning or unwinding. Sender drop also releases
+                        // the blocker on an unexpected panic.
+                        let _ = release_tx.send(());
+                        if abort {
+                            std::panic::panic_any(WatchProbeAbort);
+                        }
+                    }))
+                });
+                let _restore_hook = RestoreWatchHook(previous);
+                let previous_window = TEST_CLAUDE_RESUME_SURVIVAL_WINDOW.with(|window| {
+                    let previous = window.get();
+                    window.set(Some(Duration::ZERO));
+                    previous
+                });
+                let _restore_window = RestoreWindow(previous_window);
+                let fake_restart = FakeRuntime::default();
+                let env_restart = fake_restart.env(hub_home.path());
+                let guard = state.open_store().unwrap();
+                let restarted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    restart_hosted_session_with_store(
+                        guard,
+                        || state.open_store().map_err(LifecycleError::from),
+                        &env_restart,
+                        "claude:ada",
+                        "owner",
+                    )
+                }));
+                let blocker_joined = blocker.join();
+                let reader_joined = reader.join();
+                assert!(blocker_joined.is_ok(), "store blocker panicked");
+                assert!(reader_joined.is_ok(), "concurrent reader panicked");
+                if hold_store {
+                    let panic = restarted.expect_err("held store must abort the watch probe");
+                    assert!(panic.is::<WatchProbeAbort>(), "unexpected restart panic");
+                } else {
+                    let restarted = restarted
+                        .expect("watch probe unexpectedly aborted")
+                        .unwrap();
+                    assert_eq!(
+                        restarted.record.vendor_session_id.as_deref(),
+                        Some(sid_concurrent.as_str())
+                    );
+                }
+            });
+            let result = observed
+                .borrow_mut()
+                .take()
+                .expect("resume watch hook was not reached");
+            if hold_store {
+                let error = result.expect_err("held store must prevent completion before release");
+                assert!(
+                    error.contains("reader did not complete during watch: timed out"),
+                    "{error}"
+                );
+            } else {
+                assert_eq!(
+                    result.expect("reader must complete before watch release"),
+                    1
+                );
+            }
+        }
     }
 
     #[test]
