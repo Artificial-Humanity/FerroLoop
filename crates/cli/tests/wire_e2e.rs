@@ -110,6 +110,64 @@ fn run_json(mut cmd: Command) -> Value {
 }
 
 #[test]
+fn register_json_reports_discarded_hydration_context() {
+    let env = TestEnv::new();
+    let output = env
+        .fl()
+        .args([
+            "wire",
+            "register",
+            "Felix",
+            "--project",
+            "ferroloop",
+            "--replace",
+            "--json",
+        ])
+        .env("AGENT_PERSONA", "felix")
+        .env("FL_HOSTED_ID", "claude:ferris")
+        .env(
+            "AGENT_HYDRATION_GENERATION",
+            "01a1eb3a-351b-7000-8000-8225f982f971",
+        )
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(3));
+    let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["hosted_identity_dropped"], true);
+    assert_eq!(result["hydration_generation_dropped"], true);
+    assert_eq!(result["hydration_ack"], "not_written");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("discarded hosted identity and hydration generation"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("prior receipt may exist"), "{stderr}");
+
+    let plain = TestEnv::new();
+    let output = plain
+        .fl()
+        .args([
+            "wire",
+            "register",
+            "Felix",
+            "--project",
+            "ferroloop",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["hosted_identity_dropped"], false);
+    assert_eq!(result["hydration_generation_dropped"], false);
+    assert_eq!(result["hydration_ack"], "not_written");
+}
+
+#[test]
 fn fl_wire_cli_send_broadcast_ask_reply_read_ack_wait_status_and_prune() {
     let env = TestEnv::new();
 
