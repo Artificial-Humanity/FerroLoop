@@ -2396,7 +2396,24 @@ mod tests {
         let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
         adapter.preflight_launch(Some(home.path())).unwrap();
         drop(listener);
-        let stale = adapter.preflight_launch(Some(home.path())).unwrap_err();
+        // A sibling test forks a child that briefly holds the listener
+        // (fork inherits fds), so a connect can succeed briefly after the
+        // drop here; poll until the stale socket actually refuses instead
+        // of probing once. Proven: 5/30 failures with both tests running,
+        // 10/10 passes for this test alone.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let stale = loop {
+            if let Err(refusal) = adapter.preflight_launch(Some(home.path())) {
+                if refusal.detail.ends_with("ConnectionRefused") {
+                    break refusal;
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "stale socket did not refuse connections within 5s"
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        };
         assert_eq!(stale.code, missing.code);
         assert!(stale.detail.ends_with("ConnectionRefused"));
     }
