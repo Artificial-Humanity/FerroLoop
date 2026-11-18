@@ -2812,6 +2812,49 @@ fn is_composer_occupied_error(err: &str) -> bool {
     err.starts_with(COMPOSER_OCCUPIED_BY_NON_WIRE_INPUT_PREFIX)
 }
 
+/// Recognised composer payloads for the narrowed hold diagnostic (#575):
+/// only the exact strings `"/clear"` and `"/new"` (after trimming) are named.
+pub(crate) fn recognised_composer_payload(text: &str) -> Option<&'static str> {
+    match text.trim() {
+        "/clear" => Some("/clear"),
+        "/new" => Some("/new"),
+        _ => None,
+    }
+}
+
+/// Recognised payload in a captured screen, or `None` for any other composer text.
+pub(crate) fn recognised_composer_payload_in_screen(screen: &str) -> Option<&'static str> {
+    let lines: Vec<&str> = screen.lines().collect();
+    if let Some((compact, _)) = extract_composer_compact(&lines) {
+        return recognised_composer_payload(&compact);
+    }
+    recognised_composer_payload(screen)
+}
+
+/// Recognised payload carried by a composer-occupied error, if any.
+pub(crate) fn recognised_payload_from_error(err: &str) -> Option<&'static str> {
+    if err.contains("holds \"/clear\"") {
+        Some("/clear")
+    } else if err.contains("holds \"/new\"") {
+        Some("/new")
+    } else {
+        None
+    }
+}
+
+fn composer_occupied_error_with_payload(payload: Option<&'static str>) -> String {
+    match payload {
+        Some(payload) => format!(
+            "{COMPOSER_OCCUPIED_BY_NON_WIRE_INPUT_PREFIX} composer_occupied: composer holds \"{payload}\"; repair: Backspace, then Ctrl-U; holding delivery without sending keys"
+        ),
+        None => composer_occupied_error(),
+    }
+}
+
+fn composer_occupied_error_for_screen(screen: &str) -> String {
+    composer_occupied_error_with_payload(recognised_composer_payload_in_screen(screen))
+}
+
 pub fn is_composer_occupied_zero_keys_error(err: &str) -> bool {
     is_composer_occupied_error(err) && err.contains("without sending keys")
 }
@@ -4042,7 +4085,7 @@ fn check_bound_claude_input(
     }
     let target = matches!(phase, BoundInputPhase::Submit).then_some(payload);
     if screen_has_dialog_or_menu_markers_with_context(contents, target, None, route_keys) {
-        return Err(composer_occupied_error());
+        return Err(composer_occupied_error_for_screen(contents));
     }
     let owned = match phase {
         BoundInputPhase::Payload => !composer_has_unsubmitted_content_for_style(
@@ -4636,7 +4679,7 @@ fn prepare_clean_composer_before_paste_impl(
         return Err(composer_unlocated_error());
     }
     if screen_has_dialog_or_menu_markers_with_context(&contents1, None, None, route_keys) {
-        return Err(composer_occupied_error());
+        return Err(composer_occupied_error_for_screen(&contents1));
     }
     if !composer_has_unsubmitted_content_for_style(
         &contents1,
@@ -4660,7 +4703,7 @@ fn prepare_clean_composer_before_paste_impl(
     }
     let Some((contents2, cursor2)) = capture_rendered_only() else {
         if !composer_equals_recorded_wire_deliveries(&contents1, route_keys) {
-            return Err(composer_occupied_error());
+            return Err(composer_occupied_error_for_screen(&contents1));
         }
         return Err("prompt submission unconfirmed before paste: \
              composer still holds earlier unsubmitted content (rendered capture unavailable)"
@@ -4676,7 +4719,7 @@ fn prepare_clean_composer_before_paste_impl(
         return Err(composer_unlocated_error());
     }
     if screen_has_dialog_or_menu_markers_with_context(&contents2, None, None, route_keys) {
-        return Err(composer_occupied_error());
+        return Err(composer_occupied_error_for_screen(&contents2));
     }
     if !composer_has_unsubmitted_content_for_style(
         &contents2,
@@ -4688,7 +4731,7 @@ fn prepare_clean_composer_before_paste_impl(
         return Ok(PrePasteOutcome::CleanProceedToPaste);
     }
     if !composer_equals_recorded_wire_deliveries(&contents2, route_keys) {
-        return Err(composer_occupied_error());
+        return Err(composer_occupied_error_for_screen(&contents2));
     }
 
     let preexisting_matches_target =
@@ -7617,7 +7660,7 @@ fn dispatch_message_selected_with_status<S: MessageStore>(
         );
         if let Err(ref err) = pushed {
             if is_composer_occupied_error(err.as_str()) {
-                report.record_failure(FailureStage::ComposerOccupiedByNonWireInput);
+                report.record_composer_occupied(err.as_str());
             } else {
                 let dead_explicit = entry.explicit
                     && (matches!(err, PushError::NotConnected(_))
@@ -7653,7 +7696,7 @@ fn dispatch_message_selected_with_status<S: MessageStore>(
                     );
                     if let Err(ref retry_err) = pushed {
                         if is_composer_occupied_error(retry_err.as_str()) {
-                            report.record_failure(FailureStage::ComposerOccupiedByNonWireInput);
+                            report.record_composer_occupied(retry_err.as_str());
                         } else {
                             let retry_dead_explicit = fresh.explicit
                                 && (matches!(retry_err, PushError::NotConnected(_))
@@ -9944,6 +9987,73 @@ mod tests {
                 assert_reset_refusal(serde_json::from_str(&error).unwrap(), vendor);
             }
         }
+    }
+
+    #[test]
+    fn clear_or_reforge_refusal_table_has_zero_dispatch() {
+        let _tmux_lock = TMUX_ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let tmp = TempDir::new().unwrap();
+        let (tmux_bin, tmux_out, _) = write_fake_tmux(tmp.path(), true);
+        let _env = EnvGuard::set("FL_WIRE_TMUX_BIN", &tmux_bin);
+        // Every unconfirmable vendor refuses for both modes before any transport.
+        for (route, vendor) in unsupported_reset_routes() {
+            assert_reset_refusal(
+                serde_json::to_value(preflight_session_reset(&route).unwrap_err()).unwrap(),
+                vendor,
+            );
+            for mode in [SessionResetMode::Clear, SessionResetMode::Reforge] {
+                let error =
+                    clear_or_reforge_session(&route, mode, "owner", Some("hydrate fixture"))
+                        .expect_err("must refuse without dispatch");
+                assert_reset_refusal(serde_json::from_str(&error).unwrap(), vendor);
+            }
+        }
+        assert!(
+            !tmux_out.exists(),
+            "refused resets must not reach tmux (zero dispatch), saw: {}",
+            tmux_out.display()
+        );
+        // Supported vendors remain allowed by preflight.
+        for route in [
+            VendorRoute::Claude {
+                pid: 0,
+                session_id: "".into(),
+                socket_path: "/fixture/absent".into(),
+                key_path: None,
+            },
+            VendorRoute::Agy {
+                conversation_id: "".into(),
+                ls_pid: None,
+                ls_address: None,
+                csrf_token: None,
+                agentapi_exe: None,
+            },
+            VendorRoute::Webhook {
+                socket_path: "/fixture/absent".into(),
+            },
+        ] {
+            assert!(preflight_session_reset(&route).is_ok());
+        }
+    }
+
+    #[test]
+    fn recognised_composer_payload_names_only_clear_and_new() {
+        assert_eq!(recognised_composer_payload("/clear"), Some("/clear"));
+        assert_eq!(recognised_composer_payload("  /new\n"), Some("/new"));
+        assert_eq!(recognised_composer_payload("/clear now"), None);
+        assert_eq!(recognised_composer_payload("/clearx"), None);
+        assert_eq!(recognised_composer_payload("my secret draft"), None);
+        let rule = "─".repeat(20);
+        let clear_screen = format!("◆ Ready.\n{rule}\n❯ /clear\n{rule}\n  status");
+        let err = composer_occupied_error_for_screen(&clear_screen);
+        assert!(err.contains("holds \"/clear\""), "{err}");
+        assert!(err.contains("Backspace, then Ctrl-U"), "{err}");
+        assert!(is_composer_occupied_zero_keys_error(&err), "{err}");
+        let secret_screen = format!("◆ Ready.\n{rule}\n❯ my secret draft\n{rule}\n  status");
+        let err = composer_occupied_error_for_screen(&secret_screen);
+        assert_eq!(err, composer_occupied_error());
+        assert!(!err.contains("my secret draft"), "{err}");
+        assert!(!err.contains("Backspace"), "{err}");
     }
 
     #[test]
@@ -21457,5 +21567,41 @@ exit 1"#,
             assert!(is_composer_occupied_zero_keys_error(&err));
         }
         assert!(composer_session_busy_error().contains("session_busy"));
+    }
+
+    #[test]
+    fn prepare_clean_names_clear_payload_and_hides_arbitrary_text() {
+        let rule = "─".repeat(120);
+        for (text, recognised) in [
+            ("/clear", true),
+            ("/new", true),
+            ("owner secret draft", false),
+        ] {
+            let screen = format!("◆ Ready.\n{rule}\n❯ {text}\n{rule}\n  status");
+            let mut enters = 0u32;
+            let err = prepare_clean_composer_before_paste_impl(
+                "next payload",
+                &[],
+                false,
+                false,
+                ComposerStyle::Ruled,
+                |_| {},
+                || Some((screen.clone(), None)),
+                || false,
+                || {
+                    enters += 1;
+                    Ok(())
+                },
+            )
+            .expect_err("occupied composer must fail closed");
+            assert_eq!(enters, 0, "{text}");
+            if recognised {
+                assert!(err.contains(&format!("holds \"{text}\"")), "{err}");
+                assert!(err.contains("Backspace, then Ctrl-U"), "{err}");
+            } else {
+                assert!(!err.contains("owner secret draft"), "{err}");
+                assert!(!err.contains("Backspace"), "{err}");
+            }
+        }
     }
 }
