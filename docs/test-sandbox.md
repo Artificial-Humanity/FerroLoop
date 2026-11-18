@@ -41,7 +41,7 @@ home, XDG, runtime and temporary directories, proc and devices. System tools,
 libraries, the selected Rust sysroot, cargo registry and a source snapshot are
 read-only; `/usr/libexec` supplies compiler internals and the resolved host C
 compiler is selected explicitly for C builds and the Rust host linker. The only
-writable host-backed mount is a target directory under `/var/tmp`. The snapshot includes only Git-tracked files (including
+writable host-backed mount is the selected target directory. The snapshot includes only Git-tracked files (including
 tracked edits), omits Git metadata, untracked files and submodules, and refuses
 nested mounts in the source tree or any host bind;
 the snapshot and default target are removed on exit. The runner rejects unsafe bind
@@ -54,18 +54,35 @@ and build directories such as `target/` are excluded from this check and the
 snapshot. The source-input policy is conservative, so it can require cleanup
 of unrelated files before launch.
 
-To retain build outputs across invocations, set `FL_SANDBOX_TARGET_DIR` to a
-direct child of `/var/tmp`, for example `/var/tmp/my-sandbox-target`. The
-directory is created with mode 0700 and must remain owned by the current user
-with that mode. The runner rejects symlinks, sockets, other special entries,
+Set `FL_SANDBOX_TARGET_DIR` to `/data/toolchain/ferroloop-build/<persona>/<task>`
+for builds on the lab host, for example
+`/data/toolchain/ferroloop-build/felix/sandbox-proof`. The shared build root
+must already exist; the persona and task directories are created as needed.
+The target must be exactly two components below the build root. A direct child
+of `/var/tmp` remains supported for compatibility; the default ephemeral
+target is also under `/var/tmp`. Lab policy requires `/data` for real builds:
+remove a task target after its PR merges. No component of either path may be a
+symlink. The target is created with mode 0700 and must remain owned by the
+current user with that mode. The runner rejects symlinks, sockets, other special entries,
 and nested mounts before launch and checks again after the sandbox exits, even
 if the command fails. A failed post-run check makes the runner fail; inspect
 or remove the persistent directory yourself before reusing it. The runner does
 not remove a persistent target.
 
+Before creating the source snapshot, the runner checks available space on `/`
+and on the target filesystem; it refuses to proceed when either is below the
+reserve or cannot be measured. It keeps checking while the sandbox runs and
+stops the sandbox process group if space falls below the reserve or measurement
+fails. `FL_SANDBOX_MIN_FREE_GIB` sets the reserve as a positive integer in GiB;
+it defaults to 120 GiB. A stopped run reports failure and requires cleanup or
+more free space before retrying.
+
 The sandbox receives `/dev/null` on standard input by default. To pass the
 launcher's input through deliberately, use `scripts/test-sandboxed.sh --stdin --
-COMMAND ...`. Bubblewrap attempts a private cgroup namespace when supported;
+COMMAND ...`. A sandbox-local empty Git template directory avoids `git init` warnings without
+exposing host Git templates. For an authorized full-suite run, pass
+`--no-fail-fast` to Cargo so later test binaries run after failures.
+Bubblewrap attempts a private cgroup namespace when supported;
 the other listed namespaces are mandatory.
 
 This protects against accidental access to live endpoints, files and
