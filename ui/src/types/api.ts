@@ -757,6 +757,8 @@ export interface HostedSessionSummary {
   hydration_status?: HydrationStatus;
   node_id: string;
   status: string;
+  stop_reason?: string | null;
+  launch_prerequisite_detail?: string | null;
   restart_count?: number;
   updated_at_ms?: number;
 }
@@ -2038,6 +2040,8 @@ export interface WatchHostedSession {
   hydration_status?: HydrationStatus;
   node_id: string;
   status: string;
+  stop_reason?: string | null;
+  launch_prerequisite_detail?: string | null;
   restart_count: number;
   updated_at_ms: number;
 }
