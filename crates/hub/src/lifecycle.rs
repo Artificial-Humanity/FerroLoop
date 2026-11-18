@@ -8349,6 +8349,9 @@ where
     let mut launched_with_prompt = false;
     let mut launch_died = false;
     let mut resumed_existing = false;
+    // Use this operation's runtime observations, never a saved ownership flag, to reset
+    // an incident. The flag may remain true after dead-session reconciliation.
+    let mut restart_runtime_live = adopted_old_session || (should_check_unit && !unit_not_running);
     let resume_launch_started_ms = now_ms();
     let raw_spawned = record.hosted
         && !adopted_old_session
@@ -8434,6 +8437,7 @@ where
         record = fresh_record;
         if raw_spawned && survived_resume {
             record.runtime_spawned = true;
+            restart_runtime_live = true;
             resumed_existing = true;
             if let Some(new_pid) = env.runtime.recorded_pid(&unit, &record.session_id) {
                 record.pid = Some(new_pid);
@@ -8517,6 +8521,7 @@ where
                     record.runtime_spawned = false;
                 } else {
                     record.runtime_spawned = true;
+                    restart_runtime_live = true;
                     launched_with_prompt = launch.is_some();
                 }
             } else {
@@ -8545,6 +8550,7 @@ where
             record.runtime_spawned = false;
         } else {
             record.runtime_spawned = true;
+            restart_runtime_live = true;
             // Argv already handed off the prompt; acceptance remains unconfirmed.
             launched_with_prompt = launch.is_some();
         }
@@ -8600,11 +8606,7 @@ where
     persist_hosted_session(store, &record, by)?;
     // A returned Ok alone is insufficient: a launch can have died during survival checks.
     // Reset only after a live manual result and its record have both been persisted.
-    if !automatic
-        && !launch_died
-        && env.spawn_runtime
-        && (record.runtime_spawned || resumed_existing || adopted_old_session)
-    {
+    if !automatic && !launch_died && env.spawn_runtime && restart_runtime_live {
         save_hosted_respawn_state(
             store,
             &record.session_id,
@@ -20913,6 +20915,42 @@ mod tests {
         assert_eq!(
             load_hosted_respawn_state(&store, &record.session_id),
             HostedRespawnState::default()
+        );
+    }
+
+    // CI only: store-backed lifecycle regression; do not run under the local #539 hold.
+    #[test]
+    fn slow_recovery_failed_manual_spawn_with_stale_spawn_flag_preserves_incident() {
+        let _reset = RecoveryFixtureReset;
+        let home = TempDir::new().unwrap();
+        let _trusted = trusted_codex_home(home.path(), home.path());
+        let store = MemStore::default();
+        let fake = FakeRuntime::default();
+        let env = fake.env(home.path());
+        // Dead-session reconciliation can preserve the historical ownership flag.
+        let mut record = hosted_record("codex", "stale-manual", STATUS_STOPPED, true);
+        record.cwd = Some(home.path().display().to_string());
+        record.stop_reason = Some(STOP_REASON_CRASH_LOOP.into());
+        record.hydration_generation = Some(next_hydration_generation());
+        persist_hosted_session(&store, &record, "owner").unwrap();
+        let incident = HostedRespawnState {
+            recovery_started_at_ms: Some(1),
+            recovery_attempts: 2,
+            next_allowed_at_ms: Some(601_000),
+            ..Default::default()
+        };
+        save_hosted_respawn_state(&store, &record.session_id, &incident, "owner").unwrap();
+        TEST_RESPAWN_NOW_MS.with(|clock| clock.set(Some(1_000)));
+        TEST_LAUNCH_PREREQUISITE.with(|slot| *slot.borrow_mut() = Some(Ok(())));
+        fake.fail_windows.borrow_mut().push("codex".into());
+
+        restart_hosted_session(&store, &env, &record.session_id, "owner").unwrap();
+
+        assert!(fake.live.borrow().is_empty(), "the manual spawn failed");
+        assert_eq!(
+            load_hosted_respawn_state(&store, &record.session_id),
+            incident,
+            "a historical spawn flag is not evidence of a live manual restart"
         );
     }
 
