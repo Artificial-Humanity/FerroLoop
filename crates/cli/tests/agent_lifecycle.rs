@@ -1079,7 +1079,11 @@ fn restart_reuses_saved_configuration_and_changes_only_selected_session() {
     };
     let mut restart = e.fl();
     restart.args(["agent", "restart", "ada", "--json"]);
-    let out = Env::json_of(restart);
+    let output = restart.assert().failure().get_output().clone();
+    let out: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(out["runtime_live"], false);
+    assert_eq!(out["runtime_spawned"], false);
+    assert!(String::from_utf8_lossy(&output.stderr).contains("no live runtime"));
     for key in [
         "session_id",
         "persona",
@@ -1100,7 +1104,7 @@ fn restart_reuses_saved_configuration_and_changes_only_selected_session() {
         out["restart_count"],
         saved["restart_count"].as_u64().unwrap() + 1
     );
-    assert_eq!(out["status"], "running");
+    assert_eq!(out["status"], "stopped");
     assert_eq!(
         e.hosted_records()
             .into_iter()
@@ -1112,4 +1116,45 @@ fn restart_reuses_saved_configuration_and_changes_only_selected_session() {
         .args(["agent", "restart", "ada", "--model", "other"])
         .assert()
         .failure();
+}
+
+// CI-only: selection failure must exit before touching either saved record or host.
+#[test]
+fn restart_cli_refuses_ambiguous_persona_without_effects() {
+    let e = Env::new();
+    Env::json_of(e.spin_up("ada", "assistant", "claude"));
+    {
+        let store = fl_store::open_store(&e.store()).unwrap();
+        let mut duplicate = fl_hub::lifecycle::find_hosted_session(&store, &["claude:ada"])
+            .unwrap()
+            .unwrap();
+        duplicate.session_id = "codex:ada".into();
+        duplicate.vendor = "codex".into();
+        fl_hub::lifecycle::persist_hosted_session(&store, &duplicate, "test").unwrap();
+    }
+    let before = e.hosted_records();
+    e.fl()
+        .args(["agent", "restart", "ada", "--json"])
+        .assert()
+        .code(2)
+        .stderr(contains("multiple saved sessions"));
+    assert_eq!(e.hosted_records(), before);
+}
+
+#[test]
+fn restart_no_spawn_text_reports_spawn_hydration_and_failure() {
+    let e = Env::new();
+    Env::json_of(e.spin_up("ada", "assistant", "claude"));
+    e.fl()
+        .args(["agent", "restart", "ada"])
+        .assert()
+        .failure()
+        .stdout(
+            contains("stopped")
+                .and(contains("runtime_spawned=false"))
+                .and(contains("runtime_live=false"))
+                .and(contains("hydration_dispatched="))
+                .and(contains("hydration_status=")),
+        )
+        .stderr(contains("no live runtime"));
 }

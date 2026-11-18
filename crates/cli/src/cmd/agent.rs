@@ -584,6 +584,14 @@ pub fn pid_is_alive(pid: u32) -> bool {
     }
 }
 
+fn restart_exit_status(runtime_live: bool) -> Result<(), (i32, String)> {
+    if runtime_live {
+        Ok(())
+    } else {
+        Err((1, "restart resulted in no live runtime; inspect the saved session and vendor prerequisites".into()))
+    }
+}
+
 /// Exit code 2 for a registry conflict (as `register` reports one), 1 for everything else.
 fn lifecycle_failure(e: LifecycleError) -> (i32, String) {
     let code = if matches!(e, LifecycleError::Conflict(_)) {
@@ -826,14 +834,20 @@ pub fn run<S: AgentRegistry + Handles + StateStore + Catalog + fl_core::MessageS
                 println!("{}", serde_json::to_string_pretty(&out).unwrap());
             } else {
                 println!(
-                    "{}\t{}\trestart_count={}",
-                    out.record.session_id, out.record.status, out.record.restart_count
+                    "{}\t{}\trestart_count={}\truntime_spawned={}\truntime_live={}\thydration_dispatched={}\thydration_status={}",
+                    out.record.session_id,
+                    out.record.status,
+                    out.record.restart_count,
+                    out.record.runtime_spawned,
+                    out.runtime_live,
+                    out.record.hydration_dispatched,
+                    out.record.hydration_status
                 );
                 for warning in &out.warnings {
                     eprintln!("warning: {warning}");
                 }
             }
-            Ok(())
+            restart_exit_status(out.runtime_live)
         }
         AgentCmd::Decommission {
             session,
@@ -1199,6 +1213,14 @@ mod tests {
     struct AgentTestCli {
         #[command(subcommand)]
         cmd: AgentCmd,
+    }
+
+    #[test]
+    fn restart_exit_status_requires_current_live_runtime() {
+        assert!(restart_exit_status(true).is_ok());
+        let (code, detail) = restart_exit_status(false).unwrap_err();
+        assert_ne!(code, 0);
+        assert!(detail.contains("no live runtime"));
     }
 
     #[test]

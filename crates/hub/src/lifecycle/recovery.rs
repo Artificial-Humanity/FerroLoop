@@ -30,6 +30,9 @@ pub(super) fn classify(state: &mut HostedRespawnState, reason: &str, now: u64) -
     }
     if state.recovery_started_at_ms.is_some() {
         if state.recovery_attempts >= RECOVERY_MAX_ATTEMPTS {
+            // No further launch deadline exists. Clearing it marks the final stopped
+            // transition durably, so idle ticks do not repeat exhaustion events.
+            state.next_allowed_at_ms = None;
             return Decision::Exhausted;
         }
         if respawn_due(state, now) {
@@ -60,8 +63,8 @@ pub(super) fn reserve_attempt(state: &mut HostedRespawnState, now: u64) {
     }
 }
 
-/// Restore only this operation's reservation, then retain a bounded readiness cadence.
-pub(super) fn refund_attempt(
+/// Before any process spawns, restore only this operation's reservation, then retain a bounded readiness cadence.
+pub(super) fn refund_unspawned_attempt(
     state: &mut HostedRespawnState,
     before_reservation: &HostedRespawnState,
     now: u64,
@@ -231,6 +234,29 @@ mod tests {
     }
 
     #[test]
+    fn exhaustion_classification_is_stable_after_final_stop() {
+        let mut state = HostedRespawnState {
+            recovery_started_at_ms: Some(1),
+            recovery_attempts: 6,
+            next_allowed_at_ms: Some(601_000),
+            ..Default::default()
+        };
+        assert_eq!(
+            classify(&mut state, STOP_REASON_CRASH_LOOP, 2_000),
+            Decision::Exhausted
+        );
+        assert_eq!(state.next_allowed_at_ms, None);
+        let stopped = state.clone();
+        for now in [17_000, 9_000_000] {
+            assert_eq!(
+                classify(&mut state, STOP_REASON_CRASH_LOOP, now),
+                Decision::Exhausted
+            );
+            assert_eq!(state, stopped);
+        }
+    }
+
+    #[test]
     fn recovery_prerequisite_deferral_is_uncharged_and_never_shortens_slow_deadline() {
         let mut s = HostedRespawnState::default();
         classify(&mut s, STOP_REASON_CRASH_LOOP, 1_000);
@@ -388,7 +414,7 @@ mod tests {
     }
 
     #[test]
-    fn startup_prerequisite_refund_restores_slow_incident_and_readiness_deadline() {
+    fn unspawned_prerequisite_refusal_restores_slow_incident_and_readiness_deadline() {
         let before = HostedRespawnState {
             respawn_timestamps_ms: vec![900],
             recovery_started_at_ms: Some(1_000),
@@ -400,7 +426,7 @@ mod tests {
         let mut state = before.clone();
         reserve_attempt(&mut state, 601_000);
         assert_eq!(state.recovery_attempts, 3);
-        refund_attempt(&mut state, &before, 601_000);
+        refund_unspawned_attempt(&mut state, &before, 601_000);
         assert_eq!(
             state, before,
             "an existing later deadline must survive the refund"
@@ -409,7 +435,7 @@ mod tests {
         due.next_allowed_at_ms = Some(601_000);
         let mut attempted = due.clone();
         reserve_attempt(&mut attempted, 601_000);
-        refund_attempt(&mut attempted, &due, 601_000);
+        refund_unspawned_attempt(&mut attempted, &due, 601_000);
         due.next_allowed_at_ms = Some(661_000);
         assert_eq!(attempted, due);
     }

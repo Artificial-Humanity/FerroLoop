@@ -303,16 +303,18 @@ Spin-up, restart and remodel return HTTP 409 with `code: codex_app_server_unavai
 when this prerequisite is unavailable. Automatic recovery emits a
 `session.prerequisite_unavailable` event. An automatically recoverable stopped record has
 `stop_reason: prerequisite_unavailable` and
-`launch_prerequisite_detail` containing a bounded socket path and probe result. Automatic
-`on-failure` recovery checks again at most once per 60 seconds per session; its next deadline
-is saved across Hub restarts. These refusals spend no automatic respawn attempts. A successful
-connection is readiness evidence only; the launched process must still survive normally.
+`launch_prerequisite_detail` containing a bounded socket path and probe result. After a
+refusal before any spawn, automatic `on-failure` recovery checks again at most once per
+60 seconds per session; its next deadline is saved across Hub restarts. Such refusals spend
+no automatic respawn attempts. A successful connection is readiness evidence only; the
+launched process must still survive normally.
 A refused manual restart preserves a prior `clean_exit`, `crash_loop` or other intentional
 stop reason and its recovery state; it does not arm automatic recovery. Only an automatic
 restart, or a record already stopped for `runtime_gone` or `prerequisite_unavailable`,
 receives the prerequisite retry reason and deadline. If the daemon disappears during initial
-startup, the immediate re-probe refunds that launch attempt; later runtime deaths remain
-ordinary failures.
+startup, an immediate re-probe records the unavailable prerequisite. Once a process really
+spawns, its attempt stays charged with the normal deadline of its phase, even if it dies
+immediately. Only a refusal before any spawn is free.
 
 FerroLoop does not start the vendor daemon. Start it through a clean systemd user service,
 not from an agent command shell: a shared daemon and its updater propagate inherited
@@ -545,34 +547,45 @@ posture, working directory, node and context. It accepts no launch-setting overr
 An exact session id wins; a persona must name one eligible saved record. Retired,
 non-hosted and decommissioning/decommissioned targets are refused. The command uses
 the Owner caller model of `fl agent spin-up` and revalidates selection under the
-session lifecycle lock.
+session lifecycle lock. This lock is process-local: the CLI is not serialised with the hub
+(or a separate CLI process). Cross-process fencing is tracked in [#592](https://github.com/Artificial-Humanity/FerroLoop/issues/592)
+and gates deployment of the new command. The command prints `runtime_spawned`,
+`runtime_live`, `hydration_dispatched` and `hydration_status`; it exits non-zero when no
+live runtime resulted. `runtime_live` is a serde-default field on the restart response
+and reports current-operation evidence rather than a saved ownership flag.
 
 The fast automatic guard remains three respawns in ten minutes, with the existing
 30/60/120-second backoff. A fourth failure enters a durable recovery incident. The
 first slow launch is due ten minutes later; at most six launches are attempted,
 each at least ten minutes after the previous one. A late reconcile pass attempts
 one launch rather than catching up. When an old `crash_loop` record has no incident
-state, its first due time is ten minutes after it is first reconciled by this code.
+state at upgrade, its first launch is due about ten minutes after the new hub first
+reconciles it; existing stopped records are eligible automatically.
 After six unsuccessful recoveries the session stays stopped until manual action.
 
 A successful spawn does not refill the incident budget. The incident resets after
 ten minutes of observed healthy running (a proven live process route or an Alive
 runtime observation), or after an explicit manual restart persists a live result.
 Gone or Unknown runtime observations break the healthy interval. Refused or failed
-manual launches retain recovery state. Missing vendor prerequisites spend neither
-fast nor slow attempts; their persisted readiness deadline never shortens an existing
-slow deadline. Other preparation failures consume an attempt and the current phase's
-backoff. If a Codex launch immediately fails and a second readiness probe shows the
-daemon disappeared, only that launch reservation is refunded; the incident history
-and prior deadline are retained before readiness deferral. Later process deaths remain
-ordinary failures. FerroLoop does not start a vendor daemon automatically.
+manual launches retain recovery state. Missing vendor prerequisites before any spawn spend
+neither fast nor slow attempts; their persisted readiness deadline never shortens an
+existing slow deadline. A real spawn stays charged in both phases, including when a
+second readiness probe shows the daemon disappeared during startup, and keeps the normal
+phase deadline (fast backoff or ten-minute slow spacing). Other preparation failures
+consume an attempt and the current phase's backoff, except `Conflict` errors, which are
+not charged. FerroLoop does not start a vendor daemon automatically.
 
 Crash-loop notices go to the active project Lead, using registry project coverage.
 If the stopped persona is a Lead, or the project has no Lead, active Lab Managers
 also receive the notice. No notice goes to the stopped persona itself. Initial
 incident and final exhaustion notices have separate per-recipient delivery state;
 failed recipients and newly registered recipients are retried. Notices include the
-next due time or final-stop status and the saved-settings restart command.
+next due time as UTC text or final-stop status and the saved-settings restart command.
+The hub logs fast-guard entry and final exhaustion, emits `session.crash_loop` and
+`session.recovery_exhausted` events, and rate-limits warnings when no eligible recipient
+can be notified. Unchanged reconcile ticks append no recovery or session revisions.
+A recovery-state read or decode error skips that record for the tick rather than resetting
+its budget; a health-state write error likewise leaves other records eligible for inspection.
 
 The disjoint runtime record adds serde-default fields `recovery_started_at_ms`,
 `recovery_attempts`, `recovery_healthy_since_ms` and
