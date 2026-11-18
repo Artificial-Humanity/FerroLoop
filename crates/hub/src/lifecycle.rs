@@ -34,6 +34,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::api::{reforge_role_label, route_matches_session_id, synthesize_decommission_prompt};
 
+mod recovery;
+
 #[cfg(test)]
 use crate::api::canonical_reforge_prompt;
 
@@ -1042,6 +1044,7 @@ thread_local! {
     static TEST_LAUNCH_PREREQUISITE: std::cell::RefCell<Option<Result<(), fl_core::LaunchPrerequisiteRefusal>>> = const { std::cell::RefCell::new(None) };
     static TEST_LAUNCH_PREREQUISITE_CALLS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
     static TEST_RESPAWN_SAVE_FAILURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static TEST_RUNNING_RECORD_SAVE_FAILURE: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
     static TEST_CODEX_HOME: std::cell::RefCell<Option<Option<std::ffi::OsString>>> = const { std::cell::RefCell::new(None) };
 }
 
@@ -3486,6 +3489,31 @@ pub struct HostedRespawnState {
     pub next_allowed_at_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub crash_loop_notified: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_started_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "is_zero_recovery_attempts")]
+    pub recovery_attempts: u8,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_healthy_since_ms: Option<u64>,
+    /// Successful deliveries keyed as `recovery:<recipient>` or `exhausted:<recipient>`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub crash_loop_notified_recipients: Vec<String>,
+}
+
+fn is_zero_recovery_attempts(value: &u8) -> bool {
+    *value == 0
+}
+
+impl HostedRespawnState {
+    fn is_empty(&self) -> bool {
+        self.respawn_timestamps_ms.is_empty()
+            && self.next_allowed_at_ms.is_none()
+            && !self.crash_loop_notified
+            && self.recovery_started_at_ms.is_none()
+            && self.recovery_attempts == 0
+            && self.recovery_healthy_since_ms.is_none()
+            && self.crash_loop_notified_recipients.is_empty()
+    }
 }
 
 fn respawn_due(state: &HostedRespawnState, now: u64) -> bool {
@@ -3495,7 +3523,12 @@ fn respawn_due(state: &HostedRespawnState, now: u64) -> bool {
 }
 
 fn defer_launch_prerequisite(state: &mut HostedRespawnState, now: u64) {
-    state.next_allowed_at_ms = Some(now.saturating_add(LAUNCH_PREREQUISITE_RETRY_MS));
+    state.next_allowed_at_ms = Some(
+        state
+            .next_allowed_at_ms
+            .unwrap_or(0)
+            .max(now.saturating_add(LAUNCH_PREREQUISITE_RETRY_MS)),
+    );
 }
 
 pub fn load_hosted_respawn_state<S: StateStore>(store: &S, session_id: &str) -> HostedRespawnState {
@@ -3526,11 +3559,8 @@ pub fn save_hosted_respawn_state<S: StateStore>(
         ));
     }
     let slug = hosted_respawn_state_slug(session_id);
-    if state.respawn_timestamps_ms.is_empty()
-        && state.next_allowed_at_ms.is_none()
-        && !state.crash_loop_notified
-    {
-        let _ = store.delete_state_by_key(&StateScope::Workspace, StateConcern::Runtime, &slug);
+    if state.is_empty() {
+        store.delete_state_by_key(&StateScope::Workspace, StateConcern::Runtime, &slug)?;
         return Ok(());
     }
     let value = serde_json::to_value(state).map_err(|e| LifecycleError::Store(e.to_string()))?;
@@ -3963,6 +3993,17 @@ pub fn persist_hosted_session<S: StateStore>(
     record: &HostedSessionRecord,
     by: &str,
 ) -> Result<(), LifecycleError> {
+    #[cfg(test)]
+    if record.status.eq_ignore_ascii_case(STATUS_RUNNING)
+        && TEST_RUNNING_RECORD_SAVE_FAILURE.with(|fail| {
+            fail.get()
+                .is_some_and(|restart_count| record.restart_count >= restart_count)
+        })
+    {
+        return Err(LifecycleError::Store(
+            "injected running-record save failure".into(),
+        ));
+    }
     let mut normalized = record.clone();
     normalized.host_session_id = host_session_id_for_target(normalized.tmux_target.as_deref());
     if let Err(e) = promote_confirmed_hydration(store, &mut normalized) {
@@ -7240,6 +7281,24 @@ fn bump_dead_streak(streak_key: &DeadStreakKey) -> u32 {
     })
 }
 
+fn observe_hosted_recovery_health<S: StateStore>(
+    store: &S,
+    record: &HostedSessionRecord,
+    alive: bool,
+    by: &str,
+) -> Result<(), LifecycleError> {
+    if !record.hosted || !record.restart_policy.eq_ignore_ascii_case("on-failure") {
+        return Ok(());
+    }
+    let mut state = load_hosted_respawn_state(store, &record.session_id);
+    let before = state.clone();
+    recovery::observe_health(&mut state, alive, current_respawn_clock_ms());
+    if state != before {
+        save_hosted_respawn_state(store, &record.session_id, &state, by)?;
+    }
+    Ok(())
+}
+
 /// Mark a hosted runtime `stopped` when its tmux window is confirmed gone twice
 /// and no route of its vendor is present.
 ///
@@ -7328,6 +7387,9 @@ pub fn reconcile_dead_hosted_sessions<S: StateStore>(
             record.session_id.clone(),
         );
         if vendor_route_live_for_record(env.home_override, &record) {
+            if env.spawn_runtime {
+                observe_hosted_recovery_health(store, &record, true, by)?;
+            }
             if record.vendor == "claude" {
                 let mut rstate = load_claude_resume_state(store, &record.session_id);
                 let launch_started_ms =
@@ -7360,7 +7422,9 @@ pub fn reconcile_dead_hosted_sessions<S: StateStore>(
             .tmux_target
             .clone()
             .unwrap_or_else(|| hosted_tmux_target(&record.vendor, &record.persona));
-        match env.runtime.presence(&target) {
+        let presence = env.runtime.presence(&target);
+        observe_hosted_recovery_health(store, &record, presence == RuntimePresence::Alive, by)?;
+        match presence {
             RuntimePresence::Alive => {
                 with_dead_streaks(|streaks| {
                     streaks.remove(&streak_key);
@@ -7959,7 +8023,11 @@ where
             || !record.restart_policy.eq_ignore_ascii_case("on-failure")
             || !matches!(
                 record.stop_reason.as_deref(),
-                Some(STOP_REASON_RUNTIME_GONE | STOP_REASON_PREREQUISITE_UNAVAILABLE)
+                Some(
+                    STOP_REASON_RUNTIME_GONE
+                        | STOP_REASON_CRASH_LOOP
+                        | STOP_REASON_PREREQUISITE_UNAVAILABLE
+                )
             ))
     {
         return Err(LifecycleError::Conflict(format!(
@@ -7984,10 +8052,36 @@ where
     let automatic = by == AUTO_RESPAWN_ACTOR;
     let now = current_respawn_clock_ms();
     let mut respawn_state = load_hosted_respawn_state(store, &record.session_id);
-    if automatic && !respawn_due(&respawn_state, now) {
-        return Err(LifecycleError::Conflict(
-            "automatic restart is not due".into(),
-        ));
+    if automatic {
+        if store
+            .agent_by_name(&record.persona)?
+            .is_some_and(|agent| agent.status != AgentStatus::Active)
+        {
+            return Err(LifecycleError::Conflict(
+                "automatic restart cannot revive a retired agent".into(),
+            ));
+        }
+        if !env.spawn_runtime {
+            return Err(LifecycleError::Conflict(
+                "automatic restart requires runtime spawning".into(),
+            ));
+        }
+        let decision = recovery::classify(
+            &mut respawn_state,
+            record.stop_reason.as_deref().unwrap_or(""),
+            now,
+        );
+        // Persist classification before even a prerequisite probe. Reloading under this lock
+        // prevents a stale reconcile candidate from spending or resetting another operation's state.
+        save_hosted_respawn_state(store, &record.session_id, &respawn_state, by)?;
+        if !matches!(
+            decision,
+            recovery::Decision::FastLaunch | recovery::Decision::SlowLaunch
+        ) {
+            return Err(LifecycleError::Conflict(
+                "automatic restart is not due or recovery is exhausted".into(),
+            ));
+        }
     }
     if automatic
         && record.vendor == "codex"
@@ -8008,9 +8102,11 @@ where
             Ok(home) => home,
             Err(err @ LifecycleError::PrerequisiteUnavailable { .. }) => {
                 if record.status.eq_ignore_ascii_case(STATUS_STOPPED) {
-                    defer_launch_prerequisite(&mut respawn_state, now);
-                    // Deadline first: any partial failure remains rate limited and cannot launch.
-                    save_hosted_respawn_state(store, &record.session_id, &respawn_state, by)?;
+                    if automatic {
+                        defer_launch_prerequisite(&mut respawn_state, now);
+                        // Deadline first: a refusal cannot launch or spend either budget.
+                        save_hosted_respawn_state(store, &record.session_id, &respawn_state, by)?;
+                    }
                     if let LifecycleError::PrerequisiteUnavailable { detail, .. } = &err {
                         record.launch_prerequisite_detail =
                             Some(bounded_prerequisite_detail(detail));
@@ -8033,21 +8129,7 @@ where
     )
     .map_err(|why| invalid_field("posture", &why))?;
     if automatic {
-        respawn_state
-            .respawn_timestamps_ms
-            .retain(|ts| now.saturating_sub(*ts) < AUTO_RESPAWN_WINDOW_MS);
-        if respawn_state.respawn_timestamps_ms.len() >= AUTO_RESPAWN_MAX_IN_WINDOW {
-            return Err(LifecycleError::Conflict(
-                "automatic restart crash budget exhausted".into(),
-            ));
-        }
-        let idx = respawn_state
-            .respawn_timestamps_ms
-            .len()
-            .min(AUTO_RESPAWN_BACKOFF_SECS.len() - 1);
-        respawn_state.respawn_timestamps_ms.push(now);
-        respawn_state.next_allowed_at_ms =
-            Some(now.saturating_add(AUTO_RESPAWN_BACKOFF_SECS[idx] * 1_000));
+        recovery::reserve_attempt(&mut respawn_state, now);
         save_hosted_respawn_state(store, &record.session_id, &respawn_state, by)?;
     }
 
@@ -8511,14 +8593,25 @@ where
     crate::discovery::invalidate_route_discovery_cache();
     record.restart_count += 1;
     record.launch_prerequisite_detail = None;
-    if !automatic {
-        delete_hosted_respawn_state(store, &record.session_id);
-    }
     record.status = STATUS_RUNNING.to_string();
     record.stop_reason = None;
     record.decommission_prepared_at_ms = None;
     record.updated_at_ms = now_ms();
     persist_hosted_session(store, &record, by)?;
+    // A returned Ok alone is insufficient: a launch can have died during survival checks.
+    // Reset only after a live manual result and its record have both been persisted.
+    if !automatic
+        && !launch_died
+        && env.spawn_runtime
+        && (record.runtime_spawned || resumed_existing || adopted_old_session)
+    {
+        save_hosted_respawn_state(
+            store,
+            &record.session_id,
+            &HostedRespawnState::default(),
+            by,
+        )?;
+    }
     if resumed_existing {
         let baseline_ms = crate::boot_reconcile::hydration_baseline_ms(store, &record);
         if let Err(err) = crate::boot_reconcile::send_service_resume_notice_in_store(
@@ -8577,78 +8670,128 @@ fn resolve_project_lead<S: AgentRegistry>(
     Ok(active_leads.into_iter().next())
 }
 
-fn try_notify_crash_loop_lead<S: AgentRegistry + MessageStore>(
+fn notify_crash_loop_recipients<S: AgentRegistry + MessageStore>(
     store: &S,
     fresh: &HostedSessionRecord,
-) -> bool {
-    let subject = format!(
-        "Crash loop: {} stopped after {} automatic respawns",
-        fresh.session_id, AUTO_RESPAWN_MAX_IN_WINDOW
-    );
-    let body = format!(
-        "Hosted session `{}` (persona `{}`, vendor `{}`) stopped again after {} automatic respawns within a 10-minute window and has been left stopped (`stop_reason = \"crash_loop\"`). Inspect the failure and run manual restart once resolved.",
-        fresh.session_id, fresh.persona, fresh.vendor, AUTO_RESPAWN_MAX_IN_WINDOW
-    );
-    match resolve_project_lead(store, &fresh.project) {
-        Ok(Some(lead)) if !lead.name_key.eq_ignore_ascii_case(&fresh.persona) => {
-            match store.send_wire(SendWireArgs {
-                id: None,
-                sender_id: None,
-                sender_name: "system".to_string(),
-                sender_host: None,
-                to: WireAddress::AgentName(lead.name_key.clone()),
-                kind: MessageKind::Mail,
-                urgency: MessageUrgency::Normal,
-                durable: true,
-                subject,
-                body,
-                reply_to: None,
-                thread_id: None,
-                deadline_at: None,
-                at: stamp::now(),
-            }) {
-                Ok(_) => true,
-                Err(err) => {
-                    if should_log_auto_respawn_warning(
-                        &fresh.session_id,
-                        current_respawn_clock_ms(),
-                    ) {
-                        eprintln!(
-                            "hub: warning ({} / {}): failed to send crash-loop wire notice to `{}`: {err}",
-                            fresh.persona, fresh.session_id, lead.name_key
-                        );
-                    }
-                    false
-                }
-            }
-        }
-        Ok(Some(_lead)) => {
-            // When the crash-looping session is itself the project Lead, do not send a
-            // self-addressed wire notice to a stopped session; the `session.crash_loop`
-            // FerroDeck WebSocket broadcast and hub warning log are the notice.
-            true
-        }
-        Ok(None) => {
-            // No active Lead is registered in this project; leave `crash_loop_notified`
-            // false so the wire notice is delivered if a Lead is registered before
-            // manual restart.
-            false
-        }
+    state: &mut HostedRespawnState,
+) {
+    let agents = match store.list_agents(None, false) {
+        Ok(agents) => agents,
         Err(err) => {
             if should_log_auto_respawn_warning(&fresh.session_id, current_respawn_clock_ms()) {
                 eprintln!(
-                    "hub: warning ({} / {}): failed to resolve project Lead for crash-loop notice: {err}",
-                    fresh.persona, fresh.session_id
+                    "hub: warning ({}): failed to resolve recovery notice recipients: {err}",
+                    fresh.session_id
                 );
             }
-            false
+            return;
         }
-    }
+    };
+    // Preserve registry coverage semantics: prefer the primary project Lead, then an
+    // active Lead covering the project through extra_areas, as other lifecycle notices do.
+    let lead = match resolve_project_lead(store, &fresh.project) {
+        Ok(lead) => lead,
+        Err(err) => {
+            if should_log_auto_respawn_warning(&fresh.session_id, current_respawn_clock_ms()) {
+                eprintln!(
+                    "hub: warning ({}): failed to resolve project Lead: {err}",
+                    fresh.session_id
+                );
+            }
+            return;
+        }
+    };
+    let projection: Vec<_> = agents
+        .iter()
+        .filter_map(|a| {
+            if a.role == AgentRole::Lead {
+                lead.as_ref()
+                    .filter(|lead| lead.name_key == a.name_key)
+                    .map(|_| {
+                        (
+                            a.name_key.as_str(),
+                            fresh.project.as_str(),
+                            a.role.clone(),
+                            a.status,
+                        )
+                    })
+            } else {
+                Some((
+                    a.name_key.as_str(),
+                    a.project.as_str(),
+                    a.role.clone(),
+                    a.status,
+                ))
+            }
+        })
+        .collect();
+    let recipients = recovery::notice_recipients(
+        &projection,
+        &fresh.project,
+        &fresh.persona,
+        fresh.role.eq_ignore_ascii_case("lead"),
+    );
+    let exhausted = state.recovery_attempts >= recovery::RECOVERY_MAX_ATTEMPTS;
+    let subject = if exhausted {
+        format!("Recovery exhausted: {} left stopped", fresh.session_id)
+    } else {
+        format!(
+            "Crash loop: {} stopped after {} automatic respawns",
+            fresh.session_id, AUTO_RESPAWN_MAX_IN_WINDOW
+        )
+    };
+    let schedule = if exhausted {
+        format!(
+            "All {} slow recovery launches have been used; automatic recovery is finally stopped.",
+            recovery::RECOVERY_MAX_ATTEMPTS
+        )
+    } else {
+        format!(
+            "Slow recovery attempt {}/{} is due no earlier than Unix millisecond {} (10-minute spacing).",
+            state.recovery_attempts.saturating_add(1),
+            recovery::RECOVERY_MAX_ATTEMPTS,
+            state.next_allowed_at_ms.unwrap_or(0)
+        )
+    };
+    let body = format!(
+        "Hosted session `{}` (persona `{}`, vendor `{}`) hit the fast crash-loop guard. {schedule} Inspect the failure; after resolving it, run `fl agent restart {}` to restart from saved settings. Missing vendor prerequisites spend no recovery launch and FerroLoop does not start the vendor daemon.",
+        fresh.session_id, fresh.persona, fresh.vendor, fresh.session_id
+    );
+    recovery::deliver_pending(state, &recipients, |recipient| {
+        match store.send_wire(SendWireArgs {
+            id: None,
+            sender_id: None,
+            sender_name: "system".into(),
+            sender_host: None,
+            to: WireAddress::AgentName(recipient.to_string()),
+            kind: MessageKind::Mail,
+            urgency: MessageUrgency::Normal,
+            durable: true,
+            subject: subject.clone(),
+            body: body.clone(),
+            reply_to: None,
+            thread_id: None,
+            deadline_at: None,
+            at: stamp::now(),
+        }) {
+            Ok(_) => true,
+            Err(err) => {
+                if should_log_auto_respawn_warning(&fresh.session_id, current_respawn_clock_ms()) {
+                    eprintln!(
+                        "hub: warning ({}): failed recovery notice to `{recipient}`: {err}",
+                        fresh.session_id
+                    );
+                }
+                false
+            }
+        }
+    });
 }
 
 /// Reconcile dead hosted sessions and automatically respawn eligible `on-failure` sessions that
 /// stopped due to [`STOP_REASON_RUNTIME_GONE`], enforcing exponential backoff (`30s`, `60s`, `120s`)
-/// and a crash-loop guard (`3` automatic respawns in `10` minutes).
+/// and a fast crash-loop guard (`3` automatic respawns in `10` minutes), followed by at most
+/// six slow recovery launches spaced ten minutes apart. Incident state survives early deaths.
 pub fn reconcile_and_respawn_hosted_sessions<S>(
     store: &S,
     env: &LifecycleEnv<'_>,
@@ -8743,69 +8886,58 @@ where
             continue;
         }
         let mut rstate = load_hosted_respawn_state(&*guard, &record.session_id);
-        if fresh.stop_reason.as_deref() == Some(STOP_REASON_CRASH_LOOP) {
-            if !rstate.crash_loop_notified && try_notify_crash_loop_lead(&*guard, &fresh) {
-                rstate.crash_loop_notified = true;
-                if let Err(err) = save_hosted_respawn_state(
-                    &*guard,
-                    &fresh.session_id,
-                    &rstate,
-                    AUTO_RESPAWN_ACTOR,
-                ) {
-                    eprintln!(
-                        "hub: warning ({} / {}): failed to save crash-loop respawn state: {err}",
-                        fresh.persona, fresh.session_id
-                    );
-                }
+        let now = current_respawn_clock_ms();
+        let was_incident = rstate.recovery_started_at_ms.is_some();
+        let decision =
+            recovery::classify(&mut rstate, fresh.stop_reason.as_deref().unwrap_or(""), now);
+        // State first: a failed write cannot probe, launch or advance a recovery attempt.
+        if let Err(err) =
+            save_hosted_respawn_state(&*guard, &fresh.session_id, &rstate, AUTO_RESPAWN_ACTOR)
+        {
+            if should_log_auto_respawn_warning(&fresh.session_id, now) {
+                eprintln!(
+                    "hub: warning ({}): failed to save recovery policy: {err}",
+                    fresh.session_id
+                );
             }
             continue;
         }
-        let now = current_respawn_clock_ms();
-        rstate
-            .respawn_timestamps_ms
-            .retain(|ts| now.saturating_sub(*ts) < AUTO_RESPAWN_WINDOW_MS);
-        if rstate.respawn_timestamps_ms.len() >= AUTO_RESPAWN_MAX_IN_WINDOW {
-            fresh.stop_reason = Some(STOP_REASON_CRASH_LOOP.to_string());
-            fresh.updated_at_ms = now;
-            if let Err(err) = persist_hosted_session(&*guard, &fresh, AUTO_RESPAWN_ACTOR) {
-                eprintln!(
-                    "hub: warning ({} / {}): failed to persist crash-loop session record: {err}",
-                    fresh.persona, fresh.session_id
-                );
-                continue;
+        if rstate.recovery_started_at_ms.is_some() {
+            if decision == recovery::Decision::Exhausted
+                || fresh.stop_reason.as_deref() != Some(STOP_REASON_PREREQUISITE_UNAVAILABLE)
+            {
+                fresh.stop_reason = Some(STOP_REASON_CRASH_LOOP.into());
+                fresh.launch_prerequisite_detail = None;
+                fresh.updated_at_ms = now;
+                if let Err(err) = persist_hosted_session(&*guard, &fresh, AUTO_RESPAWN_ACTOR) {
+                    eprintln!(
+                        "hub: warning ({}): failed to persist crash-loop record: {err}",
+                        fresh.session_id
+                    );
+                    continue;
+                }
             }
-            if !rstate.crash_loop_notified {
-                rstate.crash_loop_notified = try_notify_crash_loop_lead(&*guard, &fresh);
-            }
+            notify_crash_loop_recipients(&*guard, &fresh, &mut rstate);
             if let Err(err) =
                 save_hosted_respawn_state(&*guard, &fresh.session_id, &rstate, AUTO_RESPAWN_ACTOR)
             {
                 eprintln!(
-                    "hub: warning ({} / {}): failed to save crash-loop respawn state: {err}",
-                    fresh.persona, fresh.session_id
+                    "hub: warning ({}): failed to save recovery notice deliveries: {err}",
+                    fresh.session_id
+                );
+                continue;
+            }
+            if !was_incident {
+                on_event(
+                    "session.crash_loop",
+                    serde_json::to_value(&fresh).unwrap_or_default(),
                 );
             }
-            eprintln!(
-                "hub: warning ({} / {}): crash-loop guard tripped after {} automatic respawns in 10 minutes; leaving session stopped",
-                fresh.persona, fresh.session_id, AUTO_RESPAWN_MAX_IN_WINDOW
-            );
-            on_event(
-                "session.crash_loop",
-                serde_json::to_value(&fresh).unwrap_or_default(),
-            );
-            continue;
         }
-        if let Some(next_ms) = rstate.next_allowed_at_ms
-            && now < next_ms
-        {
-            if let Err(err) =
-                save_hosted_respawn_state(&*guard, &record.session_id, &rstate, AUTO_RESPAWN_ACTOR)
-            {
-                eprintln!(
-                    "hub: warning ({} / {}): failed to save respawn state: {err}",
-                    record.persona, record.session_id
-                );
-            }
+        if !matches!(
+            decision,
+            recovery::Decision::FastLaunch | recovery::Decision::SlowLaunch
+        ) {
             continue;
         }
         // Restart reacquires this same lock and reloads eligibility and the durable deadline.
@@ -20458,6 +20590,507 @@ mod tests {
                 .unwrap()
                 .unwrap(),
             record
+        );
+    }
+    // CI only: these regressions exercise stores, filesystem configuration and lifecycle effects.
+    struct RecoveryFixtureReset;
+    impl Drop for RecoveryFixtureReset {
+        fn drop(&mut self) {
+            TEST_RESPAWN_NOW_MS.with(|clock| clock.set(None));
+            TEST_RESPAWN_SAVE_FAILURE.with(|fail| fail.set(false));
+            TEST_RUNNING_RECORD_SAVE_FAILURE.with(|fail| fail.set(None));
+        }
+    }
+
+    #[test]
+    fn slow_recovery_stops_after_six_early_deaths_without_refilling_fast_budget() {
+        let _reset = RecoveryFixtureReset;
+        let home = TempDir::new().unwrap();
+        let _trusted = trusted_codex_home(home.path(), home.path());
+        let store = MemStore::default();
+        let fake = FakeRuntime::default();
+        fake.vanish_windows.borrow_mut().push("codex".into());
+        let env = fake.env(home.path());
+        let mut record = hosted_record("codex", "slow", STATUS_STOPPED, false);
+        record.cwd = Some(home.path().display().to_string());
+        record.stop_reason = Some(STOP_REASON_CRASH_LOOP.into());
+        persist_hosted_session(&store, &record, "owner").unwrap();
+        TEST_RESPAWN_NOW_MS.with(|clock| clock.set(Some(1_000)));
+        assert!(
+            reconcile_and_respawn_hosted_sessions(&store, &env)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            load_hosted_respawn_state(&store, &record.session_id).next_allowed_at_ms,
+            Some(601_000)
+        );
+        for attempt in 1..=6 {
+            let due = load_hosted_respawn_state(&store, &record.session_id)
+                .next_allowed_at_ms
+                .unwrap();
+            TEST_RESPAWN_NOW_MS.with(|clock| clock.set(Some(due)));
+            assert_eq!(
+                reconcile_and_respawn_hosted_sessions(&store, &env)
+                    .unwrap()
+                    .len(),
+                1
+            );
+            assert_eq!(
+                fake.calls
+                    .borrow()
+                    .iter()
+                    .filter(|call| call.starts_with("spawn "))
+                    .count(),
+                attempt
+            );
+            assert_eq!(fake.launches.borrow().len(), attempt);
+            assert_eq!(
+                load_hosted_respawn_state(&store, &record.session_id).recovery_attempts,
+                attempt as u8
+            );
+            // A launch that dies in its survival check still returns a running lifecycle
+            // result. Dead-session reconcile must preserve the incident on that early death.
+            fake.presence_of
+                .borrow_mut()
+                .insert("Slow:codex".into(), RuntimePresence::Gone);
+            for now in [due + 1, due + 2] {
+                TEST_RESPAWN_NOW_MS.with(|clock| clock.set(Some(now)));
+                assert!(
+                    reconcile_and_respawn_hosted_sessions(&store, &env)
+                        .unwrap()
+                        .is_empty()
+                );
+            }
+            let state = load_hosted_respawn_state(&store, &record.session_id);
+            assert_eq!(state.recovery_attempts, attempt as u8);
+            assert!(state.respawn_timestamps_ms.is_empty());
+            assert_eq!(
+                get_hosted_session_by_id(&store, &record.session_id)
+                    .unwrap()
+                    .unwrap()
+                    .status,
+                STATUS_STOPPED
+            );
+        }
+        TEST_RESPAWN_NOW_MS.with(|clock| clock.set(Some(99_000_000)));
+        assert!(
+            reconcile_and_respawn_hosted_sessions(&store, &env)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            fake.calls
+                .borrow()
+                .iter()
+                .filter(|call| call.starts_with("spawn "))
+                .count(),
+            6
+        );
+        assert_eq!(
+            get_hosted_session_by_id(&store, &record.session_id)
+                .unwrap()
+                .unwrap()
+                .stop_reason
+                .as_deref(),
+            Some(STOP_REASON_CRASH_LOOP)
+        );
+    }
+
+    #[test]
+    fn slow_recovery_due_state_write_failure_prevents_probe_spawn_and_accounting() {
+        let _reset = RecoveryFixtureReset;
+        let home = TempDir::new().unwrap();
+        let _trusted = trusted_codex_home(home.path(), home.path());
+        let store = MemStore::default();
+        let fake = FakeRuntime::default();
+        let env = fake.env(home.path());
+        let mut record = hosted_record("codex", "savefail", STATUS_STOPPED, false);
+        record.cwd = Some(home.path().display().to_string());
+        record.stop_reason = Some(STOP_REASON_CRASH_LOOP.into());
+        persist_hosted_session(&store, &record, "owner").unwrap();
+        let before = HostedRespawnState {
+            recovery_started_at_ms: Some(1),
+            recovery_attempts: 2,
+            next_allowed_at_ms: Some(2_000),
+            ..Default::default()
+        };
+        save_hosted_respawn_state(&store, &record.session_id, &before, "owner").unwrap();
+        TEST_RESPAWN_NOW_MS.with(|clock| clock.set(Some(2_000)));
+        TEST_LAUNCH_PREREQUISITE_CALLS.with(|calls| calls.set(0));
+        TEST_RESPAWN_SAVE_FAILURE.with(|fail| fail.set(true));
+        assert!(
+            reconcile_and_respawn_hosted_sessions(&store, &env)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(matches!(
+            restart_hosted_session(&store, &env, &record.session_id, AUTO_RESPAWN_ACTOR),
+            Err(LifecycleError::Store(_))
+        ));
+        assert_eq!(TEST_LAUNCH_PREREQUISITE_CALLS.with(|calls| calls.get()), 0);
+        assert!(fake.calls.borrow().is_empty());
+        assert_eq!(
+            load_hosted_respawn_state(&store, &record.session_id),
+            before
+        );
+        assert_eq!(
+            get_hosted_session_by_id(&store, &record.session_id)
+                .unwrap()
+                .unwrap(),
+            record
+        );
+    }
+
+    #[test]
+    fn slow_recovery_prerequisite_deadline_survives_store_and_hub_reopen() {
+        let _reset = RecoveryFixtureReset;
+        let home = TempDir::new().unwrap();
+        let data = TempDir::new().unwrap();
+        let _trusted = trusted_codex_home(home.path(), home.path());
+        let new_hub = || {
+            crate::HubState::new(crate::HubServerConfig {
+                store_path: data.path().join("recovery.redb"),
+                repo_root: home.path().to_path_buf(),
+                home_override: Some(home.path().to_path_buf()),
+                ..crate::HubServerConfig::default()
+            })
+        };
+        let fake = FakeRuntime::default();
+        let env = fake.env(home.path());
+        let mut record = hosted_record("codex", "reopened", STATUS_STOPPED, false);
+        record.cwd = Some(home.path().display().to_string());
+        record.stop_reason = Some(STOP_REASON_CRASH_LOOP.into());
+        let hub = new_hub();
+        {
+            let store = hub.open_store().unwrap();
+            persist_hosted_session(&*store, &record, "owner").unwrap();
+            save_hosted_respawn_state(
+                &*store,
+                &record.session_id,
+                &HostedRespawnState {
+                    recovery_started_at_ms: Some(1_000),
+                    recovery_attempts: 2,
+                    next_allowed_at_ms: Some(601_000),
+                    ..Default::default()
+                },
+                "owner",
+            )
+            .unwrap();
+        }
+        TEST_LAUNCH_PREREQUISITE_CALLS.with(|calls| calls.set(0));
+        TEST_RESPAWN_NOW_MS.with(|clock| clock.set(Some(600_999)));
+        assert!(
+            reconcile_and_respawn_hosted_sessions_with_store(
+                hub.open_store().unwrap(),
+                || hub.open_store().map_err(LifecycleError::from),
+                &env,
+                |_, _| {}
+            )
+            .unwrap()
+            .is_empty()
+        );
+        assert_eq!(TEST_LAUNCH_PREREQUISITE_CALLS.with(|calls| calls.get()), 0);
+        TEST_LAUNCH_PREREQUISITE.with(|slot| {
+            *slot.borrow_mut() = Some(Err(fl_core::LaunchPrerequisiteRefusal {
+                code: "codex_app_server_unavailable".into(),
+                detail: "control.sock: NotFound".into(),
+            }))
+        });
+        TEST_RESPAWN_NOW_MS.with(|clock| clock.set(Some(601_000)));
+        assert!(
+            reconcile_and_respawn_hosted_sessions_with_store(
+                hub.open_store().unwrap(),
+                || hub.open_store().map_err(LifecycleError::from),
+                &env,
+                |_, _| {}
+            )
+            .unwrap()
+            .is_empty()
+        );
+        drop(hub);
+        let reopened = new_hub();
+        {
+            let store = reopened.open_store().unwrap();
+            let state = load_hosted_respawn_state(&*store, &record.session_id);
+            assert_eq!(state.recovery_attempts, 2);
+            assert_eq!(state.next_allowed_at_ms, Some(661_000));
+        }
+        TEST_LAUNCH_PREREQUISITE_CALLS.with(|calls| calls.set(0));
+        TEST_RESPAWN_NOW_MS.with(|clock| clock.set(Some(660_999)));
+        assert!(
+            reconcile_and_respawn_hosted_sessions_with_store(
+                reopened.open_store().unwrap(),
+                || reopened.open_store().map_err(LifecycleError::from),
+                &env,
+                |_, _| {}
+            )
+            .unwrap()
+            .is_empty()
+        );
+        assert_eq!(TEST_LAUNCH_PREREQUISITE_CALLS.with(|calls| calls.get()), 0);
+        TEST_LAUNCH_PREREQUISITE.with(|slot| *slot.borrow_mut() = Some(Ok(())));
+        TEST_RESPAWN_NOW_MS.with(|clock| clock.set(Some(661_000)));
+        assert_eq!(
+            reconcile_and_respawn_hosted_sessions_with_store(
+                reopened.open_store().unwrap(),
+                || reopened.open_store().map_err(LifecycleError::from),
+                &env,
+                |_, _| {}
+            )
+            .unwrap()
+            .len(),
+            1
+        );
+        let store = reopened.open_store().unwrap();
+        let state = load_hosted_respawn_state(&*store, &record.session_id);
+        assert_eq!(state.recovery_attempts, 3);
+        assert_eq!(state.next_allowed_at_ms, Some(1_261_000));
+    }
+
+    #[test]
+    fn slow_recovery_manual_refusal_failed_launch_and_failed_record_save_preserve_incident() {
+        let _reset = RecoveryFixtureReset;
+        let home = TempDir::new().unwrap();
+        let _trusted = trusted_codex_home(home.path(), home.path());
+        let store = MemStore::default();
+        let fake = FakeRuntime::default();
+        let env = fake.env(home.path());
+        let mut record = hosted_record("codex", "manual", STATUS_STOPPED, false);
+        record.cwd = Some(home.path().display().to_string());
+        record.stop_reason = Some(STOP_REASON_CRASH_LOOP.into());
+        persist_hosted_session(&store, &record, "owner").unwrap();
+        let incident = HostedRespawnState {
+            recovery_started_at_ms: Some(1),
+            recovery_attempts: 2,
+            next_allowed_at_ms: Some(601_000),
+            ..Default::default()
+        };
+        save_hosted_respawn_state(&store, &record.session_id, &incident, "owner").unwrap();
+        TEST_RESPAWN_NOW_MS.with(|clock| clock.set(Some(1_000)));
+        TEST_LAUNCH_PREREQUISITE.with(|slot| {
+            *slot.borrow_mut() = Some(Err(fl_core::LaunchPrerequisiteRefusal {
+                code: "codex_app_server_unavailable".into(),
+                detail: "control.sock: NotFound".into(),
+            }))
+        });
+        assert!(matches!(
+            restart_hosted_session(&store, &env, &record.session_id, "owner"),
+            Err(LifecycleError::PrerequisiteUnavailable { .. })
+        ));
+        assert_eq!(
+            load_hosted_respawn_state(&store, &record.session_id),
+            incident
+        );
+        TEST_LAUNCH_PREREQUISITE.with(|slot| *slot.borrow_mut() = Some(Ok(())));
+        fake.fail_windows.borrow_mut().push("codex".into());
+        let failed = restart_hosted_session(&store, &env, &record.session_id, "owner").unwrap();
+        assert!(!failed.record.runtime_spawned);
+        assert_eq!(
+            load_hosted_respawn_state(&store, &record.session_id),
+            incident
+        );
+        fake.fail_windows.borrow_mut().clear();
+        // Return to a stopped record so only the final running-record write is faulted.
+        record = get_hosted_session_by_id(&store, &record.session_id)
+            .unwrap()
+            .unwrap();
+        record.status = STATUS_STOPPED.into();
+        record.stop_reason = Some(STOP_REASON_CRASH_LOOP.into());
+        persist_hosted_session(&store, &record, "owner").unwrap();
+        TEST_RUNNING_RECORD_SAVE_FAILURE.with(|fail| fail.set(Some(record.restart_count + 1)));
+        assert!(
+            matches!(restart_hosted_session(&store, &env, &record.session_id, "owner"), Err(LifecycleError::Store(detail)) if detail.contains("running-record save failure"))
+        );
+        assert_eq!(
+            load_hosted_respawn_state(&store, &record.session_id),
+            incident
+        );
+        TEST_RUNNING_RECORD_SAVE_FAILURE.with(|fail| fail.set(None));
+        fake.live.borrow_mut().clear();
+        let live = restart_hosted_session(&store, &env, &record.session_id, "owner").unwrap();
+        assert!(live.record.runtime_spawned);
+        assert_eq!(
+            load_hosted_respawn_state(&store, &record.session_id),
+            HostedRespawnState::default()
+        );
+    }
+
+    #[test]
+    fn slow_recovery_health_reset_requires_alive_observations_and_unknown_breaks_interval() {
+        let _reset = RecoveryFixtureReset;
+        let home = TempDir::new().unwrap();
+        let store = MemStore::default();
+        let fake = FakeRuntime::running(&["Healthy"]);
+        let env = fake.env(home.path());
+        let mut record = hosted_record("codex", "healthy", STATUS_RUNNING, true);
+        record.cwd = Some(home.path().display().to_string());
+        persist_hosted_session(&store, &record, "owner").unwrap();
+        save_hosted_respawn_state(
+            &store,
+            &record.session_id,
+            &HostedRespawnState {
+                recovery_started_at_ms: Some(1),
+                recovery_attempts: 2,
+                ..Default::default()
+            },
+            "owner",
+        )
+        .unwrap();
+        for (now, presence) in [
+            (1_000, RuntimePresence::Alive),
+            (601_000, RuntimePresence::Unknown),
+            (602_000, RuntimePresence::Alive),
+        ] {
+            TEST_RESPAWN_NOW_MS.with(|clock| clock.set(Some(now)));
+            fake.presence_of
+                .borrow_mut()
+                .insert("Healthy:codex".into(), presence);
+            reconcile_dead_hosted_sessions(&store, &env, "owner").unwrap();
+            assert_eq!(
+                load_hosted_respawn_state(&store, &record.session_id).recovery_attempts,
+                2
+            );
+        }
+        TEST_RESPAWN_NOW_MS.with(|clock| clock.set(Some(1_202_000)));
+        reconcile_dead_hosted_sessions(&store, &env, "owner").unwrap();
+        assert_eq!(
+            load_hosted_respawn_state(&store, &record.session_id),
+            HostedRespawnState::default()
+        );
+    }
+
+    #[test]
+    fn slow_recovery_lead_and_no_lead_notices_reach_registry_lab_managers_twice() {
+        let store = MemStore::default();
+        register(&store, "coordinator", "workspace", AgentRole::LabManager);
+        register(&store, "captain", "ferroloop", AgentRole::Lead);
+        let mut record = hosted_record("codex", "captain", STATUS_STOPPED, false);
+        record.role = "lead".into();
+        let mut state = HostedRespawnState {
+            recovery_started_at_ms: Some(1),
+            next_allowed_at_ms: Some(601_000),
+            ..Default::default()
+        };
+        notify_crash_loop_recipients(&store, &record, &mut state);
+        notify_crash_loop_recipients(&store, &record, &mut state);
+        let inbox = |name: &str| {
+            store
+                .list_wire_inbox(&fl_core::ferrowire::WireFilter {
+                    recipient: Some(name.into()),
+                    ..Default::default()
+                })
+                .unwrap()
+        };
+        assert_eq!(inbox("coordinator").len(), 1);
+        assert!(inbox("captain").is_empty());
+        assert!(
+            inbox("coordinator")[0]
+                .message
+                .body
+                .contains("fl agent restart codex:captain")
+        );
+        assert!(inbox("coordinator")[0].message.body.contains("601000"));
+        state.recovery_attempts = recovery::RECOVERY_MAX_ATTEMPTS;
+        notify_crash_loop_recipients(&store, &record, &mut state);
+        assert_eq!(inbox("coordinator").len(), 2);
+        assert!(
+            inbox("coordinator")
+                .iter()
+                .any(|item| item.message.subject.contains("Recovery exhausted"))
+        );
+        record.project = "without-lead".into();
+        record.persona = "worker".into();
+        record.session_id = "codex:worker".into();
+        record.role = "assistant".into();
+        let mut no_lead = HostedRespawnState {
+            crash_loop_notified: true,
+            ..Default::default()
+        };
+        notify_crash_loop_recipients(&store, &record, &mut no_lead);
+        assert_eq!(
+            inbox("coordinator").len(),
+            3,
+            "legacy boolean cannot suppress Lab Manager fallback"
+        );
+    }
+    #[test]
+    fn slow_recovery_exhaustion_clears_prerequisite_detail_without_another_probe() {
+        let home = TempDir::new().unwrap();
+        let store = MemStore::default();
+        let fake = FakeRuntime::default();
+        let env = fake.env(home.path());
+        let mut record = hosted_record("codex", "finished", STATUS_STOPPED, false);
+        record.stop_reason = Some(STOP_REASON_PREREQUISITE_UNAVAILABLE.into());
+        record.launch_prerequisite_detail = Some("control.sock: NotFound".into());
+        persist_hosted_session(&store, &record, "owner").unwrap();
+        save_hosted_respawn_state(
+            &store,
+            &record.session_id,
+            &HostedRespawnState {
+                recovery_started_at_ms: Some(1),
+                recovery_attempts: 6,
+                ..Default::default()
+            },
+            "owner",
+        )
+        .unwrap();
+        TEST_LAUNCH_PREREQUISITE_CALLS.with(|calls| calls.set(0));
+        assert!(
+            reconcile_and_respawn_hosted_sessions(&store, &env)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(TEST_LAUNCH_PREREQUISITE_CALLS.with(|calls| calls.get()), 0);
+        assert!(fake.calls.borrow().is_empty());
+        let final_record = get_hosted_session_by_id(&store, &record.session_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            final_record.stop_reason.as_deref(),
+            Some(STOP_REASON_CRASH_LOOP)
+        );
+        assert_eq!(final_record.launch_prerequisite_detail, None);
+    }
+
+    #[test]
+    fn slow_recovery_does_not_revive_ineligible_records_or_charge_without_runtime() {
+        let _reset = RecoveryFixtureReset;
+        let home = TempDir::new().unwrap();
+        let store = MemStore::default();
+        let fake = FakeRuntime::default();
+        let mut env = fake.env(home.path());
+        let mut record = hosted_record("codex", "excluded", STATUS_STOPPED, false);
+        for reason in [None, Some(STOP_REASON_CLEAN_EXIT)] {
+            record.stop_reason = reason.map(str::to_string);
+            persist_hosted_session(&store, &record, "owner").unwrap();
+            assert!(
+                reconcile_and_respawn_hosted_sessions(&store, &env)
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+        record.stop_reason = Some(STOP_REASON_RUNTIME_GONE.into());
+        record.restart_policy = "never".into();
+        persist_hosted_session(&store, &record, "owner").unwrap();
+        assert!(
+            reconcile_and_respawn_hosted_sessions(&store, &env)
+                .unwrap()
+                .is_empty()
+        );
+        record.restart_policy = "on-failure".into();
+        persist_hosted_session(&store, &record, "owner").unwrap();
+        env.spawn_runtime = false;
+        TEST_LAUNCH_PREREQUISITE_CALLS.with(|calls| calls.set(0));
+        assert!(matches!(
+            restart_hosted_session(&store, &env, &record.session_id, AUTO_RESPAWN_ACTOR),
+            Err(LifecycleError::Conflict(_))
+        ));
+        assert_eq!(TEST_LAUNCH_PREREQUISITE_CALLS.with(|calls| calls.get()), 0);
+        assert!(fake.calls.borrow().is_empty());
+        assert_eq!(
+            load_hosted_respawn_state(&store, &record.session_id),
+            HostedRespawnState::default()
         );
     }
 }

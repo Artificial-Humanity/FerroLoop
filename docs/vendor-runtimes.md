@@ -527,3 +527,48 @@ drops the guard, then reads transcripts and dispatches prompts.
 
 `GET /api/v1/prs` reads workspace runtime state keys `pr-*`. This tree has no `gh pr` handler
 and no `list_pr_reviews` call in the hub crate. Those commands are not inserted here.
+
+### Hosted restart and bounded crash-loop recovery
+
+`fl agent restart <persona-or-session-id> [--by owner] [--json]` restarts a hosted
+record from its saved settings, including vendor, model, thinking level, permission
+posture, working directory, node and context. It accepts no launch-setting overrides.
+An exact session id wins; a persona must name one eligible saved record. Retired,
+non-hosted and decommissioning/decommissioned targets are refused. The command uses
+the Owner caller model of `fl agent spin-up` and revalidates selection under the
+session lifecycle lock.
+
+The fast automatic guard remains three respawns in ten minutes, with the existing
+30/60/120-second backoff. A fourth failure enters a durable recovery incident. The
+first slow launch is due ten minutes later; at most six launches are attempted,
+each at least ten minutes after the previous one. A late reconcile pass attempts
+one launch rather than catching up. When an old `crash_loop` record has no incident
+state, its first due time is ten minutes after it is first reconciled by this code.
+After six unsuccessful recoveries the session stays stopped until manual action.
+
+A successful spawn does not refill the incident budget. The incident resets after
+ten minutes of observed healthy running (a proven live process route or an Alive
+runtime observation), or after an explicit manual restart persists a live result.
+Gone or Unknown runtime observations break the healthy interval. Refused or failed
+manual launches retain recovery state. Missing vendor prerequisites spend neither
+fast nor slow attempts; their persisted readiness deadline never shortens an existing
+slow deadline. FerroLoop does not start a vendor daemon automatically.
+
+Crash-loop notices go to the active project Lead, using registry project coverage.
+If the stopped persona is a Lead, or the project has no Lead, active Lab Managers
+also receive the notice. No notice goes to the stopped persona itself. Initial
+incident and final exhaustion notices have separate per-recipient delivery state;
+failed recipients and newly registered recipients are retried. Notices include the
+next due time or final-stop status and the saved-settings restart command.
+
+The disjoint runtime record adds serde-default fields `recovery_started_at_ms`,
+`recovery_attempts`, `recovery_healthy_since_ms` and
+`crash_loop_notified_recipients`. Empty fields are omitted. The existing
+`next_allowed_at_ms` stores the phase deadline, and `crash_loop_notified` is retained
+for old readers. New delivery decisions use recipient keys `recovery:<name>` and
+`exhausted:<name>`, so the legacy aggregate flag cannot suppress required fallback
+or exhaustion delivery.
+
+The seven Codex records affected by the 2026-11-17 reboot were already recovered
+by hand. This policy bounds future recovery incidents; it does not dispatch a
+restart of those sessions during installation or deployment.
