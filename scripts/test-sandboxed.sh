@@ -7,7 +7,7 @@ die() { printf 'test-sandboxed: %s\n' "$*" >&2; exit 1; }
 command -v bwrap >/dev/null || die 'bubblewrap is required'
 command -v python3 >/dev/null || die 'python3 is required'
 help=$(bwrap --help) || die 'cannot inspect bubblewrap flags'
-for flag in --unshare-user --unshare-pid --unshare-net --unshare-ipc --unshare-uts --unshare-cgroup-try --die-with-parent --new-session --clearenv --cap-drop; do
+for flag in --unshare-user --unshare-pid --unshare-net --unshare-ipc --unshare-uts --unshare-cgroup-try --die-with-parent --new-session --clearenv --cap-drop --chmod; do
     grep -Eq -- "^[[:space:]]+$flag([[:space:]]|$)" <<< "$help" || die "bubblewrap lacks $flag"
 done
 root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
@@ -34,33 +34,67 @@ done
 scratch=$(mktemp -d /var/tmp/ferroloop-test-sandbox.XXXXXXXX)
 target=
 target_checked=0
+persistent_target=0
+recovery=
+recovery_checked=0
 scan_target() {
-    python3 "$root/scripts/test-sandbox-mounts.py" --check "$target" &&
+    if ((persistent_target)); then
+        python3 "$root/scripts/test-sandbox-target.py" --check-path "$target" || return 1
+    fi
+    python3 "$root/scripts/test-sandbox-mounts.py" --check "$target" || return 1
+    if ((persistent_target)); then
+        python3 "$root/scripts/test-sandbox-target.py" --verify-persistent "$target"
+    else
         python3 "$root/scripts/test-sandbox-target.py" "$target"
+    fi
 }
 cleanup() {
     status=$?
     trap - EXIT
+    if ((recovery_checked)); then
+        if python3 "$root/scripts/test-sandbox-mounts.py" --check "$recovery" && python3 "$root/scripts/test-sandbox-target.py" "$recovery"; then
+            rm -rf -- "$recovery" || status=1
+        else
+            printf 'test-sandboxed: unsafe recovery directory preserved: %s\n' "$recovery" >&2
+            status=1
+        fi
+    fi
     if ((target_checked)) && ! scan_target; then
         printf 'test-sandboxed: target failed post-run inspection: %s\n' "$target" >&2
         status=1
     fi
-    rm -rf -- "$scratch" || status=1
+    if [[ -n $recovery && -e $recovery && $recovery == "$scratch/"* ]]; then
+        printf 'test-sandboxed: scratch preserved for inspection: %s\n' "$scratch" >&2
+    else
+        rm -rf -- "$scratch" || status=1
+    fi
     exit "$status"
 }
 trap cleanup EXIT
 mkdir -m 700 "$scratch/source"
 if [[ -n ${FL_SANDBOX_TARGET_DIR:-} ]]; then
     target=$FL_SANDBOX_TARGET_DIR
-    [[ $target == /var/tmp/* && ${target#/var/tmp/} != */* && ${target#/var/tmp/} != . && ${target#/var/tmp/} != .. && -n ${target#/var/tmp/} ]] || die 'FL_SANDBOX_TARGET_DIR must be a direct child of /var/tmp'
-    [[ $(realpath -e /var/tmp) == /var/tmp ]] || die '/var/tmp must not be a symlink'
-    if [[ ! -e $target && ! -L $target ]]; then mkdir -m 700 -- "$target" || die 'cannot create persistent target'; fi
+    persistent_target=1
+    python3 "$root/scripts/test-sandbox-target.py" --prepare "$target" || die 'invalid persistent target'
 else
     target=$scratch/target
     mkdir -m 700 "$target"
 fi
 scan_target || die 'target failed pre-run inspection'
 target_checked=1
+min_free_gib=${FL_SANDBOX_MIN_FREE_GIB:-120}
+python3 "$root/scripts/test-sandbox-space.py" --check / "$target" "$min_free_gib" || die 'free-space preflight failed'
+# Recovery tests need a native filesystem. The directory is always created by
+# this runner under the checked target and is inspected before removal.
+recovery=$(mktemp -d "$target/.sandbox-recovery.XXXXXXXX")
+chmod 700 "$recovery"
+recovery_checked=1
+case $(stat -f -c %t -- "$recovery") in
+    ef53|58465342) ;;
+    *) die 'recovery fixture requires ext4 or XFS' ;;
+esac
+python3 "$root/scripts/test-sandbox-mounts.py" --check "$recovery" || die 'invalid recovery mount'
+python3 "$root/scripts/test-sandbox-target.py" "$recovery" || die 'invalid recovery directory'
 # Snapshot only Git-tracked files, without VCS metadata or runtime data. Never
 # traverse untracked files or submodules; tracked changes are included.
 python3 - "$root" "$scratch/source" <<'PY'
@@ -91,18 +125,21 @@ PY
 
 args=(--unshare-user --unshare-pid --unshare-net --unshare-ipc --unshare-uts --unshare-cgroup-try
       --die-with-parent --new-session --clearenv --cap-drop ALL
-      --ro-bind /usr/bin /usr/bin --ro-bind /usr/lib /usr/lib --ro-bind /usr/lib64 /usr/lib64 --ro-bind /usr/libexec /usr/libexec --ro-bind /usr/include /usr/include
+      --dir /usr --ro-bind /usr/bin /usr/bin --ro-bind /usr/lib /usr/lib --ro-bind /usr/lib64 /usr/lib64 --ro-bind /usr/libexec /usr/libexec --ro-bind /usr/include /usr/include
       --symlink usr/bin /bin --symlink usr/lib /lib --symlink usr/lib64 /lib64
       --ro-bind "$toolchain" /toolchain --ro-bind "$registry" /cargo/registry
-      --ro-bind "$scratch/source" /source --bind "$target" /target
-      --tmpfs /home --dir /home/sandbox --tmpfs /tmp --tmpfs /run --dir /run/user
+      --bind "$scratch/source" /source --bind "$target" /target --bind "$recovery" /recovery
+      --chmod 0755 /usr --dir /usr/share --dir /usr/share/git-core --symlink /tmp/git-template /usr/share/git-core/templates
+      --tmpfs /etc --dir /var --tmpfs /var/tmp --dir /usr/local --dir /sandbox-bin --symlink "$cc" /sandbox-bin/cc
+      --tmpfs /home --dir /home/sandbox --tmpfs /tmp --dir /tmp/git-template --dir /tmp/git-template/hooks --dir /tmp/git-template/info --tmpfs /run --dir /run/user
       --proc /proc --dev /dev
       --setenv HOME /home/sandbox --setenv XDG_RUNTIME_DIR /run/user
       --setenv XDG_CONFIG_HOME /home/sandbox/config --setenv XDG_DATA_HOME /home/sandbox/data
       --setenv XDG_CACHE_HOME /home/sandbox/cache --setenv XDG_STATE_HOME /home/sandbox/state
       --setenv CARGO_HOME /cargo --setenv CARGO_TARGET_DIR /target --setenv CARGO_NET_OFFLINE true
-      --setenv CC "$cc" --setenv "$linker_var" "$cc"
-      --setenv PATH /toolchain/bin:/usr/bin --setenv TMPDIR /tmp --setenv LANG C.UTF-8
+      --setenv CC "$cc" --setenv "$linker_var" "$cc" --setenv GIT_TEMPLATE_DIR /tmp/git-template
+      --setenv PATH /sandbox-bin:/toolchain/bin:/usr/bin --setenv TMPDIR /tmp --setenv LANG C.UTF-8
+      --setenv FL_RECOVERY_TEST_DIR /recovery
       --chdir /source)
 inherit_stdin=0
 if [[ ${1:-} == --stdin ]]; then inherit_stdin=1; shift; fi
@@ -111,10 +148,4 @@ if (($# == 0)); then set -- /toolchain/bin/cargo test --workspace --offline; fi
 
 # Close all descriptors inherited from the launching shell before bwrap starts.
 if ((!inherit_stdin)); then exec </dev/null; fi
-python3 -c 'import os,sys
-for name in os.listdir("/proc/self/fd"):
-    fd = int(name)
-    if fd > 2:
-        try: os.close(fd)
-        except OSError: pass
-os.execv(sys.argv[1], sys.argv[1:])' "$(command -v bwrap)" "${args[@]}" -- "$@"
+python3 "$root/scripts/test-sandbox-space.py" / "$target" "$min_free_gib" -- "$(command -v bwrap)" "${args[@]}" -- /usr/bin/python3 -c 'import os,signal,sys; open("/etc/hosts", "w").write("127.0.0.1 localhost\n::1 localhost\n"); signal.signal(signal.SIGINT, signal.SIG_DFL); os.execvp(sys.argv[1], sys.argv[1:])' "$@"
