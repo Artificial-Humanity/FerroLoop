@@ -308,10 +308,12 @@ pub(crate) fn render_with_generation(
             )
         }
         RoleGuidance::File => {
-            let file_role = match role {
+            let remapped = match role {
                 "web-developer" | "mobile-developer" => "ui-developer",
                 other => other,
             };
+            let file_role = fl_core::agent::normalize_role_slug(remapped)
+                .unwrap_or_else(|_| remapped.to_string());
             let mut candidates = Vec::new();
             if let Some(ws) = &context.workspace {
                 let roles = ws.join(".agents/roles");
@@ -1023,6 +1025,73 @@ mod tests {
         );
         assert!(context.workspace.is_none());
         assert!(context.project.is_none());
+    }
+
+    #[test]
+    fn hydration_lab_manager_wire_slug_resolves_lab_manager_role_file() {
+        let f = Fixture::new();
+        let role_file = f.workspace.join(".agents/roles/lab-manager.md");
+        std::fs::write(&role_file, "lab manager").unwrap();
+        let result = f.prompt(&f.project, "lab_manager", RoleGuidance::File);
+        assert!(
+            result.text.contains(&format!(
+                "Read your role file(s): `{}`",
+                role_file.display()
+            )),
+            "{}",
+            result.text
+        );
+        assert!(
+            !result
+                .warnings
+                .iter()
+                .any(|w| w.contains("role file not found")),
+            "{:?}",
+            result.warnings
+        );
+    }
+
+    #[test]
+    fn hydration_role_slugs_resolve_canonical_role_files() {
+        let f = Fixture::new();
+        for canonical in ["lab-manager", "lead", "ui-developer", "strategist"] {
+            std::fs::write(
+                f.workspace.join(format!(".agents/roles/{canonical}.md")),
+                "role",
+            )
+            .unwrap();
+        }
+        // `assistant.md` is created by the fixture.
+        for (role, canonical) in [
+            ("lab_manager", "lab-manager"),
+            ("lab-manager", "lab-manager"),
+            ("lead", "lead"),
+            ("assistant", "assistant"),
+            ("ui-developer", "ui-developer"),
+            ("web-developer", "ui-developer"),
+            ("strategist", "strategist"),
+        ] {
+            let expected = f
+                .workspace
+                .join(format!(".agents/roles/{canonical}.md"));
+            let result = f.prompt(&f.project, role, RoleGuidance::File);
+            assert!(
+                result.text.contains(&format!(
+                    "Read your role file(s): `{}`",
+                    expected.display()
+                )),
+                "role {role} should resolve {canonical}.md, got: {}",
+                result.text
+            );
+            assert!(
+                !result
+                    .warnings
+                    .iter()
+                    .any(|w| w.contains("role file not found")),
+                "role {role} warnings: {:?}",
+                result.warnings
+            );
+        }
     }
 
     #[test]
