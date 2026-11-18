@@ -289,6 +289,60 @@ FerroLoop writes an auth frame and a user frame to the session Unix socket.
 
 Home: `~/.codex/`.
 
+
+### Hosted launch prerequisite
+
+Hosted Codex uses `codex --remote unix://` and requires the shared Codex app-server daemon
+before launch. FerroLoop checks that its Unix control socket accepts a connection, with a
+250 ms deadline; it sends no RPC or thread request. The socket is
+`app-server-control/app-server-control.sock` under the effective `CODEX_HOME` pinned into
+the child. `FL_WIRE_CODEX_CONTROL_SOCK` selects delivery traffic, not this launch endpoint.
+Non-Unix remote launches refuse because this transport requires Unix sockets.
+
+Spin-up, restart and remodel return HTTP 409 with `code: codex_app_server_unavailable`
+when this prerequisite is unavailable. Automatic recovery emits a
+`session.prerequisite_unavailable` event. An automatically recoverable stopped record has
+`stop_reason: prerequisite_unavailable` and
+`launch_prerequisite_detail` containing a bounded socket path and probe result. Automatic
+`on-failure` recovery checks again at most once per 60 seconds per session; its next deadline
+is saved across Hub restarts. These refusals spend no automatic respawn attempts. A successful
+connection is readiness evidence only; the launched process must still survive normally.
+A refused manual restart preserves a prior `clean_exit`, `crash_loop` or other intentional
+stop reason and its recovery state; it does not arm automatic recovery. Only an automatic
+restart, or a record already stopped for `runtime_gone` or `prerequisite_unavailable`,
+receives the prerequisite retry reason and deadline. If the daemon disappears during initial
+startup, the immediate re-probe refunds that launch attempt; later runtime deaths remain
+ordinary failures.
+
+FerroLoop does not start the vendor daemon. Start it through a clean systemd user service,
+not from an agent command shell: a shared daemon and its updater propagate inherited
+`AGENT_PERSONA`, `FL_HOSTED_ID`, `AGENT_HYDRATION_GENERATION` and `CLAUDE_CODE_*` values into
+other agents' command shells. Keep those variables out of the user manager's environment too.
+The reference service orders itself before Hub (adapt the binary path to the installation):
+
+```ini
+# ~/.config/systemd/user/codex-app-server-daemon.service
+[Unit]
+Description=Shared Codex app-server daemon
+Before=ferroloop-hub.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+UnsetEnvironment=AGENT_PERSONA FL_HOSTED_ID AGENT_HYDRATION_GENERATION
+ExecStart=%h/.local/bin/codex app-server daemon start
+
+[Install]
+WantedBy=default.target
+```
+
+Enable both services for boot; ordering applies when both units are started. Ensure the user
+manager supplies no `CLAUDE_CODE_*` identity variables; `UnsetEnvironment` does not accept
+wildcards. On a configured host, `systemctl --user restart codex-app-server-daemon.service` is
+the reference manual recovery command: `start` is a no-op after daemon death while this
+oneshot unit remains active. Avoid starting another daemon from an agent shell. Restarting a
+shared daemon can interrupt active clients and requires coordinated workload handling.
+
 ### Session discovery and liveness
 
 * Rollout: `sessions/YYYY/MM/DD/rollout-<timestamp>-<thread-id>.jsonl`.

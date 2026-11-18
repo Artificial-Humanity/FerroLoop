@@ -1609,6 +1609,7 @@ fn daemon_hosted_replace_operator_replace_and_foreign_child_replace_e2e() {
         hosted: true,
         status: fl_hub::lifecycle::STATUS_RUNNING.into(),
         stop_reason: None,
+        launch_prerequisite_detail: None,
         restart_policy: "on-failure".into(),
         restart_count: 0,
         tmux_target: None,
