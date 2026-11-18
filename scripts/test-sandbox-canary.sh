@@ -58,6 +58,13 @@ if args and args[0] == '--inside':
         with open(path) as f: require(f.read() == nonce, 'writable area control failed: ' + directory)
     require(socket.getaddrinfo('localhost', None), 'localhost does not resolve')
     require(os.path.islink('/sandbox-bin/cc'), 'private compiler link missing')
+    require(sorted(os.listdir('/tmp/git-template')) == ['hooks', 'info'], 'unexpected Git template entries')
+    for name in ('hooks', 'info'):
+        require(not os.listdir('/tmp/git-template/' + name), 'Git template directory is not empty: ' + name)
+    git_dir = '/tmp/git-canary-' + nonce
+    subprocess.run(['/usr/bin/git', 'init', '-q', git_dir], check=True)
+    for name in ('hooks', 'info'):
+        require(os.path.isdir(os.path.join(git_dir, '.git', name)), 'git init omitted ' + name)
     require(stat.S_IMODE(os.stat('/usr').st_mode) == 0o755, 'synthetic /usr is not mode 0755')
     print('PASS: sandbox negative controls, writable fixtures and absent paths', flush=True)
     raise SystemExit(0)
