@@ -1708,10 +1708,12 @@ describe("Agent switch transcript isolation", () => {
     unmount();
   });
 
-  it("rejects an older initial transcript after a newer observed empty read", async () => {
+  it("rejects an older initial transcript after an explicitly refreshed read", async () => {
     let releaseInitial!: (response: Response) => void;
     const initialResponse = new Promise<Response>((resolve) => { releaseInitial = resolve; });
     let held = false;
+    let concreteReads = 0;
+    let sessionListener: ((frame: unknown) => void) | undefined;
     const response = (body: unknown) => new Response(JSON.stringify(body), { status: 200, headers: { "Content-Type": "application/json" } });
     const fetchImpl = vi.fn((input: RequestInfo | URL) => {
       const url = String(input);
@@ -1719,14 +1721,17 @@ describe("Agent switch transcript isolation", () => {
       if (url.includes("/api/v1/sessions") && !url.includes("/transcript")) return Promise.resolve(response({ sessions: [
         { id: "session-a", source: "route", adapter: "claude", persona: "ferris", status: "active", updated_at: "t1" },
       ] }));
-      if (url.includes("/session-a/transcript") && !held) { held = true; return initialResponse; }
+      if (url.includes("/session-a/transcript")) { concreteReads++; if (!held) { held = true; return initialResponse; } return Promise.resolve(response({ session_id: "session-a", turns: [turn({ index: 0, content: "Newer initial observation" })], queue: [], is_busy: false })); }
       if (url.includes("/transcript")) return Promise.resolve(response({ session_id: "session-a", turns: [], queue: [], is_busy: false }));
       return Promise.resolve(response({}));
     });
-    const wsStub = { setToken: vi.fn(), connect: vi.fn(), disconnect: vi.fn(), onStatusChange: () => () => {}, subscribe: () => () => {} } as unknown as HubWsClient;
+    const wsStub = { setToken: vi.fn(), connect: vi.fn(), disconnect: vi.fn(), onStatusChange: () => () => {}, subscribe: (topic: string, callback: (frame: unknown) => void) => { if (topic === "session") sessionListener = callback; return () => {}; } } as unknown as HubWsClient;
     const apiClient = new HubApiClient({ fetchImpl: fetchImpl as unknown as typeof fetch });
     const { unmount } = render(<App apiClient={apiClient} wsClient={wsStub} />);
     await waitFor(() => expect(held).toBe(true));
+    act(() => sessionListener?.({ type: "event", topic: "session", event: "updated", data: {} }));
+    await screen.findByText("Newer initial observation");
+    expect(concreteReads).toBe(2);
     await act(async () => {
       releaseInitial(response({ session_id: "session-a", turns: [turn({ index: 0, content: "Legitimate initial A" })], queue: [], is_busy: false }));
       await initialResponse;
@@ -2008,20 +2013,87 @@ describe("App transcript observation ownership", () => {
   function harness(initialRead?: (target: string) => Promise<Response>) {
     let sessions = [{ id: "session-a", source: "route", adapter: "claude", persona: "ferris", status: "active", updated_at: "t1" }];
     let read: (target: string) => Promise<Response> = initialRead ?? (async () => observed("Last good history"));
+    let readSessions = async () => response({ sessions });
     let listener: ((frame: unknown) => void) | undefined;
     const fetchImpl = vi.fn(async (input: RequestInfo | URL) => {
       const url = String(input);
       if (url.includes("/auth/session")) return response({ authenticated: true, authority: { tier: "owner", login: "owner" } });
       if (url.includes("/transcript")) return read(url);
       if (url.endsWith("/agents")) return response({ agents: TEST_WORKSPACE_AGENTS, routes: [] });
-      if (url.endsWith("/sessions")) return response({ sessions });
+      if (url.endsWith("/sessions")) return readSessions();
       return response({});
     });
     const api = new HubApiClient({ fetchImpl: fetchImpl as typeof fetch });
     const ws = { setToken: vi.fn(), connect: vi.fn(), disconnect: vi.fn(), onStatusChange: () => () => {}, subscribe: (topic: string, cb: (frame: unknown) => void) => { if (topic === "session") listener = cb; return () => {}; } } as unknown as HubWsClient;
     const view = render(<App apiClient={api} wsClient={ws} />);
-    return { ...view, api, ws, fetchImpl, setRead: (next: typeof read) => { read = next; }, setSessions: (next: typeof sessions) => { sessions = next; }, refresh: (data?: Record<string, unknown>) => act(() => listener?.({ type: "event", topic: "session", event: data ? "prompt_sent" : "updated", data: data ?? {} })) };
+    return { ...view, api, ws, fetchImpl, setRead: (next: typeof read) => { read = next; }, setSessionsRead: (next: typeof readSessions) => { readSessions = next; }, setSessions: (next: typeof sessions) => { sessions = next; }, refresh: (data?: Record<string, unknown>) => act(() => listener?.({ type: "event", topic: "session", event: data ? "prompt_sent" : "updated", data: data ?? {} })) };
   }
+
+  it("shares overlapping passive concrete startup reads and applies the first response", async () => {
+    let release!: (result: Response) => void;
+    const pending = new Promise<Response>((resolve) => { release = resolve; });
+    let concreteReads = 0;
+    const h = harness(async (target) => {
+      if (!target.endsWith("/sessions/session-a/transcript")) return observed("Alias history");
+      concreteReads += 1;
+      return pending;
+    });
+    await waitFor(() => expect(concreteReads).toBeGreaterThan(0));
+    // Flush the effect that responds to bootstrap's session list while the read is held.
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 50)); });
+    expect(concreteReads).toBe(1);
+    await act(async () => {
+      release(response({ session_id: "session-a", turns: [turn({ index: 0, content: "Shared history" })], queue: [{ id: "shared-queue", session_id: "session-a", prompt: "Shared queue", by: "owner", created_at: "now" }], is_busy: false }));
+      await pending;
+    });
+    await screen.findByText("Shared history");
+    await screen.findByText("Shared queue");
+    h.setRead(async () => observed("Fresh after settlement"));
+    h.refresh();
+    await screen.findByText("Fresh after settlement");
+    expect(h.fetchImpl.mock.calls.filter(([input]) => String(input).endsWith("/sessions/session-a/transcript"))).toHaveLength(2);
+    h.unmount();
+  });
+
+  it("keeps an explicit Git refresh fresh while a selection read is pending", async () => {
+    const h = harness();
+    await screen.findByText("Last good history");
+    fireEvent.click(screen.getByTestId("split-view-toggle"));
+    fireEvent.click(screen.getByTestId("right-panel-tab-git"));
+    const refreshButton = await screen.findByTestId("git-refresh-btn");
+    let release!: (result: Response) => void;
+    const pending = new Promise<Response>((resolve) => { release = resolve; });
+    let concreteReads = 0;
+    let refreshing = false;
+    h.setRead(async (target) => {
+      if (!target.endsWith("/sessions/session-a/transcript")) return observed("Other history");
+      concreteReads++;
+      return refreshing ? response({ error: "Denied" }, 403) : pending;
+    });
+    let releaseDiscovery!: (result: Response) => void;
+    const discovery = new Promise<Response>((resolve) => { releaseDiscovery = resolve; });
+    let sessionReads = 0;
+    h.setSessionsRead(async () => {
+      sessionReads++;
+      return sessionReads === 1 ? discovery : response({ sessions: [{ id: "session-a", source: "route", adapter: "claude", persona: "ferris", status: "active", updated_at: "t1" }] });
+    });
+    fireEvent.click(screen.getByTestId("agent-row-jarvis"));
+    await waitFor(() => expect(sessionReads).toBe(1));
+    fireEvent.click(screen.getByTestId("agent-row-ferris"));
+    await waitFor(() => expect(concreteReads).toBeGreaterThan(0));
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 50)); });
+    expect(concreteReads).toBe(1);
+    const previousReads = concreteReads;
+    refreshing = true;
+    fireEvent.click(refreshButton);
+    await waitFor(() => expect(concreteReads).toBe(previousReads + 1));
+    await screen.findByText("History access denied");
+    await act(async () => { release(observed("Old selection history")); await pending; });
+    expect(screen.queryByText("Old selection history")).toBeNull();
+    expect(screen.getByText("History access denied")).toBeInTheDocument();
+    h.unmount();
+    releaseDiscovery(response({ sessions: [] }));
+  });
 
   it.each(["503", "network", "malformed"])("keeps same-session history and metadata on %s then accepts recovery and observed empty", async (failure) => {
     const h = harness();
@@ -2159,20 +2231,26 @@ describe("App transcript observation ownership", () => {
     expect(screen.queryByText("History refresh unavailable; showing last loaded history")).toBeNull();
     h.unmount();
   });
-  it.each(["success", "failure"])("rejects old initial success and its queue/context after newer %s", async (latest) => {
+  it.each(["success", "failure", "401", "403"])("rejects old initial success and its queue/context after newer %s", async (latest) => {
     let release!: (result: Response) => void;
     const pending = new Promise<Response>((resolve) => { release = resolve; });
     let concreteReads = 0;
     const h = harness(async (target) => {
       if (!target.includes("session-a")) return observed("Alias history");
       if (++concreteReads === 1) return pending;
-      return latest === "success" ? observed("Newest history") : response({ code: "transcript_unavailable" }, 503);
+      return latest === "success" ? observed("Newest history") : latest === "failure" ? response({ code: "transcript_unavailable" }, 503) : response({ error: "Denied" }, Number(latest));
     });
-    await screen.findByText(latest === "success" ? "Newest history" : "History unavailable");
+    await waitFor(() => expect(concreteReads).toBe(1));
+    h.refresh();
+    await waitFor(() => expect(concreteReads).toBe(2));
+    if (latest === "success") await screen.findByText("Newest history");
+    else if (latest === "failure") await screen.findByText("History unavailable");
+    else await screen.findByText("History access denied");
     await act(async () => { release(response({ session_id: "session-a", turns: [turn({ index: 7, content: "Old response" })], is_busy: true, queue: [{ id: "old", prompt: "Old queued prompt" }], context_usage: { used_tokens: 199999, max_tokens: 200000 } })); await pending; });
     expect(screen.queryByText("Old response")).toBeNull();
     expect(screen.queryByText("Old queued prompt")).toBeNull();
-    expect(screen.getByText(latest === "success" ? "Newest history" : "History unavailable")).toBeInTheDocument();
+    if (latest === "success") expect(screen.getByText("Newest history")).toBeInTheDocument();
+    if (latest === "failure") expect(screen.getByText("History unavailable")).toBeInTheDocument();
     h.unmount();
   });
 

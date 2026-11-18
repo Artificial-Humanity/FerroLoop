@@ -8,7 +8,7 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import "./styles/tokens.css";
 import { HubApiClient, HubApiError, normalizeHubSettings } from "./api/client";
 import { HubWsClient } from "./api/ws";
-import { createTranscriptReadGuard, isObservedTranscriptTurns, isTransientTranscriptReadError, type TranscriptReadOwner } from "./lib/transcriptReadGuard";
+import { createTranscriptReadGuard, isObservedTranscriptTurns, isTransientTranscriptReadError, type TranscriptReadOwner, type TranscriptReadTicket } from "./lib/transcriptReadGuard";
 import { ArtifactPreviewPane } from "./components/ArtifactPreviewPane";
 import { ChatPane, coalesceTurnsWithToolOutputs } from "./components/ChatPane";
 import { ContextHeader, RightPanelHeader } from "./components/ContextHeader";
@@ -1487,56 +1487,69 @@ export const App: React.FC<AppProps> = ({
     if (typeof response.is_busy === "boolean") setIsSessionBusy(response.is_busy);
   }, [transcriptGuard, setSessionMetadataOwner, isTranscriptResetPending]);
 
-  const readSelectedTranscript = useCallback(async (targetId: string) => {
-    if (loggedOutRef.current || isTranscriptResetPending(ownerRef.current) || !mountedRef.current) return;
+  const passiveTranscriptReadRef = useRef<{ targetId: string; ticket: TranscriptReadTicket; promise: Promise<void> } | null>(null);
+  const readSelectedTranscript = useCallback((targetId: string, passive = false): Promise<void> => {
+    if (loggedOutRef.current || isTranscriptResetPending(ownerRef.current) || !mountedRef.current) return Promise.resolve();
     const owner = { ...ownerRef.current };
-    if (owner.sessionId && targetId !== owner.sessionId) return;
+    if (owner.sessionId && targetId !== owner.sessionId) return Promise.resolve();
+    const eligible = passive && owner.sessionId !== null && targetId === owner.sessionId;
+    const existing = passiveTranscriptReadRef.current;
+    if (eligible && existing?.targetId === targetId && transcriptGuard.accepts(existing.ticket, owner)) return existing.promise;
     const ticket = transcriptGuard.begin(owner);
     const accepts = () => mountedRef.current && !loggedOutRef.current && !isTranscriptResetPending(owner) &&
       transcriptGuard.accepts(ticket, ownerRef.current);
-    try {
-      const result: SessionTranscriptResponse = await apiClient.getSessionTranscript(targetId);
-      if (!accepts()) return;
-      if (!isObservedTranscriptTurns(result.turns)) throw new Error("Transcript observation unavailable");
-      if (result.resolved_session_id && owner.sessionId && result.resolved_session_id !== owner.sessionId) {
-        throw new Error("Transcript session changed");
+    const read = async () => {
+      try {
+        const result: SessionTranscriptResponse = await apiClient.getSessionTranscript(targetId);
+        if (!accepts()) return;
+        if (!isObservedTranscriptTurns(result.turns)) throw new Error("Transcript observation unavailable");
+        if (result.resolved_session_id && owner.sessionId && result.resolved_session_id !== owner.sessionId) {
+          throw new Error("Transcript session changed");
+        }
+        recordTranscript(owner, result.turns);
+        applyTranscriptTurns(result.turns);
+        setTranscriptSnapshot((previous) => previous ? { ...previous, owner, status: "ready" } : null);
+        if (!sessionMetadataOwnerRef.current || !sameTranscriptOwner(sessionMetadataOwnerRef.current, owner)) {
+          setSessionQueue([]);
+          setIsSessionBusy(false);
+          setSessionContextUsage(null);
+          setSessionQuotaUsage(null);
+          recordAgentContextUsage(owner.agentKey, null);
+          recordAgentQuotaUsage(owner.agentKey, null);
+        }
+        setSessionMetadataOwner(owner);
+        recordAgentContextUsage(owner.agentKey, result.context_usage);
+        recordAgentQuotaUsage(owner.agentKey, result.quota_usage);
+        recordAgentBusy(owner.agentKey, typeof result.is_busy === "boolean" ? result.is_busy : hasTrailingIncompleteWork(result.turns));
+        if (Array.isArray(result.queue)) setSessionQueue(result.queue);
+        if (typeof result.is_busy === "boolean") setIsSessionBusy(result.is_busy);
+        setUnconfirmedBySession((previous) => ({ ...previous, [targetId]: Boolean(result.in_flight_unconfirmed) }));
+        setSessionContextUsage(result.context_usage ?? null);
+        setSessionQuotaUsage(result.quota_usage ?? null);
+      } catch (error) {
+        if (!accepts()) return;
+        const transient = isTransientTranscriptReadError(error);
+        const denied = error instanceof HubApiError && (error.status === 401 || error.status === 403);
+        if (denied) {
+          recordAgentContextUsage(owner.agentKey, null);
+          recordAgentQuotaUsage(owner.agentKey, null);
+        }
+        setTranscriptSnapshot((previous) => {
+          const retain = transient && owner.sessionId && previous && sameTranscriptOwner(previous.owner, owner) && (previous.status === "ready" || previous.status === "stale");
+          return { owner, turns: retain ? previous.turns : [], status: retain ? "stale" : denied ? "denied" : "unavailable" };
+        });
+        if (error instanceof HubApiError && error.status === 401) {
+          setAuthority(null); setAuthRequired(true); setPairingOpen(true);
+        }
       }
-      recordTranscript(owner, result.turns);
-      applyTranscriptTurns(result.turns);
-      setTranscriptSnapshot((previous) => previous ? { ...previous, owner, status: "ready" } : null);
-      if (!sessionMetadataOwnerRef.current || !sameTranscriptOwner(sessionMetadataOwnerRef.current, owner)) {
-        setSessionQueue([]);
-        setIsSessionBusy(false);
-        setSessionContextUsage(null);
-        setSessionQuotaUsage(null);
-        recordAgentContextUsage(owner.agentKey, null);
-        recordAgentQuotaUsage(owner.agentKey, null);
-      }
-      setSessionMetadataOwner(owner);
-      recordAgentContextUsage(owner.agentKey, result.context_usage);
-      recordAgentQuotaUsage(owner.agentKey, result.quota_usage);
-      recordAgentBusy(owner.agentKey, typeof result.is_busy === "boolean" ? result.is_busy : hasTrailingIncompleteWork(result.turns));
-      if (Array.isArray(result.queue)) setSessionQueue(result.queue);
-      if (typeof result.is_busy === "boolean") setIsSessionBusy(result.is_busy);
-      setUnconfirmedBySession((previous) => ({ ...previous, [targetId]: Boolean(result.in_flight_unconfirmed) }));
-      setSessionContextUsage(result.context_usage ?? null);
-      setSessionQuotaUsage(result.quota_usage ?? null);
-    } catch (error) {
-      if (!accepts()) return;
-      const transient = isTransientTranscriptReadError(error);
-      const denied = error instanceof HubApiError && (error.status === 401 || error.status === 403);
-      if (denied) {
-        recordAgentContextUsage(owner.agentKey, null);
-        recordAgentQuotaUsage(owner.agentKey, null);
-      }
-      setTranscriptSnapshot((previous) => {
-        const retain = transient && owner.sessionId && previous && sameTranscriptOwner(previous.owner, owner) && (previous.status === "ready" || previous.status === "stale");
-        return { owner, turns: retain ? previous.turns : [], status: retain ? "stale" : denied ? "denied" : "unavailable" };
-      });
-      if (error instanceof HubApiError && error.status === 401) {
-        setAuthority(null); setAuthRequired(true); setPairingOpen(true);
-      }
-    }
+    };
+    if (!eligible) return read();
+    const entry = { targetId, ticket, promise: Promise.resolve() };
+    entry.promise = read().finally(() => {
+      if (passiveTranscriptReadRef.current === entry) passiveTranscriptReadRef.current = null;
+    });
+    passiveTranscriptReadRef.current = entry;
+    return entry.promise;
   }, [apiClient, transcriptGuard, applyTranscriptTurns, recordTranscript, recordAgentBusy, recordAgentContextUsage, recordAgentQuotaUsage, isTranscriptResetPending, setSessionMetadataOwner]);
 
   const [worktrees, setWorktrees] = useState<WorktreeSummary[]>([]);
@@ -1841,7 +1854,7 @@ export const App: React.FC<AppProps> = ({
     }
   }, [apiClient]);
 
-  const loadAllInitialState = useCallback(async () => {
+  const loadAllInitialState = useCallback(async (passive = false) => {
     const initialOwner = { ...ownerRef.current };
     if (loggedOutRef.current || !mountedRef.current) return;
     setLoading(true);
@@ -1954,7 +1967,7 @@ export const App: React.FC<AppProps> = ({
         void scanBackgroundTranscripts(sessionsRes?.sessions ?? []);
         const target = concrete ?? initialOwner.agentKey;
         if (target && !tornDownTargetsRef.current.has(target.toLowerCase())) {
-          await readSelectedTranscript(target);
+          await readSelectedTranscript(target, passive);
         }
       }
     } finally {
@@ -2042,7 +2055,7 @@ export const App: React.FC<AppProps> = ({
       }
 
       if (acceptsBootstrap()) {
-        await loadAllInitialState();
+        await loadAllInitialState(true);
       }
     };
 
@@ -2539,7 +2552,7 @@ export const App: React.FC<AppProps> = ({
   useEffect(() => {
     const target = activeSession?.id ?? selectedAgent?.name_key;
     if (!target || loggedOutRef.current || tornDownTargetsRef.current.has(target.toLowerCase())) return;
-    void readSelectedTranscript(target);
+    void readSelectedTranscript(target, true);
   }, [activeSession?.id, selectedAgent?.name_key, authority, readSelectedTranscript]);
 
   // The hub emits no WebSocket event for raw transcript.jsonl appends, so
@@ -2682,7 +2695,7 @@ export const App: React.FC<AppProps> = ({
     wsClient.setToken(apiClient.getToken());
     wsClient.connect();
     setPairingOpen(false);
-    await loadAllInitialState();
+    await loadAllInitialState(true);
   };
 
   const handlePairWithToken = async (token: string) => {
@@ -2698,7 +2711,7 @@ export const App: React.FC<AppProps> = ({
     wsClient.setToken(apiClient.getToken());
     wsClient.connect();
     setPairingOpen(false);
-    await loadAllInitialState();
+    await loadAllInitialState(true);
   };
 
   const handleLogout = async () => {
@@ -4044,7 +4057,7 @@ export const App: React.FC<AppProps> = ({
           wsClient.setToken(apiClient.getToken());
           wsClient.connect();
           setPairingOpen(false);
-          void loadAllInitialState();
+          void loadAllInitialState(true);
         }}
         apiClient={apiClient}
         error={pairingError}
