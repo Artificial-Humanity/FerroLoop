@@ -1503,10 +1503,23 @@ fn publication_mutation_matrix(reconciliation: Option<bool>) {
             let request = f.request();
             if let Some(existing_receipt) = reconciliation {
                 if existing_receipt {
-                    assert!(matches!(
-                        backup(&f.store, &request, &native, &CancelToken::new()).unwrap(),
-                        PublicationOutcome::Durable(_)
-                    ));
+                    // Retry only ConcurrentBackup for up to 5s: a sibling test's
+                    // forked child briefly holds the physical StoreLock fd between
+                    // fork and exec (the StoreLock file is O_CLOEXEC, fs.rs:595, so
+                    // never after exec). Not reproduced locally (15/15 exact, 6/6
+                    // full binary sandboxed).
+                    let deadline = Instant::now() + Duration::from_secs(5);
+                    let second = loop {
+                        match backup(&f.store, &request, &native, &CancelToken::new()) {
+                            Err(RecoveryError::ConcurrentBackup { .. })
+                                if Instant::now() < deadline =>
+                            {
+                                std::thread::sleep(Duration::from_millis(25));
+                            }
+                            result => break result,
+                        }
+                    };
+                    assert!(matches!(second.unwrap(), PublicationOutcome::Durable(_)));
                 } else {
                     let fault = Arc::new(Fault::default());
                     *fault.failure.lock().unwrap() =
