@@ -289,6 +289,62 @@ FerroLoop writes an auth frame and a user frame to the session Unix socket.
 
 Home: `~/.codex/`.
 
+
+### Hosted launch prerequisite
+
+Hosted Codex uses `codex --remote unix://` and requires the shared Codex app-server daemon
+before launch. FerroLoop checks that its Unix control socket accepts a connection, with a
+250 ms deadline; it sends no RPC or thread request. The socket is
+`app-server-control/app-server-control.sock` under the effective `CODEX_HOME` pinned into
+the child. `FL_WIRE_CODEX_CONTROL_SOCK` selects delivery traffic, not this launch endpoint.
+Non-Unix remote launches refuse because this transport requires Unix sockets.
+
+Spin-up, restart and remodel return HTTP 409 with `code: codex_app_server_unavailable`
+when this prerequisite is unavailable. Automatic recovery emits a
+`session.prerequisite_unavailable` event. An automatically recoverable stopped record has
+`stop_reason: prerequisite_unavailable` and
+`launch_prerequisite_detail` containing a bounded socket path and probe result. After a
+refusal before any spawn, automatic `on-failure` recovery checks again at most once per
+60 seconds per session; its next deadline is saved across Hub restarts. Such refusals spend
+no automatic respawn attempts. A successful connection is readiness evidence only; the
+launched process must still survive normally.
+A refused manual restart preserves a prior `clean_exit`, `crash_loop` or other intentional
+stop reason and its recovery state; it does not arm automatic recovery. Only an automatic
+restart, or a record already stopped for `runtime_gone` or `prerequisite_unavailable`,
+receives the prerequisite retry reason and deadline. If the daemon disappears during initial
+startup, an immediate re-probe records the unavailable prerequisite. Once a process really
+spawns, its attempt stays charged with the normal deadline of its phase, even if it dies
+immediately. Only a refusal before any spawn is free.
+
+FerroLoop does not start the vendor daemon. Start it through a clean systemd user service,
+not from an agent command shell: a shared daemon and its updater propagate inherited
+`AGENT_PERSONA`, `FL_HOSTED_ID`, `AGENT_HYDRATION_GENERATION` and `CLAUDE_CODE_*` values into
+other agents' command shells. Keep those variables out of the user manager's environment too.
+The reference service orders itself before Hub (adapt the binary path to the installation):
+
+```ini
+# ~/.config/systemd/user/codex-app-server-daemon.service
+[Unit]
+Description=Shared Codex app-server daemon
+Before=ferroloop-hub.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+UnsetEnvironment=AGENT_PERSONA FL_HOSTED_ID AGENT_HYDRATION_GENERATION
+ExecStart=%h/.local/bin/codex app-server daemon start
+
+[Install]
+WantedBy=default.target
+```
+
+Enable both services for boot; ordering applies when both units are started. Ensure the user
+manager supplies no `CLAUDE_CODE_*` identity variables; `UnsetEnvironment` does not accept
+wildcards. On a configured host, `systemctl --user restart codex-app-server-daemon.service` is
+the reference manual recovery command: `start` is a no-op after daemon death while this
+oneshot unit remains active. Avoid starting another daemon from an agent shell. Restarting a
+shared daemon can interrupt active clients and requires coordinated workload handling.
+
 ### Session discovery and liveness
 
 * Rollout: `sessions/YYYY/MM/DD/rollout-<timestamp>-<thread-id>.jsonl`.
@@ -482,3 +538,63 @@ drops the guard, then reads transcripts and dispatches prompts.
 
 `GET /api/v1/prs` reads workspace runtime state keys `pr-*`. This tree has no `gh pr` handler
 and no `list_pr_reviews` call in the hub crate. Those commands are not inserted here.
+
+### Hosted restart and bounded crash-loop recovery
+
+`fl agent restart <persona-or-session-id> [--by owner] [--json]` restarts a hosted
+record from its saved settings, including vendor, model, thinking level, permission
+posture, working directory, node and context. It accepts no launch-setting overrides.
+An exact session id wins; a persona must name one eligible saved record. Retired,
+non-hosted and decommissioning/decommissioned targets are refused. The command uses
+the Owner caller model of `fl agent spin-up` and revalidates selection under the
+session lifecycle lock. This lock is process-local: the CLI is not serialised with the hub
+(or a separate CLI process). Cross-process fencing is tracked in [#592](https://github.com/Artificial-Humanity/FerroLoop/issues/592)
+and gates deployment of the new command. The command prints `runtime_spawned`,
+`runtime_live`, `hydration_dispatched` and `hydration_status`; it exits non-zero when no
+live runtime resulted. `runtime_live` is a serde-default field on the restart response
+and reports current-operation evidence rather than a saved ownership flag.
+
+The fast automatic guard remains three respawns in ten minutes, with the existing
+30/60/120-second backoff. A fourth failure enters a durable recovery incident. The
+first slow launch is due ten minutes later; at most six launches are attempted,
+each at least ten minutes after the previous one. A late reconcile pass attempts
+one launch rather than catching up. When an old `crash_loop` record has no incident
+state at upgrade, its first launch is due about ten minutes after the new hub first
+reconciles it; existing stopped records are eligible automatically.
+After six unsuccessful recoveries the session stays stopped until manual action.
+
+A successful spawn does not refill the incident budget. The incident resets after
+ten minutes of observed healthy running (a proven live process route or an Alive
+runtime observation), or after an explicit manual restart persists a live result.
+Gone or Unknown runtime observations break the healthy interval. Refused or failed
+manual launches retain recovery state. Missing vendor prerequisites before any spawn spend
+neither fast nor slow attempts; their persisted readiness deadline never shortens an
+existing slow deadline. A real spawn stays charged in both phases, including when a
+second readiness probe shows the daemon disappeared during startup, and keeps the normal
+phase deadline (fast backoff or ten-minute slow spacing). Other preparation failures
+consume an attempt and the current phase's backoff, except `Conflict` errors, which are
+not charged. FerroLoop does not start a vendor daemon automatically.
+
+Crash-loop notices go to the active project Lead, using registry project coverage.
+If the stopped persona is a Lead, or the project has no Lead, active Lab Managers
+also receive the notice. No notice goes to the stopped persona itself. Initial
+incident and final exhaustion notices have separate per-recipient delivery state;
+failed recipients and newly registered recipients are retried. Notices include the
+next due time as UTC text or final-stop status and the saved-settings restart command.
+The hub logs fast-guard entry and final exhaustion, emits `session.crash_loop` and
+`session.recovery_exhausted` events, and rate-limits warnings when no eligible recipient
+can be notified. Unchanged reconcile ticks append no recovery or session revisions.
+A recovery-state read or decode error skips that record for the tick rather than resetting
+its budget; a health-state write error likewise leaves other records eligible for inspection.
+
+The disjoint runtime record adds serde-default fields `recovery_started_at_ms`,
+`recovery_attempts`, `recovery_healthy_since_ms` and
+`crash_loop_notified_recipients`. Empty fields are omitted. The existing
+`next_allowed_at_ms` stores the phase deadline, and `crash_loop_notified` is retained
+for old readers. New delivery decisions use recipient keys `recovery:<name>` and
+`exhausted:<name>`, so the legacy aggregate flag cannot suppress required fallback
+or exhaustion delivery.
+
+The seven Codex records affected by the 2026-11-17 reboot were already recovered
+by hand. This policy bounds future recovery incidents; it does not dispatch a
+restart of those sessions during installation or deployment.

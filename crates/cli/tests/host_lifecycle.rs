@@ -1247,8 +1247,8 @@ exec /bin/cat
         );
         std::fs::write(&binary, script).unwrap();
         std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
-        if vendor == "codex" {
-            let codex_home = root.join("codex-home");
+        let codex_home = root.join("codex-home");
+        let _codex_control = (vendor == "codex").then(|| {
             std::fs::create_dir_all(&codex_home).unwrap();
             std::fs::write(
                 codex_home.join("config.toml"),
@@ -1258,10 +1258,20 @@ exec /bin/cat
                 ),
             )
             .unwrap();
-        }
+            // Launch preflight uses the pinned CODEX_HOME, not a delivery socket override.
+            // Keep its connect-only prerequisite alive while the app-server tool fixture runs.
+            let socket = codex_home.join(fl_vendor_adapters::codex::CODEX_CONTROL_SOCKET_REL);
+            std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+            let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+            assert_eq!(
+                listener.local_addr().unwrap().as_pathname(),
+                Some(socket.as_path())
+            );
+            listener
+        });
         let mut spin = f.command();
         spin.env(bin_env, &binary)
-            .env("CODEX_HOME", root.join("codex-home"))
+            .env("CODEX_HOME", &codex_home)
             .env("FL_WIRE_ROUTES", &routes)
             .args([
                 "agent",
