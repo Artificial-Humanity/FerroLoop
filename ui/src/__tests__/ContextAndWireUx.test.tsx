@@ -2013,19 +2013,20 @@ describe("App transcript observation ownership", () => {
   function harness(initialRead?: (target: string) => Promise<Response>) {
     let sessions = [{ id: "session-a", source: "route", adapter: "claude", persona: "ferris", status: "active", updated_at: "t1" }];
     let read: (target: string) => Promise<Response> = initialRead ?? (async () => observed("Last good history"));
+    let readSessions = async () => response({ sessions });
     let listener: ((frame: unknown) => void) | undefined;
     const fetchImpl = vi.fn(async (input: RequestInfo | URL) => {
       const url = String(input);
       if (url.includes("/auth/session")) return response({ authenticated: true, authority: { tier: "owner", login: "owner" } });
       if (url.includes("/transcript")) return read(url);
       if (url.endsWith("/agents")) return response({ agents: TEST_WORKSPACE_AGENTS, routes: [] });
-      if (url.endsWith("/sessions")) return response({ sessions });
+      if (url.endsWith("/sessions")) return readSessions();
       return response({});
     });
     const api = new HubApiClient({ fetchImpl: fetchImpl as typeof fetch });
     const ws = { setToken: vi.fn(), connect: vi.fn(), disconnect: vi.fn(), onStatusChange: () => () => {}, subscribe: (topic: string, cb: (frame: unknown) => void) => { if (topic === "session") listener = cb; return () => {}; } } as unknown as HubWsClient;
     const view = render(<App apiClient={api} wsClient={ws} />);
-    return { ...view, api, ws, fetchImpl, setRead: (next: typeof read) => { read = next; }, setSessions: (next: typeof sessions) => { sessions = next; }, refresh: (data?: Record<string, unknown>) => act(() => listener?.({ type: "event", topic: "session", event: data ? "prompt_sent" : "updated", data: data ?? {} })) };
+    return { ...view, api, ws, fetchImpl, setRead: (next: typeof read) => { read = next; }, setSessionsRead: (next: typeof readSessions) => { readSessions = next; }, setSessions: (next: typeof sessions) => { sessions = next; }, refresh: (data?: Record<string, unknown>) => act(() => listener?.({ type: "event", topic: "session", event: data ? "prompt_sent" : "updated", data: data ?? {} })) };
   }
 
   it("shares overlapping passive concrete startup reads and applies the first response", async () => {
@@ -2069,10 +2070,19 @@ describe("App transcript observation ownership", () => {
       concreteReads++;
       return refreshing ? response({ error: "Denied" }, 403) : pending;
     });
+    let releaseDiscovery!: (result: Response) => void;
+    const discovery = new Promise<Response>((resolve) => { releaseDiscovery = resolve; });
+    let sessionReads = 0;
+    h.setSessionsRead(async () => {
+      sessionReads++;
+      return sessionReads === 1 ? discovery : response({ sessions: [{ id: "session-a", source: "route", adapter: "claude", persona: "ferris", status: "active", updated_at: "t1" }] });
+    });
     fireEvent.click(screen.getByTestId("agent-row-jarvis"));
+    await waitFor(() => expect(sessionReads).toBe(1));
     fireEvent.click(screen.getByTestId("agent-row-ferris"));
     await waitFor(() => expect(concreteReads).toBeGreaterThan(0));
     await act(async () => { await new Promise((resolve) => setTimeout(resolve, 50)); });
+    expect(concreteReads).toBe(1);
     const previousReads = concreteReads;
     refreshing = true;
     fireEvent.click(refreshButton);
@@ -2082,6 +2092,7 @@ describe("App transcript observation ownership", () => {
     expect(screen.queryByText("Old selection history")).toBeNull();
     expect(screen.getByText("History access denied")).toBeInTheDocument();
     h.unmount();
+    releaseDiscovery(response({ sessions: [] }));
   });
 
   it.each(["503", "network", "malformed"])("keeps same-session history and metadata on %s then accepts recovery and observed empty", async (failure) => {
