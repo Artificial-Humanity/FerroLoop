@@ -557,6 +557,7 @@ fn handle_apply(state: &HubState, authority: &HubAuthority, req: &HttpRequest) -
         );
     }
 
+    drop(store);
     let mut results: Vec<SwitchResult> = Vec::new();
     let mut down = false;
     let mut grant_checked = false;
@@ -584,27 +585,55 @@ fn handle_apply(state: &HubState, authority: &HubAuthority, req: &HttpRequest) -
             results.push(result);
             continue;
         };
-        // A single-use grant is spent only now, under the guard, just before the first remodel.
-        if !grant_checked {
-            grant_checked = true;
-            if let ApplyAuthority::Warrant {
-                id_or_token,
-                single_use: true,
-                ..
-            } = &auth
-                && let Err(e) = fl_gate::verify_owner_grant(home, id_or_token, Some(by), true)
-            {
-                return warrant_refused(e);
-            }
+        let mut warrant_error = None;
+        let run = crate::lifecycle::with_lifecycle_fence(
+            &env,
+            &target.persona,
+            "balance-remodel",
+            |env| {
+                let store = state
+                    .open_store()
+                    .map_err(crate::lifecycle::LifecycleError::from)?;
+                let target = crate::lifecycle::reload_lifecycle_target(&*store, &target)?;
+                crate::lifecycle::remodel_precheck(
+                    &*store,
+                    env,
+                    &target,
+                    &switch_request(&sw.to_vendor),
+                    caller,
+                )?;
+                // A single-use grant is spent only now, under the guard, just before the first remodel.
+                if !grant_checked {
+                    grant_checked = true;
+                    if let ApplyAuthority::Warrant {
+                        id_or_token,
+                        single_use: true,
+                        ..
+                    } = &auth
+                        && let Err(e) =
+                            fl_gate::verify_owner_grant(home, id_or_token, Some(by), true)
+                    {
+                        warrant_error = Some(warrant_refused(e));
+                        return Err(crate::lifecycle::LifecycleError::Forbidden(
+                            "owner grant refused".into(),
+                        ));
+                    }
+                }
+                Ok(run_remodel(
+                    state,
+                    &store,
+                    env,
+                    &target,
+                    &switch_request(&sw.to_vendor),
+                    by,
+                    caller,
+                ))
+            },
+        );
+        if let Some(response) = warrant_error {
+            return response;
         }
-        match run_remodel(
-            state,
-            &store,
-            &target,
-            &switch_request(&sw.to_vendor),
-            by,
-            caller,
-        ) {
+        match run.unwrap_or_else(RemodelRun::Refused) {
             RemodelRun::Done { out, .. } => {
                 result.status = SwitchStatus::Ok;
                 result.new_session_id = Some(out.session_id);
@@ -629,6 +658,9 @@ fn handle_apply(state: &HubState, authority: &HubAuthority, req: &HttpRequest) -
         results.push(result);
     }
 
+    let Ok(store) = state.open_store() else {
+        return store_open_failure();
+    };
     let mut warnings = Vec::new();
     let mut history = inputs.history.clone();
     let history_changed = history.record(

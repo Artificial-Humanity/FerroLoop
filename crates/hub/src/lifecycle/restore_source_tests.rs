@@ -218,6 +218,7 @@ fn teardown_that_stops_nothing_leaves_the_restore_source_alone() {
     // Runtime calls off: the session (if any) keeps running and keeps being saved.
     let off = LifecycleEnv {
         log_hydration_warnings: true,
+        lifecycle_fence: None,
         home_override: Some(home.path()),
         spawn_runtime: false,
         runtime: &TmuxRuntime,

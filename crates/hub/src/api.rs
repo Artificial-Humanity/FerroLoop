@@ -8482,6 +8482,23 @@ fn default_context_window_for(state: &HubState, req: &SpinUpRequest) -> Option<u
     crate::context_window::applicable_default(&defaults, &vendor, model, Some(&home))
 }
 
+// A saved record locates its persona without probing a runtime before ownership. Discovery
+// remains necessary only for an unmanaged/native target with no matching hosted record.
+fn lifecycle_candidate(
+    state: &HubState,
+    session_id: &str,
+) -> Result<SessionTarget, LifecycleError> {
+    let saved = {
+        let store = state.open_store().map_err(LifecycleError::from)?;
+        lifecycle::find_hosted_session(&*store, &[session_id])?
+    };
+    let discovered = saved
+        .map(|record| (record.session_id, Some(record.persona)))
+        .unwrap_or_else(|| resolve_session_target(state, session_id));
+    let store = state.open_store().map_err(LifecycleError::from)?;
+    SessionTarget::resolve(&*store, session_id, Some(discovered))
+}
+
 /// `POST /api/v1/sessions/:id/decommission` (`prepare` or `teardown`, see
 /// [`lifecycle::prepare_decommission`] and [`lifecycle::teardown_session`]). Owner only: 403 for
 /// a Peer, checked before the body is read and before any discovery, store access or side effect.
@@ -8512,83 +8529,101 @@ fn handle_post_session_decommission(
         Err(e) => return lifecycle_error_response(&e),
     };
 
-    // Resolve before taking the store guard: discovery opens the store itself.
-    let discovered = resolve_session_target(state, session_id);
-    let discovered_id = discovered.0.clone();
-    // Read-only discovery of what the session's transcript and brain reference; it opens the
-    // store itself, so it runs before the guard below. Nothing is archived until the teardown
-    // gate has passed.
-    let artifact_candidates = if mode == DecommissionMode::Teardown {
-        discover_session_artifact_candidates(state, session_id, &discovered_id)
-    } else {
-        Vec::new()
-    };
-    let by = authority.actor_name();
-    let env = lifecycle_env(state);
-    let Ok(store) = open_store_response(state) else {
-        return store_open_failure();
-    };
-    let target = match SessionTarget::resolve(&*store, session_id, Some(discovered)) {
+    let target = match lifecycle_candidate(state, session_id) {
         Ok(target) => target,
         Err(e) => return lifecycle_error_response(&e),
     };
-    let caller = caller_of(authority);
-    let result = match mode {
-        DecommissionMode::Prepare => {
-            lifecycle::prepare_decommission(&*store, &env, &target, by, caller)
+    let discovered_id = target.discovered_id.clone();
+    let persona = target.persona.clone();
+    let by = authority.actor_name();
+    let env = lifecycle_env(state);
+    match lifecycle::with_lifecycle_fence(&env, &persona, "decommission", |env| {
+        // Artifact discovery opens its own store; do it after ownership, before reopening.
+        let artifact_candidates = if mode == DecommissionMode::Teardown {
+            discover_session_artifact_candidates(state, session_id, &discovered_id)
+        } else {
+            Vec::new()
+        };
+        let store = state.open_store().map_err(LifecycleError::from)?;
+        let target = SessionTarget::resolve(
+            &*store,
+            session_id,
+            Some((discovered_id.clone(), Some(persona.clone()))),
+        )?;
+        if !target.persona.eq_ignore_ascii_case(&persona) {
+            return Err(LifecycleError::Conflict(
+                "lifecycle target changed during selection".into(),
+            ));
         }
-        DecommissionMode::Teardown => {
-            // Keep the session's artifacts before the teardown lets its worktree go. Asking the
-            // teardown's own gate first means a refused caller archives nothing. Best effort:
-            // archive_session_artifacts logs and swallows its failures, so the teardown and its
-            // status never depend on it.
-            if lifecycle::authorize_teardown(&*store, &target, caller).is_ok() {
-                archive_session_artifacts(state, &target, &discovered_id, artifact_candidates);
+        let target = lifecycle::reload_lifecycle_target(&*store, &target)?;
+        Ok((|| {
+            let caller = caller_of(authority);
+            let result = match mode {
+                DecommissionMode::Prepare => {
+                    lifecycle::prepare_decommission(&*store, env, &target, by, caller)
+                }
+                DecommissionMode::Teardown => {
+                    // Keep the session's artifacts before the teardown lets its worktree go. Asking the
+                    // teardown's own gate first means a refused caller archives nothing. Best effort:
+                    // archive_session_artifacts logs and swallows its failures, so the teardown and its
+                    // status never depend on it.
+                    if lifecycle::authorize_teardown(&*store, &target, caller).is_ok() {
+                        archive_session_artifacts(
+                            state,
+                            &target,
+                            &discovered_id,
+                            artifact_candidates,
+                        );
+                    }
+                    lifecycle::teardown_session(&*store, env, &target, by, caller, |key| {
+                        state.clear_session_prompt_queue(key);
+                        state.clear_session_model_override(key);
+                    })
+                }
+            };
+            let out = match result {
+                Ok(out) => out,
+                Err(e) => return lifecycle_error_response(&e),
+            };
+            if let (DecommissionMode::Prepare, false, Some(prompt)) =
+                (mode, out.handshake_dispatched, out.prompt.as_ref())
+            {
+                // No live route took the handshake: leave it on the session queue for the next idle turn.
+                let (_, queue) = state.enqueue_session_prompt(
+                    &target.session_id,
+                    Some(target.persona.clone()),
+                    prompt.clone(),
+                    prompt.clone(),
+                    by.to_string(),
+                    Vec::new(),
+                );
+                state.broadcast(
+                    "session",
+                    "queue_updated",
+                    json!({
+                        "session_id": target.session_id,
+                        "persona": target.persona,
+                        "is_busy": true,
+                        "queue": queue,
+                    }),
+                );
             }
-            lifecycle::teardown_session(&*store, &env, &target, by, caller, |key| {
-                state.clear_session_prompt_queue(key);
-                state.clear_session_model_override(key);
-            })
-        }
-    };
-    let out = match result {
-        Ok(out) => out,
-        Err(e) => return lifecycle_error_response(&e),
-    };
-    if let (DecommissionMode::Prepare, false, Some(prompt)) =
-        (mode, out.handshake_dispatched, out.prompt.as_ref())
-    {
-        // No live route took the handshake: leave it on the session queue for the next idle turn.
-        let (_, queue) = state.enqueue_session_prompt(
-            &target.session_id,
-            Some(target.persona.clone()),
-            prompt.clone(),
-            prompt.clone(),
-            by.to_string(),
-            Vec::new(),
-        );
-        state.broadcast(
-            "session",
-            "queue_updated",
-            json!({
-                "session_id": target.session_id,
-                "persona": target.persona,
-                "is_busy": true,
-                "queue": queue,
-            }),
-        );
+            let data = serde_json::to_value(&out).unwrap_or_default();
+            state.broadcast("sessions", "session.decommission", data.clone());
+            HttpResponse::json(200, data)
+        })())
+    }) {
+        Ok(response) => response,
+        Err(e) => lifecycle_error_response(&e),
     }
-    let data = serde_json::to_value(&out).unwrap_or_default();
-    state.broadcast("sessions", "session.decommission", data.clone());
-    HttpResponse::json(200, data)
 }
 
 /// `POST /api/v1/sessions/:id/remodel` (Local Record 59): move a session to another vendor,
 /// keeping its persona, project, role and worktree (see [`lifecycle::remodel_session`]).
 /// `prepare` asks the session to hand off (queued when no live route takes it); `execute`
-/// replaces it. The store guard is held from target resolution to the end of the handler, past
-/// every queue, model-override and broadcast write, so no other lifecycle request of this hub
-/// runs in between and two remodels of one persona never interleave their writes.
+/// replaces it. The initial store guard is released before acquiring the process-shared
+/// persona fence, then reopened. That fence remains held through rollback, queue, override
+/// and broadcast writes.
 ///
 /// A failed `execute` answers 502 and broadcasts `session.remodel_failed` with its outcome
 /// (`restored` or `down`). When the old session was restored, the operator's model override
@@ -8612,24 +8647,45 @@ fn handle_post_session_remodel(
         Ok(payload) => payload,
         Err(e) => return HttpResponse::json(400, json!({ "error": e })),
     };
-    // Resolve before taking the store guard: discovery opens the store itself.
-    let discovered = resolve_session_target(state, session_id);
-    let by = authority.actor_name();
-    let Ok(store) = open_store_response(state) else {
-        return store_open_failure();
-    };
-    let target = match SessionTarget::resolve(&*store, session_id, Some(discovered)) {
+    let target = match lifecycle_candidate(state, session_id) {
         Ok(target) => target,
         Err(e) => return lifecycle_error_response(&e),
     };
-    let resp = match run_remodel(state, &store, &target, &payload, by, caller_of(authority)) {
-        RemodelRun::Done { data, .. } => HttpResponse::json(200, data),
-        RemodelRun::Failed { data, .. } => HttpResponse::json(502, data),
-        RemodelRun::Refused(e) => lifecycle_error_response(&e),
-    };
-    // Released only now: every write [`run_remodel`] made belongs to this remodel.
-    drop(store);
-    resp
+    let by = authority.actor_name();
+    let persona = target.persona.clone();
+    let discovered_id = target.discovered_id.clone();
+    let env = lifecycle_env(state);
+    match lifecycle::with_lifecycle_fence(&env, &persona, "remodel", |env| {
+        let store = state.open_store().map_err(LifecycleError::from)?;
+        let target = SessionTarget::resolve(
+            &*store,
+            session_id,
+            Some((discovered_id, Some(persona.clone()))),
+        )?;
+        if !target.persona.eq_ignore_ascii_case(&persona) {
+            return Err(LifecycleError::Conflict(
+                "lifecycle target changed during selection".into(),
+            ));
+        }
+        Ok(
+            match run_remodel(
+                state,
+                &store,
+                env,
+                &target,
+                &payload,
+                by,
+                caller_of(authority),
+            ) {
+                RemodelRun::Done { data, .. } => HttpResponse::json(200, data),
+                RemodelRun::Failed { data, .. } => HttpResponse::json(502, data),
+                RemodelRun::Refused(e) => lifecycle_error_response(&e),
+            },
+        )
+    }) {
+        Ok(response) => response,
+        Err(e) => lifecycle_error_response(&e),
+    }
 }
 
 /// How [`run_remodel`] ended.
@@ -8654,20 +8710,20 @@ pub(crate) enum RemodelRun {
 /// teardown's queue and model-override clearing (and putting the overrides back when a failed
 /// remodel restored the old session), the route-scan drop, the new model override, the
 /// handshake queueing for `prepare`, and the `session.remodeled` / `session.remodel_failed`
-/// broadcast. `store` is the caller's [`HubStoreGuard`]: hold it from target resolution until
-/// after this returns (see [`lifecycle::remodel_session`] on concurrency).
+/// broadcast. The caller acquires the persona fence before reopening `store` and passes
+/// its borrowed proof in `env`; both remain held until this returns.
 pub(crate) fn run_remodel(
     state: &HubState,
     store: &AnyStore,
+    env: &LifecycleEnv<'_>,
     target: &SessionTarget,
     payload: &RemodelRequest,
     by: &str,
     caller: lifecycle::Caller,
 ) -> RemodelRun {
-    let env = lifecycle_env(state);
     // The overrides the teardown clears, as they were, so a restore can put them back.
     let mut cleared_overrides: Vec<(String, ModelOverride)> = Vec::new();
-    let result = lifecycle::remodel_session(store, &env, target, payload, by, caller, |key| {
+    let result = lifecycle::remodel_session(store, env, target, payload, by, caller, |key| {
         for k in [key.to_string(), key.to_ascii_lowercase()] {
             if let Some(o) = state.session_model_override(&k)
                 && !cleared_overrides.iter().any(|(seen, _)| *seen == k)

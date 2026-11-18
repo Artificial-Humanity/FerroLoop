@@ -547,9 +547,20 @@ posture, working directory, node and context. It accepts no launch-setting overr
 An exact session id wins; a persona must name one eligible saved record. Retired,
 non-hosted and decommissioning/decommissioned targets are refused. The command uses
 the Owner caller model of `fl agent spin-up` and revalidates selection under the
-session lifecycle lock. This lock is process-local: the CLI is not serialised with the hub
-(or a separate CLI process). Cross-process fencing is tracked in [#592](https://github.com/Artificial-Humanity/FerroLoop/issues/592)
-and gates deployment of the new command. The command prints `runtime_spawned`,
+session lifecycle fence. Explicit spin-up, restart, prepare, teardown and the entire
+remodel (including rollback) share a nonblocking OS advisory fence between the CLI
+and hub. Its namespace is the canonical host endpoint and normalized persona, so
+aliases, different HOME values and workspace stores sharing that endpoint conflict.
+Legacy tmux fallback also fences its actual server socket; both runtime endpoints
+remain pinned through the operation. A busy operation refuses immediately with
+HTTP 409 / CLI exit 2 and diagnostic holder pid, operation and start time. The
+metadata never permits stealing a lock. Private 0700 directories contain user-owned
+0600 lock files that are never removed; process exit releases ownership, and child
+processes do not inherit the descriptors. Unsafe or unsupported lock setup fails closed.
+
+This is the explicit-operation portion of [#592](https://github.com/Artificial-Humanity/FerroLoop/issues/592).
+Background reconciliation still requires shared fencing before that issue can close
+or the new command can be deployed. No deployment is authorized by this change. The command prints `runtime_spawned`,
 `runtime_live`, `hydration_dispatched` and `hydration_status`; it exits non-zero when no
 live runtime resulted. `runtime_live` is a serde-default field on the restart response
 and reports current-operation evidence rather than a saved ownership flag.
