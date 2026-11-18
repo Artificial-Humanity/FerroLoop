@@ -165,7 +165,13 @@ impl FerroStore {
         &self,
         args: SendWireArgs,
         awaiting_daemon: bool,
-    ) -> Result<(WireMessage, Vec<DeliveryReceipt>), StoreError> {
+        once: bool,
+    ) -> Result<Option<(WireMessage, Vec<DeliveryReceipt>)>, StoreError> {
+        if once && args.id.is_none() {
+            return Err(StoreError::InvalidState(
+                "Wire send-once requires a message id".into(),
+            ));
+        }
         let subject = validate_subject(&args.subject)
             .map_err(|err| StoreError::InvalidState(err.to_string()))?;
         let body = validate_wire_body(&args.body)
@@ -173,6 +179,16 @@ impl FerroStore {
         let sender_name = validate_sender_name(&args.sender_name)
             .map_err(|err| StoreError::InvalidState(err.to_string()))?;
         self.with_write(|txn| {
+            if once
+                && doc::get_json::<WireMessage>(
+                    txn,
+                    WIRE_MESSAGES,
+                    args.id.as_ref().unwrap().as_str(),
+                )?
+                .is_some()
+            {
+                return Ok(None);
+            }
             doc::raise_format(txn, FORMAT_WITH_WIRE)?;
             let (parent_thread, correlation_id) = match &args.reply_to {
                 Some(parent_id) => {
@@ -263,6 +279,11 @@ impl FerroStore {
                 &areas,
             );
             append_wire_message(txn, &msg)?;
+            // Child-process crash injection exercises the real write transaction.
+            #[cfg(test)]
+            if once && std::env::var_os("FL_TEST_WIRE_ONCE_CRASH").is_some() {
+                std::process::exit(75);
+            }
             let mut receipts = Vec::with_capacity(recipients.len());
             for (recipient_id, recipient_name) in recipients {
                 let rcpt = DeliveryReceipt {
@@ -286,7 +307,7 @@ impl FerroStore {
             if awaiting_daemon {
                 doc::put_json(txn, WIRE_AWAITING_DAEMON, msg.id.as_str(), &msg.created_at)?;
             }
-            Ok((msg, receipts))
+            Ok(Some((msg, receipts)))
         })
     }
 }
@@ -296,14 +317,23 @@ impl MessageStore for FerroStore {
         &self,
         args: SendWireArgs,
     ) -> Result<(WireMessage, Vec<DeliveryReceipt>), StoreError> {
-        self.send_wire_inner(args, false)
+        self.send_wire_inner(args, false, false)
+            .map(|value| value.expect("ordinary send always inserts"))
     }
 
     fn send_wire_awaiting_daemon(
         &self,
         args: SendWireArgs,
     ) -> Result<(WireMessage, Vec<DeliveryReceipt>), StoreError> {
-        self.send_wire_inner(args, true)
+        self.send_wire_inner(args, true, false)
+            .map(|value| value.expect("ordinary send always inserts"))
+    }
+
+    fn send_wire_once_awaiting_daemon(
+        &self,
+        args: SendWireArgs,
+    ) -> Result<Option<(WireMessage, Vec<DeliveryReceipt>)>, StoreError> {
+        self.send_wire_inner(args, true, true)
     }
 
     fn list_wire_awaiting_daemon(&self) -> Result<Vec<(MessageId, At)>, StoreError> {
