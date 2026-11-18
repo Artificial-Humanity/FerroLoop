@@ -94,3 +94,43 @@ fn ferro_concurrent_and_reopen() {
     concurrent(Arc::new(FerroStore::open(&path).unwrap()));
     after_reopen(FerroStore::open(&path).unwrap());
 }
+
+// Separate handles exercise the cross-handle lock and refresh path used by
+// independent hub processes. Redb has exclusive file opens instead.
+#[test]
+fn ferro_independent_handles_insert_one_notice() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("wire.fls");
+    let stores: Vec<_> = (0..8).map(|_| FerroStore::open(&path).unwrap()).collect();
+    let barrier = Arc::new(Barrier::new(stores.len()));
+    let inserted = std::thread::scope(|scope| {
+        let threads: Vec<_> = stores
+            .into_iter()
+            .map(|store| {
+                let barrier = Arc::clone(&barrier);
+                scope.spawn(move || {
+                    barrier.wait();
+                    store
+                        .send_wire_once_awaiting_daemon(args())
+                        .unwrap()
+                        .is_some()
+                })
+            })
+            .collect();
+        threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .filter(|inserted| *inserted)
+            .count()
+    });
+    assert_eq!(inserted, 1);
+
+    let reopened = FerroStore::open(&path).unwrap();
+    let id = args().id.unwrap();
+    assert_eq!(reopened.wire_messages_after(0).unwrap().len(), 1);
+    assert_eq!(reopened.wire_receipts_after(0).unwrap().len(), 1);
+    assert_eq!(reopened.list_wire_receipts(&id).unwrap().len(), 1);
+    let awaiting = reopened.list_wire_awaiting_daemon().unwrap();
+    assert_eq!(awaiting.len(), 1);
+    assert_eq!(awaiting[0].0, id);
+}
