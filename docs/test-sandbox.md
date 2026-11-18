@@ -91,7 +91,8 @@ The sandbox receives `/dev/null` on standard input by default. To pass the
 launcher's input through deliberately, use `scripts/test-sandboxed.sh --stdin --
 COMMAND ...`. A sandbox-local Git template containing only empty `hooks` and `info`
 directories gives `git init` its expected structure without exposing host Git
-templates. For an authorized full-suite run, pass
+templates. Git’s default template path is a sandbox-only symlink to that same
+private directory, so this also works when a test clears the environment. For an authorized full-suite run, pass
 `--no-fail-fast` to Cargo so later test binaries run after failures.
 Bubblewrap attempts a private cgroup namespace when supported;
 the other listed namespaces are mandatory.

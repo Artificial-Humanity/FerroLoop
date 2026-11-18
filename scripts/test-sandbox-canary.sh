@@ -61,10 +61,18 @@ if args and args[0] == '--inside':
     require(sorted(os.listdir('/tmp/git-template')) == ['hooks', 'info'], 'unexpected Git template entries')
     for name in ('hooks', 'info'):
         require(not os.listdir('/tmp/git-template/' + name), 'Git template directory is not empty: ' + name)
-    git_dir = '/tmp/git-canary-' + nonce
-    subprocess.run(['/usr/bin/git', 'init', '-q', git_dir], check=True)
-    for name in ('hooks', 'info'):
-        require(os.path.isdir(os.path.join(git_dir, '.git', name)), 'git init omitted ' + name)
+    default_template = '/usr/share/git-core/templates'
+    require(os.path.islink(default_template) and os.path.realpath(default_template) == '/tmp/git-template',
+            'default Git template does not resolve to private template')
+    clean_git_env = {'PATH': '/usr/bin:/bin', 'HOME': '/nonexistent',
+                     'GIT_CONFIG_NOSYSTEM': '1', 'GIT_CONFIG_GLOBAL': '/dev/null',
+                     'GIT_AUTHOR_NAME': 'Fixture', 'GIT_AUTHOR_EMAIL': 'fixture@example.invalid',
+                     'GIT_COMMITTER_NAME': 'Fixture', 'GIT_COMMITTER_EMAIL': 'fixture@example.invalid'}
+    for mode, env in (('inherited', None), ('clean', clean_git_env)):
+        git_dir = '/tmp/git-canary-' + mode + '-' + nonce
+        subprocess.run(['/usr/bin/git', 'init', '-q', git_dir], check=True, env=env)
+        for name in ('hooks', 'info'):
+            require(os.path.isdir(os.path.join(git_dir, '.git', name)), mode + ' git init omitted ' + name)
     require(stat.S_IMODE(os.stat('/usr').st_mode) == 0o755, 'synthetic /usr is not mode 0755')
     print('PASS: sandbox negative controls, writable fixtures and absent paths', flush=True)
     raise SystemExit(0)

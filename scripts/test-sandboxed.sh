@@ -129,7 +129,8 @@ args=(--unshare-user --unshare-pid --unshare-net --unshare-ipc --unshare-uts --u
       --symlink usr/bin /bin --symlink usr/lib /lib --symlink usr/lib64 /lib64
       --ro-bind "$toolchain" /toolchain --ro-bind "$registry" /cargo/registry
       --bind "$scratch/source" /source --bind "$target" /target --bind "$recovery" /recovery
-      --chmod 0755 /usr --tmpfs /etc --dir /var --tmpfs /var/tmp --dir /usr/local --dir /sandbox-bin --symlink "$cc" /sandbox-bin/cc
+      --chmod 0755 /usr --dir /usr/share --dir /usr/share/git-core --symlink /tmp/git-template /usr/share/git-core/templates
+      --tmpfs /etc --dir /var --tmpfs /var/tmp --dir /usr/local --dir /sandbox-bin --symlink "$cc" /sandbox-bin/cc
       --tmpfs /home --dir /home/sandbox --tmpfs /tmp --dir /tmp/git-template --dir /tmp/git-template/hooks --dir /tmp/git-template/info --tmpfs /run --dir /run/user
       --proc /proc --dev /dev
       --setenv HOME /home/sandbox --setenv XDG_RUNTIME_DIR /run/user
