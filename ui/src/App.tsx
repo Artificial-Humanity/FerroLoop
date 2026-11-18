@@ -1854,7 +1854,7 @@ export const App: React.FC<AppProps> = ({
     }
   }, [apiClient]);
 
-  const loadAllInitialState = useCallback(async () => {
+  const loadAllInitialState = useCallback(async (passive = false) => {
     const initialOwner = { ...ownerRef.current };
     if (loggedOutRef.current || !mountedRef.current) return;
     setLoading(true);
@@ -1967,7 +1967,7 @@ export const App: React.FC<AppProps> = ({
         void scanBackgroundTranscripts(sessionsRes?.sessions ?? []);
         const target = concrete ?? initialOwner.agentKey;
         if (target && !tornDownTargetsRef.current.has(target.toLowerCase())) {
-          await readSelectedTranscript(target, true);
+          await readSelectedTranscript(target, passive);
         }
       }
     } finally {
@@ -2055,7 +2055,7 @@ export const App: React.FC<AppProps> = ({
       }
 
       if (acceptsBootstrap()) {
-        await loadAllInitialState();
+        await loadAllInitialState(true);
       }
     };
 
@@ -2695,7 +2695,7 @@ export const App: React.FC<AppProps> = ({
     wsClient.setToken(apiClient.getToken());
     wsClient.connect();
     setPairingOpen(false);
-    await loadAllInitialState();
+    await loadAllInitialState(true);
   };
 
   const handlePairWithToken = async (token: string) => {
@@ -2711,7 +2711,7 @@ export const App: React.FC<AppProps> = ({
     wsClient.setToken(apiClient.getToken());
     wsClient.connect();
     setPairingOpen(false);
-    await loadAllInitialState();
+    await loadAllInitialState(true);
   };
 
   const handleLogout = async () => {
@@ -4057,7 +4057,7 @@ export const App: React.FC<AppProps> = ({
           wsClient.setToken(apiClient.getToken());
           wsClient.connect();
           setPairingOpen(false);
-          void loadAllInitialState();
+          void loadAllInitialState(true);
         }}
         apiClient={apiClient}
         error={pairingError}

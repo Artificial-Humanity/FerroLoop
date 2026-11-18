@@ -2054,6 +2054,36 @@ describe("App transcript observation ownership", () => {
     h.unmount();
   });
 
+  it("keeps an explicit Git refresh fresh while a selection read is pending", async () => {
+    const h = harness();
+    await screen.findByText("Last good history");
+    fireEvent.click(screen.getByTestId("split-view-toggle"));
+    fireEvent.click(screen.getByTestId("right-panel-tab-git"));
+    const refreshButton = await screen.findByTestId("git-refresh-btn");
+    let release!: (result: Response) => void;
+    const pending = new Promise<Response>((resolve) => { release = resolve; });
+    let concreteReads = 0;
+    let refreshing = false;
+    h.setRead(async (target) => {
+      if (!target.endsWith("/sessions/session-a/transcript")) return observed("Other history");
+      concreteReads++;
+      return refreshing ? response({ error: "Denied" }, 403) : pending;
+    });
+    fireEvent.click(screen.getByTestId("agent-row-jarvis"));
+    fireEvent.click(screen.getByTestId("agent-row-ferris"));
+    await waitFor(() => expect(concreteReads).toBeGreaterThan(0));
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 50)); });
+    const previousReads = concreteReads;
+    refreshing = true;
+    fireEvent.click(refreshButton);
+    await waitFor(() => expect(concreteReads).toBe(previousReads + 1));
+    await screen.findByText("History access denied");
+    await act(async () => { release(observed("Old selection history")); await pending; });
+    expect(screen.queryByText("Old selection history")).toBeNull();
+    expect(screen.getByText("History access denied")).toBeInTheDocument();
+    h.unmount();
+  });
+
   it.each(["503", "network", "malformed"])("keeps same-session history and metadata on %s then accepts recovery and observed empty", async (failure) => {
     const h = harness();
     await screen.findByText("Last good history");
