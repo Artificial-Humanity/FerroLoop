@@ -1458,7 +1458,8 @@ impl HubState {
         Err(last_err.expect("at least one attempt ran"))
     }
 
-    /// Lifecycle selection must not queue behind a store guard held by another operation.
+    /// Pre-fence candidate selection may refuse a busy local guard. Owned operations use
+    /// `open_store` so polling and post-watch reopen contention wait in rank order.
     pub(crate) fn try_open_lifecycle_store(
         &self,
     ) -> Result<HubStoreGuard<'_>, lifecycle::LifecycleError> {
@@ -1476,18 +1477,32 @@ impl HubState {
         {
             let _ = fl_store::private::create_private_dir_all(parent);
         }
-        let store = fl_store::open_store_with(
-            &self.config.store_path,
-            &fl_store::StoreOptions {
-                backend: self.store_backend,
-                ..fl_store::StoreOptions::default()
-            },
-        )
-        .map_err(lifecycle::LifecycleError::from)?;
-        Ok(HubStoreGuard {
-            store: Some(store),
-            _guard: Some(guard),
-        })
+        let mut last_err = None;
+        for attempt in 0..200 {
+            match fl_store::open_store_with(
+                &self.config.store_path,
+                &fl_store::StoreOptions {
+                    backend: self.store_backend,
+                    ..fl_store::StoreOptions::default()
+                },
+            ) {
+                Ok(store) => {
+                    return Ok(HubStoreGuard {
+                        store: Some(store),
+                        _guard: Some(guard),
+                    });
+                }
+                Err(e) => {
+                    last_err = Some(e);
+                    if attempt < 199 {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                }
+            }
+        }
+        Err(lifecycle::LifecycleError::from(
+            last_err.expect("at least one attempt ran"),
+        ))
     }
 
     /// Open a per-project store (`<slug>.redb`) for one operation, waiting at most

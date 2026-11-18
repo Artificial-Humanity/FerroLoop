@@ -682,7 +682,7 @@ pub(crate) fn delete_project_in<W>(
 where
     W: Deref<Target = AnyStore>,
 {
-    if !req.decommission_agents {
+    if !req.decommission_agents && req.reassign_to.is_none() {
         let _one_at_a_time = CONFIG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         return delete_project_fenced(slug, req, by, ctx, env_home, open_workspace, clear_queue);
     }
@@ -785,7 +785,7 @@ where
         .collect();
     // The candidate set is not authority: after all fences, repeat every original validation
     // and refuse a newly assigned persona before any decommission or unregister effect.
-    if req.decommission_agents
+    if (req.decommission_agents || req.reassign_to.is_some())
         && agents.iter().any(|a| {
             !ctx.lifecycle
                 .lifecycle_fence

@@ -551,7 +551,7 @@ fn handle_apply(state: &HubState, authority: &HubAuthority, req: &HttpRequest) -
         Err(resp) => return resp,
     };
     let now_ms = stamp::now().unix_millis();
-    let (plan, mut targets) = match checked_plan(
+    let (plan, _) = match checked_plan(
         &store,
         &env,
         &sessions,
@@ -587,15 +587,23 @@ fn handle_apply(state: &HubState, authority: &HubAuthority, req: &HttpRequest) -
     let personas: Vec<String> = plan.switches.iter().map(|sw| sw.persona.clone()).collect();
     let run = lifecycle::with_lifecycle_fences(&env, &personas, "balance-apply", |env| {
         Ok((|| -> HttpResponse {
-            let store = match state.try_open_lifecycle_store() {
+            let snap = {
+                let store = match state.open_store() {
+                    Ok(store) => store,
+                    Err(e) => return store_error(e),
+                };
+                crate::discovery::snapshot_discovery_store(&store)
+            };
+            let sessions = discover_route_sessions_without_model_info(&snap, home);
+            let store = match state.open_store() {
                 Ok(store) => store,
-                Err(e) => return error(e.status(), e.to_string()),
+                Err(e) => return store_error(e),
             };
             let current = match read_store_inputs(&store) {
                 Ok(v) => v,
                 Err(e) => return e,
             };
-            let (fresh_plan, _) = match checked_plan(
+            let (fresh_plan, mut targets) = match checked_plan(
                 &store,
                 env,
                 &sessions,
@@ -656,9 +664,11 @@ fn handle_apply(state: &HubState, authority: &HubAuthority, req: &HttpRequest) -
                     &target.persona,
                     "balance-remodel",
                     |env| {
-                        let store = state
-                            .open_store()
-                            .map_err(crate::lifecycle::LifecycleError::from)?;
+                        let (store, target) = crate::api::owned_lifecycle_target(
+                            state,
+                            &target.raw_id,
+                            &target.persona,
+                        )?;
                         // Policy and cooldown may have changed while file ownership was acquired.
                         let current = read_store_inputs(&store).map_err(|response| {
                             crate::lifecycle::LifecycleError::Store(

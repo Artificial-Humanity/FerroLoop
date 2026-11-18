@@ -8443,7 +8443,7 @@ fn handle_post_session_spin_up(
     let env = lifecycle_env(state);
     let persona = payload.persona.clone();
     match lifecycle::with_lifecycle_fence(&env, &persona, "spin-up", |env| {
-        let store = state.try_open_lifecycle_store()?;
+        let store = state.open_store().map_err(LifecycleError::from)?;
         // Resolve bindings only after ownership, and repeat lifecycle validation under it.
         let mut payload = payload.with_default_cwd_for_home(
             &*store,
@@ -8455,7 +8455,7 @@ fn handle_post_session_spin_up(
         }
         lifecycle::spin_up_with_store(
             store,
-            || state.try_open_lifecycle_store(),
+            || state.open_store().map_err(LifecycleError::from),
             env,
             &payload,
             authority.actor_name(),
@@ -8542,6 +8542,40 @@ fn lifecycle_candidate(
     SessionTarget::resolve(&*store, session_id, Some(discovered))
 }
 
+pub(crate) fn owned_lifecycle_target<'a>(
+    state: &'a HubState,
+    session_id: &str,
+    persona: &str,
+) -> Result<(crate::HubStoreGuard<'a>, SessionTarget), LifecycleError> {
+    let store = state.open_store().map_err(LifecycleError::from)?;
+    let saved = lifecycle::find_hosted_session(&*store, &[session_id])?;
+    let discovered = if let Some(record) = saved {
+        (record.session_id, Some(record.persona))
+    } else {
+        let snap = snapshot_discovery_store(&store);
+        drop(store);
+        let discovered = resolve_session_target_from_snapshot(state, &snap, session_id);
+        let store = state.open_store().map_err(LifecycleError::from)?;
+        return checked_owned_target(store, session_id, persona, discovered);
+    };
+    checked_owned_target(store, session_id, persona, discovered)
+}
+
+fn checked_owned_target<'a>(
+    store: crate::HubStoreGuard<'a>,
+    session_id: &str,
+    persona: &str,
+    discovered: (String, Option<String>),
+) -> Result<(crate::HubStoreGuard<'a>, SessionTarget), LifecycleError> {
+    let target = SessionTarget::resolve(&*store, session_id, Some(discovered))?;
+    if !target.persona.eq_ignore_ascii_case(persona) {
+        return Err(LifecycleError::Conflict(
+            "lifecycle target changed during selection".into(),
+        ));
+    }
+    Ok((store, target))
+}
+
 /// `POST /api/v1/sessions/:id/decommission` (`prepare` or `teardown`, see
 /// [`lifecycle::prepare_decommission`] and [`lifecycle::teardown_session`]). Owner only: 403 for
 /// a Peer, checked before the body is read and before any discovery, store access or side effect.
@@ -8576,7 +8610,6 @@ fn handle_post_session_decommission(
         Ok(target) => target,
         Err(e) => return lifecycle_error_response(&e),
     };
-    let discovered_id = target.discovered_id.clone();
     let persona = target.persona.clone();
     let by = authority.actor_name();
     let env = lifecycle_env(state);
@@ -8587,34 +8620,32 @@ fn handle_post_session_decommission(
                 f();
             }
         });
-        // Capture discovery rows without waiting, then release the guard across filesystem
-        // discovery. Reopen without waiting below to revalidate before any teardown effects.
-        let artifact_candidates = if mode == DecommissionMode::Teardown {
-            let snap = {
-                let store = state.try_open_lifecycle_store()?;
-                snapshot_discovery_store(&store)
-            };
-            discover_session_artifact_candidates_from_snapshot(
+        let (store, target) = owned_lifecycle_target(state, session_id, &persona)?;
+        let discovered_id = target.discovered_id.clone();
+        let (store, target, artifact_candidates) = if mode == DecommissionMode::Teardown {
+            let snap = snapshot_discovery_store(&store);
+            drop(store);
+            let artifacts = discover_session_artifact_candidates_from_snapshot(
                 state,
                 &snap,
                 session_id,
                 &discovered_id,
-            )
+            );
+            let (store, target) = owned_lifecycle_target(state, session_id, &persona)?;
+            if target.discovered_id != discovered_id {
+                return Err(LifecycleError::Conflict(
+                    "lifecycle discovery changed during selection".into(),
+                ));
+            }
+            (store, target, artifacts)
         } else {
-            Vec::new()
+            (store, target, Vec::new())
         };
-        let store = state.try_open_lifecycle_store()?;
-        let target = SessionTarget::resolve(
+        let target = lifecycle::reload_lifecycle_target_policy(
             &*store,
-            session_id,
-            Some((discovered_id.clone(), Some(persona.clone()))),
+            &target,
+            mode == DecommissionMode::Teardown,
         )?;
-        if !target.persona.eq_ignore_ascii_case(&persona) {
-            return Err(LifecycleError::Conflict(
-                "lifecycle target changed during selection".into(),
-            ));
-        }
-        let target = lifecycle::reload_lifecycle_target(&*store, &target)?;
         Ok((|| {
             let caller = caller_of(authority);
             let result = match mode {
@@ -8712,7 +8743,6 @@ fn handle_post_session_remodel(
     };
     let by = authority.actor_name();
     let persona = target.persona.clone();
-    let discovered_id = target.discovered_id.clone();
     let env = lifecycle_env(state);
     match lifecycle::with_lifecycle_fence(&env, &persona, "remodel", |env| {
         #[cfg(test)]
@@ -8721,17 +8751,7 @@ fn handle_post_session_remodel(
                 f();
             }
         });
-        let store = state.try_open_lifecycle_store()?;
-        let target = SessionTarget::resolve(
-            &*store,
-            session_id,
-            Some((discovered_id, Some(persona.clone()))),
-        )?;
-        if !target.persona.eq_ignore_ascii_case(&persona) {
-            return Err(LifecycleError::Conflict(
-                "lifecycle target changed during selection".into(),
-            ));
-        }
+        let (store, target) = owned_lifecycle_target(state, session_id, &persona)?;
         Ok(
             match run_remodel(
                 state,
@@ -8902,23 +8922,35 @@ fn handle_post_hosted_session_restart(
             json!({ "error": "only Owner authority may restart a hosted session" }),
         );
     }
-    let restart = |env: &LifecycleEnv<'_>| {
+    let selected = (|| {
         let store = state.try_open_lifecycle_store()?;
-        lifecycle::restart_hosted_session_with_store(
-            store,
-            || state.try_open_lifecycle_store(),
-            env,
-            id,
-            authority.actor_name(),
-        )
+        lifecycle::find_hosted_session(&*store, &[id])?
+            .ok_or_else(|| LifecycleError::NotFound(format!("no hosted session `{id}`")))
+    })();
+    let selected = match selected {
+        Ok(record) => record,
+        Err(e) => return lifecycle_error_response(&e),
     };
     let env = lifecycle_env(state);
-    // Hosted ids carry their persona. Opaque legacy ids use a nonblocking candidate read.
-    let result = if let Some((_, persona)) = id.split_once(':') {
-        lifecycle::with_lifecycle_fence(&env, persona, "restart", restart)
-    } else {
-        restart(&env)
-    };
+    let result = lifecycle::with_lifecycle_fence(&env, &selected.persona, "restart", |env| {
+        let store = state.open_store().map_err(LifecycleError::from)?;
+        let current = lifecycle::find_hosted_session(&*store, &[id])?
+            .ok_or_else(|| LifecycleError::NotFound(format!("no hosted session `{id}`")))?;
+        if current.session_id != selected.session_id
+            || !current.persona.eq_ignore_ascii_case(&selected.persona)
+        {
+            return Err(LifecycleError::Conflict(
+                "restart target changed during selection".into(),
+            ));
+        }
+        lifecycle::restart_hosted_session_with_store(
+            store,
+            || state.open_store().map_err(LifecycleError::from),
+            env,
+            &current.session_id,
+            authority.actor_name(),
+        )
+    });
     match result {
         Ok(out) => {
             let data = serde_json::to_value(&out).unwrap_or_default();
@@ -13993,9 +14025,16 @@ mod lifecycle_discovery_contention_tests {
                 .recv_timeout(std::time::Duration::from_secs(3))
                 .is_ok()
         });
+        let release_owned = release.clone();
         let hook: Box<dyn FnOnce()> = Box::new(move || {
             start.send(()).unwrap();
             acquired.recv().unwrap();
+            if artifacts {
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    release_owned.send(()).unwrap();
+                });
+            }
         });
         if artifacts {
             BEFORE_LIFECYCLE_ARTIFACT_READ.with_borrow_mut(|slot| *slot = Some(hook));
@@ -14011,7 +14050,7 @@ mod lifecycle_discovery_contention_tests {
     }
 
     #[test]
-    fn lifecycle_discovery_refuses_contention_after_teardown_fence() {
+    fn lifecycle_discovery_waits_for_contention_after_teardown_fence() {
         assert_discovery_contention(true);
     }
 
@@ -14036,19 +14075,34 @@ mod lifecycle_discovery_contention_tests {
             holder.join().unwrap(),
             "lifecycle discovery waited for the competing store holder"
         );
-        assert_eq!(response.status, 409);
-        assert!(
-            response.json_value().unwrap()["error"]
-                .as_str()
-                .unwrap()
-                .contains("store is busy")
-        );
+        if artifacts {
+            assert_eq!(
+                response.status,
+                200,
+                "{}",
+                String::from_utf8_lossy(&response.body)
+            );
+            assert_eq!(
+                lifecycle::list_hosted_sessions(&*state.open_store().unwrap())
+                    .unwrap()
+                    .len(),
+                1
+            );
+        } else {
+            assert_eq!(response.status, 409);
+            assert!(
+                response.json_value().unwrap()["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("store is busy")
+            );
+            assert!(
+                lifecycle::list_hosted_sessions(&*state.open_store().unwrap())
+                    .unwrap()
+                    .is_empty()
+            );
+        }
         assert!(state.session_queue("ada").is_empty());
-        assert!(
-            lifecycle::list_hosted_sessions(&*state.open_store().unwrap())
-                .unwrap()
-                .is_empty()
-        );
         assert!(!root.path().join("artifacts").exists());
     }
 }

@@ -402,18 +402,9 @@ pub(crate) fn handle_delete_project(
         &ctx,
         home.clone(),
         || {
-            if body.decommission_agents {
-                state.try_open_lifecycle_store().map_err(|e| match e {
-                    crate::lifecycle::LifecycleError::Conflict(detail) => {
-                        InitError::Conflict(detail)
-                    }
-                    other => InitError::Failed(other.to_string()),
-                })
-            } else {
-                state
-                    .open_store()
-                    .map_err(|e| InitError::Failed(format!("workspace store: {e}")))
-            }
+            state
+                .open_store()
+                .map_err(|e| InitError::Failed(format!("workspace store: {e}")))
         },
         |key| {
             state.clear_session_prompt_queue(key);

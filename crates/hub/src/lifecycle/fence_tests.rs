@@ -209,6 +209,10 @@ fn lifecycle_fence_descriptor_is_not_inherited_by_children() {
     let root = TempDir::new().unwrap();
     let held =
         lock::LifecycleFence::acquire_endpoint(endpoint(&root), None, "fiona", "parent").unwrap();
+    assert!(
+        held.descriptors_are_cloexec(),
+        "every fence FD must be close-on-exec"
+    );
     let mut child = Command::new("/bin/sleep").arg("10").spawn().unwrap();
     #[cfg(target_os = "linux")]
     let inherited = std::fs::read_dir(format!("/proc/{}/fd", child.id()))
@@ -417,7 +421,7 @@ fn lifecycle_dispatch_pin_survives_endpoint_alias_retarget() {
 }
 
 #[test]
-fn explicit_http_does_not_wait_for_same_hub_store_guard() {
+fn lead_review_owned_http_waits_for_poll_store_then_succeeds() {
     let root = TempDir::new().unwrap();
     let state = crate::HubState::new(crate::HubServerConfig {
         store_path: root.path().join("fixture.fls"),
@@ -426,39 +430,72 @@ fn explicit_http_does_not_wait_for_same_hub_store_guard() {
         owner_token: Some("fixture-owner".into()),
         ..Default::default()
     });
+    let mut events = state.subscribe();
     let guard = state.open_store().unwrap();
-    for (path, body) in [
-        (
-            "/api/v1/sessions/spin-up",
-            serde_json::json!({"persona":"ada","project":"ferroloop","role":"assistant","vendor":"claude"}),
-        ),
-        (
-            "/api/v1/hosted-sessions/claude:ada/restart",
-            serde_json::json!({}),
-        ),
-        (
-            "/api/v1/sessions/claude:ada/remodel",
-            serde_json::json!({"vendor":"claude"}),
-        ),
-        (
-            "/api/v1/sessions/claude:ada/decommission",
-            serde_json::json!({"mode":"teardown"}),
-        ),
-    ] {
-        let request = crate::HttpRequest::new("POST", path)
-            .with_header("authorization", "Bearer fixture-owner")
-            .with_json_body(&body);
-        assert_eq!(
-            crate::handle_http_request(&state, &request).status,
-            409,
-            "{path}"
+    std::thread::scope(|scope| {
+        let (started, start) = std::sync::mpsc::channel();
+        let (done, result) = std::sync::mpsc::channel();
+        let state = &state;
+        scope.spawn(move || {
+            started.send(()).unwrap();
+            let request = crate::HttpRequest::new("POST", "/api/v1/sessions/spin-up")
+                .with_header("authorization", "Bearer fixture-owner")
+                .with_json_body(&serde_json::json!({"persona":"ada","project":"ferroloop","role":"assistant","vendor":"claude"}));
+            done.send(crate::handle_http_request(state, &request)).unwrap();
+        });
+        start.recv().unwrap();
+        assert!(
+            result.recv_timeout(Duration::from_millis(100)).is_err(),
+            "owned POST must wait for poll store"
         );
-    }
-    let deletion = crate::HttpRequest::new("DELETE", "/api/v1/projects/ferroloop")
-        .with_header("authorization", "Bearer fixture-owner")
-        .with_json_body(&serde_json::json!({"decommission_agents":true}));
-    assert_eq!(crate::handle_http_request(&state, &deletion).status, 409);
-    assert!(list_hosted_sessions(&*guard).unwrap().is_empty());
+        drop(guard);
+        let response = result.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(
+            response.status,
+            200,
+            "{}",
+            String::from_utf8_lossy(&response.body)
+        );
+    });
+    assert_eq!(events.try_recv().unwrap().event, "session.spun_up");
+    assert_eq!(
+        list_hosted_sessions(&*state.open_store().unwrap())
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn lead_review_missing_endpoint_parent_has_no_effects() {
+    let root = TempDir::new().unwrap();
+    let missing = root.path().join("absent");
+    let ep = HostEndpoint::unix(missing.join("host.sock")).unwrap();
+    assert!(lock::LifecycleFence::acquire_endpoint(ep, None, "ada", "restart").is_err());
+    assert!(!missing.exists());
+}
+
+#[test]
+fn lead_review_group_conflict_names_only_busy_persona_and_safe_metadata() {
+    let root = TempDir::new().unwrap();
+    let held =
+        lock::LifecycleFence::acquire(&LifecycleEnv::new(Some(root.path())), "zelda", "restart")
+            .unwrap();
+    std::fs::write(&held.paths()[0], r#"{"pid":42,"operation":"private/path\nsecret","started_at_ms":123,"secret":"do not disclose"}"#).unwrap();
+    let error = lock::LifecycleFence::acquire_many(
+        &LifecycleEnv::new(Some(root.path())),
+        &["ada".into(), "zelda".into()],
+        "group",
+    )
+    .unwrap_err();
+    let message = error.to_string();
+    assert!(message.contains("`zelda`"), "{message}");
+    assert!(
+        !message.contains("ada, ")
+            && !message.contains("secret")
+            && !message.contains(root.path().to_str().unwrap()),
+        "{message}"
+    );
 }
 
 #[test]
@@ -478,4 +515,27 @@ fn lifecycle_native_only_pin_refuses_unfenced_tmux_preflight() {
     let _pin = held.pin();
     assert!(tmux_stdout_of(&binary, &["list-panes"]).is_none());
     assert!(!marker.exists(), "unfenced tmux preflight ran");
+}
+
+#[test]
+fn lead_review_unknown_restart_does_not_acquire_guessed_persona_fence() {
+    let root = TempDir::new().unwrap();
+    let state = crate::HubState::new(crate::HubServerConfig {
+        store_path: root.path().join("fixture.fls"),
+        repo_root: root.path().into(),
+        home_override: Some(root.path().into()),
+        owner_token: Some("fixture-owner".into()),
+        ..Default::default()
+    });
+    drop(state.open_store().unwrap());
+    let env = crate::api::lifecycle_env(&state);
+    let _held = lock::LifecycleFence::acquire(&env, "ada", "other-operation").unwrap();
+    let request = crate::HttpRequest::new("POST", "/api/v1/hosted-sessions/claude:ada/restart")
+        .with_header("authorization", "Bearer fixture-owner");
+    assert_eq!(crate::handle_http_request(&state, &request).status, 404);
+    assert!(
+        list_hosted_sessions(&*state.open_store().unwrap())
+            .unwrap()
+            .is_empty()
+    );
 }

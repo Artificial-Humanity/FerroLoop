@@ -122,27 +122,18 @@ impl LifecycleFence {
             }
         }
         let mut files = Vec::with_capacity(paths.len());
-        for path in &paths {
+        for (index, path) in paths.iter().enumerate() {
             let mut file = safe_open(path)?;
             match file.try_lock() {
                 Ok(()) => {}
                 Err(std::fs::TryLockError::WouldBlock) => {
                     let mut detail = String::new();
                     let _ = (&mut file).take(512).read_to_string(&mut detail);
-                    let detail: String = detail
-                        .chars()
-                        .filter(|c| !c.is_control())
-                        .take(256)
-                        .collect();
+                    let detail = holder_diagnostic(&detail);
                     return Err(LifecycleError::Conflict(format!(
-                        "lifecycle operation for `{}` is in progress; holder {} ({})",
-                        personas.join(", "),
-                        if detail.is_empty() {
-                            "metadata unavailable"
-                        } else {
-                            &detail
-                        },
-                        path.display()
+                        "lifecycle operation for `{}` is in progress; holder {}",
+                        personas[index % personas.len()],
+                        detail
                     )));
                 }
                 Err(std::fs::TryLockError::Error(e)) => return Err(failure("lock", e)),
@@ -153,12 +144,11 @@ impl LifecycleFence {
                 "operation": operation.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '-').take(48).collect::<String>(),
                 "started_at_ms": super::now_ms(),
             });
-            file.set_len(0)
-                .map_err(|e| failure("metadata truncate", e))?;
-            file.seek(SeekFrom::Start(0))
-                .map_err(|e| failure("metadata seek", e))?;
-            file.write_all(metadata.to_string().as_bytes())
-                .map_err(|e| failure("metadata write", e))?;
+            // Diagnostics cannot turn acquired ownership into a refusal.
+            let _ = file
+                .set_len(0)
+                .and_then(|()| file.seek(SeekFrom::Start(0)))
+                .and_then(|_| file.write_all(metadata.to_string().as_bytes()));
             files.push(file);
         }
         Ok(Self {
@@ -182,6 +172,15 @@ impl LifecycleFence {
             fl_wire::runtime_context::pin(self.runtime.endpoint.clone(), self.runtime.tmux.clone()),
         )
     }
+    #[cfg(all(test, unix))]
+    pub(super) fn descriptors_are_cloexec(&self) -> bool {
+        use std::os::fd::AsRawFd;
+        self.files.iter().all(|file| {
+            // SAFETY: this fence owns the descriptor throughout the call.
+            let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFD) };
+            flags >= 0 && flags & libc::FD_CLOEXEC != 0
+        })
+    }
     #[cfg(test)]
     pub(super) fn paths(&self) -> &[PathBuf] {
         &self.paths
@@ -193,6 +192,31 @@ impl Drop for LifecycleFence {
         for file in self.files.iter().rev() {
             let _ = file.unlock();
         }
+    }
+}
+
+// Only bounded, typed diagnostic fields may enter a response. Never expose raw file text.
+fn holder_diagnostic(raw: &str) -> String {
+    #[derive(serde::Deserialize)]
+    struct Holder {
+        pid: u32,
+        operation: String,
+        started_at_ms: u64,
+    }
+    match serde_json::from_str::<Holder>(raw) {
+        Ok(holder)
+            if holder.operation.len() <= 48
+                && holder
+                    .operation
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-') =>
+        {
+            format!(
+                "pid {}, operation {}, started_at_ms {}",
+                holder.pid, holder.operation, holder.started_at_ms
+            )
+        }
+        _ => "metadata unavailable".into(),
     }
 }
 
@@ -230,15 +254,6 @@ fn canonical_socket(path: &Path) -> Result<PathBuf, LifecycleError> {
     let name = path
         .file_name()
         .ok_or_else(|| failure("endpoint", "missing socket name"))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::DirBuilderExt;
-        std::fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(parent)
-            .map_err(|e| failure("endpoint parent", e))?;
-    }
     let parent = parent
         .canonicalize()
         .map_err(|e| failure("endpoint parent", e))?;

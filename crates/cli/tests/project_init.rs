@@ -41,6 +41,11 @@ impl Env {
         let mut c = Command::cargo_bin("fl").unwrap();
         c.env("HOME", self.home.path())
             .env("XDG_RUNTIME_DIR", self.home.path())
+            .env("FL_HOST_SOCK", self.home.path().join("host.sock"))
+            .env(
+                "TMUX",
+                format!("{},1,0", self.home.path().join("tmux.sock").display()),
+            )
             .env("XDG_CONFIG_HOME", self.home.path().join("config"))
             .env("XDG_DATA_HOME", self.home.path().join("data"))
             .env("FL_WIRE_DISABLE_HOST_DISCOVERY", "1")

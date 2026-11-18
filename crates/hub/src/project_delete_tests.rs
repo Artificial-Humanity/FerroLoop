@@ -1686,3 +1686,60 @@ fn decommission_delete_conflicts_before_effects_and_refuses_new_unfenced_persona
         );
     }
 }
+
+#[test]
+fn lead_review_reassign_delete_fences_source_and_refuses_new_persona() {
+    let fx = Fx::new();
+    fx.project("alpha");
+    fx.project("beta");
+    fx.agent("Ada", "alpha", AgentRole::Assistant, &[]);
+    let before = fx.snapshot(&[]);
+    let env = LifecycleEnv::new(Some(&fx.home));
+    let request = DeleteRequest {
+        reassign_to: Some("beta".into()),
+        ..Default::default()
+    };
+    lifecycle::with_lifecycle_fence(&env, "ada", "cli-restart", |_| {
+        assert!(matches!(
+            fx.call("alpha", &request),
+            Err(DeleteError::Init(InitError::Conflict(_)))
+        ));
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(fx.snapshot(&[]), before);
+    let ctx = DeleteContext {
+        paths: &fx.paths,
+        stores: &[],
+        home: Some(&fx.home),
+        workspace_roots: std::slice::from_ref(&fx.ws_root),
+        lifecycle: &env,
+    };
+    let mut opens = 0;
+    let result = delete_project_in(
+        "alpha",
+        &request,
+        "tester",
+        &ctx,
+        Some(fx.home.clone()),
+        || {
+            opens += 1;
+            if opens == 2 {
+                fx.agent("Bo", "alpha", AgentRole::Assistant, &[]);
+            }
+            fx.open_ws()
+        },
+        |_| panic!("refusal cleared queue"),
+    );
+    assert!(matches!(
+        result,
+        Err(DeleteError::Init(InitError::Conflict(_)))
+    ));
+    for name in ["ada", "bo"] {
+        assert_eq!(
+            fx.ws().agent_by_name(name).unwrap().unwrap().project,
+            "alpha"
+        );
+    }
+    assert!(fx.slugs().contains(&"alpha".to_string()));
+}
