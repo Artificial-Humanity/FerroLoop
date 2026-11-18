@@ -32,16 +32,19 @@ def terminate_group(proc):
     try: os.killpg(proc.pid, signal.SIGTERM)
     except ProcessLookupError: pass
     try: proc.wait(timeout=5)
-    except subprocess.TimeoutExpired:
-        try: os.killpg(proc.pid, signal.SIGKILL)
-        except ProcessLookupError: pass
-        proc.wait()
+    except subprocess.TimeoutExpired: pass
+    # The leader may exit before a SIGTERM-ignoring descendant does.  Always
+    # kill the group, even when wait() has already reaped the leader.
+    try: os.killpg(proc.pid, signal.SIGKILL)
+    except ProcessLookupError: pass
+    proc.wait()
 
 
 def supervise(paths, reserve, command, measure=available, interval=1):
     # The first check runs before starting even the bubblewrap process.
     check_space(paths, reserve, measure)
     proc = subprocess.Popen(command, close_fds=True, start_new_session=True)
+    completed = False
     try:
         while True:
             check_space(paths, reserve, measure)
@@ -49,11 +52,12 @@ def supervise(paths, reserve, command, measure=available, interval=1):
             if status is not None:
                 # Sample again after exit, including for very short commands.
                 check_space(paths, reserve, measure)
+                completed = True
                 return status if status >= 0 else 128 - status
             time.sleep(interval)
     finally:
         # --die-with-parent ends the bwrap sandbox if the leader is terminated.
-        if proc.poll() is None:
+        if not completed:
             terminate_group(proc)
 
 
@@ -98,6 +102,18 @@ def self_test():
             if os.path.exists(child_stopped): break
             time.sleep(.01)
         assert os.path.exists(child_stopped), 'descendant did not receive termination'
+        stubborn_ready = os.path.join(root, 'stubborn-ready')
+        survived = os.path.join(root, 'stubborn-survived')
+        stubborn = ('import pathlib,signal,sys,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); '
+                    'pathlib.Path(sys.argv[1]).touch(); time.sleep(2); pathlib.Path(sys.argv[2]).touch()')
+        stubborn_cmd = [sys.executable, '-c', parent, stubborn, stubborn_ready, survived]
+        def stop_stubborn(_path):
+            return reserve - 1 if os.path.exists(stubborn_ready) else reserve + 1
+        try: supervise(('/', '/target'), reserve, stubborn_cmd, stop_stubborn, .01)
+        except RuntimeError: pass
+        else: raise AssertionError('stubborn descendant group was not stopped')
+        time.sleep(2.2)
+        assert not os.path.exists(survived), 'SIGTERM-ignoring descendant survived low-space abort'
         for bad_path in ('/', '/target'):
             def failing(path):
                 if path == bad_path: raise OSError('fixture measurement failure')
@@ -109,6 +125,39 @@ def self_test():
     print('PASS: test-owned free-space preflight and running-process fixtures')
 
 
+def bwrap_self_test():
+    # An owned delayed write proves whether the real bwrap sandbox survived.
+    # The unsupervised control must write it; on abort the same command must not.
+    with tempfile.TemporaryDirectory(prefix='sandbox-space-bwrap-fixture-') as root:
+        ready = os.path.join(root, 'ready')
+        survived = os.path.join(root, 'survived')
+        child = ('import pathlib,signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); '
+                 'pathlib.Path("/fixture/ready").touch(); time.sleep(2); '
+                 'pathlib.Path("/fixture/survived").touch()')
+        parent = ('import subprocess,sys; '
+                  'sys.exit(subprocess.Popen([sys.executable, "-c", sys.argv[1]]).wait())')
+        cmd = ['bwrap', '--unshare-user', '--unshare-pid', '--unshare-net',
+               '--die-with-parent', '--new-session',
+               '--ro-bind', '/usr/bin', '/usr/bin', '--ro-bind', '/usr/lib', '/usr/lib',
+               '--ro-bind', '/usr/lib64', '/usr/lib64', '--symlink', 'usr/lib', '/lib',
+               '--symlink', 'usr/lib64', '/lib64', '--proc', '/proc', '--dev', '/dev',
+               '--bind', root, '/fixture', '--', '/usr/bin/python3', '-c', parent, child]
+        subprocess.run(cmd, check=True, timeout=15, close_fds=True)
+        assert os.path.exists(ready) and os.path.exists(survived), 'owned bwrap control did not complete'
+        os.unlink(ready)
+        os.unlink(survived)
+        reserve = reserve_bytes('120')
+        def measured(_path):
+            return reserve - 1 if os.path.exists(ready) else reserve + 1
+        try: supervise(('/', '/target'), reserve, cmd, measured, .01)
+        except RuntimeError: pass
+        else: raise AssertionError('bwrap low-space abort did not happen')
+        assert os.path.exists(ready), 'bwrap fixture did not start'
+        time.sleep(2.2)
+        assert not os.path.exists(survived), 'bwrap child survived low-space abort'
+    print('PASS: owned bwrap low-space abort and positive control')
+
+
 def interrupted(signum, _frame):
     raise SystemExit(128 + signum)
 
@@ -116,6 +165,9 @@ def interrupted(signum, _frame):
 def main():
     if sys.argv[1:] == ['--self-test']:
         self_test()
+        return 0
+    if sys.argv[1:] == ['--bwrap-self-test']:
+        bwrap_self_test()
         return 0
     if len(sys.argv) == 5 and sys.argv[1] == '--check':
         check_space((sys.argv[2], sys.argv[3]), reserve_bytes(sys.argv[4]))
