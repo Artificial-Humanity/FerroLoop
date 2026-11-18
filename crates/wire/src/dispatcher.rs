@@ -3192,8 +3192,8 @@ fn match_delivery_prefix<'a>(
         // tail. Accept only when the tail is a suffix of the body of at least
         // MIN_SCROLLED_SUFFIX_COMPACT_CHARS compact chars and the elided count
         // does not exceed the non-tail body (+1: Muse may count a trailing
-        // newline). Any text after the tail leaves a non-empty rest elsewhere
-        // and never reaches this branch as a full match.
+        // newline). Text after the tail is folded into `tail` (the
+        // placeholder's rest), so `body.ends_with(tail)` fails.
         if let Some(CompactPlaceholderPrefix::Chars { len, rest: tail }) =
             strip_compact_placeholder_prefix(after_hdr)
             && let Some(body) = &d.compact_body
@@ -21227,6 +21227,71 @@ exit 1"#,
             composer_equals_single_target(&appended_screen, &d),
             (false, false)
         );
+    }
+
+    #[test]
+    fn muse_long_paste_placeholder_len_bound_plus_one_rejected_575() {
+        let rule = "─".repeat(40);
+        let body = "Long paste body line for elision testing. ".repeat(70);
+        let payload = format!(
+            "[fl-wire reply/normal] from ferris (id: urn:uuid:01a1ebc5-4e2b-7764-b6ff-6873d9c91948, thread: urn:uuid:01a1ebc5-4e2b-7764-b6ff-6873d9c91948): Re\n\n{body}"
+        );
+        let trimmed = payload.trim();
+        let d = UnconfirmedWireDelivery::from_payload(trimmed);
+        let tail = &body[body.len() - 200..];
+        let tail_compact_chars = tail.chars().filter(|c| !c.is_whitespace()).count();
+        assert!(tail_compact_chars >= MIN_SCROLLED_SUFFIX_COMPACT_CHARS);
+        assert!(d
+            .compact_body
+            .as_deref()
+            .expect("header body")
+            .ends_with(&tail.chars().filter(|c| !c.is_whitespace()).collect::<String>()));
+        let raw_body_chars = d.body_chars.expect("header body");
+        // Bound in `match_delivery_prefix` is raw body minus compact tail + 1.
+        let len = raw_body_chars - tail_compact_chars + 1 + 1;
+        let screen = format!(
+            "◆ Ready.\n\n{rule}\n❯ [fl-wire reply/normal] from ferris (id: urn:uuid:01a1ebc5-4e2b-7764-b6ff-6873d9c91948, thread: urn:uuid:01a1ebc5-4e2b-7764-b6ff-6873d9c91948): Re\n  [Pasted Content {len} chars]{tail}\n\n{rule}\n  muse-wonder-full-1.0"
+        );
+        assert_eq!(composer_equals_single_target(&screen, &d), (false, false));
+    }
+
+    #[test]
+    fn muse_long_paste_31_char_suffix_tail_rejected_575() {
+        let rule = "─".repeat(40);
+        let body = "Long paste body line for elision testing. ".repeat(70);
+        let payload = format!(
+            "[fl-wire reply/normal] from ferris (id: urn:uuid:01a1ebc5-4e2b-7764-b6ff-6873d9c91948, thread: urn:uuid:01a1ebc5-4e2b-7764-b6ff-6873d9c91948): Re\n\n{body}"
+        );
+        let trimmed = payload.trim();
+        let d = UnconfirmedWireDelivery::from_payload(trimmed);
+        let compact_body = d.compact_body.as_deref().expect("header body");
+        let tail = last_n_chars_slice(compact_body, 31).expect("31-char suffix");
+        assert_eq!(tail.chars().count(), 31);
+        assert!(compact_body.ends_with(tail));
+        let len = d.body_chars.expect("header body") - 31;
+        let screen = format!(
+            "◆ Ready.\n\n{rule}\n❯ [fl-wire reply/normal] from ferris (id: urn:uuid:01a1ebc5-4e2b-7764-b6ff-6873d9c91948, thread: urn:uuid:01a1ebc5-4e2b-7764-b6ff-6873d9c91948): Re\n  [Pasted Content {len} chars]{tail}\n\n{rule}\n  muse-wonder-full-1.0"
+        );
+        assert_eq!(composer_equals_single_target(&screen, &d), (false, false));
+    }
+
+    #[test]
+    fn muse_long_paste_non_suffix_tail_rejected_575() {
+        let rule = "─".repeat(40);
+        let body = "Long paste body line for elision testing. ".repeat(70);
+        let payload = format!(
+            "[fl-wire reply/normal] from ferris (id: urn:uuid:01a1ebc5-4e2b-7764-b6ff-6873d9c91948, thread: urn:uuid:01a1ebc5-4e2b-7764-b6ff-6873d9c91948): Re\n\n{body}"
+        );
+        let trimmed = payload.trim();
+        let d = UnconfirmedWireDelivery::from_payload(trimmed);
+        let tail = "q".repeat(40);
+        assert!(tail.chars().count() >= MIN_SCROLLED_SUFFIX_COMPACT_CHARS);
+        assert!(!d.compact_body.as_deref().expect("header body").ends_with(&tail));
+        let len = d.body_chars.expect("header body") - tail.chars().count();
+        let screen = format!(
+            "◆ Ready.\n\n{rule}\n❯ [fl-wire reply/normal] from ferris (id: urn:uuid:01a1ebc5-4e2b-7764-b6ff-6873d9c91948, thread: urn:uuid:01a1ebc5-4e2b-7764-b6ff-6873d9c91948): Re\n  [Pasted Content {len} chars]{tail}\n\n{rule}\n  muse-wonder-full-1.0"
+        );
+        assert_eq!(composer_equals_single_target(&screen, &d), (false, false));
     }
 
     #[test]
