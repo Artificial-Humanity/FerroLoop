@@ -7464,7 +7464,30 @@ fn take_session_clear_logs() -> Vec<String> {
     SESSION_CLEAR_LOGS.with(|logs| std::mem::take(&mut *logs.borrow_mut()))
 }
 
+fn sanitise_log_field(value: &str) -> String {
+    if value.is_empty() {
+        return "unknown".to_string();
+    }
+    let sanitised: String = value
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | ':' | '-') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if sanitised.is_empty() {
+        "unknown".to_string()
+    } else {
+        sanitised
+    }
+}
+
 /// One hub log line per session-clear request (#575). No composer or prompt content.
+/// Actor/persona (and the other fields) are sanitised so crafted ids containing
+/// whitespace or control characters cannot forge additional log lines.
 fn session_clear_log_line(
     actor: &str,
     persona: Option<&str>,
@@ -7473,8 +7496,14 @@ fn session_clear_log_line(
     outcome: &str,
 ) -> String {
     format!(
-        "hub: session clear actor={actor} persona={} vendor={vendor} mode={mode} outcome={outcome}",
-        persona.unwrap_or("-")
+        "hub: session clear actor={} persona={} vendor={} mode={} outcome={}",
+        sanitise_log_field(actor),
+        persona
+            .map(sanitise_log_field)
+            .unwrap_or_else(|| "-".to_string()),
+        sanitise_log_field(vendor),
+        sanitise_log_field(mode),
+        sanitise_log_field(outcome)
     )
 }
 
@@ -12360,6 +12389,42 @@ mod council_guidance_tests {
     }
 
     #[test]
+    fn session_clear_log_line_sanitises_crafted_actor_and_persona() {
+        for (actor, persona) in [
+            ("own\ner", Some("ada\n hub: session clear actor=forged")),
+            ("evil actor", Some("a b\tc\rd")),
+            ("a\u{1b}[31m", Some("x\u{0}y")),
+        ] {
+            let line = session_clear_log_line(actor, persona, "codex", "clear", "refused");
+            assert!(!line.contains('\n'), "{line:?}");
+            assert!(!line.contains('\r'), "{line:?}");
+            assert!(!line.contains('\t'), "{line:?}");
+            assert_eq!(line.lines().count(), 1, "{line:?}");
+            // Exactly the five labelled fields, no forged extra field from spaces.
+            assert_eq!(line.matches(" actor=").count(), 1, "{line:?}");
+            assert!(!line.contains(" actor=forged"), "{line:?}");
+            assert!(line.starts_with("hub: session clear actor="), "{line:?}");
+            assert!(
+                line.contains(" vendor=codex mode=clear outcome=refused"),
+                "{line:?}"
+            );
+        }
+        assert_eq!(
+            session_clear_log_line("own\ner", Some("ada lovelace"), "codex", "clear", "refused"),
+            "hub: session clear actor=own_er persona=ada_lovelace vendor=codex mode=clear outcome=refused"
+        );
+        assert_eq!(
+            session_clear_log_line("", Some(""), "codex", "clear", "refused"),
+            "hub: session clear actor=unknown persona=unknown vendor=codex mode=clear outcome=refused"
+        );
+        // Allowed punctuation is preserved.
+        assert_eq!(
+            session_clear_log_line("o.w-n:e_r", Some("a.b-c:d_e"), "codex", "clear", "refused"),
+            "hub: session clear actor=o.w-n:e_r persona=a.b-c:d_e vendor=codex mode=clear outcome=refused"
+        );
+    }
+
+    #[test]
     fn session_clear_logs_refused_and_dispatched_and_failed() {
         use fl_wire::identity::{RouteTable, VendorRoute};
         // Refused: single-session handler with an unsupported route.
@@ -12483,6 +12548,14 @@ mod council_guidance_tests {
                 },
                 stamp::now(),
             );
+            routes.upsert(
+                "bob",
+                VendorRoute::Codex {
+                    thread_id: "thread-fixture-bob".into(),
+                    cwd: None,
+                },
+                stamp::now(),
+            );
             routes
                 .save(Some(&tmp.path().join(".cache/agent-bus/routes.json")))
                 .unwrap();
@@ -12493,12 +12566,20 @@ mod council_guidance_tests {
                 &HttpRequest::new("POST", "/fixture").with_json_body(&json!({"action":"clear"})),
             );
             assert_eq!(bulk.status, 200);
+            // Exactly one log line per bulk target (two targets here).
             let logs = take_session_clear_logs();
-            assert!(
-                logs.iter()
-                    .any(|l| l.contains("vendor=codex") && l.contains("outcome=refused")),
-                "{logs:?}"
-            );
+            assert_eq!(logs.len(), 2, "{logs:?}");
+            for persona in ["ada", "bob"] {
+                let count = logs
+                    .iter()
+                    .filter(|l| {
+                        l.contains(&format!("persona={persona}"))
+                            && l.contains("vendor=codex")
+                            && l.contains("outcome=refused")
+                    })
+                    .count();
+                assert_eq!(count, 1, "persona={persona} logs={logs:?}");
+            }
         }
     }
 

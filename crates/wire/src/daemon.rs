@@ -2077,9 +2077,9 @@ where
         reprobes
             .entry(recipient.to_string())
             .and_modify(|entry| {
-                if recognised_payload.is_some() {
-                    entry.recognised_payload = recognised_payload;
-                }
+                // Every new hold overwrites the recognised payload: an
+                // unrecognised hold clears a stale "/clear" from an earlier hold.
+                entry.recognised_payload = recognised_payload;
                 // Never reset an exhausted entry here: this is also called by the hold a
                 // reprobe's own dispatch produces, so resetting would defeat the bound.
                 // Only a new message, read/ack (see `reset_composer_occupied_reprobe`), or
@@ -9391,6 +9391,39 @@ mod tests {
         inner.schedule_composer_occupied_reprobe("held", &At::from_unix_millis(600_000), None);
         let entry = lock(&inner.composer_occupied_reprobes)["held"].clone();
         assert_eq!(entry.probes_run, 3, "live entry must keep its probe count");
+    }
+
+    #[test]
+    fn composer_occupied_new_hold_overwrites_recognised_payload() {
+        let (_tmp, inner) = fault_rig();
+        let clear_err = "composer_occupied_by_non_wire_input: composer_occupied: composer holds \"/clear\"; repair: Backspace, then Ctrl-U; holding delivery without sending keys".to_string();
+        let _id = with_transport(Err(clear_err), || run_fault_job(&inner, "held"));
+        assert_eq!(
+            lock(&inner.composer_occupied_reprobes)["held"].recognised_payload,
+            Some("/clear")
+        );
+        // Unrecognised hold clears the stale "/clear".
+        inner.schedule_composer_occupied_reprobe("held", &At::from_unix_millis(500_000), None);
+        assert_eq!(
+            lock(&inner.composer_occupied_reprobes)["held"].recognised_payload,
+            None,
+            "unrecognised hold must clear stale recognised payload"
+        );
+        // Recognised hold overwrites with the new payload.
+        inner.schedule_composer_occupied_reprobe(
+            "held",
+            &At::from_unix_millis(600_000),
+            Some("/new"),
+        );
+        assert_eq!(
+            lock(&inner.composer_occupied_reprobes)["held"].recognised_payload,
+            Some("/new")
+        );
+        inner.schedule_composer_occupied_reprobe("held", &At::from_unix_millis(700_000), None);
+        assert_eq!(
+            lock(&inner.composer_occupied_reprobes)["held"].recognised_payload,
+            None
+        );
     }
 
     #[test]
