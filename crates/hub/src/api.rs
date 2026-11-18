@@ -8423,26 +8423,28 @@ fn handle_post_session_spin_up(
             json!({ "error": "only Owner authority may choose a session's context window" }),
         );
     }
-    let Ok(store) = open_store_response(state) else {
-        return store_open_failure();
-    };
-    // Resolve project bindings before falling back to the workspace for a virtual scope.
-    let mut payload = payload.with_default_cwd_for_home(
-        &*store,
-        &resolve_workspace_root(&state.config.repo_root),
-        state.config.home_override.as_deref(),
-    );
-    if payload.context_window.is_none() {
-        payload.context_window = default_context_window_for(state, &payload);
-    }
-    match lifecycle::spin_up_with_store(
-        store,
-        || state.open_store().map_err(LifecycleError::from),
-        &lifecycle_env(state),
-        &payload,
-        authority.actor_name(),
-        caller_of(authority),
-    ) {
+    let env = lifecycle_env(state);
+    let persona = payload.persona.clone();
+    match lifecycle::with_lifecycle_fence(&env, &persona, "spin-up", |env| {
+        let store = state.try_open_lifecycle_store()?;
+        // Resolve bindings only after ownership, and repeat lifecycle validation under it.
+        let mut payload = payload.with_default_cwd_for_home(
+            &*store,
+            &resolve_workspace_root(&state.config.repo_root),
+            state.config.home_override.as_deref(),
+        );
+        if payload.context_window.is_none() {
+            payload.context_window = default_context_window_for(state, &payload);
+        }
+        lifecycle::spin_up_with_store(
+            store,
+            || state.try_open_lifecycle_store(),
+            env,
+            &payload,
+            authority.actor_name(),
+            caller_of(authority),
+        )
+    }) {
         Ok(out) => {
             // A new run has its own model: drop what the operator chose for an earlier one.
             state.clear_session_model_override(&out.session_id);
@@ -8489,13 +8491,13 @@ fn lifecycle_candidate(
     session_id: &str,
 ) -> Result<SessionTarget, LifecycleError> {
     let saved = {
-        let store = state.open_store().map_err(LifecycleError::from)?;
+        let store = state.try_open_lifecycle_store()?;
         lifecycle::find_hosted_session(&*store, &[session_id])?
     };
     let discovered = saved
         .map(|record| (record.session_id, Some(record.persona)))
         .unwrap_or_else(|| resolve_session_target(state, session_id));
-    let store = state.open_store().map_err(LifecycleError::from)?;
+    let store = state.try_open_lifecycle_store()?;
     SessionTarget::resolve(&*store, session_id, Some(discovered))
 }
 
@@ -8544,7 +8546,7 @@ fn handle_post_session_decommission(
         } else {
             Vec::new()
         };
-        let store = state.open_store().map_err(LifecycleError::from)?;
+        let store = state.try_open_lifecycle_store()?;
         let target = SessionTarget::resolve(
             &*store,
             session_id,
@@ -8656,7 +8658,7 @@ fn handle_post_session_remodel(
     let discovered_id = target.discovered_id.clone();
     let env = lifecycle_env(state);
     match lifecycle::with_lifecycle_fence(&env, &persona, "remodel", |env| {
-        let store = state.open_store().map_err(LifecycleError::from)?;
+        let store = state.try_open_lifecycle_store()?;
         let target = SessionTarget::resolve(
             &*store,
             session_id,
@@ -8837,16 +8839,24 @@ fn handle_post_hosted_session_restart(
             json!({ "error": "only Owner authority may restart a hosted session" }),
         );
     }
-    let Ok(store) = open_store_response(state) else {
-        return store_open_failure();
+    let restart = |env: &LifecycleEnv<'_>| {
+        let store = state.try_open_lifecycle_store()?;
+        lifecycle::restart_hosted_session_with_store(
+            store,
+            || state.try_open_lifecycle_store(),
+            env,
+            id,
+            authority.actor_name(),
+        )
     };
-    match lifecycle::restart_hosted_session_with_store(
-        store,
-        || state.open_store().map_err(LifecycleError::from),
-        &lifecycle_env(state),
-        id,
-        authority.actor_name(),
-    ) {
+    let env = lifecycle_env(state);
+    // Hosted ids carry their persona. Opaque legacy ids use a nonblocking candidate read.
+    let result = if let Some((_, persona)) = id.split_once(':') {
+        lifecycle::with_lifecycle_fence(&env, persona, "restart", restart)
+    } else {
+        restart(&env)
+    };
+    match result {
         Ok(out) => {
             let data = serde_json::to_value(&out).unwrap_or_default();
             state.broadcast("sessions", "session.restarted", data.clone());

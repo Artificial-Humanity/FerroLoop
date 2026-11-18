@@ -4673,7 +4673,6 @@ fn tmux_bin() -> PathBuf {
 }
 
 fn scrub_parent_identity_env(cmd: &mut Command) {
-    lock::pin_tmux_command(cmd);
     for key in [
         "AGENT_NAME",
         "AGENT_PERSONA",
@@ -4685,7 +4684,9 @@ fn scrub_parent_identity_env(cmd: &mut Command) {
 }
 
 fn tmux_ok(args: &[&str]) -> bool {
-    let mut cmd = Command::new(tmux_bin());
+    let Ok(mut cmd) = fl_wire::runtime_context::tmux_command(&tmux_bin()) else {
+        return false;
+    };
     scrub_parent_identity_env(&mut cmd);
     cmd.args(args);
     command_succeeds_within(&mut cmd, TMUX_TIMEOUT)
@@ -4725,7 +4726,7 @@ pub(crate) fn tmux_stdout(args: &[&str]) -> Option<String> {
 pub(crate) fn tmux_stdout_of(bin: &Path, args: &[&str]) -> Option<String> {
     use std::io::Read;
 
-    let mut cmd = Command::new(bin);
+    let mut cmd = fl_wire::runtime_context::tmux_command(bin).ok()?;
     scrub_parent_identity_env(&mut cmd);
     let mut child = cmd
         .args(args)
@@ -5545,7 +5546,9 @@ fn tmux_target_exists(target: &str) -> bool {
     if std::env::var_os("FL_WIRE_TMUX_BIN").is_none() && HostRuntime.exists(target) {
         return true;
     }
-    let mut cmd = Command::new(tmux_bin());
+    let Ok(mut cmd) = fl_wire::runtime_context::tmux_command(&tmux_bin()) else {
+        return false;
+    };
     scrub_parent_identity_env(&mut cmd);
     cmd.args(["display-message", "-p", "-t", target, "#{pane_id}"]);
     command_succeeds_within(&mut cmd, TMUX_TIMEOUT)
@@ -5866,8 +5869,22 @@ pub(crate) fn with_lifecycle_fence<T>(
     name: &str,
     operation: impl FnOnce(&LifecycleEnv<'_>) -> Result<T, LifecycleError>,
 ) -> Result<T, LifecycleError> {
+    with_lifecycle_fences(env, &[persona.to_string()], name, operation)
+}
+
+/// Multi-persona explicit transactions acquire every file fence before any local/store guard.
+pub(crate) fn lifecycle_runtime_unpinned() -> bool {
+    lock::pinned_endpoint().is_none()
+}
+
+pub(crate) fn with_lifecycle_fences<T>(
+    env: &LifecycleEnv<'_>,
+    personas: &[String],
+    name: &str,
+    operation: impl FnOnce(&LifecycleEnv<'_>) -> Result<T, LifecycleError>,
+) -> Result<T, LifecycleError> {
     if let Some(fence) = env.lifecycle_fence {
-        if !fence.covers(persona) {
+        if !personas.iter().all(|p| fence.covers(p)) {
             return Err(LifecycleError::Conflict(
                 "nested lifecycle persona changed".into(),
             ));
@@ -5878,18 +5895,33 @@ pub(crate) fn with_lifecycle_fence<T>(
         );
         return operation(env);
     }
-    let fence = lock::LifecycleFence::acquire(env, persona, name)?;
+    if personas.is_empty() {
+        return operation(env);
+    }
+    let mut personas = personas.to_vec();
+    for persona in &mut personas {
+        *persona = persona.trim().to_ascii_lowercase();
+    }
+    personas.sort();
+    personas.dedup();
+    let fence = lock::LifecycleFence::acquire_many(env, &personas, name)?;
     let _pin = fence.pin();
-    let mutex = hosted_session_lifecycle_mutex(env, &persona.trim().to_ascii_lowercase());
-    let _local = match mutex.try_lock() {
-        Ok(guard) => guard,
-        Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
-        Err(std::sync::TryLockError::WouldBlock) => {
-            return Err(LifecycleError::Conflict(format!(
-                "lifecycle operation for `{persona}` is in progress"
-            )));
-        }
-    };
+    let mutexes: Vec<_> = personas
+        .iter()
+        .map(|p| hosted_session_lifecycle_mutex(env, p))
+        .collect();
+    let mut local = Vec::new();
+    for (mutex, persona) in mutexes.iter().zip(&personas) {
+        local.push(match mutex.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                return Err(LifecycleError::Conflict(format!(
+                    "lifecycle operation for `{persona}` is in progress"
+                )));
+            }
+        });
+    }
     let env = LifecycleEnv {
         lifecycle_fence: Some(&fence),
         ..*env
@@ -5947,8 +5979,17 @@ where
     G: std::ops::Deref<Target = S>,
     F: FnMut() -> Result<G, LifecycleError>,
 {
-    let mut v = req.validate()?;
     let store: &S = &store_guard;
+    let current_request;
+    let req = if let Some(workspace) = env.workspace_root {
+        current_request =
+            req.clone()
+                .with_default_cwd_for_home(store, workspace, env.home_override);
+        &current_request
+    } else {
+        req
+    };
+    let mut v = req.validate()?;
     v.permission_receipts = fl_wire::vendor_adapter::launch_permissions_with_auto_approval(
         &v.vendor,
         v.posture,
@@ -12156,6 +12197,56 @@ mod tests {
             })
             .collect();
         std::fs::write(config.join("config.toml"), text).unwrap();
+    }
+
+    #[test]
+    fn lifecycle_fence_reloads_current_binding_after_store_reopen() {
+        for explicit in [false, true] {
+            let home = TempDir::new().unwrap();
+            let old = home.path().join("old");
+            let current = home.path().join("current");
+            std::fs::create_dir_all(&old).unwrap();
+            std::fs::create_dir_all(&current).unwrap();
+            let write_binding = |root: &Path| {
+                write_project_bindings(home.path(), &[root.to_path_buf()]);
+                let config = home.path().join(".config/fl/config.toml");
+                let content = std::fs::read_to_string(&config).unwrap();
+                std::fs::write(config, format!("{content}cwd='exact'\n")).unwrap();
+            };
+            write_binding(&old);
+            let store = MemStore::default();
+            let runtime = FakeRuntime::default();
+            let mut env = runtime.env(home.path());
+            env.workspace_root = Some(home.path());
+            let mut request = req("ada", "assistant", "claude");
+            request.project = "audio-suite".into();
+            if explicit {
+                request.cwd = Some(old.to_string_lossy().into_owned());
+            }
+            spin_up_with_store(
+                &store,
+                || {
+                    write_binding(&current);
+                    Ok(&store)
+                },
+                &env,
+                &request,
+                "owner",
+                Caller::Owner,
+            )
+            .unwrap();
+            let record = find_hosted_session(&store, &["claude:ada"])
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                record.cwd.as_deref(),
+                Some(if explicit {
+                    old.to_str().unwrap()
+                } else {
+                    current.to_str().unwrap()
+                })
+            );
+        }
     }
 
     #[test]
@@ -19049,6 +19140,24 @@ mod tests {
                         return;
                     }
                     let _ = reader_started_tx.send(());
+                    // Ownership survives the released store guard and the resume watch.
+                    // A different thread cannot borrow the holder's scoped proof.
+                    let home = state_ref.config.home_override.as_deref().unwrap();
+                    let contender = FakeRuntime::default();
+                    let env = contender.env(home);
+                    let untouched = MemStore::default();
+                    let before = list_hosted_sessions(&untouched).unwrap();
+                    let refusal = spin_up(
+                        &untouched,
+                        &env,
+                        &req("ada", "assistant", "claude"),
+                        "owner",
+                        Caller::Owner,
+                    );
+                    assert_eq!(refusal.unwrap_err().status(), 409);
+                    assert!(contender.calls.borrow().is_empty());
+                    assert!(contender.launches.borrow().is_empty());
+                    assert_eq!(list_hosted_sessions(&untouched).unwrap(), before);
                     let result = state_ref
                         .open_store()
                         .map_err(|error| error.to_string())

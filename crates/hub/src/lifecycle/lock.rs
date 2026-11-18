@@ -21,7 +21,7 @@ thread_local! {
 /// A thread-bound proof of ownership, borrowed by nested remodel operations.
 #[derive(Debug)]
 pub(crate) struct LifecycleFence {
-    persona: String,
+    personas: Vec<String>,
     runtime: RuntimePin,
     files: Vec<File>,
     #[cfg(test)]
@@ -30,12 +30,10 @@ pub(crate) struct LifecycleFence {
     _thread_bound: std::marker::PhantomData<std::rc::Rc<()>>,
 }
 
-pub(super) struct PinScope(
-    Option<RuntimePin>,
-    std::marker::PhantomData<std::rc::Rc<()>>,
-);
+pub(super) struct PinScope(Option<RuntimePin>, fl_wire::runtime_context::RuntimeScope);
 impl Drop for PinScope {
     fn drop(&mut self) {
+        let _ = &self.1;
         RUNTIME_PIN.with(|slot| *slot.borrow_mut() = self.0.take());
     }
 }
@@ -43,18 +41,20 @@ impl Drop for PinScope {
 pub(super) fn pinned_endpoint() -> Option<HostEndpoint> {
     RUNTIME_PIN.with_borrow(|pin| pin.as_ref().map(|p| p.endpoint.clone()))
 }
-pub(super) fn pin_tmux_command(command: &mut std::process::Command) {
-    RUNTIME_PIN.with_borrow(|pin| {
-        if let Some(socket) = pin.as_ref().and_then(|p| p.tmux.as_ref()) {
-            command.arg("-S").arg(socket);
-        }
-    });
-}
 
 impl LifecycleFence {
+    #[cfg(test)]
     pub(super) fn acquire(
         env: &LifecycleEnv<'_>,
         persona: &str,
+        operation: &str,
+    ) -> Result<Self, LifecycleError> {
+        Self::acquire_many(env, &[persona.to_string()], operation)
+    }
+
+    pub(super) fn acquire_many(
+        env: &LifecycleEnv<'_>,
+        personas: &[String],
         operation: &str,
     ) -> Result<Self, LifecycleError> {
         let endpoint = resolve_endpoint(env)?;
@@ -65,18 +65,35 @@ impl LifecycleFence {
         } else {
             None
         };
-        Self::acquire_endpoint(endpoint, tmux, persona, operation)
+        Self::acquire_endpoints(endpoint, tmux, personas, operation)
     }
 
+    #[cfg(test)]
     pub(super) fn acquire_endpoint(
         endpoint: HostEndpoint,
         tmux: Option<PathBuf>,
         persona: &str,
         operation: &str,
     ) -> Result<Self, LifecycleError> {
-        let persona = persona.trim().to_ascii_lowercase();
-        fl_core::state::validate_slug(&persona)
-            .map_err(|e| LifecycleError::Invalid(format!("lifecycle persona: {e}")))?;
+        Self::acquire_endpoints(endpoint, tmux, &[persona.to_string()], operation)
+    }
+
+    fn acquire_endpoints(
+        endpoint: HostEndpoint,
+        tmux: Option<PathBuf>,
+        personas: &[String],
+        operation: &str,
+    ) -> Result<Self, LifecycleError> {
+        let mut personas: Vec<String> = personas
+            .iter()
+            .map(|p| p.trim().to_ascii_lowercase())
+            .collect();
+        personas.sort();
+        personas.dedup();
+        for persona in &personas {
+            fl_core::state::validate_slug(persona)
+                .map_err(|e| LifecycleError::Invalid(format!("lifecycle persona: {e}")))?;
+        }
         let endpoint = match endpoint {
             HostEndpoint::Unix(path) => {
                 HostEndpoint::unix(canonical_socket(&path)?).map_err(|e| failure("endpoint", e))?
@@ -92,13 +109,17 @@ impl LifecycleFence {
             }
         };
         let tmux = tmux.map(|p| canonical_socket(&p)).transpose()?;
-        let native = match &endpoint {
-            HostEndpoint::Unix(path) => lock_path(path, &persona, "host")?,
-            HostEndpoint::Windows { .. } => unreachable!(),
-        };
-        let mut paths = vec![native];
+        // Same-rank personas sort identically in every process: all native, then all tmux.
+        let mut paths = Vec::new();
+        if let HostEndpoint::Unix(socket) = &endpoint {
+            for persona in &personas {
+                paths.push(lock_path(socket, persona, "host")?);
+            }
+        }
         if let Some(socket) = &tmux {
-            paths.push(lock_path(socket, &persona, "tmux")?);
+            for persona in &personas {
+                paths.push(lock_path(socket, persona, "tmux")?);
+            }
         }
         let mut files = Vec::with_capacity(paths.len());
         for path in &paths {
@@ -114,7 +135,8 @@ impl LifecycleFence {
                         .take(256)
                         .collect();
                     return Err(LifecycleError::Conflict(format!(
-                        "lifecycle operation for `{persona}` is in progress; holder {} ({})",
+                        "lifecycle operation for `{}` is in progress; holder {} ({})",
+                        personas.join(", "),
                         if detail.is_empty() {
                             "metadata unavailable"
                         } else {
@@ -140,7 +162,7 @@ impl LifecycleFence {
             files.push(file);
         }
         Ok(Self {
-            persona,
+            personas,
             runtime: RuntimePin { endpoint, tmux },
             files,
             #[cfg(test)]
@@ -149,13 +171,15 @@ impl LifecycleFence {
         })
     }
 
-    pub(super) fn covers(&self, persona: &str) -> bool {
-        self.persona.eq_ignore_ascii_case(persona.trim())
+    pub(crate) fn covers(&self, persona: &str) -> bool {
+        self.personas
+            .iter()
+            .any(|p| p.eq_ignore_ascii_case(persona.trim()))
     }
     pub(super) fn pin(&self) -> PinScope {
         PinScope(
             RUNTIME_PIN.with(|slot| slot.replace(Some(self.runtime.clone()))),
-            std::marker::PhantomData,
+            fl_wire::runtime_context::pin(self.runtime.endpoint.clone(), self.runtime.tmux.clone()),
         )
     }
     #[cfg(test)]

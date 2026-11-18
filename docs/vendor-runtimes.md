@@ -558,6 +558,12 @@ metadata never permits stealing a lock. Private 0700 directories contain user-ow
 0600 lock files that are never removed; process exit releases ownership, and child
 processes do not inherit the descriptors. Unsafe or unsupported lock setup fails closed.
 
+Balance apply acquires its planned persona fences as one sorted group through the
+history and audit commit. Its nonblocking admission gate serializes applies within
+one hub; `fl watch balance --apply` uses HTTP and has no local apply path. Running
+multiple hubs on one runtime is unsupported: global `min_interval_ms` is not
+serialized across separate hubs applying disjoint persona batches ([#599](https://github.com/Artificial-Humanity/FerroLoop/issues/599)).
+
 This is the explicit-operation portion of [#592](https://github.com/Artificial-Humanity/FerroLoop/issues/592).
 Background reconciliation still requires shared fencing before that issue can close
 or the new command can be deployed. No deployment is authorized by this change. The command prints `runtime_spawned`,

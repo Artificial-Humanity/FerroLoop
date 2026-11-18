@@ -86,7 +86,10 @@ fn lifecycle_fence_http_contender_child() {
             "/api/v1/sessions/spin-up",
             serde_json::json!({"persona":"ada","project":"ferroloop","role":"assistant","vendor":"claude"}),
         ),
-        ("/api/v1/sessions/claude:ada/restart", serde_json::json!({})),
+        (
+            "/api/v1/hosted-sessions/claude:ada/restart",
+            serde_json::json!({}),
+        ),
         (
             "/api/v1/sessions/claude:ada/decommission",
             serde_json::json!({"mode":"prepare"}),
@@ -110,7 +113,7 @@ fn lifecycle_fence_http_contender_child() {
             "{path}: {}",
             String::from_utf8_lossy(&response.body)
         );
-        assert!(String::from_utf8_lossy(&response.body).contains("holder"));
+        assert!(String::from_utf8_lossy(&response.body).contains("in progress"));
     }
 }
 
@@ -227,7 +230,7 @@ fn held_lifecycle_rejects_cli_and_http_without_record_or_budget_changes() {
             "{args:?}: {}",
             String::from_utf8_lossy(&out.stderr)
         );
-        assert!(String::from_utf8_lossy(&out.stderr).contains("holder"));
+        assert!(String::from_utf8_lossy(&out.stderr).contains("in progress"));
     }
     let http = Command::new(std::env::current_exe().unwrap())
         .env_clear()
@@ -255,5 +258,132 @@ fn held_lifecycle_rejects_cli_and_http_without_record_or_budget_changes() {
     assert_eq!(
         after, before,
         "losing lifecycle changed runtime/recovery entries"
+    );
+}
+
+#[test]
+fn actual_cli_holder_rejects_http_before_any_losing_runtime_or_store_effect() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::tempdir().unwrap();
+    let holder_home = root.path().join("holder");
+    let contender_home = root.path().join("contender");
+    std::fs::create_dir(&holder_home).unwrap();
+    std::fs::create_dir(&contender_home).unwrap();
+    let seeded = command(root.path(), &contender_home)
+        .args([
+            "agent",
+            "spin-up",
+            "ada",
+            "--project",
+            "ferroloop",
+            "--role",
+            "assistant",
+            "--vendor",
+            "claude",
+            "--by",
+            "owner",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        seeded.status.success(),
+        "{}",
+        String::from_utf8_lossy(&seeded.stderr)
+    );
+    let snapshot = || {
+        let out = command(root.path(), &contender_home)
+            .args(["state", "list", "--scope", "workspace", "--json"])
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        serde_json::from_slice::<serde_json::Value>(&out.stdout).unwrap()
+    };
+    let before = snapshot();
+    // The actual CLI owns the fence during its runtime spawn, not a synthetic
+    // callback in a helper. This stub is private and never invokes a real tmux.
+    let tmux = root.path().join("tmux-stub");
+    std::fs::write(
+        &tmux,
+        r#"#!/bin/sh
+[ "$1" = -S ] && shift 2
+case "$1" in
+new-session)
+  printf 'spawn\n' >> "$FIXTURE_ROOT/effects"
+  : > "$FIXTURE_ROOT/ready"
+  while [ ! -e "$FIXTURE_ROOT/release" ]; do /bin/sleep 0.01; done
+  exit 1;;
+kill*|send*|paste*) printf '%s\n' "$1" >> "$FIXTURE_ROOT/effects"; exit 0;;
+*) exit 1;;
+esac
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&tmux, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let mut holder = command(root.path(), &holder_home)
+        .env_remove("FL_TEST_SPINUP_NO_SPAWN")
+        .env("FIXTURE_ROOT", root.path())
+        .env("FL_WIRE_TMUX_BIN", &tmux)
+        .env(
+            "TMUX",
+            format!("{},0,0", root.path().join("tmux.sock").display()),
+        )
+        .args([
+            "agent",
+            "spin-up",
+            "ada",
+            "--project",
+            "ferroloop",
+            "--role",
+            "assistant",
+            "--vendor",
+            "claude",
+            "--by",
+            "owner",
+            "--json",
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .unwrap();
+    wait_file(&root.path().join("ready"), &mut holder);
+    let effects_before = std::fs::read(root.path().join("effects")).unwrap();
+    let http = Command::new(std::env::current_exe().unwrap())
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", &contender_home)
+        .env("FL_HOST_SOCK", root.path().join("host.sock"))
+        .env("FL_WIRE_TMUX_BIN", &tmux)
+        .env("FIXTURE_ROOT", root.path())
+        .env(
+            "TMUX",
+            format!("{},0,0", root.path().join("tmux.sock").display()),
+        )
+        .env("FL_TEST_SPINUP_NO_SPAWN", "1")
+        .env("FL_TEST_FENCE_HTTP", root.path())
+        .args([
+            "--exact",
+            "lifecycle_fence_http_contender_child",
+            "--nocapture",
+        ])
+        .output()
+        .unwrap();
+    let effects_after = std::fs::read(root.path().join("effects")).unwrap();
+    let after = snapshot();
+    std::fs::write(root.path().join("release"), "release").unwrap();
+    holder.wait().unwrap();
+    assert!(
+        http.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&http.stdout),
+        String::from_utf8_lossy(&http.stderr)
+    );
+    assert_eq!(
+        effects_after, effects_before,
+        "loser spawned, prompted or killed a runtime"
+    );
+    assert_eq!(
+        after, before,
+        "loser changed a record, tombstone or recovery budget"
     );
 }

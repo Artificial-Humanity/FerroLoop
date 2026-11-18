@@ -247,6 +247,8 @@ fn explicit_lifecycle_losers_leave_store_and_runtime_unchanged() {
     let before = list_hosted_sessions(&store).unwrap();
     let agent_before = store.agent_by_name("fiona").unwrap();
     let recovery_before = load_hosted_respawn_state(&store, "claude:fiona").unwrap();
+    let calls_before = runtime.calls.borrow().clone();
+    let launches_before = runtime.launches.borrow().clone();
     let held = lock::LifecycleFence::acquire(&env, "fiona", "other-process").unwrap();
     assert_eq!(
         spin_up(&store, &env, &request, "owner", Caller::Owner)
@@ -291,6 +293,16 @@ fn explicit_lifecycle_losers_leave_store_and_runtime_unchanged() {
         .status(),
         409
     );
+    assert_eq!(
+        *runtime.calls.borrow(),
+        calls_before,
+        "loser made runtime calls"
+    );
+    assert_eq!(
+        *runtime.launches.borrow(),
+        launches_before,
+        "loser launched a vendor"
+    );
     assert_eq!(list_hosted_sessions(&store).unwrap(), before);
     assert_eq!(store.agent_by_name("fiona").unwrap(), agent_before);
     assert_eq!(
@@ -319,4 +331,151 @@ fn borrowed_lifecycle_fence_allows_only_its_persona_and_restores_pin_on_error() 
     assert_eq!(result.unwrap_err().status(), 400);
     assert!(lock::pinned_endpoint().is_none());
     with_lifecycle_fence(&env, "fiona", "restart", |_| Ok(())).unwrap();
+}
+
+#[test]
+fn lifecycle_dispatch_pin_survives_endpoint_alias_retarget() {
+    let root = TempDir::new().unwrap();
+    let first = root.path().join("first.sock");
+    let second = root.path().join("second.sock");
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    for socket in [&first, &second] {
+        let endpoint = HostEndpoint::unix(socket).unwrap();
+        std::fs::write(endpoint.token_path(), [0u8; 32]).unwrap();
+        std::fs::set_permissions(
+            endpoint.token_path(),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+    }
+    let _a = std::os::unix::net::UnixListener::bind(&first).unwrap();
+    let _b = std::os::unix::net::UnixListener::bind(&second).unwrap();
+    let alias = root.path().join("alias.sock");
+    std::os::unix::fs::symlink(&first, &alias).unwrap();
+    let held = lock::LifecycleFence::acquire_endpoint(
+        HostEndpoint::unix(&alias).unwrap(),
+        None,
+        "fiona",
+        "prompt",
+    )
+    .unwrap();
+    let _pin = held.pin();
+    std::fs::remove_file(&alias).unwrap();
+    std::os::unix::fs::symlink(&second, &alias).unwrap();
+    assert_eq!(
+        fl_wire::runtime_context::host_endpoint()
+            .unwrap()
+            .socket_path(),
+        first
+    );
+    // Exercise a real runtime-port connection after retargeting, not just the selector.
+    // Both private listeners close accepted streams, so a regressed selection cannot hang.
+    use fl_core::vendor_adapter::{AdapterIdentityBinding, RuntimePort};
+    for listener in [&_a, &_b] {
+        listener.set_nonblocking(true).unwrap();
+    }
+    std::thread::scope(|scope| {
+        let accept = |listener: &std::os::unix::net::UnixListener| {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        drop(stream);
+                        return true;
+                    }
+                    Err(error)
+                        if error.kind() == std::io::ErrorKind::WouldBlock
+                            && Instant::now() < deadline =>
+                    {
+                        std::thread::sleep(Duration::from_millis(5))
+                    }
+                    Err(_) => return false,
+                }
+            }
+        };
+        let first_seen = scope.spawn(move || accept(&_a));
+        let second_seen = scope.spawn(move || accept(&_b));
+        let binding = AdapterIdentityBinding::new("fiona", 1, "Fiona.claude", None);
+        assert!(
+            fl_wire::host_runtime::HostRuntimePort::with_endpoint(
+                HostEndpoint::unix(&alias).unwrap()
+            )
+            .capture_output(&binding, 32)
+            .is_err()
+        );
+        assert!(first_seen.join().unwrap(), "pinned endpoint was not used");
+        assert!(
+            !second_seen.join().unwrap(),
+            "retargeted endpoint received control traffic"
+        );
+    });
+    assert!(
+        fl_wire::runtime_context::tmux_command(std::path::Path::new("tmux")).is_err(),
+        "unfenced tmux fallback must refuse"
+    );
+}
+
+#[test]
+fn explicit_http_does_not_wait_for_same_hub_store_guard() {
+    let root = TempDir::new().unwrap();
+    let state = crate::HubState::new(crate::HubServerConfig {
+        store_path: root.path().join("fixture.fls"),
+        repo_root: root.path().to_path_buf(),
+        home_override: Some(root.path().to_path_buf()),
+        owner_token: Some("fixture-owner".into()),
+        ..Default::default()
+    });
+    let guard = state.open_store().unwrap();
+    for (path, body) in [
+        (
+            "/api/v1/sessions/spin-up",
+            serde_json::json!({"persona":"ada","project":"ferroloop","role":"assistant","vendor":"claude"}),
+        ),
+        (
+            "/api/v1/hosted-sessions/claude:ada/restart",
+            serde_json::json!({}),
+        ),
+        (
+            "/api/v1/sessions/claude:ada/remodel",
+            serde_json::json!({"vendor":"claude"}),
+        ),
+        (
+            "/api/v1/sessions/claude:ada/decommission",
+            serde_json::json!({"mode":"teardown"}),
+        ),
+    ] {
+        let request = crate::HttpRequest::new("POST", path)
+            .with_header("authorization", "Bearer fixture-owner")
+            .with_json_body(&body);
+        assert_eq!(
+            crate::handle_http_request(&state, &request).status,
+            409,
+            "{path}"
+        );
+    }
+    let deletion = crate::HttpRequest::new("DELETE", "/api/v1/projects/ferroloop")
+        .with_header("authorization", "Bearer fixture-owner")
+        .with_json_body(&serde_json::json!({"decommission_agents":true}));
+    assert_eq!(crate::handle_http_request(&state, &deletion).status, 409);
+    assert!(list_hosted_sessions(&*guard).unwrap().is_empty());
+}
+
+#[test]
+fn lifecycle_native_only_pin_refuses_unfenced_tmux_preflight() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = TempDir::new().unwrap();
+    let marker = root.path().join("unfenced-effect");
+    let binary = root.path().join("tmux-stub");
+    std::fs::write(
+        &binary,
+        format!("#!/bin/sh\n: > '{}'\nprintf 'unfenced'\n", marker.display()),
+    )
+    .unwrap();
+    std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let held =
+        lock::LifecycleFence::acquire_endpoint(endpoint(&root), None, "fiona", "prompt").unwrap();
+    let _pin = held.pin();
+    assert!(tmux_stdout_of(&binary, &["list-panes"]).is_none());
+    assert!(!marker.exists(), "unfenced tmux preflight ran");
 }

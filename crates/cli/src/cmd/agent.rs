@@ -790,8 +790,7 @@ pub fn run<S: AgentRegistry + Handles + StateStore + Catalog + fl_core::MessageS
                 hosted: Some(hosted),
                 cwd,
                 context_window: None,
-            }
-            .with_default_cwd(store, &ws_root);
+            };
             let _ = composed_vendor_host_adapters();
             let mut env = LifecycleEnv::new(None);
             env.workspace_root = Some(&ws_root);

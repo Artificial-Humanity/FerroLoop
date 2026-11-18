@@ -58,7 +58,7 @@ fn hub_paths(state: &HubState) -> Result<InitPaths, HttpResponse> {
 
 fn open_workspace<'a>(
     state: &'a HubState,
-) -> impl FnOnce() -> Result<crate::HubStoreGuard<'a>, InitError> {
+) -> impl FnMut() -> Result<crate::HubStoreGuard<'a>, InitError> {
     move || {
         state
             .open_store()
@@ -401,7 +401,20 @@ pub(crate) fn handle_delete_project(
         authority.actor_name(),
         &ctx,
         home.clone(),
-        open_workspace(state),
+        || {
+            if body.decommission_agents {
+                state.try_open_lifecycle_store().map_err(|e| match e {
+                    crate::lifecycle::LifecycleError::Conflict(detail) => {
+                        InitError::Conflict(detail)
+                    }
+                    other => InitError::Failed(other.to_string()),
+                })
+            } else {
+                state
+                    .open_store()
+                    .map_err(|e| InitError::Failed(format!("workspace store: {e}")))
+            }
+        },
         |key| {
             state.clear_session_prompt_queue(key);
             state.clear_session_model_override(key);
