@@ -2403,10 +2403,10 @@ mod tests {
         // 10/10 passes for this test alone.
         let deadline = Instant::now() + Duration::from_secs(5);
         let stale = loop {
-            if let Err(refusal) = adapter.preflight_launch(Some(home.path())) {
-                if refusal.detail.ends_with("ConnectionRefused") {
-                    break refusal;
-                }
+            if let Err(refusal) = adapter.preflight_launch(Some(home.path()))
+                && refusal.detail.ends_with("ConnectionRefused")
+            {
+                break refusal;
             }
             assert!(
                 Instant::now() < deadline,
