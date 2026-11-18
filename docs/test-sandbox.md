@@ -62,8 +62,10 @@ The target must be exactly two components below the build root. A direct child
 of `/var/tmp` remains supported for compatibility; the default ephemeral
 target is also under `/var/tmp`. Lab policy requires `/data` for real builds:
 remove a task target after its PR merges. No component of either path may be a
-symlink. The target is created with mode 0700 and must remain owned by the
-current user with that mode. The runner rejects symlinks, sockets, other special entries,
+symlink. New persona and task directories are normalized to mode 0700 even under a
+setgid parent. Existing directories are never chmodded automatically; an
+existing target must be owned by the current user and already have mode 0700.
+Inspect and fix it yourself or choose a new target if the runner refuses it. The runner rejects symlinks, sockets, other special entries,
 and nested mounts before launch and checks again after the sandbox exits, even
 if the command fails. A failed post-run check makes the runner fail; inspect
 or remove the persistent directory yourself before reusing it. The runner does
@@ -73,7 +75,7 @@ Before creating the source snapshot, the runner checks available space on `/`
 and on the target filesystem; it refuses to proceed when either is below the
 reserve or cannot be measured. It keeps checking while the sandbox runs and
 stops the sandbox process group if space falls below the reserve or measurement
-fails. `FL_SANDBOX_MIN_FREE_GIB` sets the reserve as a positive integer in GiB;
+fails. `FL_SANDBOX_MIN_FREE_GIB` sets the reserve as an integer from 1 to 999999999 GiB;
 it defaults to 120 GiB. A stopped run reports failure and requires cleanup or
 more free space before retrying.
 

@@ -22,7 +22,7 @@ def check(directory):
 def verify_root(root):
     info = os.lstat(root)
     if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o700:
-        raise RuntimeError('target must be a 0700 directory owned by the current user: ' + root)
+        raise RuntimeError('target must be a 0700 directory owned by the current user: ' + root + '; inspect it and fix ownership/mode yourself or choose a new target')
     if os.path.ismount(root):
         raise RuntimeError('target may not itself be a mount point: ' + root)
 
@@ -56,6 +56,9 @@ def persistent_path(path, create=False, var_tmp=VAR_TMP, data_root=DATA_ROOT):
             if not create or index < len(root_parts):
                 raise RuntimeError('target parent does not exist: ' + current)
             os.mkdir(current, 0o700)
+            # setgid parents can add the setgid bit even when mkdir requests
+            # 0700. Normalize only directories that this call just created.
+            os.chmod(current, 0o700, follow_symlinks=False)
             info = os.lstat(current)
         if not stat.S_ISDIR(info.st_mode):
             raise RuntimeError('target path component must be a directory, not a symlink: ' + current)
@@ -73,6 +76,9 @@ def self_test():
         data_root = os.path.join(fixture, 'data', 'toolchain', 'ferroloop-build')
         os.makedirs(var_tmp)
         os.makedirs(data_root)
+        # Lab build roots are setgid; creation must strip inherited setgid
+        # from new persona and task directories without changing existing ones.
+        os.chmod(data_root, 0o2775)
         def path(value, create=False): return persistent_path(value, create, var_tmp, data_root)
         legacy = os.path.join(var_tmp, 'task')
         data = os.path.join(data_root, 'felix', 'task')
@@ -80,6 +86,22 @@ def self_test():
             path(candidate, True)
             path(candidate)
             verify(candidate)
+        persona = os.path.join(data_root, 'felix')
+        assert stat.S_IMODE(os.lstat(persona).st_mode) == 0o700
+        assert stat.S_IMODE(os.lstat(data).st_mode) == 0o700
+        # Reuse must not change an existing persona or existing target.
+        os.chmod(persona, 0o2700)
+        path(data, True)
+        verify(data)
+        assert stat.S_IMODE(os.lstat(persona).st_mode) == 0o2700
+        another = os.path.join(persona, 'another')
+        path(another, True)
+        assert stat.S_IMODE(os.lstat(another).st_mode) == 0o700
+        verify(another)
+        os.chmod(another, 0o750)
+        path(another, True)
+        rejects(lambda: verify(another), 'existing non-private target')
+        assert stat.S_IMODE(os.lstat(another).st_mode) == 0o750, 'existing target was modified'
         for candidate in (var_tmp, os.path.join(var_tmp, 'a', 'b'), data_root,
                           os.path.join(data_root, 'felix'), os.path.join(data, 'extra'),
                           os.path.join(data_root, '..', 'elsewhere', 'task'),

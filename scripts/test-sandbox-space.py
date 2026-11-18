@@ -22,7 +22,7 @@ def check_interruption():
 
 def reserve_bytes(value):
     if not value.isascii() or not value.isdecimal() or len(value) > 9 or int(value) < 1:
-        raise ValueError('FL_SANDBOX_MIN_FREE_GIB must be a positive integer GiB')
+        raise ValueError('FL_SANDBOX_MIN_FREE_GIB must be an integer from 1 to 999999999 GiB')
     return int(value) * GIB
 
 
