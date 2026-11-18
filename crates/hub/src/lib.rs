@@ -423,6 +423,7 @@ pub struct HubState {
     pub auth: AuthManager,
     pub ws_tx: broadcast::Sender<HubWsFrame>,
     store_lock: Arc<Mutex<()>>,
+    balance_apply_lock: Arc<Mutex<()>>,
     /// One lock per per-project store file (see [`HubState::open_project_store_at`]).
     path_locks: Arc<Mutex<HashMap<PathBuf, Arc<PathLock>>>>,
     prompt_queues: Arc<Mutex<PromptQueueState>>,
@@ -598,6 +599,7 @@ impl HubState {
             auth,
             ws_tx,
             store_lock: Arc::new(Mutex::new(())),
+            balance_apply_lock: Arc::new(Mutex::new(())),
             path_locks: Arc::new(Mutex::new(HashMap::new())),
             prompt_queues: Arc::new(Mutex::new(PromptQueueState::default())),
             model_overrides: Arc::new(Mutex::new(BTreeMap::new())),
@@ -1454,6 +1456,53 @@ impl HubState {
             }
         }
         Err(last_err.expect("at least one attempt ran"))
+    }
+
+    /// Pre-fence candidate selection may refuse a busy local guard. Owned operations use
+    /// `open_store` so polling and post-watch reopen contention wait in rank order.
+    pub(crate) fn try_open_lifecycle_store(
+        &self,
+    ) -> Result<HubStoreGuard<'_>, lifecycle::LifecycleError> {
+        let guard = match self.store_lock.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                return Err(lifecycle::LifecycleError::Conflict(
+                    "workspace store is busy with another operation; retry".into(),
+                ));
+            }
+        };
+        if let Some(parent) = self.config.store_path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            let _ = fl_store::private::create_private_dir_all(parent);
+        }
+        let mut last_err = None;
+        for attempt in 0..200 {
+            match fl_store::open_store_with(
+                &self.config.store_path,
+                &fl_store::StoreOptions {
+                    backend: self.store_backend,
+                    ..fl_store::StoreOptions::default()
+                },
+            ) {
+                Ok(store) => {
+                    return Ok(HubStoreGuard {
+                        store: Some(store),
+                        _guard: Some(guard),
+                    });
+                }
+                Err(e) => {
+                    last_err = Some(e);
+                    if attempt < 199 {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                }
+            }
+        }
+        Err(lifecycle::LifecycleError::from(
+            last_err.expect("at least one attempt ran"),
+        ))
     }
 
     /// Open a per-project store (`<slug>.redb`) for one operation, waiting at most
@@ -4981,6 +5030,9 @@ mod tests {
         let mut bad_cases: Vec<(&str, Value)> = Vec::new();
         for (field, value) in [
             ("persona", json!("")),
+            ("persona", json!("   ")),
+            ("persona", json!("-invalid")),
+            ("persona", json!("a".repeat(37))),
             ("persona", json!("Felicity")),
             ("persona", json!("fel icity")),
             ("project", json!("  ")),

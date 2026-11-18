@@ -41,9 +41,12 @@ impl HostRuntimePort {
         &self,
         binding: &AdapterIdentityBinding,
     ) -> Result<BlockingHostClient, VendorAdapterError> {
-        let endpoint = match &self.endpoint {
+        let endpoint = match crate::runtime_context::pinned_endpoint()
+            .as_ref()
+            .or(self.endpoint.as_ref())
+        {
             Some(endpoint) => endpoint.clone(),
-            None => HostEndpoint::discover()
+            None => crate::runtime_context::host_endpoint()
                 .map_err(|err| transport(binding, "discover host endpoint", err))?,
         };
         #[cfg(feature = "wire-test-isolation")]

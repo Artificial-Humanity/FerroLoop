@@ -34,6 +34,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::api::{reforge_role_label, route_matches_session_id, synthesize_decommission_prompt};
 
+#[cfg(test)]
+mod fence_tests;
+mod lock;
 mod recovery;
 
 #[cfg(test)]
@@ -196,6 +199,8 @@ pub struct LifecycleEnv<'a> {
     /// Log guidance warnings independently of response consumption (the hub default).
     /// CLI callers disable this and render the returned warnings once in their output format.
     pub log_hydration_warnings: bool,
+    /// Borrowed proof for nested helpers; never a bypass for a different persona.
+    pub(crate) lifecycle_fence: Option<&'a lock::LifecycleFence>,
 }
 
 /// Process-wide [`fl_core::VendorHostAdapterRegistry`] slot injected at startup by `fl-cli`.
@@ -227,6 +232,7 @@ impl<'a> LifecycleEnv<'a> {
             key_probe: &HostKeyProbe,
             workspace_root: None,
             log_hydration_warnings: true,
+            lifecycle_fence: None,
         }
     }
 
@@ -448,6 +454,11 @@ pub enum RuntimePresence {
 /// `kill` and `exists` take the unit, so a Muse window is never confused with the session that
 /// holds other agents' windows.
 pub trait SessionRuntime: std::fmt::Debug {
+    /// Direct legacy runtimes also fence their server when no fallback binary is configured.
+    fn requires_tmux_fence(&self) -> bool {
+        false
+    }
+
     /// Whether each vendor has a separate session rather than a shared persona container.
     fn separate_vendor_units(&self) -> bool {
         false
@@ -1838,13 +1849,16 @@ pub struct HostRuntime;
 
 fn use_legacy_tmux_fallback() -> bool {
     std::env::var_os("FL_WIRE_TMUX_BIN").is_some()
-        && fl_host_proto::HostEndpoint::discover()
+        && lock::pinned_endpoint()
+            .map_or_else(fl_host_proto::HostEndpoint::discover, Ok)
             .and_then(|ep| fl_host_proto::BlockingHostClient::connect(&ep))
             .is_err()
 }
 
 fn connect_host_client() -> Option<fl_host_proto::BlockingHostClient> {
-    let endpoint = fl_host_proto::HostEndpoint::discover().ok()?;
+    let endpoint = lock::pinned_endpoint()
+        .map_or_else(fl_host_proto::HostEndpoint::discover, Ok)
+        .ok()?;
     fl_host_proto::BlockingHostClient::connect(&endpoint).ok()
 }
 
@@ -2361,6 +2375,10 @@ fn select_host_recorded_exit_code(
 pub struct TmuxRuntime;
 
 impl SessionRuntime for TmuxRuntime {
+    fn requires_tmux_fence(&self) -> bool {
+        true
+    }
+
     fn spawn(
         &self,
         session: &str,
@@ -2521,6 +2539,7 @@ impl FakeRuntime {
             key_probe: &ProvisionedKeys,
             workspace_root: None,
             log_hydration_warnings: true,
+            lifecycle_fence: None,
         }
     }
 
@@ -3117,6 +3136,12 @@ fn check_slug_free<S: StateStore>(store: &S, session_id: &str) -> Result<(), Lif
 }
 
 impl SpinUpRequest {
+    /// Check the ordinary request contract before acquiring lifecycle ownership. Execution
+    /// repeats the full validation under the fence before using the normalized fields.
+    pub(crate) fn validate_request(&self) -> Result<(), LifecycleError> {
+        self.validate().map(|_| ())
+    }
+
     fn validate(&self) -> Result<ValidSpinUp, LifecycleError> {
         let persona = self.persona.trim().to_string();
         let slug_ok = persona
@@ -3580,6 +3605,14 @@ pub fn load_hosted_respawn_state<S: StateStore>(
     store: &S,
     session_id: &str,
 ) -> Result<HostedRespawnState, LifecycleError> {
+    load_hosted_respawn_state_policy(store, session_id, false)
+}
+
+fn load_hosted_respawn_state_policy<S: StateStore>(
+    store: &S,
+    session_id: &str,
+    discard_malformed: bool,
+) -> Result<HostedRespawnState, LifecycleError> {
     #[cfg(test)]
     if TEST_RESPAWN_LOAD_FAILURE_SESSION.with(|s| s.borrow().as_deref() == Some(session_id)) {
         return Err(LifecycleError::Store(
@@ -3592,13 +3625,17 @@ pub fn load_hosted_respawn_state<S: StateStore>(
     else {
         return Ok(HostedRespawnState::default());
     };
-    match entry.payload {
+    let decoded = match entry.payload {
         StatePayload::Runtime(rt) => serde_json::from_value(rt.value).map_err(|err| {
             LifecycleError::Store(format!("invalid recovery state for `{session_id}`: {err}"))
         }),
         _ => Err(LifecycleError::Store(format!(
             "invalid recovery payload for `{session_id}`"
         ))),
+    };
+    match decoded {
+        Err(_) if discard_malformed => Ok(HostedRespawnState::default()),
+        result => result,
     }
 }
 
@@ -4665,7 +4702,9 @@ fn scrub_parent_identity_env(cmd: &mut Command) {
 }
 
 fn tmux_ok(args: &[&str]) -> bool {
-    let mut cmd = Command::new(tmux_bin());
+    let Ok(mut cmd) = fl_wire::runtime_context::tmux_command(&tmux_bin()) else {
+        return false;
+    };
     scrub_parent_identity_env(&mut cmd);
     cmd.args(args);
     command_succeeds_within(&mut cmd, TMUX_TIMEOUT)
@@ -4705,7 +4744,7 @@ pub(crate) fn tmux_stdout(args: &[&str]) -> Option<String> {
 pub(crate) fn tmux_stdout_of(bin: &Path, args: &[&str]) -> Option<String> {
     use std::io::Read;
 
-    let mut cmd = Command::new(bin);
+    let mut cmd = fl_wire::runtime_context::tmux_command(bin).ok()?;
     scrub_parent_identity_env(&mut cmd);
     let mut child = cmd
         .args(args)
@@ -5525,7 +5564,10 @@ fn tmux_target_exists(target: &str) -> bool {
     if std::env::var_os("FL_WIRE_TMUX_BIN").is_none() && HostRuntime.exists(target) {
         return true;
     }
-    let mut cmd = Command::new(tmux_bin());
+    let Ok(mut cmd) = fl_wire::runtime_context::tmux_command(&tmux_bin()) else {
+        return false;
+    };
+    scrub_parent_identity_env(&mut cmd);
     cmd.args(["display-message", "-p", "-t", target, "#{pane_id}"]);
     command_succeeds_within(&mut cmd, TMUX_TIMEOUT)
 }
@@ -5817,7 +5859,7 @@ type HostedSessionLockKey = (Option<PathBuf>, Option<PathBuf>, String);
 
 fn hosted_session_lifecycle_mutex(
     env: &LifecycleEnv<'_>,
-    session_id: &str,
+    persona: &str,
 ) -> std::sync::Arc<std::sync::Mutex<()>> {
     static LOCKS: std::sync::OnceLock<
         std::sync::Mutex<
@@ -5828,13 +5870,81 @@ fn hosted_session_lifecycle_mutex(
     let key = (
         env.home_override.map(Path::to_path_buf),
         env.workspace_root.map(Path::to_path_buf),
-        session_id.trim().to_ascii_lowercase(),
+        persona.trim().to_ascii_lowercase(),
     );
     let mut guard = map.lock().unwrap_or_else(|e| e.into_inner());
     guard
         .entry(key)
         .or_insert_with(|| std::sync::Arc::new(std::sync::Mutex::new(())))
         .clone()
+}
+
+/// Run an explicit operation in file -> local mutex -> store order. Callers holding a
+/// HubStoreGuard must release it before calling, then reopen it inside `operation`.
+pub(crate) fn with_lifecycle_fence<T>(
+    env: &LifecycleEnv<'_>,
+    persona: &str,
+    name: &str,
+    operation: impl FnOnce(&LifecycleEnv<'_>) -> Result<T, LifecycleError>,
+) -> Result<T, LifecycleError> {
+    with_lifecycle_fences(env, &[persona.to_string()], name, operation)
+}
+
+/// Multi-persona explicit transactions acquire every file fence before any local/store guard.
+pub(crate) fn lifecycle_runtime_unpinned() -> bool {
+    lock::pinned_endpoint().is_none()
+}
+
+pub(crate) fn with_lifecycle_fences<T>(
+    env: &LifecycleEnv<'_>,
+    personas: &[String],
+    name: &str,
+    operation: impl FnOnce(&LifecycleEnv<'_>) -> Result<T, LifecycleError>,
+) -> Result<T, LifecycleError> {
+    if let Some(fence) = env.lifecycle_fence {
+        if !personas.iter().all(|p| fence.covers(p)) {
+            return Err(LifecycleError::Conflict(
+                "nested lifecycle persona changed".into(),
+            ));
+        }
+        debug_assert!(
+            lock::pinned_endpoint().is_some(),
+            "borrowed fence requires its runtime pin"
+        );
+        return operation(env);
+    }
+    if personas.is_empty() {
+        return operation(env);
+    }
+    let mut personas = personas.to_vec();
+    for persona in &mut personas {
+        *persona = persona.trim().to_ascii_lowercase();
+    }
+    personas.sort();
+    personas.dedup();
+    let fence = lock::LifecycleFence::acquire_many(env, &personas, name)?;
+    let _pin = fence.pin();
+    let mutexes: Vec<_> = personas
+        .iter()
+        .map(|p| hosted_session_lifecycle_mutex(env, p))
+        .collect();
+    let mut local = Vec::new();
+    for (mutex, persona) in mutexes.iter().zip(&personas) {
+        local.push(match mutex.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                return Err(LifecycleError::Conflict(format!(
+                    "lifecycle operation for `{persona}` is in progress"
+                )));
+            }
+        });
+    }
+    let env = LifecycleEnv {
+        lifecycle_fence: Some(&fence),
+        ..*env
+    };
+    operation(&env)
 }
 
 /// `caller` gates hosting an unmanaged agent: an Active agent with no LIVE hosted record for this
@@ -5866,21 +5976,41 @@ where
     G: std::ops::Deref<Target = S>,
     F: FnMut() -> Result<G, LifecycleError>,
 {
-    let mut v = req.validate()?;
-    let session_id = format!("{}:{}", v.vendor, v.persona);
-    let session_mutex = hosted_session_lifecycle_mutex(env, &session_id);
-    let _session_lifecycle_guard = match session_mutex.try_lock() {
-        Ok(guard) => guard,
-        Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
-        Err(std::sync::TryLockError::WouldBlock) => {
-            drop(store_guard);
-            let _waited = session_mutex.lock().unwrap_or_else(|e| e.into_inner());
-            return Err(LifecycleError::Conflict(format!(
-                "hosted session `{session_id}` already had a lifecycle operation in progress"
-            )));
-        }
-    };
+    let persona = req.validate()?.persona;
+    if env.lifecycle_fence.is_some_and(|f| f.covers(&persona)) {
+        return spin_up_fenced(store_guard, &mut reopen_store, env, req, by, caller);
+    }
+    drop(store_guard);
+    with_lifecycle_fence(env, &persona, "spin-up", |env| {
+        let store_guard = reopen_store()?;
+        spin_up_fenced(store_guard, &mut reopen_store, env, req, by, caller)
+    })
+}
+
+fn spin_up_fenced<S, G, F>(
+    store_guard: G,
+    mut reopen_store: F,
+    env: &LifecycleEnv<'_>,
+    req: &SpinUpRequest,
+    by: &str,
+    caller: Caller,
+) -> Result<SpinUpResponse, LifecycleError>
+where
+    S: AgentRegistry + StateStore + Catalog + MessageStore,
+    G: std::ops::Deref<Target = S>,
+    F: FnMut() -> Result<G, LifecycleError>,
+{
     let store: &S = &store_guard;
+    let current_request;
+    let req = if let Some(workspace) = env.workspace_root {
+        current_request =
+            req.clone()
+                .with_default_cwd_for_home(store, workspace, env.home_override);
+        &current_request
+    } else {
+        req
+    };
+    let mut v = req.validate()?;
     v.permission_receipts = fl_wire::vendor_adapter::launch_permissions_with_auto_approval(
         &v.vendor,
         v.posture,
@@ -5932,6 +6062,9 @@ where
         previous.as_ref(),
         OwnerGate::SpinUp,
     )?;
+    if let Some(record) = &previous {
+        load_hosted_respawn_state_policy(store, &record.session_id, true)?;
+    }
     let config_home = preflight_vendor_launch(env, &v.vendor, v.hosted, &mut v.cwd)?;
     let tmux_target = has_runtime.then(|| hosted_tmux_target(&v.vendor, &v.persona));
     let host_session_id = host_session_id_for_target(tmux_target.as_deref());
@@ -6559,6 +6692,35 @@ impl SessionTarget {
     }
 }
 
+pub(crate) fn reload_lifecycle_target<S: StateStore>(
+    store: &S,
+    target: &SessionTarget,
+) -> Result<SessionTarget, LifecycleError> {
+    reload_lifecycle_target_policy(store, target, false)
+}
+
+pub(crate) fn reload_lifecycle_target_policy<S: StateStore>(
+    store: &S,
+    target: &SessionTarget,
+    discard_malformed: bool,
+) -> Result<SessionTarget, LifecycleError> {
+    let current = SessionTarget::resolve(
+        store,
+        &target.raw_id,
+        Some((target.discovered_id.clone(), Some(target.persona.clone()))),
+    )?;
+    if !current.persona.eq_ignore_ascii_case(&target.persona) {
+        return Err(LifecycleError::Conflict(
+            "lifecycle target changed during selection".into(),
+        ));
+    }
+    // Fail closed on an unreadable recovery incident before any explicit effect.
+    if let Some(record) = &current.hosted {
+        load_hosted_respawn_state_policy(store, &record.session_id, discard_malformed)?;
+    }
+    Ok(current)
+}
+
 /// Vendor named by the start of a session id (`claude:ada`, `muse-<uuid>`, `kimi-api:ada`), if
 /// registered: the LONGEST registered id that the session id begins with and that is followed by
 /// `:` or `-` (or ends the id), so a hyphenated id and an id that is a prefix of another both
@@ -6693,6 +6855,19 @@ pub fn prepare_decommission<S: AgentRegistry + StateStore>(
     by: &str,
     caller: Caller,
 ) -> Result<DecommissionResponse, LifecycleError> {
+    with_lifecycle_fence(env, &target.persona, "prepare", |env| {
+        let target = reload_lifecycle_target(store, target)?;
+        prepare_decommission_fenced(store, env, &target, by, caller)
+    })
+}
+
+fn prepare_decommission_fenced<S: AgentRegistry + StateStore>(
+    store: &S,
+    env: &LifecycleEnv<'_>,
+    target: &SessionTarget,
+    by: &str,
+    caller: Caller,
+) -> Result<DecommissionResponse, LifecycleError> {
     // Prepare adopts an unmanaged session into a hosted record, which teardown then accepts from
     // any caller, so the adoption gate applies here too, before any side effect. Order: this
     // gate runs before the decommissioned 409 below. A Peer is refused with 403 when the agent
@@ -6718,9 +6893,7 @@ pub fn prepare_decommission<S: AgentRegistry + StateStore>(
     } else {
         target
     };
-    // Other running records are updated too. This target may become `stopped`
-    // here and is then rewritten to `decommissioning` below.
-    reconcile_dead_hosted_sessions(store, env, by)?;
+    // Explicit prepare owns only this persona; background sweeps own their own scope.
     let Some((project, role)) = project_and_role(store, target)? else {
         return Err(LifecycleError::NotFound(format!(
             "no hosted session or agent record for `{}`",
@@ -7391,8 +7564,7 @@ fn observe_hosted_recovery_health<S: StateStore>(
 /// called and the streak is left as it is.
 ///
 /// This does not retire the agent, write a tombstone, kill tmux, or delete files.
-/// [`prepare_decommission`] still continues after this and may set the target to
-/// `decommissioning`. Other running records are updated too. A stopped record is
+/// This background sweep may update other running records. A stopped record is
 /// not decommissioned, so it does not become unmanaged.
 pub fn reconcile_dead_hosted_sessions<S: StateStore>(
     store: &S,
@@ -7401,12 +7573,20 @@ pub fn reconcile_dead_hosted_sessions<S: StateStore>(
 ) -> Result<(), LifecycleError> {
     let records = list_hosted_sessions(store)?;
     for record in records {
+        // Prepare/remodel already own this persona; never recurse into its reconciliation.
+        if env
+            .lifecycle_fence
+            .is_some_and(|fence| fence.covers(&record.persona))
+        {
+            continue;
+        }
+
         if !record.status.eq_ignore_ascii_case(STATUS_RUNNING)
             || !vendor_has_runtime(&record.vendor)
         {
             continue;
         }
-        let session_mutex = hosted_session_lifecycle_mutex(env, &record.session_id);
+        let session_mutex = hosted_session_lifecycle_mutex(env, &record.persona);
         let _session_lifecycle_guard = match session_mutex.try_lock() {
             Ok(guard) => guard,
             Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
@@ -7711,6 +7891,20 @@ fn preflight_teardown_runtime<S: AgentRegistry + StateStore>(
 /// persona keeps the persona key and the persona route; the session ids are still cleared.
 /// Everything that can fail on a lookup runs before the first side effect.
 pub fn teardown_session<S: AgentRegistry + StateStore>(
+    store: &S,
+    env: &LifecycleEnv<'_>,
+    target: &SessionTarget,
+    by: &str,
+    caller: Caller,
+    clear_queue: impl FnMut(&str),
+) -> Result<DecommissionResponse, LifecycleError> {
+    with_lifecycle_fence(env, &target.persona, "teardown", |env| {
+        let target = reload_lifecycle_target_policy(store, target, true)?;
+        teardown_session_fenced(store, env, &target, by, caller, clear_queue)
+    })
+}
+
+fn teardown_session_fenced<S: AgentRegistry + StateStore>(
     store: &S,
     env: &LifecycleEnv<'_>,
     target: &SessionTarget,
@@ -8059,24 +8253,59 @@ where
     G: std::ops::Deref<Target = S>,
     F: FnMut() -> Result<G, LifecycleError>,
 {
+    let initial_record = find_hosted_session(&*store_guard, &[id])?
+        .ok_or_else(|| LifecycleError::NotFound(format!("no hosted session `{id}`")))?;
+    if env
+        .lifecycle_fence
+        .is_some_and(|f| f.covers(&initial_record.persona))
+    {
+        return restart_hosted_session_fenced(
+            store_guard,
+            &mut reopen_store,
+            env,
+            &initial_record.session_id,
+            by,
+            strict_target,
+        );
+    }
+    drop(store_guard);
+    with_lifecycle_fence(env, &initial_record.persona, "restart", |env| {
+        let store_guard = reopen_store()?;
+        restart_hosted_session_fenced(
+            store_guard,
+            &mut reopen_store,
+            env,
+            &initial_record.session_id,
+            by,
+            strict_target,
+        )
+    })
+}
+
+fn restart_hosted_session_fenced<S, G, F>(
+    store_guard: G,
+    mut reopen_store: F,
+    env: &LifecycleEnv<'_>,
+    id: &str,
+    by: &str,
+    strict_target: Option<&str>,
+) -> Result<RestartResponse, LifecycleError>
+where
+    S: StateStore + AgentRegistry + Catalog + MessageStore,
+    G: std::ops::Deref<Target = S>,
+    F: FnMut() -> Result<G, LifecycleError>,
+{
     let store: &S = &store_guard;
-    let initial_record = find_hosted_session(store, &[id])?
+    let mut record = get_hosted_session_by_id(store, id)?
         .ok_or_else(|| LifecycleError::NotFound(format!("no hosted session `{id}`")))?;
-    let session_mutex = hosted_session_lifecycle_mutex(env, &initial_record.session_id);
-    let _session_lifecycle_guard = match session_mutex.try_lock() {
-        Ok(guard) => guard,
-        Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
-        Err(std::sync::TryLockError::WouldBlock) => {
-            let sid = initial_record.session_id;
-            drop(store_guard);
-            let _waited = session_mutex.lock().unwrap_or_else(|e| e.into_inner());
-            return Err(LifecycleError::Conflict(format!(
-                "hosted session `{sid}` already had a lifecycle operation in progress"
-            )));
-        }
-    };
-    let mut record = get_hosted_session_by_id(store, &initial_record.session_id)?
-        .ok_or_else(|| LifecycleError::NotFound(format!("no hosted session `{id}`")))?;
+    if !env
+        .lifecycle_fence
+        .is_some_and(|fence| fence.covers(&record.persona))
+    {
+        return Err(LifecycleError::Conflict(
+            "restart target changed persona during selection".into(),
+        ));
+    }
     if let Some(target) = strict_target {
         let selected = select_restart_target(&list_hosted_sessions(store)?, target)?;
         if selected != record.session_id {
@@ -9017,7 +9246,7 @@ where
                 continue;
             }
         };
-        let session_mutex = hosted_session_lifecycle_mutex(env, &record.session_id);
+        let session_mutex = hosted_session_lifecycle_mutex(env, &record.persona);
         // Never wait for the session mutex while holding the reopened store guard.
         let reconcile_lifecycle_guard = match session_mutex.try_lock() {
             Ok(guard) => guard,
@@ -9289,7 +9518,7 @@ pub fn reconcile_running_session_pids_with_store<S: StateStore>(
         if !record.status.eq_ignore_ascii_case(STATUS_RUNNING) {
             continue;
         }
-        let session_mutex = hosted_session_lifecycle_mutex(env, &record.session_id);
+        let session_mutex = hosted_session_lifecycle_mutex(env, &record.persona);
         let _session_lifecycle_guard = match session_mutex.try_lock() {
             Ok(guard) => guard,
             Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
@@ -9896,11 +10125,8 @@ type SpinUpFn<'f, S> = dyn FnMut(
 ///
 /// A same-vendor remodel ends with the same session id, `running`, on the new model and `cwd`.
 ///
-/// Concurrency: the caller must hold the store exclusively for the whole call, so a remodel is
-/// never interleaved with another lifecycle call for the same persona. The hub does: every
-/// handler holds its `HubStoreGuard` (one process-wide store lock) from target resolution to
-/// the end of the call. `fl agent remodel` is a separate process and is not serialized with the
-/// hub, as `fl agent spin-up` and `decommission` are not.
+/// The shared persona fence covers prepare, teardown, both vendor identities and rollback.
+/// Hub callers release their initial store guard before acquiring it and reopen afterward.
 pub fn remodel_session<S: AgentRegistry + StateStore + Catalog + MessageStore>(
     store: &S,
     env: &LifecycleEnv<'_>,
@@ -9941,6 +10167,23 @@ thread_local! {
 
 #[allow(clippy::too_many_arguments)]
 fn remodel_with<S: AgentRegistry + StateStore + Catalog + MessageStore>(
+    store: &S,
+    env: &LifecycleEnv<'_>,
+    target: &SessionTarget,
+    req: &RemodelRequest,
+    by: &str,
+    caller: Caller,
+    clear_queue: impl FnMut(&str),
+    spin: &mut SpinUpFn<'_, S>,
+) -> Result<RemodelResponse, LifecycleError> {
+    with_lifecycle_fence(env, &target.persona, "remodel", |env| {
+        let target = reload_lifecycle_target(store, target)?;
+        remodel_fenced(store, env, &target, req, by, caller, clear_queue, spin)
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn remodel_fenced<S: AgentRegistry + StateStore + Catalog + MessageStore>(
     store: &S,
     env: &LifecycleEnv<'_>,
     target: &SessionTarget,
@@ -10711,6 +10954,7 @@ mod tests {
             key_probe: &ProvisionedKeys,
             workspace_root: None,
             log_hydration_warnings: true,
+            lifecycle_fence: None,
         }
     }
 
@@ -11888,6 +12132,288 @@ mod tests {
     }
 
     #[test]
+    fn lead_review_prepare_leaves_other_cli_owned_persona_untouched() {
+        let store = MemStore::default();
+        let home = TempDir::new().unwrap();
+        let fake = FakeRuntime::default();
+        let env = fake.env(home.path());
+        for persona in ["ada", "zelda"] {
+            spin_up(
+                &store,
+                &env,
+                &req(persona, "assistant", "claude"),
+                "owner",
+                Caller::Owner,
+            )
+            .unwrap();
+        }
+        fake.presence_of
+            .borrow_mut()
+            .insert("Zelda".into(), RuntimePresence::Gone);
+        fake.presence_of
+            .borrow_mut()
+            .insert("Zelda:claude".into(), RuntimePresence::Gone);
+        fake.clear();
+        let before = get_hosted_session_by_id(&store, "claude:zelda").unwrap();
+        let recovery = load_hosted_respawn_state(&store, "claude:zelda").unwrap();
+        let _other = lock::LifecycleFence::acquire(&env, "zelda", "cli-restart").unwrap();
+        let target = SessionTarget::resolve(&store, "claude:ada", None).unwrap();
+        TEST_DEAD_STREAK_MIN_SPACING_MS.with(|v| v.set(Some(0)));
+        for _ in 0..2 {
+            prepare_decommission(&store, &env, &target, "owner", Caller::Owner).unwrap();
+        }
+        TEST_DEAD_STREAK_MIN_SPACING_MS.with(|v| v.set(None));
+        assert_eq!(
+            get_hosted_session_by_id(&store, "claude:zelda").unwrap(),
+            before
+        );
+        assert_eq!(
+            load_hosted_respawn_state(&store, "claude:zelda").unwrap(),
+            recovery
+        );
+    }
+
+    #[test]
+    fn lead_review_all_background_paths_skip_real_explicit_persona_ownership() {
+        let store = MemStore::default();
+        let home = TempDir::new().unwrap();
+        let fake = FakeRuntime::default();
+        let env = fake.env(home.path());
+        spin_up(
+            &store,
+            &env,
+            &req("ada", "assistant", "claude"),
+            "owner",
+            Caller::Owner,
+        )
+        .unwrap();
+        fake.clear();
+        fake.presence_of
+            .borrow_mut()
+            .insert("Ada:claude".into(), RuntimePresence::Gone);
+        fake.presence_of
+            .borrow_mut()
+            .insert("Ada".into(), RuntimePresence::Gone);
+        fake.unit_pids
+            .borrow_mut()
+            .insert("Ada".into(), std::process::id());
+        let before = get_hosted_session_by_id(&store, "claude:ada").unwrap();
+        let revisions = store.state_revisions_after(0).unwrap().len();
+        TEST_DEAD_STREAK_MIN_SPACING_MS.with(|v| v.set(Some(0)));
+        with_lifecycle_fence(&env, "ADA", "restart", |_| {
+            // Deliberately use the original env: borrowed-proof early skips cannot hide a wrong key.
+            for _ in 0..2 {
+                reconcile_dead_hosted_sessions(&store, &env, "test")?;
+            }
+            assert_eq!(reconcile_running_session_pids_with_store(&env, &store)?, 0);
+            Ok(())
+        })
+        .unwrap();
+        TEST_DEAD_STREAK_MIN_SPACING_MS.with(|v| v.set(None));
+        assert_eq!(
+            get_hosted_session_by_id(&store, "claude:ada").unwrap(),
+            before
+        );
+        assert_eq!(store.state_revisions_after(0).unwrap().len(), revisions);
+        let mut record = before.unwrap();
+        record.status = STATUS_STOPPED.into();
+        record.stop_reason = Some(STOP_REASON_CRASH_LOOP.into());
+        persist_hosted_session(&store, &record, "test").unwrap();
+        save_hosted_respawn_state(
+            &store,
+            &record.session_id,
+            &HostedRespawnState {
+                recovery_started_at_ms: Some(1),
+                recovery_attempts: recovery::RECOVERY_MAX_ATTEMPTS,
+                ..Default::default()
+            },
+            "test",
+        )
+        .unwrap();
+        let revisions = store.state_revisions_after(0).unwrap().len();
+        let mut events = Vec::new();
+        with_lifecycle_fence(&env, "ada", "restart", |_| {
+            assert!(
+                reconcile_and_respawn_hosted_sessions_with_store(
+                    &store,
+                    || Ok(&store),
+                    &env,
+                    |name, _| events.push(name.to_string())
+                )?
+                .is_empty()
+            );
+            Ok(())
+        })
+        .unwrap();
+        assert!(events.is_empty());
+        assert_eq!(store.state_revisions_after(0).unwrap().len(), revisions);
+    }
+
+    #[test]
+    fn lead_review_discard_operations_reset_malformed_recovery_but_fail_on_read_errors() {
+        for teardown in [false, true] {
+            for read_error in [false, true] {
+                let store = MemStore::default();
+                let home = TempDir::new().unwrap();
+                let env = env(&home);
+                let request = req("ada", "assistant", "claude");
+                spin_up(&store, &env, &request, "owner", Caller::Owner).unwrap();
+                store
+                    .upsert_state(UpsertStateArgs {
+                        scope: StateScope::Workspace,
+                        slug: hosted_respawn_state_slug("claude:ada"),
+                        sensitivity: SensitivityPatch::Inherit,
+                        payload: StatePayload::Runtime(RuntimeEntry {
+                            value: serde_json::json!({"recovery_attempts":"corrupt"}),
+                            merge_mode: MergeMode::LastWriter,
+                        }),
+                        at: stamp::now(),
+                        by: "test".into(),
+                    })
+                    .unwrap();
+                let before = get_hosted_session_by_id(&store, "claude:ada").unwrap();
+                if read_error {
+                    TEST_RESPAWN_LOAD_FAILURE_SESSION
+                        .with(|v| *v.borrow_mut() = Some("claude:ada".into()));
+                }
+                let result = if teardown {
+                    let target = SessionTarget::resolve(&store, "claude:ada", None).unwrap();
+                    teardown_session(&store, &env, &target, "owner", Caller::Owner, |_| {})
+                        .map(|_| ())
+                } else {
+                    spin_up(&store, &env, &request, "owner", Caller::Owner).map(|_| ())
+                };
+                TEST_RESPAWN_LOAD_FAILURE_SESSION.with(|v| *v.borrow_mut() = None);
+                if read_error {
+                    assert!(matches!(result, Err(LifecycleError::Store(_))));
+                    assert_eq!(
+                        get_hosted_session_by_id(&store, "claude:ada").unwrap(),
+                        before
+                    );
+                } else {
+                    result.unwrap();
+                    assert_eq!(
+                        load_hosted_respawn_state(&store, "claude:ada").unwrap(),
+                        HostedRespawnState::default()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn lead_review_post_watch_reopen_waits_then_finishes_bookkeeping() {
+        for restart in [false, true] {
+            let home = TempDir::new().unwrap();
+            let state = crate::HubState::new(crate::HubServerConfig {
+                store_path: home.path().join("fixture.fls"),
+                repo_root: home.path().into(),
+                home_override: Some(home.path().into()),
+                ..Default::default()
+            });
+            let fake = FakeRuntime::default();
+            let env = fake.env(home.path());
+            let request = req("ada", "assistant", "claude");
+            let spun = spin_up_with_store(
+                state.open_store().unwrap(),
+                || state.open_store().map_err(LifecycleError::from),
+                &env,
+                &request,
+                "owner",
+                Caller::Owner,
+            )
+            .unwrap();
+            let sid = {
+                let store = state.open_store().unwrap();
+                record_hydration_ack(
+                    &*store,
+                    "ada",
+                    true,
+                    spun.hydration_generation.as_deref(),
+                    Some("claude:ada"),
+                )
+                .unwrap();
+                get_hosted_session_by_id(&*store, "claude:ada")
+                    .unwrap()
+                    .unwrap()
+                    .vendor_session_id
+                    .unwrap()
+            };
+            write_claude_transcript(home.path(), false, &sid, "claude-opus-5-5", 10_000, false);
+            fake.clear();
+            let (hold, held) = std::sync::mpsc::channel();
+            let (ready, acquired) = std::sync::mpsc::channel();
+            let (release, released) = std::sync::mpsc::channel();
+            let mutex = state.store_lock.clone();
+            let holder = std::thread::spawn(move || {
+                held.recv_timeout(Duration::from_secs(5)).unwrap();
+                let _guard = mutex.lock().unwrap();
+                ready.send(()).unwrap();
+                released.recv_timeout(Duration::from_secs(5)).unwrap();
+            });
+            let mut hold = Some(hold);
+            TEST_CLAUDE_RESUME_WATCH_HOOK.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move || {
+                    if let Some(start) = hold.take() {
+                        start.send(()).unwrap();
+                        acquired.recv_timeout(Duration::from_secs(5)).unwrap();
+                    }
+                }))
+            });
+            TEST_CLAUDE_RESUME_SURVIVAL_WINDOW.with(|v| v.set(Some(Duration::from_millis(10))));
+            // Owned wrappers consume the supplied guard; the only reopen is after the watch.
+            let mut release = Some(release);
+            let mut reopen = || {
+                let release = release.take().expect("no gratuitous owned-store reopen");
+                std::thread::spawn(move || {
+                    std::thread::sleep(Duration::from_millis(100));
+                    release.send(()).unwrap();
+                });
+                state.open_store().map_err(LifecycleError::from)
+            };
+            with_lifecycle_fence(&env, "ada", "restart", |env| {
+                let store = state.open_store().map_err(LifecycleError::from)?;
+                if restart {
+                    assert!(
+                        restart_hosted_session_with_store(
+                            store,
+                            &mut reopen,
+                            env,
+                            "claude:ada",
+                            "owner"
+                        )?
+                        .runtime_live
+                    );
+                } else {
+                    assert!(
+                        spin_up_with_store(
+                            store,
+                            &mut reopen,
+                            env,
+                            &request,
+                            "owner",
+                            Caller::Owner
+                        )?
+                        .runtime_spawned
+                    );
+                }
+                Ok(())
+            })
+            .unwrap();
+            TEST_CLAUDE_RESUME_WATCH_HOOK.with(|hook| *hook.borrow_mut() = None);
+            TEST_CLAUDE_RESUME_SURVIVAL_WINDOW.with(|v| v.set(None));
+            holder.join().unwrap();
+            let store = state.open_store().unwrap();
+            assert!(!load_claude_resume_state(&*store, "claude:ada").in_survival_window);
+            let record = get_hosted_session_by_id(&*store, "claude:ada")
+                .unwrap()
+                .unwrap();
+            assert_eq!(record.status, STATUS_RUNNING);
+            assert_eq!(record.restart_count, u32::from(restart));
+        }
+    }
+
+    #[test]
     fn prepare_of_an_unknown_session_is_not_found() {
         let store = MemStore::default();
         let home = TempDir::new().unwrap();
@@ -11992,6 +12518,56 @@ mod tests {
             })
             .collect();
         std::fs::write(config.join("config.toml"), text).unwrap();
+    }
+
+    #[test]
+    fn lifecycle_fence_reloads_current_binding_after_store_reopen() {
+        for explicit in [false, true] {
+            let home = TempDir::new().unwrap();
+            let old = home.path().join("old");
+            let current = home.path().join("current");
+            std::fs::create_dir_all(&old).unwrap();
+            std::fs::create_dir_all(&current).unwrap();
+            let write_binding = |root: &Path| {
+                write_project_bindings(home.path(), &[root.to_path_buf()]);
+                let config = home.path().join(".config/fl/config.toml");
+                let content = std::fs::read_to_string(&config).unwrap();
+                std::fs::write(config, format!("{content}cwd='exact'\n")).unwrap();
+            };
+            write_binding(&old);
+            let store = MemStore::default();
+            let runtime = FakeRuntime::default();
+            let mut env = runtime.env(home.path());
+            env.workspace_root = Some(home.path());
+            let mut request = req("ada", "assistant", "claude");
+            request.project = "audio-suite".into();
+            if explicit {
+                request.cwd = Some(old.to_string_lossy().into_owned());
+            }
+            spin_up_with_store(
+                &store,
+                || {
+                    write_binding(&current);
+                    Ok(&store)
+                },
+                &env,
+                &request,
+                "owner",
+                Caller::Owner,
+            )
+            .unwrap();
+            let record = find_hosted_session(&store, &["claude:ada"])
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                record.cwd.as_deref(),
+                Some(if explicit {
+                    old.to_str().unwrap()
+                } else {
+                    current.to_str().unwrap()
+                })
+            );
+        }
     }
 
     #[test]
@@ -14140,7 +14716,8 @@ mod tests {
             cleared.push(k.to_string())
         })
         .unwrap_err();
-        assert_eq!(err.status(), 500);
+        assert_eq!(err.status(), 400);
+        assert!(matches!(err, LifecycleError::Invalid(_)));
         assert!(cleared.is_empty());
         assert!(list_hosted_sessions(&store).unwrap().is_empty());
     }
@@ -15630,14 +16207,21 @@ mod tests {
 
         // When env.home_override is None and env.spawn_runtime is true (production path),
         // teardown_session resolves home_dir from $HOME and passes it to adapter.archive().
-        struct RestoreHome(Option<std::ffi::OsString>);
+        struct RestoreHome {
+            home: Option<std::ffi::OsString>,
+            host_sock: Option<std::ffi::OsString>,
+        }
         impl Drop for RestoreHome {
             fn drop(&mut self) {
                 // SAFETY: serialized by with_probe_lock and TMUX_ENV_LOCK.
                 unsafe {
-                    match &self.0 {
+                    match &self.home {
                         Some(v) => std::env::set_var("HOME", v),
                         None => std::env::remove_var("HOME"),
+                    }
+                    match &self.host_sock {
+                        Some(v) => std::env::set_var("FL_HOST_SOCK", v),
+                        None => std::env::remove_var("FL_HOST_SOCK"),
                     }
                 }
             }
@@ -15646,10 +16230,17 @@ mod tests {
             let _tmux_lock = crate::TMUX_ENV_LOCK
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
-            let _restore_home = RestoreHome(std::env::var_os("HOME"));
+            let _restore_home = RestoreHome {
+                home: std::env::var_os("HOME"),
+                host_sock: std::env::var_os("FL_HOST_SOCK"),
+            };
+            let socket = home.path().join("fallback-host.sock");
+            let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+            let _fixture = fl_host_proto::register_hub_test_host_fixture(&socket).unwrap();
             // SAFETY: serialized by with_probe_lock and TMUX_ENV_LOCK; restored by _restore_home.
             unsafe {
                 std::env::set_var("HOME", home.path());
+                std::env::set_var("FL_HOST_SOCK", &socket);
             }
             spin_up(
                 &store,
@@ -18885,6 +19476,24 @@ mod tests {
                         return;
                     }
                     let _ = reader_started_tx.send(());
+                    // Ownership survives the released store guard and the resume watch.
+                    // A different thread cannot borrow the holder's scoped proof.
+                    let home = state_ref.config.home_override.as_deref().unwrap();
+                    let contender = FakeRuntime::default();
+                    let env = contender.env(home);
+                    let untouched = MemStore::default();
+                    let before = list_hosted_sessions(&untouched).unwrap();
+                    let refusal = spin_up(
+                        &untouched,
+                        &env,
+                        &req("ada", "assistant", "claude"),
+                        "owner",
+                        Caller::Owner,
+                    );
+                    assert_eq!(refusal.unwrap_err().status(), 409);
+                    assert!(contender.calls.borrow().is_empty());
+                    assert!(contender.launches.borrow().is_empty());
+                    assert_eq!(list_hosted_sessions(&untouched).unwrap(), before);
                     let result = state_ref
                         .open_store()
                         .map_err(|error| error.to_string())
@@ -19026,15 +19635,15 @@ mod tests {
 
         let watch_window = Duration::from_millis(250);
 
-        // 1. Two concurrent restarts of the same session produce ONE spawn, and the second waits
-        //    on the per-session lifecycle lock and reports a Conflict.
-        let (t2_tx, t2_rx) = std::sync::mpsc::channel();
-        std::thread::scope(|s| {
+        // 1. Hold the first restart inside its survival watch until the contender finishes.
+        //    A busy restart must refuse promptly while ownership remains held, with no spawn.
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let (res2, t2_spawns) = std::thread::scope(|s| {
             let state_ref = &state;
             let home_path = hub_home.path();
             let t2 = s.spawn(move || {
-                std::thread::sleep(Duration::from_millis(50));
-                let t0 = Instant::now();
+                entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
                 let fake2 = FakeRuntime::default();
                 let env2 = fake2.env(home_path);
                 let guard = state_ref.open_store().unwrap();
@@ -19045,11 +19654,19 @@ mod tests {
                     "claude:ada",
                     "owner",
                 );
-                let elapsed = t0.elapsed();
                 let spawns = fake2.launches.borrow().len();
-                t2_tx.send((res, elapsed, spawns)).unwrap();
+                done_tx.send(()).unwrap();
+                (res, spawns)
             });
 
+            TEST_CLAUDE_RESUME_WATCH_HOOK.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move || {
+                    entered_tx.send(()).unwrap();
+                    done_rx
+                        .recv_timeout(Duration::from_secs(5))
+                        .expect("busy restart must finish before the owner leaves its watch");
+                }));
+            });
             TEST_CLAUDE_RESUME_SURVIVAL_WINDOW.with(|c| c.set(Some(watch_window)));
             let fake1 = FakeRuntime::default();
             let env1 = fake1.env(hub_home.path());
@@ -19061,6 +19678,7 @@ mod tests {
                 "claude:ada",
                 "owner",
             );
+            TEST_CLAUDE_RESUME_WATCH_HOOK.with(|hook| *hook.borrow_mut() = None);
             TEST_CLAUDE_RESUME_SURVIVAL_WINDOW.with(|c| c.set(None));
             assert!(res1.is_ok(), "first restart must succeed: {res1:?}");
             assert_eq!(
@@ -19068,9 +19686,8 @@ mod tests {
                 1,
                 "first restart must spawn exactly 1 runtime unit"
             );
-            t2.join().unwrap();
+            t2.join().unwrap()
         });
-        let (res2, t2_elapsed, t2_spawns) = t2_rx.recv().unwrap();
         assert_eq!(
             t2_spawns, 0,
             "second concurrent restart must not spawn a duplicate unit"
@@ -19078,10 +19695,6 @@ mod tests {
         assert!(
             matches!(res2, Err(LifecycleError::Conflict(_))),
             "second concurrent restart must report Conflict, got {res2:?}"
-        );
-        assert!(
-            t2_elapsed >= Duration::from_millis(120),
-            "second concurrent restart must wait on the per-session lock until the first finishes (took {t2_elapsed:?})"
         );
         {
             let guard = state.open_store().unwrap();
@@ -19169,23 +19782,47 @@ mod tests {
             delete_claude_resume_state(&*guard, "claude:ada");
         }
 
-        // 3. A decommission during the watch is NOT undone by the post-watch write-back, and the
-        //    newly spawned runtime unit is stopped.
+        // 3. Public teardown refuses during an owned watch. An out-of-band decommission
+        //    persisted by a legacy writer is still not undone by the watch's write-back,
+        //    and the newly spawned runtime unit is stopped.
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
         std::thread::scope(|s| {
             let state_ref = &state;
             let home_path = hub_home.path();
             let decomm_thread = s.spawn(move || {
-                std::thread::sleep(Duration::from_millis(50));
+                entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
                 let fake_d = FakeRuntime::default();
                 let env_d = fake_d.env(home_path);
                 let guard = state_ref.open_store().unwrap();
                 let target = SessionTarget::resolve(&*guard, "claude:ada", None).unwrap();
-                let resp =
-                    teardown_session(&*guard, &env_d, &target, "owner", Caller::Owner, |_| {})
-                        .unwrap();
-                assert_eq!(resp.status, STATUS_DECOMMISSIONED);
+                let before = list_hosted_sessions(&*guard).unwrap();
+                let route_path = home_path.join(".cache/agent-bus/routes.json");
+                let routes_before = std::fs::read(&route_path).ok();
+                let error =
+                    teardown_session(&*guard, &env_d, &target, "owner", Caller::Owner, |_| {
+                        panic!("busy teardown must not clear queues")
+                    })
+                    .unwrap_err();
+                assert!(matches!(error, LifecycleError::Conflict(_)));
+                assert_eq!(list_hosted_sessions(&*guard).unwrap(), before);
+                assert_eq!(std::fs::read(&route_path).ok(), routes_before);
+                assert!(fake_d.calls.borrow().is_empty());
+                assert!(fake_d.launches.borrow().is_empty());
+                let mut record = target.hosted.unwrap();
+                record.status = STATUS_DECOMMISSIONED.into();
+                persist_hosted_session(&*guard, &record, "owner").unwrap();
+                done_tx.send(()).unwrap();
             });
 
+            TEST_CLAUDE_RESUME_WATCH_HOOK.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move || {
+                    entered_tx.send(()).unwrap();
+                    done_rx
+                        .recv_timeout(Duration::from_secs(5))
+                        .expect("decommission fixture must finish inside the owned watch");
+                }));
+            });
             TEST_CLAUDE_RESUME_SURVIVAL_WINDOW.with(|c| c.set(Some(watch_window)));
             let fake_r = FakeRuntime::default();
             let env_r = fake_r.env(hub_home.path());
@@ -19197,6 +19834,7 @@ mod tests {
                 "claude:ada",
                 "owner",
             );
+            TEST_CLAUDE_RESUME_WATCH_HOOK.with(|hook| *hook.borrow_mut() = None);
             TEST_CLAUDE_RESUME_SURVIVAL_WINDOW.with(|c| c.set(None));
             decomm_thread.join().unwrap();
 
@@ -19822,11 +20460,8 @@ mod tests {
                 if call == 2 {
                     // Fail promptly if reconcile holds the non-reentrant mutex here:
                     // the synchronous manual restart below would otherwise deadlock.
-                    let mutex = hosted_session_lifecycle_mutex(&env, "claude:race");
-                    assert!(
-                        mutex.try_lock().is_ok(),
-                        "reopen_store must run before locking the candidate lifecycle mutex"
-                    );
+                    with_lifecycle_fence(&env, "race", "restart", |_| Ok(()))
+                        .expect("reopen_store must run before locking candidate ownership");
                     let manual_guard = state.open_store().map_err(LifecycleError::from)?;
                     let manual = restart_hosted_session_with_store(
                         manual_guard,
@@ -19885,13 +20520,18 @@ mod tests {
         }
         let fake_locked = FakeRuntime::default();
         let env_locked = fake_locked.env(hub_home.path());
-        let mutex = hosted_session_lifecycle_mutex(&env_locked, "claude:race");
         let (locked_tx, locked_rx) = std::sync::mpsc::channel::<()>();
         let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let holder_home = hub_home.path().to_path_buf();
         let holder = std::thread::spawn(move || {
-            let _held_guard = mutex.lock().unwrap();
-            locked_tx.send(()).unwrap();
-            let _ = release_rx.recv_timeout(Duration::from_secs(5));
+            let fake = FakeRuntime::default();
+            let env = fake.env(&holder_home);
+            with_lifecycle_fence(&env, "race", "restart", |_| {
+                locked_tx.send(()).unwrap();
+                let _ = release_rx.recv_timeout(Duration::from_secs(5));
+                Ok(())
+            })
+            .unwrap();
         });
         locked_rx.recv().unwrap();
         TEST_CLAUDE_RESUME_SURVIVAL_WINDOW.with(|c| c.set(Some(Duration::from_millis(10))));

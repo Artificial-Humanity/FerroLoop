@@ -27,10 +27,14 @@ struct Fx {
     paths: InitPaths,
     home: PathBuf,
     ws_root: PathBuf,
+    _config_fixture: std::sync::MutexGuard<'static, ()>,
 }
 
 impl Fx {
     fn new() -> Self {
+        let config_fixture = crate::project_init::CONFIG_FIXTURE_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         hooks::reset();
         let tmp = TempDir::new().unwrap();
         let base = fs::canonicalize(tmp.path()).unwrap();
@@ -38,6 +42,7 @@ impl Fx {
             fs::create_dir_all(base.join(dir)).unwrap();
         }
         Self {
+            _config_fixture: config_fixture,
             paths: InitPaths {
                 config_path: base.join("cfg/fl/config.toml"),
                 store_dir: base.join("data/fl"),
@@ -1601,4 +1606,140 @@ fn an_agent_spun_up_in_a_virtual_group_runs_in_the_workspace_root() {
             .active_agent_count,
         1
     );
+}
+
+#[test]
+fn decommission_delete_conflicts_before_effects_and_refuses_new_unfenced_persona() {
+    let fx = Fx::new();
+    fx.project("alpha");
+    fx.agent("Ada", "alpha", AgentRole::Assistant, &[]);
+    let before = fx.snapshot(&[]);
+    let env = LifecycleEnv::new(Some(&fx.home));
+    lifecycle::with_lifecycle_fence(&env, "ada", "fixture-holder", |_| {
+        let error = fx
+            .call(
+                "alpha",
+                &DeleteRequest {
+                    decommission_agents: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(error, DeleteError::Init(InitError::Conflict(_))));
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(fx.snapshot(&[]), before);
+    {
+        let _config = crate::project_init::CONFIG_LOCK.lock().unwrap();
+        let error = fx
+            .call(
+                "alpha",
+                &DeleteRequest {
+                    decommission_agents: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(error, DeleteError::Init(InitError::Conflict(_))));
+    }
+    assert_eq!(fx.snapshot(&[]), before);
+    let ctx = DeleteContext {
+        paths: &fx.paths,
+        stores: &[],
+        home: Some(&fx.home),
+        workspace_roots: std::slice::from_ref(&fx.ws_root),
+        lifecycle: &env,
+    };
+    let mut opens = 0;
+    let error = delete_project_in(
+        "alpha",
+        &DeleteRequest {
+            decommission_agents: true,
+            ..Default::default()
+        },
+        "tester",
+        &ctx,
+        Some(fx.home.clone()),
+        || {
+            opens += 1;
+            if opens == 2 {
+                fx.agent("Bo", "alpha", AgentRole::Assistant, &[]);
+            }
+            fx.open_ws()
+        },
+        |_| panic!("refused deletion cleared a queue"),
+    )
+    .unwrap_err();
+    assert_eq!(opens, 2, "must reach target revalidation after ownership");
+    assert!(
+        matches!(&error, DeleteError::Init(InitError::Conflict(reason))
+            if reason == "project's active agents changed during lifecycle selection; retry"),
+        "{error:?}"
+    );
+    assert!(fx.slugs().contains(&"alpha".to_string()));
+    let store = fx.ws();
+    for name in ["ada", "bo"] {
+        assert_eq!(
+            store.agent_by_name(name).unwrap().unwrap().status,
+            AgentStatus::Active
+        );
+    }
+}
+
+#[test]
+fn lead_review_reassign_delete_fences_source_and_refuses_new_persona() {
+    let fx = Fx::new();
+    fx.project("alpha");
+    fx.project("beta");
+    fx.agent("Ada", "alpha", AgentRole::Assistant, &[]);
+    let before = fx.snapshot(&[]);
+    let env = LifecycleEnv::new(Some(&fx.home));
+    let request = DeleteRequest {
+        reassign_to: Some("beta".into()),
+        ..Default::default()
+    };
+    lifecycle::with_lifecycle_fence(&env, "ada", "cli-restart", |_| {
+        assert!(matches!(
+            fx.call("alpha", &request),
+            Err(DeleteError::Init(InitError::Conflict(_)))
+        ));
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(fx.snapshot(&[]), before);
+    let ctx = DeleteContext {
+        paths: &fx.paths,
+        stores: &[],
+        home: Some(&fx.home),
+        workspace_roots: std::slice::from_ref(&fx.ws_root),
+        lifecycle: &env,
+    };
+    let mut opens = 0;
+    let result = delete_project_in(
+        "alpha",
+        &request,
+        "tester",
+        &ctx,
+        Some(fx.home.clone()),
+        || {
+            opens += 1;
+            if opens == 2 {
+                fx.agent("Bo", "alpha", AgentRole::Assistant, &[]);
+            }
+            fx.open_ws()
+        },
+        |_| panic!("refusal cleared queue"),
+    );
+    assert!(matches!(
+        result,
+        Err(DeleteError::Init(InitError::Conflict(_)))
+    ));
+    for name in ["ada", "bo"] {
+        assert_eq!(
+            fx.ws().agent_by_name(name).unwrap().unwrap().project,
+            "alpha"
+        );
+    }
+    assert!(fx.slugs().contains(&"alpha".to_string()));
 }

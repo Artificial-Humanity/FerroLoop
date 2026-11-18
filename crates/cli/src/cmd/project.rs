@@ -473,6 +473,10 @@ pub fn delete(
             );
             return Ok(2);
         }
+        Err(DeleteError::Init(fl_hub::project_init::InitError::Conflict(detail))) => {
+            eprintln!("error: {detail}");
+            return Ok(2);
+        }
         Err(DeleteError::Init(e)) => return Err(anyhow::anyhow!("{e}")),
     };
     if args.json {
