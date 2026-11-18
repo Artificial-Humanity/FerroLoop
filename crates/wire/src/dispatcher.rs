@@ -2862,6 +2862,8 @@ struct UnconfirmedWireDelivery {
     wire_id: String,
     compact_full: String,
     compact_header: Option<String>,
+    compact_body: Option<String>,
+    body_chars: Option<usize>,
     full_placeholder_lengths: Vec<usize>,
     body_placeholder_lengths: Vec<usize>,
     /// `payload_line_count` values a Claude `[Pasted text #N +M lines]` placeholder may
@@ -2925,6 +2927,8 @@ fn build_delivery_descriptor(
     }
 
     let mut compact_header = None;
+    let mut compact_body = None;
+    let mut body_chars = None;
     let mut body_placeholder_lengths = Vec::new();
     let mut body_placeholder_line_counts = Vec::new();
     if (trimmed_clean.starts_with("[fl-wire ")
@@ -2936,6 +2940,8 @@ fn build_delivery_descriptor(
             let hdr_compact: String = first_line.chars().filter(|c| !c.is_whitespace()).collect();
             if !hdr_compact.is_empty() {
                 compact_header = Some(hdr_compact);
+                compact_body = Some(body.chars().filter(|c| !c.is_whitespace()).collect());
+                body_chars = Some(body.chars().count());
                 push_len_and_plus_one(&mut body_placeholder_lengths, body);
                 let body_lines = payload_line_count(body);
                 if body_lines > 0 {
@@ -2949,6 +2955,8 @@ fn build_delivery_descriptor(
         wire_id: wire_id.to_string(),
         compact_full,
         compact_header,
+        compact_body,
+        body_chars,
         full_placeholder_lengths,
         body_placeholder_lengths,
         full_placeholder_line_counts,
@@ -3179,6 +3187,29 @@ fn match_delivery_prefix<'a>(
                 push_unique(&mut out, rest, true);
             }
             _ => {}
+        }
+        // Long Muse paste (#575): header + `[Pasted Content N chars]` + visible
+        // tail. Accept only when the tail is a suffix of the body of at least
+        // MIN_SCROLLED_SUFFIX_COMPACT_CHARS compact chars and the elided count
+        // does not exceed the non-tail body (+1: Muse may count a trailing
+        // newline). Any text after the tail leaves a non-empty rest elsewhere
+        // and never reaches this branch as a full match.
+        if let Some(CompactPlaceholderPrefix::Chars { len, rest: tail }) =
+            strip_compact_placeholder_prefix(after_hdr)
+            && let Some(body) = &d.compact_body
+        {
+            let tail_chars = tail.chars().count();
+            // Tolerance: tail is compact (whitespace removed) while the
+            // placeholder count is over raw text, so the bound uses the raw
+            // body count minus the compact tail, plus 1 for a trailing
+            // newline Muse may count.
+            let raw_body_chars = d.body_chars.unwrap_or(0);
+            if tail_chars >= MIN_SCROLLED_SUFFIX_COMPACT_CHARS
+                && body.ends_with(tail)
+                && len <= raw_body_chars.saturating_sub(tail_chars) + 1
+            {
+                push_unique(&mut out, &tail[tail.len()..], true);
+            }
         }
     }
     out
@@ -21170,6 +21201,31 @@ exit 1"#,
         assert_eq!(
             claude_reforge_timeout_error(CLAUDE_REFORGE_SETTLE_TIMEOUT),
             "reforge unconfirmed: Claude session id did not change within 20 seconds after /clear; the reforge prompt was not sent"
+        );
+    }
+
+    #[test]
+    fn muse_long_paste_header_placeholder_tail_matches_target_575() {
+        let rule = "─".repeat(40);
+        let body = "Long paste body line for elision testing. ".repeat(70);
+        let payload = format!(
+            "[fl-wire reply/normal] from ferris (id: urn:uuid:01a1ebc5-4e2b-7764-b6ff-6873d9c91948, thread: urn:uuid:01a1ebc5-4e2b-7764-b6ff-6873d9c91948): Re\n\n{body}"
+        );
+        let trimmed = payload.trim();
+        let d = UnconfirmedWireDelivery::from_payload(trimmed);
+        let tail = &body[body.len() - 200..];
+        let elided = body.trim().chars().count() - tail.trim().chars().count();
+        let screen = format!(
+            "◆ Ready.\n\n{rule}\n❯ [fl-wire reply/normal] from ferris (id: urn:uuid:01a1ebc5-4e2b-7764-b6ff-6873d9c91948, thread: urn:uuid:01a1ebc5-4e2b-7764-b6ff-6873d9c91948): Re\n  [Pasted Content {elided} chars]{tail}\n\n{rule}\n  muse-wonder-full-1.0"
+        );
+        assert_eq!(composer_equals_single_target(&screen, &d), (true, true));
+        // Text after the tail must fail closed.
+        let appended_screen = format!(
+            "◆ Ready.\n\n{rule}\n❯ [fl-wire reply/normal] from ferris (id: urn:uuid:01a1ebc5-4e2b-7764-b6ff-6873d9c91948, thread: urn:uuid:01a1ebc5-4e2b-7764-b6ff-6873d9c91948): Re\n  [Pasted Content {elided} chars]{tail} human appended\n\n{rule}\n  muse-wonder-full-1.0"
+        );
+        assert_eq!(
+            composer_equals_single_target(&appended_screen, &d),
+            (false, false)
         );
     }
 
