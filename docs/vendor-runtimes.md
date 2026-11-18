@@ -570,12 +570,17 @@ one hub; `fl watch balance --apply` uses HTTP and has no local apply path. Runni
 multiple hubs on one runtime is unsupported: global `min_interval_ms` is not
 serialized across separate hubs applying disjoint persona batches ([#599](https://github.com/Artificial-Humanity/FerroLoop/issues/599)).
 
-This is the explicit-operation portion of [#592](https://github.com/Artificial-Humanity/FerroLoop/issues/592).
-Same-hub background paths share the normalized persona mutex. Cross-process fencing
-is still missing for the GET sessions sweep, dead-session reconciliation, automatic
-classification and recovery health updates, and background restart/PID paths. These
-remain the deferred background portion and must gain file fencing before that issue
-can close or the new command can be deployed. No deployment is authorized by this change. The command prints `runtime_spawned`,
+Background dead-session reconciliation, recovery health observation, automatic
+classification/restart and PID refresh use the same file fence and normalized persona
+mutex. The GET sessions sweep follows that order too. Candidate snapshots only locate
+records: each sweep releases the store before trying ownership, reopens it under the
+fence, and validates the current record and recovery state before effects. A busy or
+unreadable record is skipped with rate-limited diagnostics so other personas can
+progress. Automatic restart keeps ownership through its survival watch, store reopen,
+recovery notices and final events. Prepare/remodel do not invoke a global sweep while
+holding their transaction. This completes the shared-path implementation of
+[#592](https://github.com/Artificial-Humanity/FerroLoop/issues/592); no deployment is
+authorized by this change. The command prints `runtime_spawned`,
 `runtime_live`, `hydration_dispatched` and `hydration_status`; it exits non-zero when no
 live runtime resulted. `runtime_live` is a serde-default field on the restart response
 and reports current-operation evidence rather than a saved ownership flag.

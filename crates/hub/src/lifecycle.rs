@@ -2507,6 +2507,7 @@ pub(crate) struct FakeRuntime {
     pub(crate) owns_calls: std::cell::Cell<u32>,
     /// Pane text [`SessionRuntime::capture`] returns, by runtime unit or tmux target.
     pub(crate) panes: std::cell::RefCell<std::collections::BTreeMap<String, String>>,
+    pub(crate) presence_calls: std::cell::RefCell<Vec<String>>,
     /// Cross-thread event log for ordering assertions in tests.
     pub(crate) shared_events: Option<std::sync::Arc<std::sync::Mutex<Vec<&'static str>>>>,
 }
@@ -2805,6 +2806,7 @@ impl SessionRuntime for FakeRuntime {
     }
 
     fn presence(&self, unit: &str) -> RuntimePresence {
+        self.presence_calls.borrow_mut().push(unit.to_string());
         self.presence_of
             .borrow()
             .get(unit)
@@ -4174,6 +4176,18 @@ pub fn get_hosted_session_by_id<S: StateStore>(
     store: &S,
     session_id: &str,
 ) -> Result<Option<HostedSessionRecord>, LifecycleError> {
+    let mut record = get_hosted_session_record(store, session_id)?;
+    if let Some(record) = &mut record {
+        let _ = promote_confirmed_hydration(store, record);
+    }
+    Ok(record)
+}
+
+// Background selection must validate persona coverage before any hydration promotion.
+fn get_hosted_session_record<S: StateStore>(
+    store: &S,
+    session_id: &str,
+) -> Result<Option<HostedSessionRecord>, LifecycleError> {
     let trimmed = session_id.trim();
     if trimmed.is_empty() {
         return Ok(None);
@@ -4196,7 +4210,6 @@ pub fn get_hosted_session_by_id<S: StateStore>(
     if rec.host_session_id.is_none() {
         rec.host_session_id = host_session_id_for_target(rec.tmux_target.as_deref());
     }
-    let _ = promote_confirmed_hydration(store, &mut rec);
     Ok(Some(rec))
 }
 
@@ -5947,6 +5960,56 @@ pub(crate) fn with_lifecycle_fences<T>(
     operation(&env)
 }
 
+/// Background ownership is nonblocking. A borrowed transaction may operate only on
+/// its covered personas; it must never acquire another file/local fence under its store.
+fn with_background_lifecycle_fence<T>(
+    env: &LifecycleEnv<'_>,
+    candidate: &HostedSessionRecord,
+    name: &str,
+    operation: impl FnOnce(&LifecycleEnv<'_>) -> Result<T, LifecycleError>,
+) -> Option<T> {
+    if env
+        .lifecycle_fence
+        .is_some_and(|f| !f.covers(&candidate.persona))
+    {
+        return None;
+    }
+    match with_lifecycle_fence(env, &candidate.persona, name, operation) {
+        Ok(value) => Some(value),
+        Err(error) => {
+            if should_log_auto_respawn_warning(&candidate.session_id, current_respawn_clock_ms()) {
+                eprintln!(
+                    "hub: warning ({} / {}): {name} deferred: {error}",
+                    candidate.persona, candidate.session_id
+                );
+            }
+            None
+        }
+    }
+}
+
+fn reload_background_session<S: StateStore>(
+    store: &S,
+    env: &LifecycleEnv<'_>,
+    id: &str,
+) -> Result<Option<HostedSessionRecord>, LifecycleError> {
+    let record = get_hosted_session_record(store, id)?;
+    if let Some(record) = &record
+        && !env
+            .lifecycle_fence
+            .is_some_and(|f| f.covers(&record.persona))
+    {
+        return Err(LifecycleError::Conflict(
+            "background target changed persona during selection".into(),
+        ));
+    }
+    debug_assert!(
+        lock::pinned_endpoint().is_some(),
+        "background operation requires its runtime pin"
+    );
+    Ok(record)
+}
+
 /// `caller` gates hosting an unmanaged agent: an Active agent with no LIVE hosted record for this
 /// session (none, or a decommissioned one left from an earlier teardown) becomes hosted by the
 /// spin-up, after which a peer's teardown would be allowed, so only the owner may do it. A peer
@@ -7533,10 +7596,8 @@ fn observe_hosted_recovery_health<S: StateStore>(
 /// Mark a hosted runtime `stopped` when its tmux window is confirmed gone twice
 /// and no route of its vendor is present.
 ///
-/// Call sites: [`prepare_decommission`] (after the owner gate and the decommissioned
-/// 409, before the target is rewritten to `decommissioning`) and `GET /api/v1/sessions`
-/// (`handle_get_sessions`, before the discovery snapshot). Feira's boot reconcile
-/// (Record #129) calls this the same way: `reconcile_dead_hosted_sessions(store, env, by)?`.
+/// Called by hub reconciliation and `GET /api/v1/sessions` before discovery.
+/// Prepare/remodel do not invoke a global sweep while holding their transaction.
 ///
 /// A hosted record is considered only when its status is `running` and
 /// `vendor_has_runtime` is true. HTTP API vendors are never marked `stopped` for
@@ -7566,111 +7627,83 @@ fn observe_hosted_recovery_health<S: StateStore>(
 /// This does not retire the agent, write a tombstone, kill tmux, or delete files.
 /// This background sweep may update other running records. A stopped record is
 /// not decommissioned, so it does not become unmanaged.
+/// For stores without an externally held guard. Hub callers must use the owned-guard
+/// variant so their store mutex is released before acquiring a lifecycle fence.
 pub fn reconcile_dead_hosted_sessions<S: StateStore>(
     store: &S,
     env: &LifecycleEnv<'_>,
     by: &str,
 ) -> Result<(), LifecycleError> {
-    let records = list_hosted_sessions(store)?;
-    for record in records {
-        // Prepare/remodel already own this persona; never recurse into its reconciliation.
-        if env
-            .lifecycle_fence
-            .is_some_and(|fence| fence.covers(&record.persona))
-        {
-            continue;
-        }
+    reconcile_dead_hosted_sessions_with_store(store, || Ok(store), env, by)
+}
 
-        if !record.status.eq_ignore_ascii_case(STATUS_RUNNING)
-            || !vendor_has_runtime(&record.vendor)
-        {
-            continue;
+pub fn reconcile_dead_hosted_sessions_with_store<S, G, F>(
+    store_guard: G,
+    mut reopen_store: F,
+    env: &LifecycleEnv<'_>,
+    by: &str,
+) -> Result<(), LifecycleError>
+where
+    S: StateStore,
+    G: std::ops::Deref<Target = S>,
+    F: FnMut() -> Result<G, LifecycleError>,
+{
+    let records = list_hosted_sessions(&*store_guard)?;
+    drop(store_guard);
+    for candidate in records {
+        with_background_lifecycle_fence(env, &candidate, "dead-reconcile", |env| {
+            let guard = reopen_store()?;
+            let Some(record) = reload_background_session(&*guard, env, &candidate.session_id)?
+            else {
+                return Ok(());
+            };
+            reconcile_dead_hosted_session_fenced(&*guard, env, record, by)
+        });
+    }
+    Ok(())
+}
+
+pub fn reconcile_dead_hosted_sessions_in_hub(
+    state: &crate::HubState,
+    by: &str,
+) -> Result<(), LifecycleError> {
+    let guard = state.try_open_lifecycle_store()?;
+    reconcile_dead_hosted_sessions_with_store(
+        guard,
+        || state.open_store().map_err(LifecycleError::from),
+        &crate::api::lifecycle_env(state),
+        by,
+    )
+}
+
+fn reconcile_dead_hosted_session_fenced<S: StateStore>(
+    store: &S,
+    env: &LifecycleEnv<'_>,
+    mut record: HostedSessionRecord,
+    by: &str,
+) -> Result<(), LifecycleError> {
+    if !record.status.eq_ignore_ascii_case(STATUS_RUNNING) || !vendor_has_runtime(&record.vendor) {
+        return Ok(());
+    }
+    load_hosted_respawn_state(store, &record.session_id)?;
+    let _ = promote_confirmed_hydration(store, &mut record);
+    if record.vendor == "claude" {
+        let mut rstate = load_claude_resume_state(store, &record.session_id);
+        if claude_survival_window_active(env, &rstate, current_respawn_clock_ms()) {
+            return Ok(());
         }
-        let session_mutex = hosted_session_lifecycle_mutex(env, &record.persona);
-        let _session_lifecycle_guard = match session_mutex.try_lock() {
-            Ok(guard) => guard,
-            Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
-            Err(std::sync::TryLockError::WouldBlock) => {
-                continue;
-            }
-        };
-        let mut record = match get_hosted_session_by_id(store, &record.session_id) {
-            Ok(Some(r)) => r,
-            Ok(None) => continue,
-            Err(err) => {
-                eprintln!(
-                    "hub: warning ({} / {}): failed to load hosted session during dead-session reconcile: {err}",
-                    record.persona, record.session_id
-                );
-                continue;
-            }
-        };
-        if !record.status.eq_ignore_ascii_case(STATUS_RUNNING)
-            || !vendor_has_runtime(&record.vendor)
-        {
-            continue;
+        if rstate.in_survival_window {
+            rstate.in_survival_window = false;
+            let _ = save_claude_resume_state(store, &record.session_id, &rstate, by);
         }
-        if record.vendor == "claude" {
-            let mut rstate = load_claude_resume_state(store, &record.session_id);
-            if claude_survival_window_active(env, &rstate, current_respawn_clock_ms()) {
-                continue;
-            }
-            if rstate.in_survival_window {
-                rstate.in_survival_window = false;
-                let _ = save_claude_resume_state(store, &record.session_id, &rstate, by);
-            }
-        }
-        let streak_key = (
-            env.home_override.map(Path::to_path_buf),
-            record.session_id.clone(),
-        );
-        if vendor_route_live_for_record(env.home_override, &record) {
-            if env.spawn_runtime
-                && let Err(err) = observe_hosted_recovery_health(store, &record, true, by)
-            {
-                if should_log_auto_respawn_warning(&record.session_id, current_respawn_clock_ms()) {
-                    eprintln!(
-                        "hub: warning ({}): failed recovery health observation: {err}",
-                        record.session_id
-                    );
-                }
-                continue;
-            }
-            if record.vendor == "claude" {
-                let mut rstate = load_claude_resume_state(store, &record.session_id);
-                let launch_started_ms =
-                    rstate.resume_launched_at_ms.unwrap_or(record.updated_at_ms);
-                if let Some(ref unconfirmed_sid) = rstate.resume_unconfirmed_session_id
-                    && claude_route_confirmed_for_session(
-                        env,
-                        &record.persona,
-                        &record.session_id,
-                        unconfirmed_sid,
-                        record.hydration_generation.as_deref(),
-                        record.pid,
-                        launch_started_ms,
-                    )
-                {
-                    rstate.resume_unconfirmed_session_id = None;
-                    rstate.resume_launched_at_ms = None;
-                    let _ = save_claude_resume_state(store, &record.session_id, &rstate, by);
-                }
-            }
-            with_dead_streaks(|streaks| {
-                streaks.remove(&streak_key);
-            });
-            continue;
-        }
-        if !env.spawn_runtime {
-            continue;
-        }
-        let target = record
-            .tmux_target
-            .clone()
-            .unwrap_or_else(|| hosted_tmux_target(&record.vendor, &record.persona));
-        let presence = env.runtime.presence(&target);
-        if let Err(err) =
-            observe_hosted_recovery_health(store, &record, presence == RuntimePresence::Alive, by)
+    }
+    let streak_key = (
+        env.home_override.map(Path::to_path_buf),
+        record.session_id.clone(),
+    );
+    if vendor_route_live_for_record(env.home_override, &record) {
+        if env.spawn_runtime
+            && let Err(err) = observe_hosted_recovery_health(store, &record, true, by)
         {
             if should_log_auto_respawn_warning(&record.session_id, current_respawn_clock_ms()) {
                 eprintln!(
@@ -7678,82 +7711,118 @@ pub fn reconcile_dead_hosted_sessions<S: StateStore>(
                     record.session_id
                 );
             }
-            continue;
+            return Ok(());
         }
-        match presence {
-            RuntimePresence::Alive => {
-                with_dead_streaks(|streaks| {
-                    streaks.remove(&streak_key);
-                });
+        if record.vendor == "claude" {
+            let mut rstate = load_claude_resume_state(store, &record.session_id);
+            let launch_started_ms = rstate.resume_launched_at_ms.unwrap_or(record.updated_at_ms);
+            if let Some(ref unconfirmed_sid) = rstate.resume_unconfirmed_session_id
+                && claude_route_confirmed_for_session(
+                    env,
+                    &record.persona,
+                    &record.session_id,
+                    unconfirmed_sid,
+                    record.hydration_generation.as_deref(),
+                    record.pid,
+                    launch_started_ms,
+                )
+            {
+                rstate.resume_unconfirmed_session_id = None;
+                rstate.resume_launched_at_ms = None;
+                let _ = save_claude_resume_state(store, &record.session_id, &rstate, by);
             }
-            RuntimePresence::Unknown => {}
-            RuntimePresence::Gone => {
-                let streak = bump_dead_streak(&streak_key);
-                if streak >= 2 {
-                    if record.vendor == "claude" {
-                        let mut rstate = load_claude_resume_state(store, &record.session_id);
-                        rstate.in_survival_window = false;
-                        let launch_started_ms =
-                            rstate.resume_launched_at_ms.unwrap_or(record.updated_at_ms);
-                        if let Some(unconfirmed_sid) = rstate.resume_unconfirmed_session_id.clone()
-                            && !claude_route_confirmed_for_session(
-                                env,
-                                &record.persona,
-                                &record.session_id,
-                                &unconfirmed_sid,
-                                record.hydration_generation.as_deref(),
-                                record.pid,
-                                launch_started_ms,
-                            )
+        }
+        with_dead_streaks(|streaks| {
+            streaks.remove(&streak_key);
+        });
+        return Ok(());
+    }
+    if !env.spawn_runtime {
+        return Ok(());
+    }
+    let target = record
+        .tmux_target
+        .clone()
+        .unwrap_or_else(|| hosted_tmux_target(&record.vendor, &record.persona));
+    let presence = env.runtime.presence(&target);
+    if let Err(err) =
+        observe_hosted_recovery_health(store, &record, presence == RuntimePresence::Alive, by)
+    {
+        if should_log_auto_respawn_warning(&record.session_id, current_respawn_clock_ms()) {
+            eprintln!(
+                "hub: warning ({}): failed recovery health observation: {err}",
+                record.session_id
+            );
+        }
+        return Ok(());
+    }
+    match presence {
+        RuntimePresence::Alive => {
+            with_dead_streaks(|streaks| {
+                streaks.remove(&streak_key);
+            });
+        }
+        RuntimePresence::Unknown => {}
+        RuntimePresence::Gone => {
+            let streak = bump_dead_streak(&streak_key);
+            if streak >= 2 {
+                if record.vendor == "claude" {
+                    let mut rstate = load_claude_resume_state(store, &record.session_id);
+                    rstate.in_survival_window = false;
+                    let launch_started_ms =
+                        rstate.resume_launched_at_ms.unwrap_or(record.updated_at_ms);
+                    if let Some(unconfirmed_sid) = rstate.resume_unconfirmed_session_id.clone()
+                        && !claude_route_confirmed_for_session(
+                            env,
+                            &record.persona,
+                            &record.session_id,
+                            &unconfirmed_sid,
+                            record.hydration_generation.as_deref(),
+                            record.pid,
+                            launch_started_ms,
+                        )
+                    {
+                        rstate.resume_failed = true;
+                        rstate.resume_unconfirmed_session_id = None;
+                        rstate.resume_launched_at_ms = None;
+                        let _ = save_claude_resume_state(store, &record.session_id, &rstate, by);
+                    } else {
+                        if rstate.resume_unconfirmed_session_id.is_some()
+                            || rstate.resume_launched_at_ms.is_some()
                         {
-                            rstate.resume_failed = true;
                             rstate.resume_unconfirmed_session_id = None;
                             rstate.resume_launched_at_ms = None;
                             let _ =
                                 save_claude_resume_state(store, &record.session_id, &rstate, by);
-                        } else {
-                            if rstate.resume_unconfirmed_session_id.is_some()
-                                || rstate.resume_launched_at_ms.is_some()
-                            {
-                                rstate.resume_unconfirmed_session_id = None;
-                                rstate.resume_launched_at_ms = None;
-                                let _ = save_claude_resume_state(
-                                    store,
-                                    &record.session_id,
-                                    &rstate,
-                                    by,
-                                );
-                            }
-                            let _ =
-                                sync_claude_vendor_session_id_from_route(store, env, &mut record);
                         }
+                        let _ = sync_claude_vendor_session_id_from_route(store, env, &mut record);
                     }
-                    let clean_exit = env
-                        .runtime
-                        .recorded_exit_code(&target, record.runtime_leader_pid.or(record.pid))
-                        == Some(0);
-                    record.status = STATUS_STOPPED.to_string();
-                    record.launch_prerequisite_detail = None;
-                    record.stop_reason = Some(
-                        if clean_exit {
-                            STOP_REASON_CLEAN_EXIT
-                        } else {
-                            STOP_REASON_RUNTIME_GONE
-                        }
-                        .to_string(),
-                    );
-                    record.updated_at_ms = now_ms();
-                    if let Err(err) = persist_hosted_session(store, &record, by) {
-                        eprintln!(
-                            "hub: warning ({} / {}): failed to persist stopped session during dead-session reconcile: {err}",
-                            record.persona, record.session_id
-                        );
-                        continue;
-                    }
-                    with_dead_streaks(|streaks| {
-                        streaks.remove(&streak_key);
-                    });
                 }
+                let clean_exit = env
+                    .runtime
+                    .recorded_exit_code(&target, record.runtime_leader_pid.or(record.pid))
+                    == Some(0);
+                record.status = STATUS_STOPPED.to_string();
+                record.launch_prerequisite_detail = None;
+                record.stop_reason = Some(
+                    if clean_exit {
+                        STOP_REASON_CLEAN_EXIT
+                    } else {
+                        STOP_REASON_RUNTIME_GONE
+                    }
+                    .to_string(),
+                );
+                record.updated_at_ms = now_ms();
+                if let Err(err) = persist_hosted_session(store, &record, by) {
+                    eprintln!(
+                        "hub: warning ({} / {}): failed to persist stopped session during dead-session reconcile: {err}",
+                        record.persona, record.session_id
+                    );
+                    return Ok(());
+                }
+                with_dead_streaks(|streaks| {
+                    streaks.remove(&streak_key);
+                });
             }
         }
     }
@@ -9186,6 +9255,8 @@ fn notify_crash_loop_recipients<S: AgentRegistry + MessageStore>(
 /// stopped due to [`STOP_REASON_RUNTIME_GONE`], enforcing exponential backoff (`30s`, `60s`, `120s`)
 /// and a fast crash-loop guard (`3` automatic respawns in `10` minutes), followed by at most
 /// six slow recovery launches spaced ten minutes apart. Incident state survives early deaths.
+/// For stores without an externally held guard. Callers owning a HubStoreGuard must
+/// transfer it to the reopen variant, which drops it before taking any file fence.
 pub fn reconcile_and_respawn_hosted_sessions<S>(
     store: &S,
     env: &LifecycleEnv<'_>,
@@ -9207,155 +9278,71 @@ where
     G: std::ops::Deref<Target = S>,
     F: FnMut() -> Result<G, LifecycleError>,
 {
-    reconcile_dead_hosted_sessions(&*store_guard, env, AUTO_RESPAWN_ACTOR)?;
-    drop(store_guard);
+    reconcile_dead_hosted_sessions_with_store(
+        store_guard,
+        &mut reopen_store,
+        env,
+        AUTO_RESPAWN_ACTOR,
+    )?;
     if !env.spawn_runtime {
         return Ok(Vec::new());
     }
-    let candidates: Vec<HostedSessionRecord> = {
+    let candidates = {
         let guard = reopen_store()?;
         list_hosted_sessions(&*guard)?
-            .into_iter()
-            .filter(|r| {
-                r.hosted
-                    && vendor_has_runtime(&r.vendor)
-                    && r.status.eq_ignore_ascii_case(STATUS_STOPPED)
-                    && r.restart_policy.eq_ignore_ascii_case("on-failure")
-                    && matches!(
-                        r.stop_reason.as_deref(),
-                        Some(
-                            STOP_REASON_RUNTIME_GONE
-                                | STOP_REASON_CRASH_LOOP
-                                | STOP_REASON_PREREQUISITE_UNAVAILABLE
-                        )
-                    )
-            })
-            .collect()
     };
     let mut respawned = Vec::new();
     for record in candidates {
-        // Reopening may interleave with manual lifecycle work; do it before taking the
-        // non-reentrant session mutex, then reload and classify the record under the lock.
-        let guard = match reopen_store() {
-            Ok(g) => g,
-            Err(err) => {
-                eprintln!(
-                    "hub: warning ({} / {}): failed to reopen store during auto-respawn: {err}",
-                    record.persona, record.session_id
-                );
-                continue;
-            }
-        };
-        let session_mutex = hosted_session_lifecycle_mutex(env, &record.persona);
-        // Never wait for the session mutex while holding the reopened store guard.
-        let reconcile_lifecycle_guard = match session_mutex.try_lock() {
-            Ok(guard) => guard,
-            Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
-            Err(std::sync::TryLockError::WouldBlock) => continue,
-        };
-        let mut fresh = match get_hosted_session_by_id(&*guard, &record.session_id) {
-            Ok(Some(r)) => r,
-            Ok(None) => continue,
-            Err(err) => {
-                eprintln!(
-                    "hub: warning ({} / {}): failed to load hosted session during auto-respawn: {err}",
-                    record.persona, record.session_id
-                );
-                continue;
-            }
-        };
-        if !fresh.hosted
-            || !vendor_has_runtime(&fresh.vendor)
-            || !fresh.status.eq_ignore_ascii_case(STATUS_STOPPED)
-            || !fresh.restart_policy.eq_ignore_ascii_case("on-failure")
-            || !matches!(
-                fresh.stop_reason.as_deref(),
-                Some(
-                    STOP_REASON_RUNTIME_GONE
-                        | STOP_REASON_CRASH_LOOP
-                        | STOP_REASON_PREREQUISITE_UNAVAILABLE
+        with_background_lifecycle_fence(env, &record, "auto-respawn", |env| {
+            let guard = reopen_store()?;
+            let Some(mut fresh) = reload_background_session(&*guard, env, &record.session_id)?
+            else {
+                return Ok(());
+            };
+            if !fresh.hosted
+                || !vendor_has_runtime(&fresh.vendor)
+                || !fresh.status.eq_ignore_ascii_case(STATUS_STOPPED)
+                || !fresh.restart_policy.eq_ignore_ascii_case("on-failure")
+                || !matches!(
+                    fresh.stop_reason.as_deref(),
+                    Some(
+                        STOP_REASON_RUNTIME_GONE
+                            | STOP_REASON_CRASH_LOOP
+                            | STOP_REASON_PREREQUISITE_UNAVAILABLE
+                    )
                 )
-            )
-        {
-            continue;
-        }
-        let now = current_respawn_clock_ms();
-        let mut rstate = match load_hosted_respawn_state(&*guard, &record.session_id) {
-            Ok(state) => state,
-            Err(err) => {
-                if should_log_auto_respawn_warning(&fresh.session_id, now) {
-                    eprintln!(
-                        "hub: warning ({}): failed to read recovery policy: {err}",
-                        fresh.session_id
-                    );
-                }
-                continue;
-            }
-        };
-        let loaded_state = rstate.clone();
-        let was_incident = rstate.recovery_started_at_ms.is_some();
-        let decision =
-            recovery::classify(&mut rstate, fresh.stop_reason.as_deref().unwrap_or(""), now);
-        let exhaustion_transition = decision == recovery::Decision::Exhausted
-            && (loaded_state.next_allowed_at_ms.is_some()
-                || fresh.stop_reason.as_deref() != Some(STOP_REASON_CRASH_LOOP));
-        // State first: a failed write cannot probe, launch or advance recovery.
-        if rstate != loaded_state
-            && let Err(err) =
-                save_hosted_respawn_state(&*guard, &fresh.session_id, &rstate, AUTO_RESPAWN_ACTOR)
-        {
-            if should_log_auto_respawn_warning(&fresh.session_id, now) {
-                eprintln!(
-                    "hub: warning ({}): failed to save recovery policy: {err}",
-                    fresh.session_id
-                );
-            }
-            continue;
-        }
-        if rstate.recovery_started_at_ms.is_some() {
-            if (decision == recovery::Decision::Exhausted
-                || fresh.stop_reason.as_deref() != Some(STOP_REASON_PREREQUISITE_UNAVAILABLE))
-                && (fresh.stop_reason.as_deref() != Some(STOP_REASON_CRASH_LOOP)
-                    || fresh.launch_prerequisite_detail.is_some())
             {
-                fresh.stop_reason = Some(STOP_REASON_CRASH_LOOP.into());
-                fresh.launch_prerequisite_detail = None;
-                fresh.updated_at_ms = now;
-                if let Err(err) = persist_hosted_session(&*guard, &fresh, AUTO_RESPAWN_ACTOR) {
+                return Ok(());
+            }
+            if guard
+                .agent_by_name(&fresh.persona)?
+                .is_some_and(|a| a.status != AgentStatus::Active)
+            {
+                return Ok(());
+            }
+            let now = current_respawn_clock_ms();
+            let mut rstate = match load_hosted_respawn_state(&*guard, &record.session_id) {
+                Ok(state) => state,
+                Err(err) => {
                     if should_log_auto_respawn_warning(&fresh.session_id, now) {
                         eprintln!(
-                            "hub: warning ({}): failed to persist crash-loop record: {err}",
+                            "hub: warning ({}): failed to read recovery policy: {err}",
                             fresh.session_id
                         );
                     }
-                    continue;
+                    return Ok(());
                 }
-            }
-            if !was_incident {
-                eprintln!(
-                    "hub: warning ({}): fast crash-loop guard tripped; first slow recovery due {} UTC",
-                    fresh.session_id,
-                    fl_core::At::from_unix_millis(rstate.next_allowed_at_ms.unwrap_or(0))
-                );
-                on_event(
-                    "session.crash_loop",
-                    serde_json::to_value(&fresh).unwrap_or_default(),
-                );
-            }
-            if exhaustion_transition {
-                eprintln!(
-                    "hub: warning ({}): recovery exhausted after {} slow launches; left stopped",
-                    fresh.session_id,
-                    recovery::RECOVERY_MAX_ATTEMPTS
-                );
-                on_event(
-                    "session.recovery_exhausted",
-                    serde_json::to_value(&fresh).unwrap_or_default(),
-                );
-            }
-            let before_notice = rstate.clone();
-            notify_crash_loop_recipients(&*guard, &fresh, &mut rstate);
-            if rstate != before_notice
+            };
+            let _ = promote_confirmed_hydration(&*guard, &mut fresh);
+            let loaded_state = rstate.clone();
+            let was_incident = rstate.recovery_started_at_ms.is_some();
+            let decision =
+                recovery::classify(&mut rstate, fresh.stop_reason.as_deref().unwrap_or(""), now);
+            let exhaustion_transition = decision == recovery::Decision::Exhausted
+                && (loaded_state.next_allowed_at_ms.is_some()
+                    || fresh.stop_reason.as_deref() != Some(STOP_REASON_CRASH_LOOP));
+            // State first: a failed write cannot probe, launch or advance recovery.
+            if rstate != loaded_state
                 && let Err(err) = save_hosted_respawn_state(
                     &*guard,
                     &fresh.session_id,
@@ -9365,76 +9352,138 @@ where
             {
                 if should_log_auto_respawn_warning(&fresh.session_id, now) {
                     eprintln!(
-                        "hub: warning ({}): failed to save recovery notice deliveries: {err}",
+                        "hub: warning ({}): failed to save recovery policy: {err}",
                         fresh.session_id
                     );
                 }
-                continue;
+                return Ok(());
             }
-        }
-        if !matches!(
-            decision,
-            recovery::Decision::FastLaunch | recovery::Decision::SlowLaunch
-        ) {
-            continue;
-        }
-        // Restart reacquires this same lock and reloads eligibility and the durable deadline.
-        drop(reconcile_lifecycle_guard);
-        match restart_hosted_session_with_store(
-            guard,
-            &mut reopen_store,
-            env,
-            &record.session_id,
-            AUTO_RESPAWN_ACTOR,
-        ) {
-            Ok(out) => {
-                // `restart_hosted_session_with_store` returns `Ok` even when `runtime.spawn()`
-                // returns `false` (or the newly spawned process fails `launch_survived`). Counting
-                // that attempt in the current fast/slow budget and emitting `session.restarted`
-                // is intentional. An immediate Codex prerequisite loss instead returns the typed
-                // refusal above after refunding this operation's reservation.
-                on_event(
-                    "session.restarted",
-                    serde_json::to_value(&out).unwrap_or_default(),
-                );
-                respawned.push(out);
-            }
-            Err(LifecycleError::Conflict(msg)) => {
-                if should_log_auto_respawn_warning(&record.session_id, now) {
-                    eprintln!(
-                        "hub: warning ({} / {}): auto-respawn deferred: {msg}",
-                        record.persona, record.session_id
-                    );
-                }
-            }
-            Err(LifecycleError::PrerequisiteUnavailable { detail, .. }) => {
-                if should_log_auto_respawn_warning(&record.session_id, now) {
-                    eprintln!(
-                        "hub: warning ({} / {}): auto-respawn prerequisite unavailable: {}",
-                        record.persona,
-                        record.session_id,
-                        bounded_prerequisite_detail(&detail)
-                    );
-                }
-                if let Ok(guard) = reopen_store()
-                    && let Ok(Some(current)) = get_hosted_session_by_id(&*guard, &record.session_id)
-                    && current.stop_reason.as_deref() == Some(STOP_REASON_PREREQUISITE_UNAVAILABLE)
+            if rstate.recovery_started_at_ms.is_some() {
+                if (decision == recovery::Decision::Exhausted
+                    || fresh.stop_reason.as_deref() != Some(STOP_REASON_PREREQUISITE_UNAVAILABLE))
+                    && (fresh.stop_reason.as_deref() != Some(STOP_REASON_CRASH_LOOP)
+                        || fresh.launch_prerequisite_detail.is_some())
                 {
-                    on_event(
-                        "session.prerequisite_unavailable",
-                        serde_json::to_value(current).unwrap_or_default(),
-                    );
+                    fresh.stop_reason = Some(STOP_REASON_CRASH_LOOP.into());
+                    fresh.launch_prerequisite_detail = None;
+                    fresh.updated_at_ms = now;
+                    if let Err(err) = persist_hosted_session(&*guard, &fresh, AUTO_RESPAWN_ACTOR) {
+                        if should_log_auto_respawn_warning(&fresh.session_id, now) {
+                            eprintln!(
+                                "hub: warning ({}): failed to persist crash-loop record: {err}",
+                                fresh.session_id
+                            );
+                        }
+                        return Ok(());
+                    }
                 }
-            }
-            Err(err) => {
-                if should_log_auto_respawn_warning(&record.session_id, now) {
+                if !was_incident {
                     eprintln!(
-                        "hub: warning ({} / {}): auto-respawn failed: {err}",
-                        record.persona, record.session_id
+                        "hub: warning ({}): fast crash-loop guard tripped; first slow recovery due {} UTC",
+                        fresh.session_id,
+                        fl_core::At::from_unix_millis(rstate.next_allowed_at_ms.unwrap_or(0))
+                    );
+                    on_event(
+                        "session.crash_loop",
+                        serde_json::to_value(&fresh).unwrap_or_default(),
                     );
                 }
+                if exhaustion_transition {
+                    eprintln!(
+                        "hub: warning ({}): recovery exhausted after {} slow launches; left stopped",
+                        fresh.session_id,
+                        recovery::RECOVERY_MAX_ATTEMPTS
+                    );
+                    on_event(
+                        "session.recovery_exhausted",
+                        serde_json::to_value(&fresh).unwrap_or_default(),
+                    );
+                }
+                let before_notice = rstate.clone();
+                notify_crash_loop_recipients(&*guard, &fresh, &mut rstate);
+                if rstate != before_notice
+                    && let Err(err) = save_hosted_respawn_state(
+                        &*guard,
+                        &fresh.session_id,
+                        &rstate,
+                        AUTO_RESPAWN_ACTOR,
+                    )
+                {
+                    if should_log_auto_respawn_warning(&fresh.session_id, now) {
+                        eprintln!(
+                            "hub: warning ({}): failed to save recovery notice deliveries: {err}",
+                            fresh.session_id
+                        );
+                    }
+                    return Ok(());
+                }
             }
-        }
+            if !matches!(
+                decision,
+                recovery::Decision::FastLaunch | recovery::Decision::SlowLaunch
+            ) {
+                return Ok(());
+            }
+            // Nested restart borrows this proof through launch, store reopen and final effects.
+            match restart_hosted_session_with_store(
+                guard,
+                &mut reopen_store,
+                env,
+                &record.session_id,
+                AUTO_RESPAWN_ACTOR,
+            ) {
+                Ok(out) => {
+                    // `restart_hosted_session_with_store` returns `Ok` even when `runtime.spawn()`
+                    // returns `false` (or the newly spawned process fails `launch_survived`). Counting
+                    // that attempt in the current fast/slow budget and emitting `session.restarted`
+                    // is intentional. An immediate Codex prerequisite loss instead returns the typed
+                    // refusal above after refunding this operation's reservation.
+                    on_event(
+                        "session.restarted",
+                        serde_json::to_value(&out).unwrap_or_default(),
+                    );
+                    respawned.push(out);
+                }
+                Err(LifecycleError::Conflict(msg)) => {
+                    if should_log_auto_respawn_warning(&record.session_id, now) {
+                        eprintln!(
+                            "hub: warning ({} / {}): auto-respawn deferred: {msg}",
+                            record.persona, record.session_id
+                        );
+                    }
+                }
+                Err(LifecycleError::PrerequisiteUnavailable { detail, .. }) => {
+                    if should_log_auto_respawn_warning(&record.session_id, now) {
+                        eprintln!(
+                            "hub: warning ({} / {}): auto-respawn prerequisite unavailable: {}",
+                            record.persona,
+                            record.session_id,
+                            bounded_prerequisite_detail(&detail)
+                        );
+                    }
+                    if let Ok(guard) = reopen_store()
+                        && let Ok(Some(current)) =
+                            reload_background_session(&*guard, env, &record.session_id)
+                        && current.stop_reason.as_deref()
+                            == Some(STOP_REASON_PREREQUISITE_UNAVAILABLE)
+                    {
+                        on_event(
+                            "session.prerequisite_unavailable",
+                            serde_json::to_value(current).unwrap_or_default(),
+                        );
+                    }
+                }
+                Err(err) => {
+                    if should_log_auto_respawn_warning(&record.session_id, now) {
+                        eprintln!(
+                            "hub: warning ({} / {}): auto-respawn failed: {err}",
+                            record.persona, record.session_id
+                        );
+                    }
+                }
+            }
+            Ok(())
+        });
     }
     Ok(respawned)
 }
@@ -9442,9 +9491,7 @@ where
 pub fn reconcile_and_respawn_hosted_sessions_in_hub(
     state: &crate::HubState,
 ) -> Result<Vec<RestartResponse>, LifecycleError> {
-    let store_guard = state
-        .open_store()
-        .map_err(|e| LifecycleError::Store(e.to_string()))?;
+    let store_guard = state.try_open_lifecycle_store()?;
     let env = crate::api::lifecycle_env(state);
     reconcile_and_respawn_hosted_sessions_with_store(
         store_guard,
@@ -9508,57 +9555,80 @@ fn refresh_owned_runtime_pid(env: &LifecycleEnv<'_>, unit: &str, record: &mut Ho
 /// Backfill or refresh `record.pid` and `record.pid_start_time` for running hosted sessions whose
 /// recorded PID is missing, lacks `pid_start_time`, is a wrapper shell that now has a vendor CLI
 /// child, or is not proven live while the runtime unit is live.
+/// For stores without an externally held guard; hub callers use the reopen variant.
 pub fn reconcile_running_session_pids_with_store<S: StateStore>(
     env: &LifecycleEnv<'_>,
     store: &S,
 ) -> Result<usize, LifecycleError> {
-    let records = list_hosted_sessions(store)?;
-    let mut updated = 0usize;
-    for record in records {
-        if !record.status.eq_ignore_ascii_case(STATUS_RUNNING) {
-            continue;
-        }
-        let session_mutex = hosted_session_lifecycle_mutex(env, &record.persona);
-        let _session_lifecycle_guard = match session_mutex.try_lock() {
-            Ok(guard) => guard,
-            Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
-            Err(std::sync::TryLockError::WouldBlock) => continue,
-        };
-        let Some(mut record) = get_hosted_session_by_id(store, &record.session_id)? else {
-            continue;
-        };
-        if !record.status.eq_ignore_ascii_case(STATUS_RUNNING) {
-            continue;
-        }
-        let target = record
-            .tmux_target
-            .clone()
-            .unwrap_or_else(|| hosted_tmux_target(&record.vendor, &record.persona));
-        let unit = env.runtime.unit(&target).to_string();
-        if env.spawn_runtime
-            && vendor_has_runtime(&record.vendor)
-            && !matches!(env.runtime.presence(&target), RuntimePresence::Gone)
-        {
-            let before = (record.pid, record.pid_start_time, record.runtime_leader_pid);
-            refresh_owned_runtime_pid(env, &unit, &mut record);
-            if before != (record.pid, record.pid_start_time, record.runtime_leader_pid) {
-                record.updated_at_ms = now_ms();
-                persist_hosted_session(store, &record, AUTO_RESPAWN_ACTOR)?;
-                updated += 1;
-            }
-        }
+    reconcile_running_session_pids_with_reopen(store, || Ok(store), env)
+}
+
+pub fn reconcile_running_session_pids_with_reopen<S, G, F>(
+    store_guard: G,
+    mut reopen_store: F,
+    env: &LifecycleEnv<'_>,
+) -> Result<usize, LifecycleError>
+where
+    S: StateStore,
+    G: std::ops::Deref<Target = S>,
+    F: FnMut() -> Result<G, LifecycleError>,
+{
+    let records = list_hosted_sessions(&*store_guard)?;
+    drop(store_guard);
+    let mut updated = 0;
+    for candidate in records {
+        updated += with_background_lifecycle_fence(env, &candidate, "pid-reconcile", |env| {
+            let guard = reopen_store()?;
+            let Some(record) = reload_background_session(&*guard, env, &candidate.session_id)?
+            else {
+                return Ok(0);
+            };
+            reconcile_running_session_pid_fenced(&*guard, env, record)
+        })
+        .unwrap_or(0);
     }
     Ok(updated)
+}
+
+fn reconcile_running_session_pid_fenced<S: StateStore>(
+    store: &S,
+    env: &LifecycleEnv<'_>,
+    mut record: HostedSessionRecord,
+) -> Result<usize, LifecycleError> {
+    if !record.status.eq_ignore_ascii_case(STATUS_RUNNING) {
+        return Ok(0);
+    }
+    load_hosted_respawn_state(store, &record.session_id)?;
+    let _ = promote_confirmed_hydration(store, &mut record);
+    let target = record
+        .tmux_target
+        .clone()
+        .unwrap_or_else(|| hosted_tmux_target(&record.vendor, &record.persona));
+    let unit = env.runtime.unit(&target).to_string();
+    if env.spawn_runtime
+        && vendor_has_runtime(&record.vendor)
+        && !matches!(env.runtime.presence(&target), RuntimePresence::Gone)
+    {
+        let before = (record.pid, record.pid_start_time, record.runtime_leader_pid);
+        refresh_owned_runtime_pid(env, &unit, &mut record);
+        if before != (record.pid, record.pid_start_time, record.runtime_leader_pid) {
+            record.updated_at_ms = now_ms();
+            persist_hosted_session(store, &record, AUTO_RESPAWN_ACTOR)?;
+            return Ok(1);
+        }
+    }
+    Ok(0)
 }
 
 pub fn reconcile_running_session_pids_in_hub(
     state: &crate::HubState,
 ) -> Result<usize, LifecycleError> {
-    let store_guard = state
-        .open_store()
-        .map_err(|e| LifecycleError::Store(e.to_string()))?;
-    let env = crate::api::lifecycle_env(state);
-    reconcile_running_session_pids_with_store(&env, &*store_guard)
+    let guard = state.try_open_lifecycle_store()?;
+    reconcile_running_session_pids_with_reopen(
+        guard,
+        || state.open_store().map_err(LifecycleError::from),
+        &crate::api::lifecycle_env(state),
+    )
 }
 
 /// Remodel phase named by the request body.
@@ -12170,6 +12240,434 @@ mod tests {
         assert_eq!(
             load_hosted_respawn_state(&store, "claude:zelda").unwrap(),
             recovery
+        );
+    }
+
+    // The OS owner deliberately leaves the local mutex free.
+    #[test]
+    fn background_file_owner_skips_dead_health_pid_and_recovery_without_writes() {
+        let _reset = RecoveryFixtureReset;
+        for operation in ["dead", "health", "pid", "auto"] {
+            let store = MemStore::default();
+            let home = TempDir::new().unwrap();
+            let fake = FakeRuntime::default();
+            let env = fake.env(home.path());
+            let mut record = hosted_record("claude", "ada", STATUS_RUNNING, true);
+            if operation == "auto" {
+                record.status = STATUS_STOPPED.into();
+                record.stop_reason = Some(STOP_REASON_CRASH_LOOP.into());
+            }
+            persist_hosted_session(&store, &record, "test").unwrap();
+            save_hosted_respawn_state(
+                &store,
+                &record.session_id,
+                &HostedRespawnState {
+                    recovery_started_at_ms: Some(1),
+                    recovery_attempts: if operation == "auto" {
+                        recovery::RECOVERY_MAX_ATTEMPTS
+                    } else {
+                        1
+                    },
+                    next_allowed_at_ms: Some(1),
+                    ..Default::default()
+                },
+                "test",
+            )
+            .unwrap();
+            fake.presence_of.borrow_mut().insert(
+                "Ada:claude".into(),
+                if matches!(operation, "health" | "pid") {
+                    RuntimePresence::Alive
+                } else {
+                    RuntimePresence::Gone
+                },
+            );
+            fake.live.borrow_mut().insert("Ada".into());
+            fake.set_unit_pid("Ada", std::process::id());
+            let before = get_hosted_session_by_id(&store, &record.session_id).unwrap();
+            let recovery = load_hosted_respawn_state(&store, &record.session_id).unwrap();
+            let revisions = store.state_revisions_after(0).unwrap().len();
+            let _owner = lock::LifecycleFence::acquire(&env, "ADA", "cli-restart").unwrap();
+            let mut events = Vec::new();
+            TEST_DEAD_STREAK_MIN_SPACING_MS.with(|v| v.set(Some(0)));
+            match operation {
+                "auto" => {
+                    reconcile_and_respawn_hosted_sessions_with_store(
+                        &store,
+                        || Ok(&store),
+                        &env,
+                        |name, _| events.push(name.to_string()),
+                    )
+                    .unwrap();
+                }
+                "pid" => {
+                    reconcile_running_session_pids_with_store(&env, &store).unwrap();
+                }
+                _ => {
+                    for _ in 0..2 {
+                        reconcile_dead_hosted_sessions(&store, &env, "test").unwrap();
+                    }
+                }
+            }
+            TEST_DEAD_STREAK_MIN_SPACING_MS.with(|v| v.set(None));
+            assert_eq!(
+                store.state_revisions_after(0).unwrap().len(),
+                revisions,
+                "{operation}: background must not write while the CLI owns its file fence"
+            );
+            assert_eq!(
+                get_hosted_session_by_id(&store, &record.session_id).unwrap(),
+                before,
+                "{operation}"
+            );
+            assert_eq!(
+                load_hosted_respawn_state(&store, &record.session_id).unwrap(),
+                recovery,
+                "{operation}"
+            );
+            assert!(
+                fake.presence_calls.borrow().is_empty(),
+                "{operation}: no losing presence probe"
+            );
+            assert!(events.is_empty(), "{operation}: no losing event");
+            assert!(
+                fake.calls.borrow().is_empty(),
+                "{operation}: no losing runtime effect"
+            );
+        }
+    }
+
+    #[test]
+    fn background_reopen_validates_current_persona_before_observation_or_promotion() {
+        let _reset = RecoveryFixtureReset;
+        for (operation, change) in [
+            ("dead", "persona"),
+            ("pid", "persona"),
+            ("auto", "persona"),
+            ("dead", "status"),
+            ("pid", "status"),
+            ("auto", "status"),
+            ("dead", "vendor"),
+            ("pid", "vendor"),
+            ("auto", "vendor"),
+            ("dead", "read-error"),
+            ("pid", "read-error"),
+            ("auto", "read-error"),
+            ("auto", "policy"),
+        ] {
+            let home = TempDir::new().unwrap();
+            let hub = crate::HubState::new(crate::HubServerConfig {
+                store_path: home.path().join("fixture.fls"),
+                repo_root: home.path().into(),
+                home_override: Some(home.path().into()),
+                ..Default::default()
+            });
+            let fake = FakeRuntime::default();
+            let env = fake.env(home.path());
+            let mut record = hosted_record("claude", "ada", STATUS_RUNNING, true);
+            if operation == "auto" {
+                record.status = STATUS_STOPPED.into();
+                record.stop_reason = Some(STOP_REASON_RUNTIME_GONE.into());
+            }
+            {
+                let store = hub.open_store().unwrap();
+                persist_hosted_session(&*store, &record, "test").unwrap();
+            }
+            let mut reopens = 0;
+            let mut injected_revision_count = None;
+            let mut reopen = || {
+                reopens += 1;
+                // Auto first performs dead reconciliation, then lists respawn candidates.
+                let selected = if operation == "auto" { 3 } else { 1 };
+                if reopens == selected {
+                    assert!(
+                        matches!(
+                            lock::LifecycleFence::acquire(&env, "ada", "contender"),
+                            Err(LifecycleError::Conflict(_))
+                        ),
+                        "file ownership precedes store reopen"
+                    );
+                    let store = hub.open_store().map_err(LifecycleError::from)?;
+                    match change {
+                        "persona" => record.persona = "zelda".into(),
+                        "vendor" => {
+                            assert!(!vendor_has_runtime("openai-api"));
+                            record.vendor = "openai-api".into();
+                        }
+                        "status" => {
+                            record.status = if operation == "auto" {
+                                STATUS_RUNNING
+                            } else {
+                                STATUS_STOPPED
+                            }
+                            .into()
+                        }
+                        "policy" => record.restart_policy = "never".into(),
+                        _ => TEST_RESPAWN_LOAD_FAILURE_SESSION
+                            .with(|v| *v.borrow_mut() = Some(record.session_id.clone())),
+                    }
+                    if change != "read-error" {
+                        persist_hosted_session(&*store, &record, "interleaved")?;
+                    }
+                    injected_revision_count = Some(store.state_revisions_after(0).unwrap().len());
+                    return Ok(store);
+                }
+                hub.open_store().map_err(LifecycleError::from)
+            };
+            let guard = hub.open_store().unwrap();
+            let mut events = Vec::new();
+            match operation {
+                "dead" => {
+                    reconcile_dead_hosted_sessions_with_store(guard, &mut reopen, &env, "test")
+                        .unwrap()
+                }
+                "pid" => {
+                    reconcile_running_session_pids_with_reopen(guard, &mut reopen, &env).unwrap();
+                }
+                _ => {
+                    reconcile_and_respawn_hosted_sessions_with_store(
+                        guard,
+                        &mut reopen,
+                        &env,
+                        |name, _| events.push(name.to_string()),
+                    )
+                    .unwrap();
+                }
+            }
+            TEST_RESPAWN_LOAD_FAILURE_SESSION.with(|v| *v.borrow_mut() = None);
+            assert!(
+                fake.presence_calls.borrow().is_empty(),
+                "{operation} {change}"
+            );
+            assert!(fake.calls.borrow().is_empty(), "{operation}");
+            assert!(events.is_empty(), "{operation}");
+            let store = hub.open_store().unwrap();
+            assert_eq!(
+                Some(store.state_revisions_after(0).unwrap().len()),
+                injected_revision_count,
+                "{operation}: no write after persona replacement"
+            );
+        }
+    }
+
+    #[test]
+    fn background_busy_and_broken_first_records_allow_other_personas_to_progress() {
+        let _reset = RecoveryFixtureReset;
+        for operation in ["dead", "pid", "auto"] {
+            for busy in [false, true] {
+                let store = MemStore::default();
+                let home = TempDir::new().unwrap();
+                let fake = FakeRuntime::default();
+                let env = fake.env(home.path());
+                for persona in ["ada", "zelda"] {
+                    let mut record = hosted_record("claude", persona, STATUS_RUNNING, true);
+                    record.cwd = Some(home.path().display().to_string());
+                    if operation == "auto" {
+                        record.status = STATUS_STOPPED.into();
+                        record.stop_reason = Some(STOP_REASON_RUNTIME_GONE.into());
+                    }
+                    persist_hosted_session(&store, &record, "test").unwrap();
+                    save_hosted_respawn_state(
+                        &store,
+                        &record.session_id,
+                        &HostedRespawnState {
+                            recovery_started_at_ms: Some(1),
+                            recovery_attempts: 1,
+                            next_allowed_at_ms: Some(1),
+                            ..Default::default()
+                        },
+                        "test",
+                    )
+                    .unwrap();
+                }
+                let _owner = busy
+                    .then(|| lock::LifecycleFence::acquire(&env, "ada", "cli-restart").unwrap());
+                if !busy {
+                    TEST_RESPAWN_LOAD_FAILURE_SESSION
+                        .with(|v| *v.borrow_mut() = Some("claude:ada".into()));
+                }
+                fake.live
+                    .borrow_mut()
+                    .extend(["Ada".into(), "Zelda".into()]);
+                fake.set_unit_pid("Ada", std::process::id());
+                fake.set_unit_pid("Zelda", std::process::id());
+                let before = get_hosted_session_by_id(&store, "claude:ada").unwrap();
+                let result = match operation {
+                    "dead" => {
+                        reconcile_dead_hosted_sessions(&store, &env, "test").unwrap();
+                        true
+                    }
+                    "pid" => reconcile_running_session_pids_with_store(&env, &store).unwrap() == 1,
+                    _ => {
+                        fake.clear();
+                        reconcile_and_respawn_hosted_sessions(&store, &env)
+                            .unwrap()
+                            .len()
+                            == 1
+                    }
+                };
+                TEST_RESPAWN_LOAD_FAILURE_SESSION.with(|v| *v.borrow_mut() = None);
+                assert!(result, "{operation} busy={busy}: other persona progresses");
+                assert_eq!(
+                    get_hosted_session_by_id(&store, "claude:ada").unwrap(),
+                    before,
+                    "{operation}"
+                );
+                assert!(
+                    !fake
+                        .presence_calls
+                        .borrow()
+                        .iter()
+                        .any(|unit| unit.starts_with("Ada")),
+                    "{operation}: broken/busy persona not observed"
+                );
+                if operation == "dead" {
+                    assert!(
+                        load_hosted_respawn_state(&store, "claude:zelda")
+                            .unwrap()
+                            .recovery_healthy_since_ms
+                            .is_some()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn background_borrowed_sweep_never_acquires_an_uncovered_persona() {
+        let store = MemStore::default();
+        let home = TempDir::new().unwrap();
+        let fake = FakeRuntime::default();
+        let env = fake.env(home.path());
+        for persona in ["ada", "zelda"] {
+            persist_hosted_session(
+                &store,
+                &hosted_record("claude", persona, STATUS_RUNNING, true),
+                "fixture",
+            )
+            .unwrap();
+        }
+        let zelda = get_hosted_session_by_id(&store, "claude:zelda").unwrap();
+        with_lifecycle_fence(&env, "ada", "prepare", |owned| {
+            let target = SessionTarget::resolve(&store, "claude:ada", None)?;
+            prepare_decommission(&store, owned, &target, "owner", Caller::Owner)?;
+            reconcile_dead_hosted_sessions(&store, owned, "fixture")?;
+            reconcile_running_session_pids_with_store(owned, &store)?;
+            assert!(
+                fake.presence_calls
+                    .borrow()
+                    .iter()
+                    .all(|unit| !unit.starts_with("Zelda"))
+            );
+            let _other = lock::LifecycleFence::acquire(&env, "zelda", "contender")?;
+            assert_eq!(get_hosted_session_by_id(&store, "claude:zelda")?, zelda);
+            Ok(())
+        })
+        .unwrap();
+        reconcile_dead_hosted_sessions(&store, &env, "fixture").unwrap();
+        assert!(
+            fake.presence_calls
+                .borrow()
+                .iter()
+                .any(|unit| unit.starts_with("Zelda"))
+        );
+    }
+
+    #[test]
+    fn background_auto_keeps_file_ownership_through_survival_reopen_and_event() {
+        let _reset = RecoveryFixtureReset;
+        let home = TempDir::new().unwrap();
+        let hub = std::sync::Arc::new(crate::HubState::new(crate::HubServerConfig {
+            store_path: home.path().join("fixture.fls"),
+            repo_root: home.path().into(),
+            home_override: Some(home.path().into()),
+            ..Default::default()
+        }));
+        let fake = FakeRuntime::default();
+        let env = fake.env(home.path());
+        let spun = spin_up_with_store(
+            hub.open_store().unwrap(),
+            || hub.open_store().map_err(LifecycleError::from),
+            &env,
+            &req("ada", "assistant", "claude"),
+            "owner",
+            Caller::Owner,
+        )
+        .unwrap();
+        let sid = {
+            let store = hub.open_store().unwrap();
+            record_hydration_ack(
+                &*store,
+                "ada",
+                true,
+                spun.hydration_generation.as_deref(),
+                Some("claude:ada"),
+            )
+            .unwrap();
+            let mut record = get_hosted_session_by_id(&*store, "claude:ada")
+                .unwrap()
+                .unwrap();
+            record.status = STATUS_STOPPED.into();
+            record.stop_reason = Some(STOP_REASON_CRASH_LOOP.into());
+            persist_hosted_session(&*store, &record, "fixture").unwrap();
+            save_hosted_respawn_state(
+                &*store,
+                &record.session_id,
+                &HostedRespawnState {
+                    recovery_started_at_ms: Some(1),
+                    recovery_attempts: 1,
+                    next_allowed_at_ms: Some(1),
+                    ..Default::default()
+                },
+                "fixture",
+            )
+            .unwrap();
+            record.vendor_session_id.unwrap()
+        };
+        write_claude_transcript(home.path(), false, &sid, "claude-opus-5-5", 10_000, false);
+        fake.clear();
+        let watched = std::rc::Rc::new(std::cell::Cell::new(false));
+        let observed = watched.clone();
+        let watch_home = home.path().to_path_buf();
+        let watch_hub = hub.clone();
+        TEST_CLAUDE_RESUME_WATCH_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                observed.set(true);
+                let env = LifecycleEnv::new(Some(&watch_home));
+                assert!(matches!(
+                    lock::LifecycleFence::acquire(&env, "ADA", "cli-restart"),
+                    Err(LifecycleError::Conflict(_))
+                ));
+                // The fence remains owned while the store is released for the watch.
+                assert!(watch_hub.try_open_lifecycle_store().is_ok());
+            }))
+        });
+        TEST_CLAUDE_RESUME_SURVIVAL_WINDOW.with(|v| v.set(Some(Duration::from_millis(10))));
+        let mut restarted = false;
+        let result = reconcile_and_respawn_hosted_sessions_with_store(
+            hub.open_store().unwrap(),
+            || hub.open_store().map_err(LifecycleError::from),
+            &env,
+            |name, _| {
+                if name == "session.restarted" {
+                    restarted = true;
+                    assert!(matches!(
+                        lock::LifecycleFence::acquire(&env, "ada", "cli-restart"),
+                        Err(LifecycleError::Conflict(_))
+                    ));
+                }
+            },
+        );
+        TEST_CLAUDE_RESUME_WATCH_HOOK.with(|hook| *hook.borrow_mut() = None);
+        TEST_CLAUDE_RESUME_SURVIVAL_WINDOW.with(|v| v.set(None));
+        assert_eq!(result.unwrap().len(), 1);
+        assert!(watched.get() && restarted);
+        let store = hub.open_store().unwrap();
+        assert_eq!(
+            load_hosted_respawn_state(&*store, "claude:ada")
+                .unwrap()
+                .recovery_attempts,
+            2
         );
     }
 
@@ -20443,36 +20941,85 @@ mod tests {
             persist_hosted_session(&*guard, &rec, "owner").unwrap();
         }
 
-        // Case A: A manual `restart_hosted_session_with_store` runs deterministically between
-        // reconcile's initial candidate collection (`list_hosted_sessions`, reopen call #1) and its
-        // per-candidate re-read (`reopen_store()` inside the candidate loop, reopen call #2).
-        // Reconcile must observe that the session is no longer `STATUS_STOPPED` +
-        // `STOP_REASON_RUNTIME_GONE` and skip it without spawning a second runtime unit.
+        // Drop the actual store before a one-shot interleaving. Only the candidate-list
+        // guard has a hook: its Vec of stopped records exists before its scoped guard drops.
+        struct DropHookStoreGuard<'a> {
+            inner: Option<crate::HubStoreGuard<'a>>,
+            after_drop: Option<Box<dyn FnOnce() + 'a>>,
+        }
+        impl std::ops::Deref for DropHookStoreGuard<'_> {
+            type Target = fl_store::AnyStore;
+            fn deref(&self) -> &Self::Target {
+                self.inner.as_deref().expect("fixture store guard")
+            }
+        }
+        impl Drop for DropHookStoreGuard<'_> {
+            fn drop(&mut self) {
+                drop(self.inner.take());
+                if let Some(hook) = self.after_drop.take() {
+                    hook();
+                }
+            }
+        }
+
+        // Case A: the manual restart runs after the stopped candidate snapshot is built,
+        // before auto takes ownership. The per-candidate reopen must already own the OS
+        // fence, reload the now-running record and avoid a second spawn.
         TEST_CLAUDE_RESUME_SURVIVAL_WINDOW.with(|c| c.set(Some(Duration::from_millis(10))));
         let fake = FakeRuntime::default();
         let env = fake.env(hub_home.path());
         let reopen_calls = std::cell::Cell::new(0usize);
+        let manual_after_snapshot = std::cell::Cell::new(false);
+        let fenced_reread_seen = std::cell::Cell::new(false);
         let respawned = reconcile_and_respawn_hosted_sessions_with_store(
-            state.open_store().unwrap(),
+            DropHookStoreGuard {
+                inner: Some(state.open_store().unwrap()),
+                after_drop: None,
+            },
             || {
                 let call = reopen_calls.get() + 1;
                 reopen_calls.set(call);
-                if call == 2 {
-                    // Fail promptly if reconcile holds the non-reentrant mutex here:
-                    // the synchronous manual restart below would otherwise deadlock.
-                    with_lifecycle_fence(&env, "race", "restart", |_| Ok(()))
-                        .expect("reopen_store must run before locking candidate ownership");
-                    let manual_guard = state.open_store().map_err(LifecycleError::from)?;
-                    let manual = restart_hosted_session_with_store(
-                        manual_guard,
-                        || state.open_store().map_err(LifecycleError::from),
-                        &env,
-                        "claude:race",
-                        "owner",
-                    )?;
-                    assert_eq!(manual.record.status, STATUS_RUNNING);
+                if call == 3 {
+                    assert!(
+                        manual_after_snapshot.get(),
+                        "manual restart followed candidate snapshot"
+                    );
+                    assert!(
+                        matches!(
+                            lock::LifecycleFence::acquire(&env, "race", "cli-contender"),
+                            Err(LifecycleError::Conflict(_))
+                        ),
+                        "per-candidate reopen must already own the OS fence"
+                    );
+                    fenced_reread_seen.set(true);
                 }
-                state.open_store().map_err(LifecycleError::from)
+                let guard = state.open_store().map_err(LifecycleError::from)?;
+                let after_drop: Option<Box<dyn FnOnce() + '_>> = if call == 2 {
+                    Some(Box::new(|| {
+                        // Both the store and any auto lifecycle ownership must be absent.
+                        drop(
+                            lock::LifecycleFence::acquire(&env, "race", "manual-before-auto")
+                                .expect("snapshot drop must precede auto file ownership"),
+                        );
+                        let manual = restart_hosted_session_with_store(
+                            state.open_store().unwrap(),
+                            || state.open_store().map_err(LifecycleError::from),
+                            &env,
+                            "claude:race",
+                            "owner",
+                        )
+                        .unwrap();
+                        assert_eq!(manual.record.status, STATUS_RUNNING);
+                        assert_eq!(manual.record.restart_count, 1);
+                        manual_after_snapshot.set(true);
+                    }))
+                } else {
+                    None
+                };
+                Ok(DropHookStoreGuard {
+                    inner: Some(guard),
+                    after_drop,
+                })
             },
             &env,
             |_, _| {},
@@ -20480,11 +21027,8 @@ mod tests {
         .unwrap();
         TEST_CLAUDE_RESUME_SURVIVAL_WINDOW.with(|c| c.set(None));
 
-        assert_eq!(
-            reopen_calls.get(),
-            2,
-            "reopen_store must run once for candidate listing and once for per-candidate re-read"
-        );
+        assert!(manual_after_snapshot.get());
+        assert!(fenced_reread_seen.get());
         assert!(
             respawned.is_empty(),
             "reconcile must skip a candidate that manual restart already transitioned to running"
