@@ -3136,6 +3136,12 @@ fn check_slug_free<S: StateStore>(store: &S, session_id: &str) -> Result<(), Lif
 }
 
 impl SpinUpRequest {
+    /// Check the ordinary request contract before acquiring lifecycle ownership. Execution
+    /// repeats the full validation under the fence before using the normalized fields.
+    pub(crate) fn validate_request(&self) -> Result<(), LifecycleError> {
+        self.validate().map(|_| ())
+    }
+
     fn validate(&self) -> Result<ValidSpinUp, LifecycleError> {
         let persona = self.persona.trim().to_string();
         let slug_ok = persona
@@ -14395,7 +14401,8 @@ mod tests {
             cleared.push(k.to_string())
         })
         .unwrap_err();
-        assert_eq!(err.status(), 500);
+        assert_eq!(err.status(), 400);
+        assert!(matches!(err, LifecycleError::Invalid(_)));
         assert!(cleared.is_empty());
         assert!(list_hosted_sessions(&store).unwrap().is_empty());
     }
@@ -15885,14 +15892,21 @@ mod tests {
 
         // When env.home_override is None and env.spawn_runtime is true (production path),
         // teardown_session resolves home_dir from $HOME and passes it to adapter.archive().
-        struct RestoreHome(Option<std::ffi::OsString>);
+        struct RestoreHome {
+            home: Option<std::ffi::OsString>,
+            host_sock: Option<std::ffi::OsString>,
+        }
         impl Drop for RestoreHome {
             fn drop(&mut self) {
                 // SAFETY: serialized by with_probe_lock and TMUX_ENV_LOCK.
                 unsafe {
-                    match &self.0 {
+                    match &self.home {
                         Some(v) => std::env::set_var("HOME", v),
                         None => std::env::remove_var("HOME"),
+                    }
+                    match &self.host_sock {
+                        Some(v) => std::env::set_var("FL_HOST_SOCK", v),
+                        None => std::env::remove_var("FL_HOST_SOCK"),
                     }
                 }
             }
@@ -15901,10 +15915,17 @@ mod tests {
             let _tmux_lock = crate::TMUX_ENV_LOCK
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
-            let _restore_home = RestoreHome(std::env::var_os("HOME"));
+            let _restore_home = RestoreHome {
+                home: std::env::var_os("HOME"),
+                host_sock: std::env::var_os("FL_HOST_SOCK"),
+            };
+            let socket = home.path().join("fallback-host.sock");
+            let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+            let _fixture = fl_host_proto::register_hub_test_host_fixture(&socket).unwrap();
             // SAFETY: serialized by with_probe_lock and TMUX_ENV_LOCK; restored by _restore_home.
             unsafe {
                 std::env::set_var("HOME", home.path());
+                std::env::set_var("FL_HOST_SOCK", &socket);
             }
             spin_up(
                 &store,
@@ -19299,15 +19320,15 @@ mod tests {
 
         let watch_window = Duration::from_millis(250);
 
-        // 1. Two concurrent restarts of the same session produce ONE spawn, and the second waits
-        //    on the per-session lifecycle lock and reports a Conflict.
-        let (t2_tx, t2_rx) = std::sync::mpsc::channel();
-        std::thread::scope(|s| {
+        // 1. Hold the first restart inside its survival watch until the contender finishes.
+        //    A busy restart must refuse promptly while ownership remains held, with no spawn.
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let (res2, t2_spawns) = std::thread::scope(|s| {
             let state_ref = &state;
             let home_path = hub_home.path();
             let t2 = s.spawn(move || {
-                std::thread::sleep(Duration::from_millis(50));
-                let t0 = Instant::now();
+                entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
                 let fake2 = FakeRuntime::default();
                 let env2 = fake2.env(home_path);
                 let guard = state_ref.open_store().unwrap();
@@ -19318,11 +19339,19 @@ mod tests {
                     "claude:ada",
                     "owner",
                 );
-                let elapsed = t0.elapsed();
                 let spawns = fake2.launches.borrow().len();
-                t2_tx.send((res, elapsed, spawns)).unwrap();
+                done_tx.send(()).unwrap();
+                (res, spawns)
             });
 
+            TEST_CLAUDE_RESUME_WATCH_HOOK.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move || {
+                    entered_tx.send(()).unwrap();
+                    done_rx
+                        .recv_timeout(Duration::from_secs(5))
+                        .expect("busy restart must finish before the owner leaves its watch");
+                }));
+            });
             TEST_CLAUDE_RESUME_SURVIVAL_WINDOW.with(|c| c.set(Some(watch_window)));
             let fake1 = FakeRuntime::default();
             let env1 = fake1.env(hub_home.path());
@@ -19334,6 +19363,7 @@ mod tests {
                 "claude:ada",
                 "owner",
             );
+            TEST_CLAUDE_RESUME_WATCH_HOOK.with(|hook| *hook.borrow_mut() = None);
             TEST_CLAUDE_RESUME_SURVIVAL_WINDOW.with(|c| c.set(None));
             assert!(res1.is_ok(), "first restart must succeed: {res1:?}");
             assert_eq!(
@@ -19341,9 +19371,8 @@ mod tests {
                 1,
                 "first restart must spawn exactly 1 runtime unit"
             );
-            t2.join().unwrap();
+            t2.join().unwrap()
         });
-        let (res2, t2_elapsed, t2_spawns) = t2_rx.recv().unwrap();
         assert_eq!(
             t2_spawns, 0,
             "second concurrent restart must not spawn a duplicate unit"
@@ -19351,10 +19380,6 @@ mod tests {
         assert!(
             matches!(res2, Err(LifecycleError::Conflict(_))),
             "second concurrent restart must report Conflict, got {res2:?}"
-        );
-        assert!(
-            t2_elapsed >= Duration::from_millis(120),
-            "second concurrent restart must wait on the per-session lock until the first finishes (took {t2_elapsed:?})"
         );
         {
             let guard = state.open_store().unwrap();
@@ -19442,23 +19467,47 @@ mod tests {
             delete_claude_resume_state(&*guard, "claude:ada");
         }
 
-        // 3. A decommission during the watch is NOT undone by the post-watch write-back, and the
-        //    newly spawned runtime unit is stopped.
+        // 3. Public teardown refuses during an owned watch. An out-of-band decommission
+        //    persisted by a legacy writer is still not undone by the watch's write-back,
+        //    and the newly spawned runtime unit is stopped.
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
         std::thread::scope(|s| {
             let state_ref = &state;
             let home_path = hub_home.path();
             let decomm_thread = s.spawn(move || {
-                std::thread::sleep(Duration::from_millis(50));
+                entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
                 let fake_d = FakeRuntime::default();
                 let env_d = fake_d.env(home_path);
                 let guard = state_ref.open_store().unwrap();
                 let target = SessionTarget::resolve(&*guard, "claude:ada", None).unwrap();
-                let resp =
-                    teardown_session(&*guard, &env_d, &target, "owner", Caller::Owner, |_| {})
-                        .unwrap();
-                assert_eq!(resp.status, STATUS_DECOMMISSIONED);
+                let before = list_hosted_sessions(&*guard).unwrap();
+                let route_path = home_path.join(".cache/agent-bus/routes.json");
+                let routes_before = std::fs::read(&route_path).ok();
+                let error =
+                    teardown_session(&*guard, &env_d, &target, "owner", Caller::Owner, |_| {
+                        panic!("busy teardown must not clear queues")
+                    })
+                    .unwrap_err();
+                assert!(matches!(error, LifecycleError::Conflict(_)));
+                assert_eq!(list_hosted_sessions(&*guard).unwrap(), before);
+                assert_eq!(std::fs::read(&route_path).ok(), routes_before);
+                assert!(fake_d.calls.borrow().is_empty());
+                assert!(fake_d.launches.borrow().is_empty());
+                let mut record = target.hosted.unwrap();
+                record.status = STATUS_DECOMMISSIONED.into();
+                persist_hosted_session(&*guard, &record, "owner").unwrap();
+                done_tx.send(()).unwrap();
             });
 
+            TEST_CLAUDE_RESUME_WATCH_HOOK.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move || {
+                    entered_tx.send(()).unwrap();
+                    done_rx
+                        .recv_timeout(Duration::from_secs(5))
+                        .expect("decommission fixture must finish inside the owned watch");
+                }));
+            });
             TEST_CLAUDE_RESUME_SURVIVAL_WINDOW.with(|c| c.set(Some(watch_window)));
             let fake_r = FakeRuntime::default();
             let env_r = fake_r.env(hub_home.path());
@@ -19470,6 +19519,7 @@ mod tests {
                 "claude:ada",
                 "owner",
             );
+            TEST_CLAUDE_RESUME_WATCH_HOOK.with(|hook| *hook.borrow_mut() = None);
             TEST_CLAUDE_RESUME_SURVIVAL_WINDOW.with(|c| c.set(None));
             decomm_thread.join().unwrap();
 

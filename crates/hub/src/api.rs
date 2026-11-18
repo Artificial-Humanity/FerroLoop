@@ -8437,6 +8437,9 @@ fn handle_post_session_spin_up(
             json!({ "error": "only Owner authority may choose a session's context window" }),
         );
     }
+    if let Err(error) = payload.validate_request() {
+        return lifecycle_error_response(&error);
+    }
     let env = lifecycle_env(state);
     let persona = payload.persona.clone();
     match lifecycle::with_lifecycle_fence(&env, &persona, "spin-up", |env| {
@@ -8503,6 +8506,8 @@ thread_local! {
     static AFTER_LIFECYCLE_CANDIDATE_READ: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         std::cell::RefCell::new(None);
     static BEFORE_LIFECYCLE_ARTIFACT_READ: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        std::cell::RefCell::new(None);
+    pub(crate) static BEFORE_REMODEL_STORE_READ: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         std::cell::RefCell::new(None);
 }
 
@@ -8710,6 +8715,12 @@ fn handle_post_session_remodel(
     let discovered_id = target.discovered_id.clone();
     let env = lifecycle_env(state);
     match lifecycle::with_lifecycle_fence(&env, &persona, "remodel", |env| {
+        #[cfg(test)]
+        BEFORE_REMODEL_STORE_READ.with_borrow_mut(|hook| {
+            if let Some(f) = hook.take() {
+                f();
+            }
+        });
         let store = state.try_open_lifecycle_store()?;
         let target = SessionTarget::resolve(
             &*store,

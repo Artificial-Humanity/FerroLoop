@@ -5015,6 +5015,9 @@ mod tests {
         let mut bad_cases: Vec<(&str, Value)> = Vec::new();
         for (field, value) in [
             ("persona", json!("")),
+            ("persona", json!("   ")),
+            ("persona", json!("-invalid")),
+            ("persona", json!("a".repeat(37))),
             ("persona", json!("Felicity")),
             ("persona", json!("fel icity")),
             ("project", json!("  ")),

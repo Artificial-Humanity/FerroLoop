@@ -27,10 +27,14 @@ struct Fx {
     paths: InitPaths,
     home: PathBuf,
     ws_root: PathBuf,
+    _config_fixture: std::sync::MutexGuard<'static, ()>,
 }
 
 impl Fx {
     fn new() -> Self {
+        let config_fixture = crate::project_init::CONFIG_FIXTURE_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         hooks::reset();
         let tmp = TempDir::new().unwrap();
         let base = fs::canonicalize(tmp.path()).unwrap();
@@ -38,6 +42,7 @@ impl Fx {
             fs::create_dir_all(base.join(dir)).unwrap();
         }
         Self {
+            _config_fixture: config_fixture,
             paths: InitPaths {
                 config_path: base.join("cfg/fl/config.toml"),
                 store_dir: base.join("data/fl"),
@@ -1666,7 +1671,12 @@ fn decommission_delete_conflicts_before_effects_and_refuses_new_unfenced_persona
         |_| panic!("refused deletion cleared a queue"),
     )
     .unwrap_err();
-    assert!(matches!(error, DeleteError::Init(InitError::Conflict(_))));
+    assert_eq!(opens, 2, "must reach target revalidation after ownership");
+    assert!(
+        matches!(&error, DeleteError::Init(InitError::Conflict(reason))
+            if reason == "project's active agents changed during lifecycle selection; retry"),
+        "{error:?}"
+    );
     assert!(fx.slugs().contains(&"alpha".to_string()));
     let store = fx.ws();
     for name in ["ada", "bo"] {
