@@ -34,9 +34,17 @@ done
 scratch=$(mktemp -d /var/tmp/ferroloop-test-sandbox.XXXXXXXX)
 target=
 target_checked=0
+persistent_target=0
 scan_target() {
-    python3 "$root/scripts/test-sandbox-mounts.py" --check "$target" &&
+    if ((persistent_target)); then
+        python3 "$root/scripts/test-sandbox-target.py" --check-path "$target" || return 1
+    fi
+    python3 "$root/scripts/test-sandbox-mounts.py" --check "$target" || return 1
+    if ((persistent_target)); then
+        python3 "$root/scripts/test-sandbox-target.py" --verify-persistent "$target"
+    else
         python3 "$root/scripts/test-sandbox-target.py" "$target"
+    fi
 }
 cleanup() {
     status=$?
@@ -52,15 +60,16 @@ trap cleanup EXIT
 mkdir -m 700 "$scratch/source"
 if [[ -n ${FL_SANDBOX_TARGET_DIR:-} ]]; then
     target=$FL_SANDBOX_TARGET_DIR
-    [[ $target == /var/tmp/* && ${target#/var/tmp/} != */* && ${target#/var/tmp/} != . && ${target#/var/tmp/} != .. && -n ${target#/var/tmp/} ]] || die 'FL_SANDBOX_TARGET_DIR must be a direct child of /var/tmp'
-    [[ $(realpath -e /var/tmp) == /var/tmp ]] || die '/var/tmp must not be a symlink'
-    if [[ ! -e $target && ! -L $target ]]; then mkdir -m 700 -- "$target" || die 'cannot create persistent target'; fi
+    persistent_target=1
+    python3 "$root/scripts/test-sandbox-target.py" --prepare "$target" || die 'invalid persistent target'
 else
     target=$scratch/target
     mkdir -m 700 "$target"
 fi
 scan_target || die 'target failed pre-run inspection'
 target_checked=1
+min_free_gib=${FL_SANDBOX_MIN_FREE_GIB:-120}
+python3 "$root/scripts/test-sandbox-space.py" --check / "$target" "$min_free_gib" || die 'free-space preflight failed'
 # Snapshot only Git-tracked files, without VCS metadata or runtime data. Never
 # traverse untracked files or submodules; tracked changes are included.
 python3 - "$root" "$scratch/source" <<'PY'
@@ -95,13 +104,13 @@ args=(--unshare-user --unshare-pid --unshare-net --unshare-ipc --unshare-uts --u
       --symlink usr/bin /bin --symlink usr/lib /lib --symlink usr/lib64 /lib64
       --ro-bind "$toolchain" /toolchain --ro-bind "$registry" /cargo/registry
       --ro-bind "$scratch/source" /source --bind "$target" /target
-      --tmpfs /home --dir /home/sandbox --tmpfs /tmp --tmpfs /run --dir /run/user
+      --tmpfs /home --dir /home/sandbox --tmpfs /tmp --dir /tmp/git-template --tmpfs /run --dir /run/user
       --proc /proc --dev /dev
       --setenv HOME /home/sandbox --setenv XDG_RUNTIME_DIR /run/user
       --setenv XDG_CONFIG_HOME /home/sandbox/config --setenv XDG_DATA_HOME /home/sandbox/data
       --setenv XDG_CACHE_HOME /home/sandbox/cache --setenv XDG_STATE_HOME /home/sandbox/state
       --setenv CARGO_HOME /cargo --setenv CARGO_TARGET_DIR /target --setenv CARGO_NET_OFFLINE true
-      --setenv CC "$cc" --setenv "$linker_var" "$cc"
+      --setenv CC "$cc" --setenv "$linker_var" "$cc" --setenv GIT_TEMPLATE_DIR /tmp/git-template
       --setenv PATH /toolchain/bin:/usr/bin --setenv TMPDIR /tmp --setenv LANG C.UTF-8
       --chdir /source)
 inherit_stdin=0
@@ -111,10 +120,4 @@ if (($# == 0)); then set -- /toolchain/bin/cargo test --workspace --offline; fi
 
 # Close all descriptors inherited from the launching shell before bwrap starts.
 if ((!inherit_stdin)); then exec </dev/null; fi
-python3 -c 'import os,sys
-for name in os.listdir("/proc/self/fd"):
-    fd = int(name)
-    if fd > 2:
-        try: os.close(fd)
-        except OSError: pass
-os.execv(sys.argv[1], sys.argv[1:])' "$(command -v bwrap)" "${args[@]}" -- "$@"
+python3 "$root/scripts/test-sandbox-space.py" / "$target" "$min_free_gib" -- "$(command -v bwrap)" "${args[@]}" -- "$@"
