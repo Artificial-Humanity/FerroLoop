@@ -790,8 +790,7 @@ pub fn run<S: AgentRegistry + Handles + StateStore + Catalog + fl_core::MessageS
                 hosted: Some(hosted),
                 cwd,
                 context_window: None,
-            }
-            .with_default_cwd(store, &ws_root);
+            };
             let _ = composed_vendor_host_adapters();
             let mut env = LifecycleEnv::new(None);
             env.workspace_root = Some(&ws_root);
@@ -1645,6 +1644,25 @@ mod tests {
 
     #[test]
     fn spin_up_and_teardown_with_composed_claude_host_adapter_binds_and_archives_session_uuid() {
+        if std::env::var_os("FL_TEST_COMPOSED_ADAPTER_CHILD").is_none() {
+            let endpoint_root = tempfile::tempdir().unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .env_clear().env("PATH", "/usr/bin:/bin")
+                .env("HOME", endpoint_root.path())
+                .env("FL_HOST_SOCK", endpoint_root.path().join("host.sock"))
+                .env("TMUX", format!("{},1,0", endpoint_root.path().join("tmux.sock").display()))
+                .env("FL_TEST_COMPOSED_ADAPTER_CHILD", "1")
+                .args(["--exact", "cmd::agent::tests::spin_up_and_teardown_with_composed_claude_host_adapter_binds_and_archives_session_uuid", "--nocapture"])
+                .output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+            return;
+        }
         #[derive(Debug, Default)]
         struct RecordingRuntime {
             live: std::cell::RefCell<std::collections::BTreeSet<String>>,

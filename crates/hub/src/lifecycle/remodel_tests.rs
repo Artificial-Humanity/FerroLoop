@@ -15,6 +15,7 @@ fn env(home: &TempDir) -> LifecycleEnv<'_> {
         key_probe: &ProvisionedKeys,
         workspace_root: None,
         log_hydration_warnings: true,
+        lifecycle_fence: None,
     }
 }
 

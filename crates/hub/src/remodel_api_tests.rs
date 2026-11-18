@@ -381,30 +381,58 @@ fn concurrent_remodels_of_one_persona_leave_exactly_one_live_session() {
     let tmp = TempDir::new().unwrap();
     let state = hub(&tmp);
     spin_up(&state, "felicity", "assistant", "claude");
-    let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
-    let racers: Vec<_> = ["codex", "grok", "muse"]
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let winner_state = state.clone();
+    let winner = std::thread::spawn(move || {
+        crate::api::BEFORE_REMODEL_STORE_READ.with_borrow_mut(|hook| {
+            *hook = Some(Box::new(move || {
+                entered_tx.send(()).unwrap();
+                release_rx
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .expect("contenders must refuse while the winner owns the fence");
+            }));
+        });
+        remodel(
+            &winner_state,
+            "felicity",
+            OWNER,
+            &json!({
+                "vendor": "codex", "model": "m-codex"
+            }),
+        )
+        .status
+    });
+    entered_rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .unwrap();
+    let racers: Vec<_> = ["grok", "muse"]
         .into_iter()
         .map(|vendor| {
             let state = state.clone();
-            let barrier = barrier.clone();
             std::thread::spawn(move || {
-                barrier.wait();
                 let body = json!({ "vendor": vendor, "model": format!("m-{vendor}") });
                 remodel(&state, "felicity", OWNER, &body).status
             })
         })
         .collect();
     let statuses: Vec<u16> = racers.into_iter().map(|r| r.join().unwrap()).collect();
-    // The store guard serializes them: each remodels whatever the one before left running.
-    assert_eq!(statuses, [200, 200, 200]);
+    release_tx.send(()).unwrap();
+    assert_eq!(winner.join().unwrap(), 200);
+    assert_eq!(statuses, [409, 409]);
     let live: Vec<HostedSessionRecord> = records(&state)
         .into_iter()
         .filter(|r| r.status != "decommissioned")
         .collect();
     assert_eq!(live.len(), 1, "{live:?}");
+    assert_eq!(live[0].vendor, "codex");
+    assert_eq!(
+        records(&state).len(),
+        2,
+        "only the winner created a replacement"
+    );
     assert_eq!(status_of(&state, "felicity"), AgentStatus::Active);
-    // The last remodel's writes are the last ones: its model shows under the persona, and no
-    // earlier remodel's late write replaced it.
+    // Only the winning remodel updates the live record and model overrides.
     let last = format!("m-{}", live[0].vendor);
     assert_eq!(live[0].model.as_deref(), Some(last.as_str()));
     for key in ["felicity", live[0].session_id.as_str()] {

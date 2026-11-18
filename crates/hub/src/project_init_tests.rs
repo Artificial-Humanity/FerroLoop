@@ -27,10 +27,14 @@ struct Sandbox {
     /// Canonical base of everything the test makes.
     base: PathBuf,
     paths: InitPaths,
+    _config_fixture: std::sync::MutexGuard<'static, ()>,
 }
 
 impl Sandbox {
     fn new() -> Self {
+        let config_fixture = crate::project_init::CONFIG_FIXTURE_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let tmp = TempDir::new().unwrap();
         let base = fs::canonicalize(tmp.path()).unwrap();
         let paths = InitPaths {
@@ -39,6 +43,7 @@ impl Sandbox {
             workspace_store: base.join("data/fl/fl.fls"),
         };
         Self {
+            _config_fixture: config_fixture,
             _tmp: tmp,
             base,
             paths,
@@ -821,10 +826,14 @@ struct Hub {
     _tmp: TempDir,
     base: PathBuf,
     state: HubState,
+    _config_fixture: std::sync::MutexGuard<'static, ()>,
 }
 
 impl Hub {
     fn new() -> Self {
+        let config_fixture = crate::project_init::CONFIG_FIXTURE_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let tmp = TempDir::new().unwrap();
         let base = fs::canonicalize(tmp.path()).unwrap();
         for dir in ["home", "data", "repo", "work"] {
@@ -850,6 +859,7 @@ impl Hub {
         });
         state.store_backend = Some(fl_store::BackendKind::Ferro);
         Self {
+            _config_fixture: config_fixture,
             _tmp: tmp,
             base,
             state,

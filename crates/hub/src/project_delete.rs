@@ -658,7 +658,7 @@ pub fn delete_project<W>(
     req: &DeleteRequest,
     by: &str,
     ctx: &DeleteContext<'_>,
-    open_workspace: impl FnOnce() -> Result<W, InitError>,
+    open_workspace: impl FnMut() -> Result<W, InitError>,
     clear_queue: impl FnMut(&str),
 ) -> Result<DeleteOutcome, DeleteError>
 where
@@ -676,13 +676,73 @@ pub(crate) fn delete_project_in<W>(
     by: &str,
     ctx: &DeleteContext<'_>,
     env_home: Option<PathBuf>,
-    open_workspace: impl FnOnce() -> Result<W, InitError>,
+    mut open_workspace: impl FnMut() -> Result<W, InitError>,
     mut clear_queue: impl FnMut(&str),
 ) -> Result<DeleteOutcome, DeleteError>
 where
     W: Deref<Target = AnyStore>,
 {
-    let _one_at_a_time = CONFIG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    if !req.decommission_agents && req.reassign_to.is_none() {
+        let _one_at_a_time = CONFIG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        return delete_project_fenced(slug, req, by, ctx, env_home, open_workspace, clear_queue);
+    }
+    // Candidate reads only: drop the workspace guard before any lifecycle file/local fence.
+    let personas = {
+        let ws = open_workspace()?;
+        let slug = checked_slug(slug)?;
+        let area = ws.get_area(&slug).map_err(|e| failed(e.to_string()))?;
+        ws.list_agents(None, false)
+            .map_err(|e| failed(e.to_string()))?
+            .into_iter()
+            .filter(|a| agent_in_project(a, &slug, area.as_ref().map(|a| a.name.as_str())))
+            .map(|a| a.name_key)
+            .collect::<Vec<_>>()
+    };
+    lifecycle::with_lifecycle_fences(ctx.lifecycle, &personas, "project-delete", |env| {
+        // Configuration is part of this explicit transaction: take its local mutex
+        // after every file fence, without queueing behind another transaction.
+        let _config = match CONFIG_LOCK.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                return Err(lifecycle::LifecycleError::Conflict(
+                    "project configuration is busy; retry".into(),
+                ));
+            }
+        };
+        let ctx = DeleteContext {
+            lifecycle: env,
+            ..*ctx
+        };
+        Ok(delete_project_fenced(
+            slug,
+            req,
+            by,
+            &ctx,
+            env_home,
+            &mut open_workspace,
+            &mut clear_queue,
+        ))
+    })
+    .map_err(|e| match e {
+        lifecycle::LifecycleError::Conflict(detail) => DeleteError::Init(conflict(detail)),
+        other => DeleteError::Init(failed(other.to_string())),
+    })?
+}
+
+#[allow(clippy::too_many_arguments)]
+fn delete_project_fenced<W>(
+    slug: &str,
+    req: &DeleteRequest,
+    by: &str,
+    ctx: &DeleteContext<'_>,
+    env_home: Option<PathBuf>,
+    mut open_workspace: impl FnMut() -> Result<W, InitError>,
+    mut clear_queue: impl FnMut(&str),
+) -> Result<DeleteOutcome, DeleteError>
+where
+    W: Deref<Target = AnyStore>,
+{
     let paths = ctx.paths;
     let slug = checked_slug(slug)?;
     if by.trim().is_empty() {
@@ -723,6 +783,19 @@ where
         .filter(|a| agent_in_project(a, &slug, area_name.as_deref()))
         .cloned()
         .collect();
+    // The candidate set is not authority: after all fences, repeat every original validation
+    // and refuse a newly assigned persona before any decommission or unregister effect.
+    if (req.decommission_agents || req.reassign_to.is_some())
+        && agents.iter().any(|a| {
+            !ctx.lifecycle
+                .lifecycle_fence
+                .is_some_and(|f| f.covers(&a.name_key))
+        })
+    {
+        return Err(
+            conflict("project's active agents changed during lifecycle selection; retry").into(),
+        );
+    }
     if !agents.is_empty() && req.reassign_to.is_none() && !req.decommission_agents {
         return Err(DeleteError::ActiveAgents {
             agents: agents.iter().map(|a| a.display_name.clone()).collect(),
@@ -861,6 +934,9 @@ where
                 )
             });
             done.map_err(|e| {
+                if let lifecycle::LifecycleError::Conflict(detail) = &e {
+                    return conflict(detail.clone());
+                }
                 failed(format!(
                     "could not decommission {}: {e} ({} of {} agents were decommissioned; the \
                      project is still registered)",

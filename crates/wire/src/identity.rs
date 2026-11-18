@@ -971,7 +971,7 @@ fn agy_host_session_running(persona: Option<&str>) -> bool {
     let Some(norm) = persona.and_then(normalize_persona) else {
         return false;
     };
-    let Ok(endpoint) = fl_host_proto::HostEndpoint::discover() else {
+    let Ok(endpoint) = crate::runtime_context::host_endpoint() else {
         return false;
     };
     let Ok(mut client) = fl_host_proto::BlockingHostClient::connect(&endpoint) else {
@@ -3785,7 +3785,7 @@ impl RouteTable {
     }
 
     fn discover_host_cli_sessions(&mut self, at: &At) {
-        let Ok(endpoint) = fl_host_proto::HostEndpoint::discover() else {
+        let Ok(endpoint) = crate::runtime_context::host_endpoint() else {
             return;
         };
         let Ok(mut client) = fl_host_proto::BlockingHostClient::connect(&endpoint) else {
@@ -4205,7 +4205,7 @@ fn list_tmux_windows() -> Option<Vec<TmuxWindow>> {
 
 fn list_tmux_windows_within(timeout: Duration) -> Option<Vec<TmuxWindow>> {
     if crate::dispatcher::host_discovery_allowed()
-        && let Ok(endpoint) = fl_host_proto::HostEndpoint::discover()
+        && let Ok(endpoint) = crate::runtime_context::host_endpoint()
         && let Ok(mut client) = fl_host_proto::BlockingHostClient::connect(&endpoint)
         && let Ok(sessions) = client.list_sessions()
     {
@@ -4226,9 +4226,13 @@ fn list_tmux_windows_within(timeout: Duration) -> Option<Vec<TmuxWindow>> {
 
 fn run_tmux_list_windows(timeout: Duration) -> Option<Vec<TmuxWindow>> {
     use std::io::Read;
-    use std::process::{Command, Stdio};
+    use std::process::Stdio;
 
-    let mut child = Command::new(crate::dispatcher::tmux_bin())
+    let Ok(mut command) = crate::runtime_context::tmux_command(&crate::dispatcher::tmux_bin())
+    else {
+        return None;
+    };
+    let mut child = command
         .args(["list-windows", "-a", "-F", "#{session_name}:#{window_name}"])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
