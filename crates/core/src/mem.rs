@@ -1856,7 +1856,13 @@ impl MemStore {
         &self,
         args: SendWireArgs,
         awaiting_daemon: bool,
-    ) -> Result<(WireMessage, Vec<DeliveryReceipt>), StoreError> {
+        once: bool,
+    ) -> Result<Option<(WireMessage, Vec<DeliveryReceipt>)>, StoreError> {
+        if once && args.id.is_none() {
+            return Err(StoreError::InvalidState(
+                "Wire send-once requires a message id".into(),
+            ));
+        }
         let subject =
             validate_subject(&args.subject).map_err(|e| StoreError::InvalidState(e.to_string()))?;
         let body =
@@ -1865,6 +1871,9 @@ impl MemStore {
             .map_err(|e| StoreError::InvalidState(e.to_string()))?;
 
         let mut s = self.inner.borrow_mut();
+        if once && s.wire_messages.contains_key(args.id.as_ref().unwrap()) {
+            return Ok(None);
+        }
 
         let (parent_thread, correlation_id) = match &args.reply_to {
             Some(parent_id) => {
@@ -1979,7 +1988,7 @@ impl MemStore {
                 .insert(msg.id.clone(), msg.created_at.clone());
         }
 
-        Ok((msg, receipts))
+        Ok(Some((msg, receipts)))
     }
 }
 
@@ -1988,14 +1997,23 @@ impl MessageStore for MemStore {
         &self,
         args: SendWireArgs,
     ) -> Result<(WireMessage, Vec<DeliveryReceipt>), StoreError> {
-        self.send_wire_inner(args, false)
+        self.send_wire_inner(args, false, false)
+            .map(|value| value.expect("ordinary send always inserts"))
     }
 
     fn send_wire_awaiting_daemon(
         &self,
         args: SendWireArgs,
     ) -> Result<(WireMessage, Vec<DeliveryReceipt>), StoreError> {
-        self.send_wire_inner(args, true)
+        self.send_wire_inner(args, true, false)
+            .map(|value| value.expect("ordinary send always inserts"))
+    }
+
+    fn send_wire_once_awaiting_daemon(
+        &self,
+        args: SendWireArgs,
+    ) -> Result<Option<(WireMessage, Vec<DeliveryReceipt>)>, StoreError> {
+        self.send_wire_inner(args, true, true)
     }
 
     fn list_wire_awaiting_daemon(&self) -> Result<Vec<(MessageId, At)>, StoreError> {

@@ -850,6 +850,19 @@ pub trait MessageStore {
         args: SendWireArgs,
     ) -> Result<(WireMessage, Vec<DeliveryReceipt>), StoreError>;
 
+    /// Atomically queue a message with a caller-supplied id and daemon marker, or
+    /// return `None` without modifying existing receipts when that id is retained.
+    /// Once retention pruning removes the message, the same id can be inserted again.
+    /// Stores without atomic support refuse rather than falling back to a racy check.
+    fn send_wire_once_awaiting_daemon(
+        &self,
+        _args: SendWireArgs,
+    ) -> Result<Option<(WireMessage, Vec<DeliveryReceipt>)>, StoreError> {
+        Err(StoreError::InvalidState(
+            "atomic Wire send-once is unsupported".into(),
+        ))
+    }
+
     /// Look up a single message by `MessageId`.
     fn get_wire_message(&self, id: &MessageId) -> Result<Option<WireMessage>, StoreError>;
 

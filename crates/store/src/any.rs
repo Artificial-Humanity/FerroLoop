@@ -1260,6 +1260,7 @@ delegate! {
     }
     MessageStore {
         fn send_wire(&self, args: SendWireArgs) -> Result<(WireMessage, Vec<DeliveryReceipt>), StoreError>;
+        fn send_wire_once_awaiting_daemon(&self, args: SendWireArgs) -> Result<Option<(WireMessage, Vec<DeliveryReceipt>)>, StoreError>;
         fn get_wire_message(&self, id: &MessageId) -> Result<Option<WireMessage>, StoreError>;
         fn list_wire_inbox(&self, filter: &WireFilter) -> Result<Vec<WireInboxItem>, StoreError>;
         fn list_wire_thread(&self, thread_id: &ThreadId) -> Result<Vec<WireMessage>, StoreError>;
