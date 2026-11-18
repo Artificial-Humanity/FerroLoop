@@ -60,6 +60,16 @@ pub(super) fn reserve_attempt(state: &mut HostedRespawnState, now: u64) {
     }
 }
 
+/// Restore only this operation's reservation, then retain a bounded readiness cadence.
+pub(super) fn refund_attempt(
+    state: &mut HostedRespawnState,
+    before_reservation: &HostedRespawnState,
+    now: u64,
+) {
+    *state = before_reservation.clone();
+    defer_launch_prerequisite(state, now);
+}
+
 /// Unknown/gone observations break the healthy interval; a backwards clock starts it anew.
 pub(super) fn observe_health(state: &mut HostedRespawnState, alive: bool, now: u64) {
     if state.recovery_started_at_ms.is_none() {
@@ -352,5 +362,55 @@ mod tests {
             true
         });
         assert_eq!(calls, expanded);
+    }
+    #[test]
+    fn automatic_preparation_errors_reserve_slow_budget_and_spacing() {
+        let mut state = HostedRespawnState {
+            recovery_started_at_ms: Some(1_000),
+            recovery_attempts: 2,
+            next_allowed_at_ms: Some(601_000),
+            ..Default::default()
+        };
+        reserve_automatic_respawn(&mut state, 601_000).unwrap();
+        assert_eq!(state.recovery_attempts, 3);
+        assert!(state.respawn_timestamps_ms.is_empty());
+        assert_eq!(state.next_allowed_at_ms, Some(1_201_000));
+        assert_eq!(
+            classify(&mut state, STOP_REASON_CRASH_LOOP, 601_001),
+            Decision::Wait
+        );
+        state.recovery_attempts = RECOVERY_MAX_ATTEMPTS;
+        assert!(matches!(
+            reserve_automatic_respawn(&mut state, 1_201_000),
+            Err(LifecycleError::Conflict(_))
+        ));
+        assert_eq!(state.recovery_attempts, RECOVERY_MAX_ATTEMPTS);
+    }
+
+    #[test]
+    fn startup_prerequisite_refund_restores_slow_incident_and_readiness_deadline() {
+        let before = HostedRespawnState {
+            respawn_timestamps_ms: vec![900],
+            recovery_started_at_ms: Some(1_000),
+            recovery_attempts: 2,
+            next_allowed_at_ms: Some(701_000),
+            crash_loop_notified_recipients: vec!["recovery:lead".into()],
+            ..Default::default()
+        };
+        let mut state = before.clone();
+        reserve_attempt(&mut state, 601_000);
+        assert_eq!(state.recovery_attempts, 3);
+        refund_attempt(&mut state, &before, 601_000);
+        assert_eq!(
+            state, before,
+            "an existing later deadline must survive the refund"
+        );
+        let mut due = before.clone();
+        due.next_allowed_at_ms = Some(601_000);
+        let mut attempted = due.clone();
+        reserve_attempt(&mut attempted, 601_000);
+        refund_attempt(&mut attempted, &due, 601_000);
+        due.next_allowed_at_ms = Some(661_000);
+        assert_eq!(attempted, due);
     }
 }

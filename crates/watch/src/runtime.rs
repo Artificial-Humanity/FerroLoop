@@ -44,6 +44,10 @@ pub struct WatchHostedSession {
     pub node_id: String,
     /// `running`, `decommissioning` or `decommissioned` (the hub's words).
     pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_prerequisite_detail: Option<String>,
     pub restart_count: u64,
     pub updated_at_ms: u64,
 }
@@ -73,6 +77,14 @@ impl WatchHostedSession {
             model: obj.get("model").and_then(Value::as_str).map(str::to_string),
             node_id: text("node_id"),
             status: text("status"),
+            stop_reason: obj
+                .get("stop_reason")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            launch_prerequisite_detail: obj
+                .get("launch_prerequisite_detail")
+                .and_then(Value::as_str)
+                .map(str::to_string),
             restart_count: number("restart_count"),
             updated_at_ms: number("updated_at_ms"),
         })
@@ -185,6 +197,23 @@ mod tests {
     use fl_core::MemStore;
     use fl_core::telemetry::LivenessStatus;
     use serde_json::json;
+
+    #[test]
+    fn hosted_session_stop_reason_survives_watch_serialization() {
+        let record = json!({"session_id": "codex:felix", "status": "stopped",
+            "stop_reason": "prerequisite_unavailable",
+            "launch_prerequisite_detail": "The daemon socket is missing"});
+        let value = serde_json::to_value(WatchHostedSession::from_value(&record).unwrap()).unwrap();
+        assert_eq!(value["stop_reason"], "prerequisite_unavailable");
+        assert_eq!(
+            value["launch_prerequisite_detail"],
+            "The daemon socket is missing"
+        );
+        let old = json!({"session_id": "codex:old", "stop_reason": 42});
+        let value = serde_json::to_value(WatchHostedSession::from_value(&old).unwrap()).unwrap();
+        assert!(value.get("stop_reason").is_none());
+        assert!(value.get("launch_prerequisite_detail").is_none());
+    }
 
     #[test]
     fn hosted_session_json_is_read_field_by_field() {

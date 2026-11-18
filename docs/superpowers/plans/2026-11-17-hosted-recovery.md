@@ -61,3 +61,14 @@ libraries passed; the broad check retains the same 454 normalized errors as c17f
 were authored and compiled, not run locally. Pending A review fixes must be integrated
 by the coordinator after this clean B2 handback; B2 does not implement the separate
 state-read, future-deadline clamp or vendor-guidance follow-ups.
+
+
+A/B accounting integration: merged the reviewed prerequisite fixes from 9088f02f.
+Preparation errors reserve the active fast or slow phase once; immediate Codex
+readiness loss restores the operation's pre-reservation state before bounded readiness
+deferral. Manual intentional-stop preservation and operation-local live reset remain.
+The exact pure integration RED failed on the old fast-only helper (slow attempts stayed
+at 2); the new slow reservation, refund, and inherited fast helper filters each passed
+one test. All-target check/strict clippy and GNU core/host-proto/host library checks
+passed. Store/runtime/socket/subprocess integration regressions remain CI-only under
+#539; independent merge review and final branch review still remain.

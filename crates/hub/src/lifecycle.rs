@@ -154,7 +154,7 @@ impl std::fmt::Display for LifecycleError {
         match self {
             Self::PrerequisiteUnavailable { code, detail } => write!(
                 f,
-                "{code}: {detail}; start the Codex app-server from its clean systemd user unit before retrying"
+                "{code}: {detail}; restart the Codex app-server from its clean systemd user unit before retrying"
             ),
             Self::Invalid(m)
             | Self::NotFound(m)
@@ -984,6 +984,15 @@ fn check_vendor_launch_prerequisite(
     #[cfg(test)]
     TEST_LAUNCH_PREREQUISITE_CALLS.with(|calls| calls.set(calls.get() + 1));
     #[cfg(test)]
+    if let Some(result) =
+        TEST_LAUNCH_PREREQUISITE_SEQUENCE.with(|slot| slot.borrow_mut().pop_front())
+    {
+        return result.map_err(|r| LifecycleError::PrerequisiteUnavailable {
+            code: r.code,
+            detail: r.detail,
+        });
+    }
+    #[cfg(test)]
     if let Some(result) = TEST_LAUNCH_PREREQUISITE.with(|slot| slot.borrow().clone()) {
         return result.map_err(|r| LifecycleError::PrerequisiteUnavailable {
             code: r.code,
@@ -1042,6 +1051,7 @@ fn codex_config_home(
 thread_local! {
     // Scoped ambient input replacement, not a trust bypass or process environment edit.
     static TEST_LAUNCH_PREREQUISITE: std::cell::RefCell<Option<Result<(), fl_core::LaunchPrerequisiteRefusal>>> = const { std::cell::RefCell::new(None) };
+    static TEST_LAUNCH_PREREQUISITE_SEQUENCE: std::cell::RefCell<std::collections::VecDeque<Result<(), fl_core::LaunchPrerequisiteRefusal>>> = const { std::cell::RefCell::new(std::collections::VecDeque::new()) };
     static TEST_LAUNCH_PREREQUISITE_CALLS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
     static TEST_RESPAWN_SAVE_FAILURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static TEST_RUNNING_RECORD_SAVE_FAILURE: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
@@ -3520,6 +3530,39 @@ fn respawn_due(state: &HostedRespawnState, now: u64) -> bool {
     state
         .next_allowed_at_ms
         .is_none_or(|deadline| now >= deadline)
+}
+
+fn prerequisite_retry_allowed(by: &str, prior_reason: Option<&str>) -> bool {
+    by == AUTO_RESPAWN_ACTOR
+        || matches!(
+            prior_reason,
+            Some(STOP_REASON_RUNTIME_GONE | STOP_REASON_PREREQUISITE_UNAVAILABLE)
+        )
+}
+
+/// Reserve exactly one automatic attempt in the current phase before launch effects.
+fn reserve_automatic_respawn(
+    state: &mut HostedRespawnState,
+    now: u64,
+) -> Result<(), LifecycleError> {
+    if state.recovery_started_at_ms.is_some() {
+        if state.recovery_attempts >= recovery::RECOVERY_MAX_ATTEMPTS {
+            return Err(LifecycleError::Conflict(
+                "automatic recovery budget exhausted".into(),
+            ));
+        }
+    } else {
+        state
+            .respawn_timestamps_ms
+            .retain(|ts| now.saturating_sub(*ts) < AUTO_RESPAWN_WINDOW_MS);
+        if state.respawn_timestamps_ms.len() >= AUTO_RESPAWN_MAX_IN_WINDOW {
+            return Err(LifecycleError::Conflict(
+                "automatic restart crash budget exhausted".into(),
+            ));
+        }
+    }
+    recovery::reserve_attempt(state, now);
+    Ok(())
 }
 
 fn defer_launch_prerequisite(state: &mut HostedRespawnState, now: u64) {
@@ -7477,6 +7520,7 @@ pub fn reconcile_dead_hosted_sessions<S: StateStore>(
                         .recorded_exit_code(&target, record.runtime_leader_pid.or(record.pid))
                         == Some(0);
                     record.status = STATUS_STOPPED.to_string();
+                    record.launch_prerequisite_detail = None;
                     record.stop_reason = Some(
                         if clean_exit {
                             STOP_REASON_CLEAN_EXIT
@@ -7779,6 +7823,7 @@ pub fn teardown_session<S: AgentRegistry + StateStore>(
     let updated_ms = now_ms();
     record.status = STATUS_DECOMMISSIONED.to_string();
     record.stop_reason = None;
+    record.launch_prerequisite_detail = None;
     record.hydration_generation = None;
     record.tombstone_ids = tombstone_ids;
     record.updated_at_ms = updated_ms;
@@ -7789,6 +7834,7 @@ pub fn teardown_session<S: AgentRegistry + StateStore>(
         if !is_decommissioned(&sib) {
             sib.status = STATUS_DECOMMISSIONED.to_string();
             sib.stop_reason = None;
+            sib.launch_prerequisite_detail = None;
             sib.hydration_generation = None;
             sib.runtime_spawned = false;
             for tid in &record.tombstone_ids {
@@ -8035,20 +8081,6 @@ where
             record.session_id
         )));
     }
-    let recast_assignment = current_recast_assignment(store, &record.persona)?;
-    let recast_staged = recast_assignment.is_some();
-    if let Some(agent) = recast_assignment {
-        record.project = agent.project;
-        record.role = role_label_of(&agent.role);
-    }
-    if record.cwd.is_none() {
-        record.cwd = resolve_project_cwd(
-            store,
-            &record.project,
-            env.workspace_root,
-            env.home_override,
-        )?;
-    }
     let automatic = by == AUTO_RESPAWN_ACTOR;
     let now = current_respawn_clock_ms();
     let mut respawn_state = load_hosted_respawn_state(store, &record.session_id);
@@ -8095,41 +8127,71 @@ where
         defer_launch_prerequisite(&mut respawn_state, now);
         save_hosted_respawn_state(store, &record.session_id, &respawn_state, by)?;
     }
-    // This check and all accounting run under the session lifecycle lock. In particular,
-    // no timestamp exists to refund if a prerequisite disappears before this check.
-    let config_home =
-        match preflight_vendor_launch(env, &record.vendor, record.hosted, &mut record.cwd) {
-            Ok(home) => home,
-            Err(err @ LifecycleError::PrerequisiteUnavailable { .. }) => {
-                if record.status.eq_ignore_ascii_case(STATUS_STOPPED) {
-                    if automatic {
-                        defer_launch_prerequisite(&mut respawn_state, now);
-                        // Deadline first: a refusal cannot launch or spend either budget.
-                        save_hosted_respawn_state(store, &record.session_id, &respawn_state, by)?;
-                    }
-                    if let LifecycleError::PrerequisiteUnavailable { detail, .. } = &err {
-                        record.launch_prerequisite_detail =
-                            Some(bounded_prerequisite_detail(detail));
-                    }
-                    record.stop_reason = Some(STOP_REASON_PREREQUISITE_UNAVAILABLE.into());
-                    record.updated_at_ms = now;
-                    persist_hosted_session(store, &record, by)?;
+    let prior_stop_reason = record.stop_reason.clone();
+    let retry_prerequisite = prerequisite_retry_allowed(by, prior_stop_reason.as_deref());
+    let mut recast_staged = false;
+    // Classify every preparation error under the same lock as its attempt reservation.
+    let preparation = (|| {
+        let recast_assignment = current_recast_assignment(store, &record.persona)?;
+        recast_staged = recast_assignment.is_some();
+        if let Some(agent) = recast_assignment {
+            record.project = agent.project;
+            record.role = role_label_of(&agent.role);
+        }
+        if record.cwd.is_none() {
+            record.cwd = resolve_project_cwd(
+                store,
+                &record.project,
+                env.workspace_root,
+                env.home_override,
+            )?;
+        }
+        let config_home =
+            preflight_vendor_launch(env, &record.vendor, record.hosted, &mut record.cwd)?;
+        if record.hosted && vendor_has_runtime(&record.vendor) && env.spawn_runtime {
+            env.runtime.preflight_spawn(&record.session_id)?;
+        }
+        fl_wire::vendor_adapter::launch_permissions_with_auto_approval(
+            &record.vendor,
+            record.posture,
+            env.auto_approval_for(&record.vendor),
+        )
+        .map_err(|why| invalid_field("posture", &why))?;
+        Ok(config_home)
+    })();
+    let config_home = match preparation {
+        Ok(home) => home,
+        Err(err @ LifecycleError::PrerequisiteUnavailable { .. }) => {
+            if record.status.eq_ignore_ascii_case(STATUS_STOPPED) && retry_prerequisite {
+                defer_launch_prerequisite(&mut respawn_state, now);
+                save_hosted_respawn_state(store, &record.session_id, &respawn_state, by)?;
+                if let LifecycleError::PrerequisiteUnavailable { detail, .. } = &err {
+                    record.launch_prerequisite_detail = Some(bounded_prerequisite_detail(detail));
                 }
-                return Err(err);
+                record.stop_reason = Some(STOP_REASON_PREREQUISITE_UNAVAILABLE.into());
+                record.updated_at_ms = now;
+                persist_hosted_session(store, &record, by)?;
             }
-            Err(err) => return Err(err),
-        };
-    if record.hosted && vendor_has_runtime(&record.vendor) && env.spawn_runtime {
-        env.runtime.preflight_spawn(&record.session_id)?;
-    }
-    fl_wire::vendor_adapter::launch_permissions_with_auto_approval(
-        &record.vendor,
-        record.posture,
-        env.auto_approval_for(&record.vendor),
-    )
-    .map_err(|why| invalid_field("posture", &why))?;
+            return Err(err);
+        }
+        Err(err) => {
+            if automatic && !matches!(&err, LifecycleError::Conflict(_)) {
+                reserve_automatic_respawn(&mut respawn_state, now)?;
+                save_hosted_respawn_state(store, &record.session_id, &respawn_state, by)?;
+            }
+            if record.launch_prerequisite_detail.take().is_some() {
+                if record.stop_reason.as_deref() == Some(STOP_REASON_PREREQUISITE_UNAVAILABLE) {
+                    record.stop_reason = Some(STOP_REASON_RUNTIME_GONE.into());
+                }
+                record.updated_at_ms = now;
+                persist_hosted_session(store, &record, by)?;
+            }
+            return Err(err);
+        }
+    };
+    let before_reservation = respawn_state.clone();
     if automatic {
-        recovery::reserve_attempt(&mut respawn_state, now);
+        reserve_automatic_respawn(&mut respawn_state, now)?;
         save_hosted_respawn_state(store, &record.session_id, &respawn_state, by)?;
     }
 
@@ -8323,6 +8385,7 @@ where
     }
     record.status = STATUS_RUNNING.to_string();
     record.stop_reason = None;
+    record.launch_prerequisite_detail = None;
     record.decommission_prepared_at_ms = None;
     record.hydration_status = if is_claude_resume {
         HydrationStatus::Confirmed
@@ -8581,6 +8644,42 @@ where
         }
         store
     };
+    if record.vendor == "codex"
+        && will_spawn
+        && (!raw_spawned || launch_died)
+        && env
+            .vendor_launch_options_for_vendor(&record.vendor, record.posture)
+            .remote_control
+        && let Err(err @ LifecycleError::PrerequisiteUnavailable { .. }) =
+            check_vendor_launch_prerequisite(env, &record.vendor, config_home.as_deref())
+    {
+        if retry_prerequisite {
+            if automatic {
+                // The lifecycle mutex fences this operation's reservation in either phase.
+                recovery::refund_attempt(&mut respawn_state, &before_reservation, now);
+            } else {
+                defer_launch_prerequisite(&mut respawn_state, now);
+            }
+            save_hosted_respawn_state(store, &record.session_id, &respawn_state, by)?;
+            record.stop_reason = Some(STOP_REASON_PREREQUISITE_UNAVAILABLE.into());
+            if let LifecycleError::PrerequisiteUnavailable { detail, .. } = &err {
+                record.launch_prerequisite_detail = Some(bounded_prerequisite_detail(detail));
+            }
+        } else {
+            record.stop_reason = prior_stop_reason;
+            record.launch_prerequisite_detail = None;
+        }
+        record.status = STATUS_STOPPED.into();
+        record.runtime_spawned = false;
+        record.pid = None;
+        record.runtime_leader_pid = None;
+        record.pid_start_time = None;
+        record.hydration_dispatched = false;
+        record.hydration_status = HydrationStatus::Unconfirmed;
+        record.updated_at_ms = now;
+        persist_hosted_session(store, &record, by)?;
+        return Err(err);
+    }
     let hydration = if resumed_existing {
         HydrationOutcome {
             dispatched: true,
@@ -8599,8 +8698,10 @@ where
     crate::discovery::invalidate_route_discovery_cache();
     record.restart_count += 1;
     record.launch_prerequisite_detail = None;
+
     record.status = STATUS_RUNNING.to_string();
     record.stop_reason = None;
+    record.launch_prerequisite_detail = None;
     record.decommission_prepared_at_ms = None;
     record.updated_at_ms = now_ms();
     persist_hosted_session(store, &record, by)?;
@@ -8954,9 +9055,9 @@ where
             Ok(out) => {
                 // `restart_hosted_session_with_store` returns `Ok` even when `runtime.spawn()`
                 // returns `false` (or the newly spawned process fails `launch_survived`). Counting
-                // that attempt in `respawn_timestamps_ms` and emitting `session.restarted` is
-                // intentional: a broken binary or failing runtime trips the 3-in-10m crash-loop
-                // guard rather than retrying indefinitely.
+                // that attempt in the current fast/slow budget and emitting `session.restarted`
+                // is intentional. An immediate Codex prerequisite loss instead returns the typed
+                // refusal above after refunding this operation's reservation.
                 on_event(
                     "session.restarted",
                     serde_json::to_value(&out).unwrap_or_default(),
@@ -8971,7 +9072,15 @@ where
                     );
                 }
             }
-            Err(LifecycleError::PrerequisiteUnavailable { .. }) => {
+            Err(LifecycleError::PrerequisiteUnavailable { detail, .. }) => {
+                if should_log_auto_respawn_warning(&record.session_id, now) {
+                    eprintln!(
+                        "hub: warning ({} / {}): auto-respawn prerequisite unavailable: {}",
+                        record.persona,
+                        record.session_id,
+                        bounded_prerequisite_detail(&detail)
+                    );
+                }
                 if let Ok(guard) = reopen_store()
                     && let Ok(Some(current)) = get_hosted_session_by_id(&*guard, &record.session_id)
                     && current.stop_reason.as_deref() == Some(STOP_REASON_PREREQUISITE_UNAVAILABLE)
@@ -14607,6 +14716,11 @@ mod tests {
         )
         .unwrap();
 
+        let mut original = get_hosted_session_by_id(&store, "codex:fiona")
+            .unwrap()
+            .unwrap();
+        original.launch_prerequisite_detail = Some("stale socket detail".into());
+        persist_hosted_session(&store, &original, "owner").unwrap();
         let native_id = "019d8f34-89cd-7e43-8a66-31f3b49788b7";
         let mut routes = RouteTable::default();
         routes.upsert(
@@ -14626,6 +14740,7 @@ mod tests {
         adopted.session_id = native_id.to_string();
         adopted.tmux_target = None;
         adopted.runtime_spawned = false;
+        adopted.launch_prerequisite_detail = Some("stale socket detail".into());
         persist_hosted_session(&store, &adopted, "owner").unwrap();
 
         let target = SessionTarget::resolve(
@@ -14646,6 +14761,7 @@ mod tests {
         assert_eq!(all.len(), 2, "{all:?}");
         for rec in &all {
             assert_eq!(rec.status, STATUS_DECOMMISSIONED, "{rec:?}");
+            assert_eq!(rec.launch_prerequisite_detail, None, "{rec:?}");
             assert!(!rec.runtime_spawned, "{rec:?}");
             assert!(
                 rec.tombstone_ids.iter().any(|id| id == native_id),
@@ -20480,7 +20596,7 @@ mod tests {
         );
         assert!(fake.launches.borrow().is_empty());
         // Recreate the reconciliation inputs at the next tick: deadline is durable, not a
-        // process-local retry timer. If the hook runs too soon this panic trips.
+        // process-local retry timer. The deadline must remain unchanged without another probe.
         TEST_LAUNCH_PREREQUISITE.with(|slot| *slot.borrow_mut() = None);
         TEST_RESPAWN_NOW_MS.with(|clock| clock.set(Some(60_999)));
         assert!(
@@ -21130,5 +21246,537 @@ mod tests {
             load_hosted_respawn_state(&store, &record.session_id),
             HostedRespawnState::default()
         );
+    }
+    #[test]
+    fn prerequisite_manual_retry_policy_preserves_intentional_stops() {
+        for reason in [
+            None,
+            Some(STOP_REASON_CLEAN_EXIT),
+            Some(STOP_REASON_CRASH_LOOP),
+        ] {
+            assert!(!prerequisite_retry_allowed("owner", reason));
+            assert!(prerequisite_retry_allowed(AUTO_RESPAWN_ACTOR, reason));
+        }
+        for reason in [
+            STOP_REASON_RUNTIME_GONE,
+            STOP_REASON_PREREQUISITE_UNAVAILABLE,
+        ] {
+            assert!(prerequisite_retry_allowed("owner", Some(reason)));
+        }
+    }
+
+    #[test]
+    fn automatic_error_reservation_is_bounded_and_backed_off() {
+        let mut state = HostedRespawnState::default();
+        for (now, deadline) in [(1_000, 31_000), (31_000, 91_000), (91_000, 211_000)] {
+            reserve_automatic_respawn(&mut state, now).unwrap();
+            assert_eq!(state.next_allowed_at_ms, Some(deadline));
+        }
+        assert_eq!(state.respawn_timestamps_ms, vec![1_000, 31_000, 91_000]);
+        assert!(matches!(
+            reserve_automatic_respawn(&mut state, 211_000),
+            Err(LifecycleError::Conflict(_))
+        ));
+    }
+
+    // CI only under #539: persisted lifecycle state and fake-runtime boundaries.
+    #[test]
+    fn manual_prerequisite_refusal_preserves_clean_exit_and_crash_loop() {
+        let home = TempDir::new().unwrap();
+        let _trusted = trusted_codex_home(home.path(), home.path());
+        let store = MemStore::default();
+        let fake = FakeRuntime::default();
+        let env = fake.env(home.path());
+        for reason in [STOP_REASON_CLEAN_EXIT, STOP_REASON_CRASH_LOOP] {
+            let mut record = hosted_record("codex", "manual-stop", STATUS_STOPPED, false);
+            record.cwd = Some(home.path().display().to_string());
+            record.stop_reason = Some(reason.into());
+            persist_hosted_session(&store, &record, "owner").unwrap();
+            let state = HostedRespawnState {
+                respawn_timestamps_ms: vec![900],
+                next_allowed_at_ms: Some(99_000),
+                crash_loop_notified: true,
+                recovery_started_at_ms: Some(1),
+                recovery_attempts: 2,
+                ..Default::default()
+            };
+            save_hosted_respawn_state(&store, &record.session_id, &state, "owner").unwrap();
+            TEST_LAUNCH_PREREQUISITE.with(|slot| {
+                *slot.borrow_mut() = Some(Err(fl_core::LaunchPrerequisiteRefusal {
+                    code: "codex_app_server_unavailable".into(),
+                    detail: "/private/control.sock: NotFound".into(),
+                }))
+            });
+            assert!(matches!(
+                restart_hosted_session(&store, &env, &record.session_id, "owner"),
+                Err(LifecycleError::PrerequisiteUnavailable { .. })
+            ));
+            assert_eq!(
+                get_hosted_session_by_id(&store, &record.session_id)
+                    .unwrap()
+                    .unwrap(),
+                record
+            );
+            assert_eq!(load_hosted_respawn_state(&store, &record.session_id), state);
+        }
+        assert!(fake.calls.borrow().is_empty());
+    }
+
+    // CI only: a lost trust entry must spend the ordinary bounded automatic budget.
+    #[test]
+    fn automatic_invalid_preflight_charges_budget_and_reaches_crash_loop() {
+        let home = TempDir::new().unwrap();
+        let _trusted = trusted_codex_home(home.path(), home.path());
+        let store = MemStore::default();
+        let fake = FakeRuntime::default();
+        let env = fake.env(home.path());
+        let mut record = hosted_record("codex", "invalid", STATUS_STOPPED, false);
+        record.cwd = Some(home.path().display().to_string());
+        record.stop_reason = Some(STOP_REASON_RUNTIME_GONE.into());
+        persist_hosted_session(&store, &record, "owner").unwrap();
+        std::fs::write(home.path().join(".codex/config.toml"), "").unwrap();
+        for now in [1_000, 31_000, 91_000] {
+            TEST_RESPAWN_NOW_MS.with(|clock| clock.set(Some(now)));
+            assert!(matches!(
+                restart_hosted_session(&store, &env, &record.session_id, AUTO_RESPAWN_ACTOR),
+                Err(LifecycleError::Invalid(_))
+            ));
+            assert!(matches!(
+                restart_hosted_session(&store, &env, &record.session_id, AUTO_RESPAWN_ACTOR),
+                Err(LifecycleError::Conflict(_))
+            ));
+        }
+        assert_eq!(
+            load_hosted_respawn_state(&store, &record.session_id).respawn_timestamps_ms,
+            vec![1_000, 31_000, 91_000]
+        );
+        TEST_RESPAWN_NOW_MS.with(|clock| clock.set(Some(211_000)));
+        reconcile_and_respawn_hosted_sessions(&store, &env).unwrap();
+        assert_eq!(
+            get_hosted_session_by_id(&store, &record.session_id)
+                .unwrap()
+                .unwrap()
+                .stop_reason
+                .as_deref(),
+            Some(STOP_REASON_CRASH_LOOP)
+        );
+        assert!(fake.launches.borrow().is_empty());
+        TEST_RESPAWN_NOW_MS.with(|clock| clock.set(None));
+    }
+
+    // CI only: the second probe distinguishes a vanished daemon from a broken launch.
+    #[test]
+    fn failed_codex_startup_refunds_only_a_vanished_prerequisite() {
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                TEST_LAUNCH_PREREQUISITE_SEQUENCE.with(|slot| slot.borrow_mut().clear());
+                TEST_RESPAWN_NOW_MS.with(|clock| clock.set(None));
+            }
+        }
+        let _reset = Reset;
+        for (spawn_fails, daemon_disappears) in
+            [(true, true), (false, true), (true, false), (false, false)]
+        {
+            let home = TempDir::new().unwrap();
+            let _trusted = trusted_codex_home(home.path(), home.path());
+            let store = MemStore::default();
+            let fake = FakeRuntime::default();
+            if spawn_fails {
+                fake.fail_windows.borrow_mut().push("codex".into());
+            } else {
+                fake.vanish_windows.borrow_mut().push("codex".into());
+            }
+            let env = fake.env(home.path());
+            let mut record = hosted_record("codex", "startup", STATUS_STOPPED, false);
+            record.cwd = Some(home.path().display().to_string());
+            record.stop_reason = Some(STOP_REASON_RUNTIME_GONE.into());
+            persist_hosted_session(&store, &record, "owner").unwrap();
+            save_hosted_respawn_state(
+                &store,
+                &record.session_id,
+                &HostedRespawnState {
+                    respawn_timestamps_ms: vec![900],
+                    ..Default::default()
+                },
+                "owner",
+            )
+            .unwrap();
+            TEST_RESPAWN_NOW_MS.with(|clock| clock.set(Some(1_000)));
+            TEST_LAUNCH_PREREQUISITE_SEQUENCE.with(|slot| {
+                *slot.borrow_mut() = [
+                    Ok(()),
+                    if daemon_disappears {
+                        Err(fl_core::LaunchPrerequisiteRefusal {
+                            code: "codex_app_server_unavailable".into(),
+                            detail: "/private/control.sock: ConnectionRefused".into(),
+                        })
+                    } else {
+                        Ok(())
+                    },
+                ]
+                .into_iter()
+                .collect()
+            });
+            let out = restart_hosted_session(&store, &env, &record.session_id, AUTO_RESPAWN_ACTOR);
+            let state = load_hosted_respawn_state(&store, &record.session_id);
+            if daemon_disappears {
+                assert!(matches!(
+                    out,
+                    Err(LifecycleError::PrerequisiteUnavailable { .. })
+                ));
+                assert_eq!(state.respawn_timestamps_ms, vec![900]);
+                assert_eq!(state.next_allowed_at_ms, Some(61_000));
+                let stopped = get_hosted_session_by_id(&store, &record.session_id)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(stopped.status, STATUS_STOPPED);
+                assert_eq!(
+                    stopped.stop_reason.as_deref(),
+                    Some(STOP_REASON_PREREQUISITE_UNAVAILABLE)
+                );
+                assert_eq!(
+                    stopped.launch_prerequisite_detail.as_deref(),
+                    Some("/private/control.sock: ConnectionRefused")
+                );
+            } else {
+                assert!(out.is_ok());
+                assert_eq!(state.respawn_timestamps_ms, vec![900, 1_000]);
+            }
+            assert!(TEST_LAUNCH_PREREQUISITE_SEQUENCE.with(|slot| slot.borrow().is_empty()));
+        }
+    }
+    // CI only: inspect the persisted boundary before a runtime can observe the record.
+    #[test]
+    fn restart_clears_prerequisite_detail_before_first_running_persist() {
+        struct InspectRuntime<'a> {
+            store: &'a MemStore,
+            inner: FakeRuntime,
+        }
+        impl std::fmt::Debug for InspectRuntime<'_> {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("InspectRuntime")
+            }
+        }
+        impl SessionRuntime for InspectRuntime<'_> {
+            fn spawn(
+                &self,
+                session: &str,
+                window: &str,
+                cwd: Option<&str>,
+                launch: Option<&LaunchSpec>,
+                id: &str,
+            ) -> bool {
+                let running = get_hosted_session_by_id(self.store, id).unwrap().unwrap();
+                assert_eq!(running.status, STATUS_RUNNING);
+                assert_eq!(running.stop_reason, None);
+                assert_eq!(running.launch_prerequisite_detail, None);
+                self.inner.spawn(session, window, cwd, launch, id)
+            }
+            fn kill(&self, unit: &str, id: &str) -> bool {
+                self.inner.kill(unit, id)
+            }
+            fn exists(&self, unit: &str) -> bool {
+                self.inner.exists(unit)
+            }
+            fn owns(&self, unit: &str, id: &str) -> bool {
+                self.inner.owns(unit, id)
+            }
+        }
+        let home = TempDir::new().unwrap();
+        let _trusted = trusted_codex_home(home.path(), home.path());
+        let store = MemStore::default();
+        let runtime = InspectRuntime {
+            store: &store,
+            inner: FakeRuntime::default(),
+        };
+        let env = LifecycleEnv {
+            runtime: &runtime,
+            spawn_runtime: true,
+            ..env(&home)
+        };
+        let mut record = hosted_record("codex", "running-detail", STATUS_STOPPED, false);
+        record.cwd = Some(home.path().display().to_string());
+        record.stop_reason = Some(STOP_REASON_PREREQUISITE_UNAVAILABLE.into());
+        record.launch_prerequisite_detail = Some("old socket refusal".into());
+        persist_hosted_session(&store, &record, "owner").unwrap();
+        let out = restart_hosted_session(&store, &env, &record.session_id, "owner").unwrap();
+        assert_eq!(out.record.launch_prerequisite_detail, None);
+        assert_eq!(runtime.inner.launches.borrow().len(), 1);
+    }
+
+    // CI only: another refusal and crash-loop classification must replace stale socket detail.
+    #[test]
+    fn other_refusal_and_crash_loop_clear_prerequisite_detail() {
+        let home = TempDir::new().unwrap();
+        let _trusted = trusted_codex_home(home.path(), home.path());
+        #[derive(Debug)]
+        struct RefusesSpawn;
+        impl SessionRuntime for RefusesSpawn {
+            fn preflight_spawn(&self, _: &str) -> Result<(), LifecycleError> {
+                Err(LifecycleError::Invalid(
+                    "fixture launch configuration".into(),
+                ))
+            }
+            fn spawn(
+                &self,
+                _: &str,
+                _: &str,
+                _: Option<&str>,
+                _: Option<&LaunchSpec>,
+                _: &str,
+            ) -> bool {
+                panic!("preflight must refuse before spawn")
+            }
+            fn kill(&self, _: &str, _: &str) -> bool {
+                false
+            }
+            fn exists(&self, _: &str) -> bool {
+                false
+            }
+            fn owns(&self, _: &str, _: &str) -> bool {
+                false
+            }
+        }
+        let store = MemStore::default();
+        let runtime = RefusesSpawn;
+        let env = LifecycleEnv {
+            runtime: &runtime,
+            spawn_runtime: true,
+            ..env(&home)
+        };
+        let mut record = hosted_record("codex", "stale-detail", STATUS_STOPPED, false);
+        record.cwd = Some(home.path().display().to_string());
+        record.stop_reason = Some(STOP_REASON_PREREQUISITE_UNAVAILABLE.into());
+        record.launch_prerequisite_detail = Some("old socket refusal".into());
+        persist_hosted_session(&store, &record, "owner").unwrap();
+        TEST_LAUNCH_PREREQUISITE_CALLS.with(|calls| calls.set(0));
+        assert!(matches!(
+            restart_hosted_session(&store, &env, &record.session_id, "owner"),
+            Err(LifecycleError::Invalid(_))
+        ));
+        assert_eq!(
+            TEST_LAUNCH_PREREQUISITE_CALLS.with(|calls| calls.get()),
+            1,
+            "socket preflight passed before the different refusal"
+        );
+        let refused = get_hosted_session_by_id(&store, &record.session_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            refused.stop_reason.as_deref(),
+            Some(STOP_REASON_RUNTIME_GONE)
+        );
+        assert_eq!(refused.launch_prerequisite_detail, None);
+        persist_hosted_session(&store, &record, "owner").unwrap();
+        TEST_RESPAWN_NOW_MS.with(|clock| clock.set(Some(1_000)));
+        save_hosted_respawn_state(
+            &store,
+            &record.session_id,
+            &HostedRespawnState {
+                respawn_timestamps_ms: vec![900, 901, 902],
+                ..Default::default()
+            },
+            "owner",
+        )
+        .unwrap();
+        reconcile_and_respawn_hosted_sessions(&store, &env).unwrap();
+        let stopped = get_hosted_session_by_id(&store, &record.session_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stopped.stop_reason.as_deref(), Some(STOP_REASON_CRASH_LOOP));
+        assert_eq!(stopped.launch_prerequisite_detail, None);
+        TEST_RESPAWN_NOW_MS.with(|clock| clock.set(None));
+    }
+    // CI only: a late readiness refusal must not arm either intentional manual stop.
+    #[test]
+    fn failed_manual_codex_startup_preserves_intentional_stop_reason() {
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                TEST_LAUNCH_PREREQUISITE_SEQUENCE.with(|slot| slot.borrow_mut().clear());
+                TEST_RESPAWN_NOW_MS.with(|clock| clock.set(None));
+            }
+        }
+        let _reset = Reset;
+        for reason in [STOP_REASON_CLEAN_EXIT, STOP_REASON_CRASH_LOOP] {
+            for spawn_fails in [true, false] {
+                let home = TempDir::new().unwrap();
+                let _trusted = trusted_codex_home(home.path(), home.path());
+                let store = MemStore::default();
+                let fake = FakeRuntime::default();
+                if spawn_fails {
+                    fake.fail_windows.borrow_mut().push("codex".into());
+                } else {
+                    fake.vanish_windows.borrow_mut().push("codex".into());
+                }
+                let env = fake.env(home.path());
+                let mut record = hosted_record("codex", "manual-startup", STATUS_STOPPED, false);
+                record.cwd = Some(home.path().display().to_string());
+                record.stop_reason = Some(reason.into());
+                persist_hosted_session(&store, &record, "owner").unwrap();
+                let state = HostedRespawnState {
+                    respawn_timestamps_ms: vec![900],
+                    next_allowed_at_ms: Some(99_000),
+                    crash_loop_notified: true,
+                    recovery_started_at_ms: Some(1),
+                    recovery_attempts: 2,
+                    ..Default::default()
+                };
+                save_hosted_respawn_state(&store, &record.session_id, &state, "owner").unwrap();
+                TEST_RESPAWN_NOW_MS.with(|clock| clock.set(Some(1_000)));
+                TEST_LAUNCH_PREREQUISITE_SEQUENCE.with(|slot| {
+                    *slot.borrow_mut() = [
+                        Ok(()),
+                        Err(fl_core::LaunchPrerequisiteRefusal {
+                            code: "codex_app_server_unavailable".into(),
+                            detail: "/private/control.sock: NotFound".into(),
+                        }),
+                    ]
+                    .into_iter()
+                    .collect()
+                });
+                assert!(matches!(
+                    restart_hosted_session(&store, &env, &record.session_id, "owner"),
+                    Err(LifecycleError::PrerequisiteUnavailable { .. })
+                ));
+                let stopped = get_hosted_session_by_id(&store, &record.session_id)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(stopped.status, STATUS_STOPPED);
+                assert_eq!(stopped.stop_reason.as_deref(), Some(reason));
+                assert_eq!(stopped.launch_prerequisite_detail, None);
+                assert!(!stopped.runtime_spawned);
+                assert_eq!(load_hosted_respawn_state(&store, &record.session_id), state);
+                let calls = fake.calls.borrow().clone();
+                assert!(
+                    reconcile_and_respawn_hosted_sessions(&store, &env)
+                        .unwrap()
+                        .is_empty()
+                );
+                assert_eq!(
+                    *fake.calls.borrow(),
+                    calls,
+                    "no automatic launch may follow the refused manual attempt"
+                );
+            }
+        }
+    }
+    // CI only: preparation refusal must reserve the current slow phase exactly once.
+    #[test]
+    fn slow_recovery_invalid_preparation_charges_once_and_preserves_spacing() {
+        let _reset = RecoveryFixtureReset;
+        let home = TempDir::new().unwrap();
+        let _trusted = trusted_codex_home(home.path(), home.path());
+        let store = MemStore::default();
+        let fake = FakeRuntime::default();
+        let env = fake.env(home.path());
+        let mut record = hosted_record("codex", "slow-invalid", STATUS_STOPPED, false);
+        record.cwd = Some(home.path().display().to_string());
+        record.stop_reason = Some(STOP_REASON_CRASH_LOOP.into());
+        persist_hosted_session(&store, &record, "owner").unwrap();
+        let before = HostedRespawnState {
+            respawn_timestamps_ms: vec![900],
+            recovery_started_at_ms: Some(1_000),
+            recovery_attempts: 2,
+            next_allowed_at_ms: Some(601_000),
+            ..Default::default()
+        };
+        save_hosted_respawn_state(&store, &record.session_id, &before, "owner").unwrap();
+        std::fs::write(home.path().join(".codex/config.toml"), "").unwrap();
+        TEST_RESPAWN_NOW_MS.with(|clock| clock.set(Some(601_000)));
+        assert!(matches!(
+            restart_hosted_session(&store, &env, &record.session_id, AUTO_RESPAWN_ACTOR),
+            Err(LifecycleError::Invalid(_))
+        ));
+        let after = load_hosted_respawn_state(&store, &record.session_id);
+        assert_eq!(after.recovery_attempts, 3);
+        assert_eq!(after.next_allowed_at_ms, Some(1_201_000));
+        assert_eq!(after.respawn_timestamps_ms, before.respawn_timestamps_ms);
+        assert_eq!(after.recovery_started_at_ms, before.recovery_started_at_ms);
+        assert!(matches!(
+            restart_hosted_session(&store, &env, &record.session_id, AUTO_RESPAWN_ACTOR),
+            Err(LifecycleError::Conflict(_))
+        ));
+        assert_eq!(load_hosted_respawn_state(&store, &record.session_id), after);
+        assert!(fake.calls.borrow().is_empty());
+    }
+
+    // CI only: startup readiness loss refunds the slow reservation without refilling history.
+    #[test]
+    fn slow_recovery_startup_refund_preserves_incident_and_prerequisite_cadence() {
+        let _reset = RecoveryFixtureReset;
+        struct ResetSequence;
+        impl Drop for ResetSequence {
+            fn drop(&mut self) {
+                TEST_LAUNCH_PREREQUISITE_SEQUENCE.with(|slot| slot.borrow_mut().clear());
+            }
+        }
+        let _sequence = ResetSequence;
+        for spawn_fails in [true, false] {
+            let home = TempDir::new().unwrap();
+            let _trusted = trusted_codex_home(home.path(), home.path());
+            let store = MemStore::default();
+            let fake = FakeRuntime::default();
+            if spawn_fails {
+                fake.fail_windows.borrow_mut().push("codex".into());
+            } else {
+                fake.vanish_windows.borrow_mut().push("codex".into());
+            }
+            let env = fake.env(home.path());
+            let mut record = hosted_record("codex", "slow-refund", STATUS_STOPPED, false);
+            record.cwd = Some(home.path().display().to_string());
+            record.stop_reason = Some(STOP_REASON_CRASH_LOOP.into());
+            persist_hosted_session(&store, &record, "owner").unwrap();
+            let mut expected = HostedRespawnState {
+                respawn_timestamps_ms: vec![900],
+                recovery_started_at_ms: Some(1_000),
+                recovery_attempts: 2,
+                next_allowed_at_ms: Some(601_000),
+                crash_loop_notified_recipients: vec!["recovery:lead".into()],
+                ..Default::default()
+            };
+            save_hosted_respawn_state(&store, &record.session_id, &expected, "owner").unwrap();
+            TEST_RESPAWN_NOW_MS.with(|clock| clock.set(Some(601_000)));
+            TEST_LAUNCH_PREREQUISITE_SEQUENCE.with(|slot| {
+                *slot.borrow_mut() = [
+                    Ok(()),
+                    Err(fl_core::LaunchPrerequisiteRefusal {
+                        code: "codex_app_server_unavailable".into(),
+                        detail: "/private/control.sock: ConnectionRefused".into(),
+                    }),
+                ]
+                .into_iter()
+                .collect();
+            });
+            assert!(matches!(
+                restart_hosted_session(&store, &env, &record.session_id, AUTO_RESPAWN_ACTOR),
+                Err(LifecycleError::PrerequisiteUnavailable { .. })
+            ));
+            expected.next_allowed_at_ms = Some(661_000);
+            assert_eq!(
+                load_hosted_respawn_state(&store, &record.session_id),
+                expected
+            );
+            let stopped = get_hosted_session_by_id(&store, &record.session_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                stopped.stop_reason.as_deref(),
+                Some(STOP_REASON_PREREQUISITE_UNAVAILABLE)
+            );
+            assert!(!stopped.runtime_spawned);
+            assert!(TEST_LAUNCH_PREREQUISITE_SEQUENCE.with(|slot| slot.borrow().is_empty()));
+            let calls = fake.calls.borrow().clone();
+            assert!(matches!(
+                restart_hosted_session(&store, &env, &record.session_id, AUTO_RESPAWN_ACTOR),
+                Err(LifecycleError::Conflict(_))
+            ));
+            assert_eq!(*fake.calls.borrow(), calls);
+            assert_eq!(
+                load_hosted_respawn_state(&store, &record.session_id),
+                expected
+            );
+        }
     }
 }
