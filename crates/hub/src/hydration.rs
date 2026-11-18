@@ -307,50 +307,48 @@ pub(crate) fn render_with_generation(
                 "Catalog guidance workspace-relative base: {base}.\nApply your current catalog role guidance: {template}"
             )
         }
-        RoleGuidance::File => {
-            match fl_core::agent::normalize_role_slug(role) {
-                Err(_) => {
-                    let warning = format!("role file not found: invalid role slug {role:?}");
+        RoleGuidance::File => match fl_core::agent::normalize_role_slug(role) {
+            Err(_) => {
+                let warning = format!("role file not found: invalid role slug {role:?}");
+                context.warnings.push(warning.clone());
+                format!("Missing guidance: {warning}. Continue with available guidance.")
+            }
+            Ok(normalized) => {
+                let file_role = match normalized.as_str() {
+                    "web-developer" | "mobile-developer" => "ui-developer".to_string(),
+                    _ => normalized,
+                };
+                let mut candidates = Vec::new();
+                if let Some(ws) = &context.workspace {
+                    let roles = ws.join(".agents/roles");
+                    let dirs = unique(matching_dirs(&roles, project));
+                    if dirs.len() > 1 {
+                        context.warnings.push(format!("ambiguous project role directories for {project}; using global role guidance"));
+                    } else if let Some(dir) = dirs.first() {
+                        candidates.push(dir.join(format!("{file_role}.md")));
+                    } else {
+                        candidates.push(roles.join(project).join(format!("{file_role}.md")));
+                    }
+                    candidates.push(roles.join(format!("{file_role}.md")));
+                }
+                if let Some(path) = candidates.iter().find_map(|p| regular_file(p)) {
+                    format!("Read your role file(s): `{}`.", path.display())
+                } else {
+                    let locations = if candidates.is_empty() {
+                        "workspace unavailable".into()
+                    } else {
+                        candidates
+                            .iter()
+                            .map(|p| p.display().to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    };
+                    let warning = format!("role file not found: looked in {locations}");
                     context.warnings.push(warning.clone());
                     format!("Missing guidance: {warning}. Continue with available guidance.")
                 }
-                Ok(normalized) => {
-                    let file_role = match normalized.as_str() {
-                        "web-developer" | "mobile-developer" => "ui-developer".to_string(),
-                        _ => normalized,
-                    };
-                    let mut candidates = Vec::new();
-                    if let Some(ws) = &context.workspace {
-                        let roles = ws.join(".agents/roles");
-                        let dirs = unique(matching_dirs(&roles, project));
-                        if dirs.len() > 1 {
-                            context.warnings.push(format!("ambiguous project role directories for {project}; using global role guidance"));
-                        } else if let Some(dir) = dirs.first() {
-                            candidates.push(dir.join(format!("{file_role}.md")));
-                        } else {
-                            candidates.push(roles.join(project).join(format!("{file_role}.md")));
-                        }
-                        candidates.push(roles.join(format!("{file_role}.md")));
-                    }
-                    if let Some(path) = candidates.iter().find_map(|p| regular_file(p)) {
-                        format!("Read your role file(s): `{}`.", path.display())
-                    } else {
-                        let locations = if candidates.is_empty() {
-                            "workspace unavailable".into()
-                        } else {
-                            candidates
-                                .iter()
-                                .map(|p| p.display().to_string())
-                                .collect::<Vec<_>>()
-                                .join(", ")
-                        };
-                        let warning = format!("role file not found: looked in {locations}");
-                        context.warnings.push(warning.clone());
-                        format!("Missing guidance: {warning}. Continue with available guidance.")
-                    }
-                }
             }
-        }
+        },
     };
     let instructions = ["AGENTS.md", "WORKFLOW.md", "PERSONA.md"]
         .map(|file| {
@@ -1096,15 +1094,12 @@ mod tests {
             ("lab_manager", "lab-manager"),
             ("lab-manager", "lab-manager"),
         ] {
-            let expected = f
-                .workspace
-                .join(format!(".agents/roles/{canonical}.md"));
+            let expected = f.workspace.join(format!(".agents/roles/{canonical}.md"));
             let result = f.prompt(&f.project, role, RoleGuidance::File);
             assert!(
-                result.text.contains(&format!(
-                    "Read your role file(s): `{}`",
-                    expected.display()
-                )),
+                result
+                    .text
+                    .contains(&format!("Read your role file(s): `{}`", expected.display())),
                 "role {role} should resolve {canonical}.md, got: {}",
                 result.text
             );
@@ -1126,7 +1121,9 @@ mod tests {
         std::fs::write(&raw_file, "raw").unwrap();
         let result = f.prompt(&f.project, "BAD ROLE!", RoleGuidance::File);
         assert!(
-            result.text.contains("Missing guidance: role file not found: invalid role slug"),
+            result
+                .text
+                .contains("Missing guidance: role file not found: invalid role slug"),
             "{}",
             result.text
         );
@@ -1138,10 +1135,11 @@ mod tests {
             "{:?}",
             result.warnings
         );
-        assert!(!result.text.contains(&format!(
-            "Read your role file(s): `{}`",
-            raw_file.display()
-        )));
+        assert!(
+            !result
+                .text
+                .contains(&format!("Read your role file(s): `{}`", raw_file.display()))
+        );
     }
 
     #[test]
