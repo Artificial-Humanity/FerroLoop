@@ -817,10 +817,7 @@ export const FerroWatchPane: React.FC<FerroWatchPaneProps> = ({
             health: {
               ...summaryRes.health,
               agents: summaryRes.health.agents.map((ag) => {
-                if (
-                  !ag.hosted_session ||
-                  ag.hosted_session.hydration_status !== undefined
-                ) {
+                if (!ag.hosted_session) {
                   return ag;
                 }
                 const sidKey = (ag.hosted_session.session_id ?? "")
@@ -840,8 +837,16 @@ export const FerroWatchPane: React.FC<FerroWatchPaneProps> = ({
                   hosted_session: {
                     ...ag.hosted_session,
                     hydration_status: normalizeHydrationStatus(
-                      matched.hydration_status,
+                      ag.hosted_session.hydration_status ?? matched.hydration_status,
                     ),
+                    // Reasons must belong to the same hosted session, not merely
+                    // another record for the same persona.
+                    stop_reason: ag.hosted_session.stop_reason ??
+                      (sidKey && sidKey === (matched.session_id ?? "").trim().toLowerCase()
+                        ? matched.stop_reason : undefined),
+                    launch_prerequisite_detail: ag.hosted_session.launch_prerequisite_detail ??
+                      (sidKey && sidKey === (matched.session_id ?? "").trim().toLowerCase()
+                        ? matched.launch_prerequisite_detail : undefined),
                     hydration_dispatched:
                       ag.hosted_session.hydration_dispatched ??
                       matched.hydration_dispatched,
@@ -2863,6 +2868,22 @@ export const FerroWatchPane: React.FC<FerroWatchPaneProps> = ({
                           >
                             {normalizeHydrationStatus(hosted.hydration_status)}
                           </span>
+                        </div>
+                      )}
+                      {hosted?.status?.trim().toLowerCase() === "stopped" && hosted.stop_reason?.trim() && (
+                        <div
+                          data-testid={`watch-liveness-stop-reason-${key}`}
+                          style={{ fontSize: "11px", color: "var(--text-secondary)" }}
+                        >
+                          {hosted.stop_reason === "runtime_gone" ? (
+                            <>Runtime disappeared. Check the runtime, then restart the session.</>
+                          ) : hosted.stop_reason === "crash_loop" ? (
+                            <>Repeated crashes. Inspect the failure, then restart the session.</>
+                          ) : hosted.stop_reason === "prerequisite_unavailable" ? (
+                            <>Prerequisite unavailable. {hosted.launch_prerequisite_detail?.trim() || "Check the runtime prerequisite, then restart the session."}</>
+                          ) : (
+                            <>Stop reason: {hosted.stop_reason}</>
+                          )}
                         </div>
                       )}
                     </div>

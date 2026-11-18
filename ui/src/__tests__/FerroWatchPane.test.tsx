@@ -315,6 +315,52 @@ describe("FerroWatchPane — Antigravity hosted model suffix", () => {
     );
   });
 
+  it.each([
+    ["runtime_gone", null, "Runtime disappeared", "restart"],
+    ["crash_loop", null, "Repeated crashes", "restart"],
+    ["prerequisite_unavailable", "The daemon socket is missing", "Prerequisite unavailable", "The daemon socket is missing"],
+    ["future_reason", null, "future_reason", "future_reason"],
+  ])("shows stop reason %s and its detail from the hosted record", async (reason, detail, label, actionable) => {
+    const summary = makeSampleWatchSummary();
+    const hosted = summary.health!.agents[0].hosted_session!;
+    hosted.status = "stopped";
+    // The summary may already contain hydration, while an older watch omits the reason.
+    hosted.hydration_status = "confirmed";
+    const fetchImpl = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      const body = url.includes("/api/v1/watch/summary") ? summary :
+        url.includes("/api/v1/hosted-sessions") ? { sessions: [{ ...hosted,
+          hydration_dispatched: true, stop_reason: reason, launch_prerequisite_detail: detail }] } : {};
+      return new Response(JSON.stringify(body), { status: 200, headers: { "Content-Type": "application/json" } });
+    });
+    render(<FerroWatchPane authority={{ tier: "owner", login: "lmcfarlin" }}
+      apiClient={new HubApiClient({ fetchImpl: fetchImpl as unknown as typeof fetch })} />);
+    const row = await screen.findByTestId("watch-liveness-stop-reason-ferris");
+    expect(row).toHaveTextContent(label);
+    expect(row).toHaveTextContent(actionable);
+  });
+
+  it("uses the reason from watch without an enrichment record and hides it for running sessions", async () => {
+    const summary = makeSampleWatchSummary();
+    const hosted = summary.health!.agents[0].hosted_session!;
+    hosted.status = "stopped";
+    hosted.stop_reason = "prerequisite_unavailable";
+    hosted.launch_prerequisite_detail = "Start the daemon";
+    const fetchImpl = vi.fn(async (input: RequestInfo | URL) => {
+      const body = String(input).includes("/api/v1/watch/summary") ? summary : {};
+      return new Response(JSON.stringify(body), { status: 200, headers: { "Content-Type": "application/json" } });
+    });
+    const props = { authority: { tier: "owner" as const, login: "lmcfarlin" },
+      apiClient: new HubApiClient({ fetchImpl: fetchImpl as unknown as typeof fetch }) };
+    const view = render(<FerroWatchPane {...props} />);
+    expect(await screen.findByTestId("watch-liveness-stop-reason-ferris")).toHaveTextContent("Start the daemon");
+    view.unmount();
+    hosted.status = "running";
+    render(<FerroWatchPane {...props} />);
+    await screen.findByTestId("watch-liveness-hosted-ferris");
+    expect(screen.queryByTestId("watch-liveness-stop-reason-ferris")).not.toBeInTheDocument();
+  });
+
   it("shows a live unmanaged persona instead of its decommissioned record (issue #485)", async () => {
     const summary = makeSampleWatchSummary();
     summary.health!.agents = [
