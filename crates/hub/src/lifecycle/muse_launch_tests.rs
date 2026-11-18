@@ -1141,7 +1141,7 @@ impl FakeTmuxWindows {
         std::fs::write(
             &bin,
             format!(
-                "#!/bin/sh\n[ \"$1\" = \"{EXEC_PROBE}\" ] && exit 0\nif [ \"$1\" = \"list-windows\" ]; then\n{list}elif [ \"$1\" = \"display-message\" ]; then\n  echo '%5'\nfi\n"
+                "#!/bin/sh\n[ \"$1\" = \"{EXEC_PROBE}\" ] && exit 0\n[ \"$1\" = \"-S\" ] && shift 2\nif [ \"$1\" = \"list-windows\" ]; then\n{list}elif [ \"$1\" = \"display-message\" ]; then\n  echo '%5'\nfi\n"
             ),
         )
         .unwrap();
@@ -1339,7 +1339,7 @@ impl TmuxLog {
         std::fs::write(
             &bin,
             format!(
-                "#!/bin/sh\n[ \"$1\" = \"{EXEC_PROBE}\" ] && exit 0\nprintf '%s\\n' \"$*\" >> '{}'\ncase \"$1\" in\n{fail_cases}  has-session) exit {has_session};;\n  new-window|new-session) echo '{new_window_out}'; exit 0;;\n  list-windows)\n    case \"$*\" in\n    *'#{{window_id}}'*)\n{full}      exit 0;;\n    *)\n{names}      exit 0;;\n    esac;;\n  *) exit 0;;\nesac\n",
+                "#!/bin/sh\n[ \"$1\" = \"{EXEC_PROBE}\" ] && exit 0\n[ \"$1\" = \"-S\" ] && shift 2\nprintf '%s\\n' \"$*\" >> '{}'\ncase \"$1\" in\n{fail_cases}  has-session) exit {has_session};;\n  new-window|new-session) echo '{new_window_out}'; exit 0;;\n  list-windows)\n    case \"$*\" in\n    *'#{{window_id}}'*)\n{full}      exit 0;;\n    *)\n{names}      exit 0;;\n    esac;;\n  *) exit 0;;\nesac\n",
                 log.display()
             ),
         )

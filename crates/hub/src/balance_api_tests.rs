@@ -846,3 +846,60 @@ fn a_blocked_or_empty_apply_leaves_a_single_use_grant_unspent() {
     assert_eq!(out["results"][0]["persona"], "bo", "{out}");
     assert!(!unspent(&tmp, &grant));
 }
+
+#[test]
+fn apply_admission_refuses_immediately_without_store_or_runtime_effects() {
+    let tmp = TempDir::new().unwrap();
+    let state = hub(&tmp);
+    let _gate = state.balance_apply_lock.lock().unwrap();
+    let _store = state.open_store().unwrap();
+    let (status, out) = post(&state, APPLY, OWNER, json!({}));
+    assert_eq!(status, 409, "{out}");
+    assert!(
+        out["error"]
+            .as_str()
+            .unwrap()
+            .contains("another balance apply")
+    );
+}
+
+#[test]
+fn apply_revalidates_policy_and_merges_current_history_after_selection() {
+    let tmp = TempDir::new().unwrap();
+    let state = hub(&tmp);
+    hot_claude(&state);
+    let before = records(&state);
+    let changed = state.clone();
+    crate::balance_api::before_apply_fence(move || {
+        set_policy(&changed, json!({"excluded_personas":["ada"]}))
+    });
+    let (status, out) = post(&state, APPLY, OWNER, json!({}));
+    assert_eq!(status, 409, "{out}");
+    assert_eq!(records(&state), before);
+    assert!(audits(&state).is_empty());
+    set_policy(
+        &state,
+        json!({"excluded_personas":[],"min_interval_ms":0,"cooldown_ms":0}),
+    );
+    let changed = state.clone();
+    crate::balance_api::before_apply_fence(move || {
+        let store = changed.open_store().unwrap();
+        let mut history = read_history(&*store).unwrap();
+        history.record(1, ["unrelated-persona"]);
+        fl_watch::balance_store::write_history(
+            &*store,
+            &history,
+            At::from_unix_millis(1),
+            "fixture",
+        )
+        .unwrap();
+    });
+    let (status, out) = post(&state, APPLY, OWNER, json!({}));
+    assert_eq!(status, 200, "{out}");
+    let history = read_history(&*state.open_store().unwrap()).unwrap();
+    assert_eq!(
+        history.persona_last_switch_ms.get("unrelated-persona"),
+        Some(&1)
+    );
+    assert!(history.persona_last_switch_ms.contains_key("ada"));
+}

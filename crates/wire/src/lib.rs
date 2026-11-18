@@ -13,6 +13,7 @@ pub mod host_runtime;
 pub mod identity;
 pub mod peer;
 mod registration_evidence;
+pub mod runtime_context;
 pub mod scanner;
 pub mod vendor_adapter;
 pub mod ws;

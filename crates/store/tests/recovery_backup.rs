@@ -15,6 +15,7 @@ use fl_store::{
 };
 use serde_json::json;
 use std::{
+    collections::VecDeque,
     fs, io,
     os::unix::fs::{PermissionsExt, symlink},
     path::{Path, PathBuf},
@@ -1423,9 +1424,20 @@ struct MutatePublication {
     event: RecoveryEvent,
     mutation: PublicationMutation,
     done: std::sync::atomic::AtomicBool,
+    seen: Mutex<VecDeque<RecoveryEvent>>,
 }
 impl RecoveryIo for MutatePublication {
     fn before(&self, event: RecoveryEvent) -> io::Result<()> {
+        // Retain at most 16 observed events before the mutation filter so
+        // an `unreached` failure can show what actually flowed. The guard
+        // is scoped to release the lock before the filter/mutation below.
+        {
+            let mut seen = self.seen.lock().unwrap();
+            if seen.len() == 16 {
+                seen.pop_front();
+            }
+            seen.push_back(event);
+        }
         if event != self.event || self.done.swap(true, std::sync::atomic::Ordering::AcqRel) {
             return Ok(());
         }
@@ -1549,6 +1561,7 @@ fn publication_mutation_matrix(reconciliation: Option<bool>) {
                 event,
                 mutation,
                 done: Default::default(),
+                seen: Default::default(),
             });
             let filesystem = FaultFs {
                 root: f.destination.clone(),
@@ -1560,9 +1573,15 @@ fn publication_mutation_matrix(reconciliation: Option<bool>) {
             } else {
                 backup(&f.store, &request, &filesystem, &CancelToken::new())
             };
+            let seen_tail: Vec<RecoveryEvent> = {
+                let seen = hook.seen.lock().unwrap();
+                seen.iter().copied().collect()
+            };
             assert!(
                 hook.done.load(std::sync::atomic::Ordering::Acquire),
-                "unreached: {reconciliation:?} {event:?} {mutation:?}"
+                "unreached: {reconciliation:?} {event:?} {mutation:?} result={result:?} \
+                 seen_tail(last {}): {seen_tail:?}",
+                seen_tail.len()
             );
             if !matches!(result, Err(fl_store::recovery::RecoveryError::Quarantined { operation_id }) if operation_id == request.operation_id)
             {

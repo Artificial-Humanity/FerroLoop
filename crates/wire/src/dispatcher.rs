@@ -845,7 +845,7 @@ fn parent_pid(pid: u32) -> Option<u32> {
 /// or the chain is cut.
 pub(crate) fn tmux_pane_for_pid(pid: u32) -> Option<String> {
     if host_discovery_allowed()
-        && let Ok(endpoint) = fl_host_proto::HostEndpoint::discover()
+        && let Ok(endpoint) = crate::runtime_context::host_endpoint()
         && let Ok(mut client) = fl_host_proto::BlockingHostClient::connect(&endpoint)
         && let Ok(sessions) = client.list_sessions()
     {
@@ -865,7 +865,8 @@ pub(crate) fn tmux_pane_for_pid(pid: u32) -> Option<String> {
             cur = next;
         }
     }
-    let out = Command::new(tmux_bin())
+    let out = crate::runtime_context::tmux_command(&tmux_bin())
+        .ok()?
         .args(["list-panes", "-a", "-F", "#{pane_id} #{pane_pid}"])
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
@@ -2495,7 +2496,7 @@ pub fn run_interrupt(plan: &InterruptPlan) -> Result<(), String> {
                 .iter()
                 .find(|t| tmux_target_alive(t))
                 .ok_or_else(|| "no live tmux target for the session".to_string())?;
-            let status = Command::new(tmux_bin())
+            let status = crate::runtime_context::tmux_command(&tmux_bin())?
                 .args(["send-keys", "-t", &tmux_exact_target(target), key])
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
@@ -2609,16 +2610,15 @@ pub fn tmux_exact_target(target: &str) -> String {
 /// consulted only when `FL_HOST_SOCK` is explicitly set so hermetic tests never reach a live
 /// host daemon on the machine.
 pub(crate) fn host_discovery_allowed() -> bool {
-    if std::env::var_os("FL_WIRE_TMUX_BIN").is_some() {
-        return false;
-    }
-    #[cfg(test)]
-    {
-        std::env::var_os("FL_HOST_SOCK").is_some()
-    }
-    #[cfg(not(test))]
-    {
-        true
+    std::env::var_os("FL_WIRE_TMUX_BIN").is_none() && {
+        #[cfg(test)]
+        {
+            std::env::var_os("FL_HOST_SOCK").is_some()
+        }
+        #[cfg(not(test))]
+        {
+            cfg!(not(test))
+        }
     }
 }
 
@@ -2632,7 +2632,7 @@ fn resolve_live_host_session_with_mode(
     if !host_discovery_allowed() {
         return None;
     }
-    let endpoint = fl_host_proto::HostEndpoint::discover().ok()?;
+    let endpoint = crate::runtime_context::host_endpoint().ok()?;
     let mut client = fl_host_proto::BlockingHostClient::connect(&endpoint).ok()?;
     let sessions = client.list_sessions().ok()?;
     let matched_ids = crate::vendor_adapter::matching_live_host_sessions(&sessions, target);
@@ -2670,7 +2670,7 @@ fn resolve_claude_host(target: &str, pid: u32) -> Result<ResolvedClaudeHost, Str
     if !host_discovery_allowed() {
         return Err("Claude host discovery is unavailable".into());
     }
-    let endpoint = fl_host_proto::HostEndpoint::discover().map_err(|e| e.to_string())?;
+    let endpoint = crate::runtime_context::host_endpoint().map_err(|e| e.to_string())?;
     let mut client =
         fl_host_proto::BlockingHostClient::connect(&endpoint).map_err(|e| e.to_string())?;
     let sessions = client.list_sessions().map_err(|e| e.to_string())?;
@@ -2738,7 +2738,9 @@ fn probe_tmux_target(target: &str, timeout: Duration) -> TmuxProbeOutcome {
     // `display-message` answers for the current window when an exact `session:window` target
     // matches nothing, so a window-qualified target is asked with `list-panes`, which fails.
     let by_window = exact != target;
-    let mut cmd = Command::new(tmux_bin());
+    let Ok(mut cmd) = crate::runtime_context::tmux_command(&tmux_bin()) else {
+        return TmuxProbeOutcome::Dead;
+    };
     if by_window {
         cmd.args(["list-panes", "-t", &exact, "-F", "#{pane_id}"]);
     } else {
@@ -3747,7 +3749,7 @@ fn capture_host_rendered_screen(
         {
             rendered.ghost_styled = true;
         } else {
-            let raw_hint = fl_host_proto::HostEndpoint::discover()
+            let raw_hint = crate::runtime_context::host_endpoint()
                 .ok()
                 .and_then(|ep| fl_host_proto::BlockingHostClient::connect(&ep).ok())
                 .and_then(|mut ro_client| {
@@ -4471,7 +4473,7 @@ fn deliver_via_tmux_paste_with_resolved_host(
                 .as_nanos();
             let buf_name = format!("fl-wire-muse-{}-{nanos}", std::process::id());
             let payload = format!("{trimmed}\n");
-            let mut load_child = Command::new(&tmux_write)
+            let mut load_child = crate::runtime_context::tmux_command(&tmux_write)?
                 .args(["load-buffer", "-b", &buf_name, "-"])
                 .stdin(std::process::Stdio::piped())
                 .stdout(std::process::Stdio::null())
@@ -4498,14 +4500,14 @@ fn deliver_via_tmux_paste_with_resolved_host(
                 paste_args.push("-p");
             }
             paste_args.extend(["-t", target_write.as_str()]);
-            let paste_status = Command::new(&tmux_write)
+            let paste_status = crate::runtime_context::tmux_command(&tmux_write)?
                 .args(&paste_args)
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
                 .status()
                 .map_err(|e| format!("failed to spawn tmux paste-buffer: {e}"))?;
             if !paste_status.success() {
-                let _ = Command::new(&tmux_write)
+                let _ = crate::runtime_context::tmux_command(&tmux_write)?
                     .args(["delete-buffer", "-b", &buf_name])
                     .stdout(std::process::Stdio::null())
                     .stderr(std::process::Stdio::null())
@@ -4515,7 +4517,7 @@ fn deliver_via_tmux_paste_with_resolved_host(
             Ok(())
         },
         || {
-            let status = Command::new(&tmux_enter)
+            let status = crate::runtime_context::tmux_command(&tmux_enter)?
                 .args(["send-keys", "-t", &target_enter, "Enter"])
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
@@ -4528,7 +4530,10 @@ fn deliver_via_tmux_paste_with_resolved_host(
         },
         || {
             if opts.bracketed {
-                let _ = Command::new(&tmux_err_cu)
+                let Ok(mut command) = crate::runtime_context::tmux_command(&tmux_err_cu) else {
+                    return;
+                };
+                let _ = command
                     .args(["send-keys", "-t", &target_err_cu, "C-u"])
                     .stdout(std::process::Stdio::null())
                     .stderr(std::process::Stdio::null())
@@ -4537,7 +4542,10 @@ fn deliver_via_tmux_paste_with_resolved_host(
         },
         |err| {
             if !err.contains("active dialog or menu detected") && !is_composer_occupied_error(err) {
-                let _ = Command::new(&tmux_abort_cu)
+                let Ok(mut command) = crate::runtime_context::tmux_command(&tmux_abort_cu) else {
+                    return;
+                };
+                let _ = command
                     .args(["send-keys", "-t", &target_abort_cu, "C-u"])
                     .stdout(std::process::Stdio::null())
                     .stderr(std::process::Stdio::null())
@@ -6839,7 +6847,8 @@ fn poll_for_pasted_content(
 }
 
 fn capture_tmux_rendered_screen(tmux: &Path, target: &str) -> Option<RenderedCursorScreen> {
-    let cap = Command::new(tmux)
+    let cap = crate::runtime_context::tmux_command(tmux)
+        .ok()?
         .args(["capture-pane", "-e", "-p", "-t", target])
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
@@ -6849,7 +6858,8 @@ fn capture_tmux_rendered_screen(tmux: &Path, target: &str) -> Option<RenderedCur
         return None;
     }
     let contents = String::from_utf8_lossy(&cap.stdout).into_owned();
-    let (cursor, dims) = Command::new(tmux)
+    let (cursor, dims) = crate::runtime_context::tmux_command(tmux)
+        .ok()?
         .args([
             "display-message",
             "-p",

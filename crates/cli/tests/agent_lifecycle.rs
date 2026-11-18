@@ -38,6 +38,11 @@ impl Env {
         c.current_dir(self.path())
             .env("HOME", self.path())
             .env("XDG_RUNTIME_DIR", self.path())
+            .env("FL_HOST_SOCK", self.path().join("host.sock"))
+            .env(
+                "TMUX",
+                format!("{},1,0", self.path().join("tmux.sock").display()),
+            )
             .env("XDG_CONFIG_HOME", self.path().join("config"))
             .env("XDG_DATA_HOME", self.path().join("data"))
             .env("FL_WIRE_DISABLE_HOST_DISCOVERY", "1")
