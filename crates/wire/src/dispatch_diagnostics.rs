@@ -291,6 +291,10 @@ pub struct FenceDiagnostic {
     pub route_dispatch_calls_saturated: bool,
     /// No registration generation exists in v1; always null.
     pub registration_generation: Option<u64>,
+    /// Recognised composer payload (`"/clear"` or `"/new"`) for a composer-occupied
+    /// hold, or `None` for any other composer text. Never arbitrary composer text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recognised_composer_payload: Option<String>,
 }
 
 /// Only safe, bounded projections enter this report: never route clones,
@@ -305,9 +309,17 @@ pub(crate) struct DispatchReport {
     pub(crate) omitted_route_observations_saturated: bool,
     pub(crate) route_dispatch_calls: u64,
     pub(crate) route_dispatch_calls_saturated: bool,
+    pub(crate) recognised_composer_payload: Option<&'static str>,
 }
 
 impl DispatchReport {
+    pub(crate) fn record_composer_occupied(&mut self, err: &str) {
+        self.record_failure(FailureStage::ComposerOccupiedByNonWireInput);
+        if let Some(payload) = crate::dispatcher::recognised_payload_from_error(err) {
+            self.recognised_composer_payload = Some(payload);
+        }
+    }
+
     pub(crate) fn record_failure(&mut self, stage: FailureStage) {
         if self.failure_stages.len() < MAX_FAILURE_STAGES {
             self.failure_stages.push(stage);
@@ -416,6 +428,7 @@ impl FenceDiagnostic {
             route_dispatch_calls: report.route_dispatch_calls,
             route_dispatch_calls_saturated: report.route_dispatch_calls_saturated,
             registration_generation: None,
+            recognised_composer_payload: report.recognised_composer_payload.map(str::to_string),
         }
     }
 }
@@ -480,6 +493,9 @@ impl DiagnosticsState {
                     row.omitted_route_observations_saturated;
                 first.route_dispatch_calls = row.route_dispatch_calls;
                 first.route_dispatch_calls_saturated = row.route_dispatch_calls_saturated;
+                if row.recognised_composer_payload.is_some() {
+                    first.recognised_composer_payload = row.recognised_composer_payload.clone();
+                }
                 if row.omitted_failure_stages > 0 {
                     let (total, overflow) = first
                         .omitted_failure_stages
@@ -562,6 +578,58 @@ mod tests {
             FenceReason::UnresolvedReceiptStatus,
             report,
         )
+    }
+
+    #[test]
+    fn diagnostic_carries_only_recognised_composer_payload() {
+        let mut report = DispatchReport::default();
+        report.record_composer_occupied(
+            "composer_occupied_by_non_wire_input: composer_occupied: composer holds \"/clear\"; repair: Backspace, then Ctrl-U; holding delivery without sending keys",
+        );
+        let diagnostic = row(&report);
+        assert_eq!(
+            diagnostic.recognised_composer_payload.as_deref(),
+            Some("/clear")
+        );
+        let json = serde_json::to_value(&diagnostic).unwrap();
+        assert_eq!(json["recognised_composer_payload"], "/clear");
+        // Route observations carry no composer text even when a call was recorded:
+        // record one, then check its serialised shape is only the allowlisted fields.
+        let mut with_call = DispatchReport::default();
+        let slot = with_call.record_call_started(&codex());
+        with_call.record_call_finished(slot, DispatchCallOutcome::ReturnedError);
+        with_call.record_composer_occupied(
+            "composer_occupied_by_non_wire_input: composer_occupied: composer holds \"/clear\"; repair: Backspace, then Ctrl-U; holding delivery without sending keys",
+        );
+        let diagnostic = row(&with_call);
+        assert_eq!(diagnostic.route_observations.len(), 1);
+        let obs_json = serde_json::to_value(&diagnostic.route_observations[0]).unwrap();
+        let obs_obj = obs_json.as_object().unwrap();
+        let mut keys: Vec<&str> = obs_obj.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "adapter",
+                "explicit",
+                "identity_digest",
+                "outcome",
+                "route_updated_at"
+            ]
+        );
+        let obs_text = serde_json::to_string(&diagnostic.route_observations).unwrap();
+        assert!(!obs_text.contains("/clear"), "{obs_text}");
+        assert!(!obs_text.contains("ROUTE_PERSONA_SECRET"), "{obs_text}");
+
+        let mut arbitrary = DispatchReport::default();
+        arbitrary.record_composer_occupied(
+            "composer_occupied_by_non_wire_input: composer holds owner secret draft; holding delivery without sending keys",
+        );
+        let diagnostic = row(&arbitrary);
+        assert_eq!(diagnostic.recognised_composer_payload, None);
+        let json = serde_json::to_string(&diagnostic).unwrap();
+        assert!(!json.contains("owner secret draft"), "{json}");
+        assert!(!json.contains("recognised_composer_payload"), "{json}");
     }
 
     #[test]

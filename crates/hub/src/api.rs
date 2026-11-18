@@ -2019,6 +2019,8 @@ pub struct HubFenceDiagnostic {
     pub route_dispatch_calls: u64,
     pub route_dispatch_calls_saturated: bool,
     pub registration_generation: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recognised_composer_payload: Option<String>,
 }
 
 /// Allowlist projection of [`fl_wire::dispatch_diagnostics::RouteDispatchObservation`].
@@ -2102,6 +2104,11 @@ impl HubRouteDispatchObservation {
     }
 }
 
+/// Clamp a wire recognised payload to the two named values; anything else is dropped.
+fn clamp_recognised_composer_payload(payload: Option<String>) -> Option<String> {
+    payload.filter(|p| p == "/clear" || p == "/new")
+}
+
 impl HubFenceDiagnostic {
     fn from_wire(record: fl_wire::dispatch_diagnostics::FenceDiagnostic) -> Self {
         let fl_wire::dispatch_diagnostics::FenceDiagnostic {
@@ -2124,6 +2131,7 @@ impl HubFenceDiagnostic {
             route_dispatch_calls,
             route_dispatch_calls_saturated,
             registration_generation,
+            recognised_composer_payload,
         } = record;
         Self {
             recipient,
@@ -2148,6 +2156,9 @@ impl HubFenceDiagnostic {
             route_dispatch_calls,
             route_dispatch_calls_saturated,
             registration_generation,
+            recognised_composer_payload: clamp_recognised_composer_payload(
+                recognised_composer_payload,
+            ),
         }
     }
 }
@@ -7463,6 +7474,68 @@ pub(crate) fn with_hydrate_lock<T>(body: impl FnOnce() -> T) -> T {
     body()
 }
 
+#[cfg(test)]
+thread_local! {
+    static SESSION_CLEAR_LOGS: std::cell::RefCell<Vec<String>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+#[cfg(test)]
+fn take_session_clear_logs() -> Vec<String> {
+    SESSION_CLEAR_LOGS.with(|logs| std::mem::take(&mut *logs.borrow_mut()))
+}
+
+fn sanitise_log_field(value: &str) -> String {
+    if value.is_empty() {
+        return "unknown".to_string();
+    }
+    let sanitised: String = value
+        .chars()
+        .take(64)
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | ':' | '-') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if sanitised.is_empty() {
+        "unknown".to_string()
+    } else {
+        sanitised
+    }
+}
+
+/// One hub log line per session-clear request (#575). No composer or prompt content.
+/// Actor/persona (and the other fields) are sanitised so crafted ids containing
+/// whitespace or control characters cannot forge additional log lines.
+fn session_clear_log_line(
+    actor: &str,
+    persona: Option<&str>,
+    vendor: &str,
+    mode: &str,
+    outcome: &str,
+) -> String {
+    format!(
+        "hub: session clear actor={} persona={} vendor={} mode={} outcome={}",
+        sanitise_log_field(actor),
+        persona
+            .map(sanitise_log_field)
+            .unwrap_or_else(|| "-".to_string()),
+        sanitise_log_field(vendor),
+        sanitise_log_field(mode),
+        sanitise_log_field(outcome)
+    )
+}
+
+fn log_session_clear(actor: &str, persona: Option<&str>, vendor: &str, mode: &str, outcome: &str) {
+    let line = session_clear_log_line(actor, persona, vendor, mode, outcome);
+    #[cfg(test)]
+    SESSION_CLEAR_LOGS.with(|logs| logs.borrow_mut().push(line.clone()));
+    eprintln!("{line}");
+}
+
 /// `POST /api/v1/sessions/:id/clear` (mode `clear` or `reforge`): drop the session's queued
 /// prompts and model override and reset its live route; `reforge` then sends the synthesized
 /// startup prompt. Owner only (403 for a Peer, checked before the body is read and before any
@@ -7512,6 +7585,7 @@ fn handle_post_session_clear(
             || persona.eq_ignore_ascii_case(requested)
             || route_matches_session_id(route, requested)
     }) else {
+        log_session_clear(authority.actor_name(), Some(requested), "-", mode, "failed");
         return HttpResponse::json(
             404,
             json!({
@@ -7520,6 +7594,13 @@ fn handle_post_session_clear(
         );
     };
     if let Err(refusal) = preflight_session_reset(route) {
+        log_session_clear(
+            authority.actor_name(),
+            Some(persona.as_str()),
+            route.canonical_vendor(),
+            mode,
+            "refused",
+        );
         return HttpResponse::json(409, json!(refusal));
     }
     match reset_session(
@@ -7572,22 +7653,44 @@ fn reset_session_with_prompt(
     mode: &str,
     prepare_prompt: impl FnOnce() -> Result<String, LifecycleError>,
 ) -> Result<Value, (u16, Value)> {
-    let route = crate::lifecycle::lookup_reset_route_read_only(
+    let route = match crate::lifecycle::lookup_reset_route_read_only(
         state.config.home_override.as_deref(),
         session_route_query(persona, canonical_id),
-    )
-    .ok_or_else(|| {
-        (
-            404,
-            json!({ "error": no_route_error(persona, canonical_id) }),
-        )
-    })?;
-    preflight_session_reset(&route).map_err(|refusal| (409, json!(refusal)))?;
+    ) {
+        Some(route) => route,
+        None => {
+            log_session_clear(actor, persona.or(Some(canonical_id)), "-", mode, "failed");
+            return Err((
+                404,
+                json!({ "error": no_route_error(persona, canonical_id) }),
+            ));
+        }
+    };
+    let vendor = route.canonical_vendor().to_string();
+    if let Err(refusal) = preflight_session_reset(&route) {
+        log_session_clear(
+            actor,
+            persona.or(Some(canonical_id)),
+            &vendor,
+            mode,
+            "refused",
+        );
+        return Err((409, json!(refusal)));
+    }
     // Fallible guidance preparation must not erase queues or model choices on refusal.
     let prompt = if mode == "reforge" {
         match prepare_prompt() {
             Ok(prompt) => Some(prompt),
-            Err(error) => return Err((error.status(), json!({ "error": error.to_string() }))),
+            Err(error) => {
+                log_session_clear(
+                    actor,
+                    persona.or(Some(canonical_id)),
+                    &vendor,
+                    mode,
+                    "failed",
+                );
+                return Err((error.status(), json!({ "error": error.to_string() })));
+            }
         }
     } else {
         None
@@ -7621,7 +7724,23 @@ fn reset_session_with_prompt(
     let reset = clear_or_reforge_session(&route, reset_mode, actor, prompt.as_deref());
     // A clear can start a new vendor session (a new id) behind the same persona.
     crate::discovery::invalidate_route_discovery_cache();
-    reset.map_err(|e| (502, json!({ "error": e })))?;
+    if let Err(e) = reset {
+        log_session_clear(
+            actor,
+            persona.or(Some(canonical_id)),
+            &vendor,
+            mode,
+            "failed",
+        );
+        return Err((502, json!({ "error": e })));
+    }
+    log_session_clear(
+        actor,
+        persona.or(Some(canonical_id)),
+        &vendor,
+        mode,
+        "dispatched",
+    );
 
     let data = json!({
         "ok": true,
@@ -12422,6 +12541,243 @@ mod council_guidance_tests {
     }
 
     #[test]
+    fn session_clear_log_line_names_actor_persona_vendor_mode_outcome() {
+        assert_eq!(
+            session_clear_log_line("owner", Some("ada"), "codex", "clear", "refused"),
+            "hub: session clear actor=owner persona=ada vendor=codex mode=clear outcome=refused"
+        );
+        assert_eq!(
+            session_clear_log_line("owner", None, "webhook", "reforge", "dispatched"),
+            "hub: session clear actor=owner persona=- vendor=webhook mode=reforge outcome=dispatched"
+        );
+        // Exactly the five labelled fields, in order, with no extra field:
+        // composer/prompt content has no field to ride in on.
+        let line = session_clear_log_line("owner", Some("ada"), "claude", "clear", "failed");
+        assert_eq!(
+            line,
+            "hub: session clear actor=owner persona=ada vendor=claude mode=clear outcome=failed"
+        );
+        assert_eq!(line.split(' ').count(), 8, "{line}");
+        for label in ["actor=", "persona=", "vendor=", "mode=", "outcome="] {
+            assert_eq!(line.matches(label).count(), 1, "{line}");
+        }
+    }
+
+    #[test]
+    fn hub_fence_diagnostic_clamps_recognised_payload_and_caps_log_fields() {
+        assert_eq!(
+            clamp_recognised_composer_payload(Some("/clear".into())),
+            Some("/clear".to_string())
+        );
+        assert_eq!(
+            clamp_recognised_composer_payload(Some("/new".into())),
+            Some("/new".to_string())
+        );
+        assert_eq!(
+            clamp_recognised_composer_payload(Some("owner secret draft".into())),
+            None
+        );
+        assert_eq!(clamp_recognised_composer_payload(None), None);
+        assert_eq!(sanitise_log_field(&"a".repeat(100)), "a".repeat(64));
+        assert_eq!(sanitise_log_field(&"é".repeat(100)).chars().count(), 64);
+    }
+
+    #[test]
+    fn session_clear_log_line_sanitises_crafted_actor_and_persona() {
+        for (actor, persona) in [
+            ("own\ner", Some("ada\n hub: session clear actor=forged")),
+            ("evil actor", Some("a b\tc\rd")),
+            ("a\u{1b}[31m", Some("x\u{0}y")),
+        ] {
+            let line = session_clear_log_line(actor, persona, "codex", "clear", "refused");
+            assert!(!line.contains('\n'), "{line:?}");
+            assert!(!line.contains('\r'), "{line:?}");
+            assert!(!line.contains('\t'), "{line:?}");
+            assert_eq!(line.lines().count(), 1, "{line:?}");
+            // Exactly the five labelled fields, no forged extra field from spaces.
+            assert_eq!(line.matches(" actor=").count(), 1, "{line:?}");
+            assert!(!line.contains(" actor=forged"), "{line:?}");
+            assert!(line.starts_with("hub: session clear actor="), "{line:?}");
+            assert!(
+                line.contains(" vendor=codex mode=clear outcome=refused"),
+                "{line:?}"
+            );
+        }
+        assert_eq!(
+            session_clear_log_line("own\ner", Some("ada lovelace"), "codex", "clear", "refused"),
+            "hub: session clear actor=own_er persona=ada_lovelace vendor=codex mode=clear outcome=refused"
+        );
+        assert_eq!(
+            session_clear_log_line("", Some(""), "codex", "clear", "refused"),
+            "hub: session clear actor=unknown persona=unknown vendor=codex mode=clear outcome=refused"
+        );
+        // Allowed punctuation is preserved.
+        assert_eq!(
+            session_clear_log_line("o.w-n:e_r", Some("a.b-c:d_e"), "codex", "clear", "refused"),
+            "hub: session clear actor=o.w-n:e_r persona=a.b-c:d_e vendor=codex mode=clear outcome=refused"
+        );
+    }
+
+    #[test]
+    fn session_clear_logs_refused_and_dispatched_and_failed() {
+        use fl_wire::identity::{RouteTable, VendorRoute};
+        // Refused: single-session handler with an unsupported route.
+        {
+            let tmp = TempDir::new().unwrap();
+            let state = HubState::new(HubServerConfig {
+                store_path: tmp.path().join("store.redb"),
+                repo_root: tmp.path().into(),
+                home_override: Some(tmp.path().into()),
+                ..HubServerConfig::default()
+            });
+            let owner = HubAuthority::Owner {
+                login: "owner".into(),
+            };
+            let mut routes = RouteTable::default();
+            routes.upsert(
+                "ada",
+                VendorRoute::Codex {
+                    thread_id: "thread-fixture".into(),
+                    cwd: None,
+                },
+                stamp::now(),
+            );
+            routes
+                .save(Some(&tmp.path().join(".cache/agent-bus/routes.json")))
+                .unwrap();
+            let _ = take_session_clear_logs();
+            let response = handle_post_session_clear(
+                &state,
+                &owner,
+                "ada",
+                &HttpRequest::new("POST", "/fixture").with_json_body(&json!({"mode":"clear"})),
+            );
+            assert_eq!(response.status, 409);
+            let logs = take_session_clear_logs();
+            assert_eq!(logs.len(), 1, "{logs:?}");
+            assert!(
+                logs[0].contains("actor=owner")
+                    && logs[0].contains("persona=ada")
+                    && logs[0].contains("vendor=codex")
+                    && logs[0].contains("mode=clear")
+                    && logs[0].contains("outcome=refused"),
+                "{logs:?}"
+            );
+        }
+        // Dispatched: webhook route with a live listener accepts the reset.
+        {
+            let tmp = TempDir::new().unwrap();
+            let state = HubState::new(HubServerConfig {
+                store_path: tmp.path().join("store.redb"),
+                repo_root: tmp.path().into(),
+                home_override: Some(tmp.path().into()),
+                ..HubServerConfig::default()
+            });
+            let sock = tmp.path().join("webhook.sock");
+            let _listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+            let mut routes = RouteTable::default();
+            routes.upsert(
+                "ada",
+                VendorRoute::Webhook { socket_path: sock },
+                stamp::now(),
+            );
+            routes
+                .save(Some(&tmp.path().join(".cache/agent-bus/routes.json")))
+                .unwrap();
+            let _ = take_session_clear_logs();
+            reset_session(&state, "owner", "ada", "webhook-ada", Some("ada"), "clear").unwrap();
+            let logs = take_session_clear_logs();
+            assert_eq!(logs.len(), 1, "{logs:?}");
+            assert!(
+                logs[0].contains("vendor=webhook") && logs[0].contains("outcome=dispatched"),
+                "{logs:?}"
+            );
+        }
+        // Failed: supported route whose dispatch fails (absent webhook socket).
+        {
+            let tmp = TempDir::new().unwrap();
+            let state = HubState::new(HubServerConfig {
+                store_path: tmp.path().join("store.redb"),
+                repo_root: tmp.path().into(),
+                home_override: Some(tmp.path().into()),
+                ..HubServerConfig::default()
+            });
+            let mut routes = RouteTable::default();
+            routes.upsert(
+                "ada",
+                VendorRoute::Webhook {
+                    socket_path: tmp.path().join("absent.sock"),
+                },
+                stamp::now(),
+            );
+            routes
+                .save(Some(&tmp.path().join(".cache/agent-bus/routes.json")))
+                .unwrap();
+            let _ = take_session_clear_logs();
+            let error = reset_session(&state, "owner", "ada", "webhook-ada", Some("ada"), "clear")
+                .unwrap_err();
+            assert_eq!(error.0, 502);
+            let logs = take_session_clear_logs();
+            assert_eq!(logs.len(), 1, "{logs:?}");
+            assert!(logs[0].contains("outcome=failed"), "{logs:?}");
+        }
+        // Bulk refused items each log one refused line via the shared reset path.
+        {
+            let tmp = TempDir::new().unwrap();
+            let state = HubState::new(HubServerConfig {
+                store_path: tmp.path().join("store.redb"),
+                repo_root: tmp.path().into(),
+                home_override: Some(tmp.path().into()),
+                ..HubServerConfig::default()
+            });
+            let owner = HubAuthority::Owner {
+                login: "owner".into(),
+            };
+            let mut routes = RouteTable::default();
+            routes.upsert(
+                "ada",
+                VendorRoute::Codex {
+                    thread_id: "thread-fixture".into(),
+                    cwd: None,
+                },
+                stamp::now(),
+            );
+            routes.upsert(
+                "bob",
+                VendorRoute::Codex {
+                    thread_id: "thread-fixture-bob".into(),
+                    cwd: None,
+                },
+                stamp::now(),
+            );
+            routes
+                .save(Some(&tmp.path().join(".cache/agent-bus/routes.json")))
+                .unwrap();
+            let _ = take_session_clear_logs();
+            let bulk = handle_post_session_bulk_action(
+                &state,
+                &owner,
+                &HttpRequest::new("POST", "/fixture").with_json_body(&json!({"action":"clear"})),
+            );
+            assert_eq!(bulk.status, 200);
+            // Exactly one log line per bulk target (two targets here).
+            let logs = take_session_clear_logs();
+            assert_eq!(logs.len(), 2, "{logs:?}");
+            for persona in ["ada", "bob"] {
+                let count = logs
+                    .iter()
+                    .filter(|l| {
+                        l.contains(&format!("persona={persona}"))
+                            && l.contains("vendor=codex")
+                            && l.contains("outcome=refused")
+                    })
+                    .count();
+                assert_eq!(count, 1, "persona={persona} logs={logs:?}");
+            }
+        }
+    }
+
+    #[test]
     fn read_only_reset_scan_keeps_supported_session_identity_pinned() {
         use fl_wire::identity::{RouteTable, VendorRoute};
         let tmp = TempDir::new().unwrap();
@@ -13087,6 +13443,7 @@ mod council_guidance_tests {
                         route_dispatch_calls: 2,
                         route_dispatch_calls_saturated: false,
                         registration_generation: None,
+                        recognised_composer_payload: None,
                     }],
                     global_capacity_exhausted: false,
                     diagnostics_partial: false,

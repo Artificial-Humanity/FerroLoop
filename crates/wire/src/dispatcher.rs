@@ -2815,6 +2815,51 @@ fn is_composer_occupied_error(err: &str) -> bool {
     err.starts_with(COMPOSER_OCCUPIED_BY_NON_WIRE_INPUT_PREFIX)
 }
 
+/// Recognised composer payloads for the narrowed hold diagnostic (#575):
+/// only the exact strings `"/clear"` and `"/new"` (after trimming) are named.
+pub(crate) fn recognised_composer_payload(text: &str) -> Option<&'static str> {
+    match text.trim() {
+        "/clear" => Some("/clear"),
+        "/new" => Some("/new"),
+        _ => None,
+    }
+}
+
+/// Recognised payload in a captured screen, or `None` for any other composer text.
+/// Matches the RAW composer text exactly (after trimming): whitespace-stripped
+/// compact forms such as `"/ clear"`, `"/cle ar"` or a payload split across
+/// lines must NOT be named.
+pub(crate) fn recognised_composer_payload_in_screen(screen: &str) -> Option<&'static str> {
+    let cleaned = normalize_terminal_screen(screen);
+    let lines: Vec<&str> = cleaned.lines().collect();
+    if let Some(raw) = extract_composer_raw(&lines) {
+        return recognised_composer_payload(&raw);
+    }
+    recognised_composer_payload(&cleaned)
+}
+
+/// Recognised payload carried by a composer-occupied error, if any.
+/// Compares the whole error by equality with the canonical payload error, so
+/// arbitrary composer text that merely contains `holds "/clear"` is not named.
+pub(crate) fn recognised_payload_from_error(err: &str) -> Option<&'static str> {
+    ["/clear", "/new"]
+        .into_iter()
+        .find(|payload| err == composer_occupied_error_with_payload(Some(payload)))
+}
+
+fn composer_occupied_error_with_payload(payload: Option<&'static str>) -> String {
+    match payload {
+        Some(payload) => format!(
+            "{COMPOSER_OCCUPIED_BY_NON_WIRE_INPUT_PREFIX} composer_occupied: composer holds \"{payload}\"; repair: Backspace, then Ctrl-U; holding delivery without sending keys"
+        ),
+        None => composer_occupied_error(),
+    }
+}
+
+fn composer_occupied_error_for_screen(screen: &str) -> String {
+    composer_occupied_error_with_payload(recognised_composer_payload_in_screen(screen))
+}
+
 pub fn is_composer_occupied_zero_keys_error(err: &str) -> bool {
     is_composer_occupied_error(err) && err.contains("without sending keys")
 }
@@ -3237,10 +3282,31 @@ fn build_compact_from_composer_slice(slice: &[&str], top_is_zero: bool) -> Optio
     Some((compact, is_top_zero_scrolled))
 }
 
-fn extract_composer_compact(lines: &[&str]) -> Option<(String, bool)> {
+fn build_raw_from_composer_slice(slice: &[&str]) -> Option<String> {
+    let first_non_empty = slice.iter().position(|l| !l.trim().is_empty())?;
+    let first_has_prompt = line_starts_with_prompt(slice[first_non_empty]);
+    let mut parts: Vec<&str> = Vec::new();
+    for (idx, &line) in slice[first_non_empty..].iter().enumerate() {
+        let seg = if idx == 0 && first_has_prompt {
+            strip_composer_prompt_prefix(line)
+        } else {
+            line
+        };
+        parts.push(seg);
+    }
+    let raw = parts.join("\n");
+    if raw.trim().is_empty() {
+        return None;
+    }
+    Some(raw)
+}
+
+/// Shared composer slice selection for the raw and compact extractors.
+/// Returns the slice and whether its top rule is at line zero (scrolled).
+fn select_composer_slice<'a>(lines: &'a [&'a str]) -> Option<(Vec<&'a str>, bool)> {
     if lines.iter().any(|l| is_horizontal_rule_line(l)) {
         let (between, top) = composer_region_lines(lines)?;
-        return build_compact_from_composer_slice(between, top == 0);
+        return Some((between.to_vec(), top == 0));
     }
     let tail_start = lines
         .iter()
@@ -3269,7 +3335,17 @@ fn extract_composer_compact(lines: &[&str]) -> Option<(String, bool)> {
     if lines_have_dialog_or_menu_markers(slice) {
         return None;
     }
-    build_compact_from_composer_slice(slice, false)
+    Some((slice.to_vec(), false))
+}
+
+fn extract_composer_raw(lines: &[&str]) -> Option<String> {
+    let (slice, _is_top_zero) = select_composer_slice(lines)?;
+    build_raw_from_composer_slice(&slice)
+}
+
+fn extract_composer_compact(lines: &[&str]) -> Option<(String, bool)> {
+    let (slice, is_top_zero) = select_composer_slice(lines)?;
+    build_compact_from_composer_slice(&slice, is_top_zero)
 }
 
 fn consumes_recorded_deliveries_to_end(
@@ -4076,7 +4152,7 @@ fn check_bound_claude_input(
     }
     let target = matches!(phase, BoundInputPhase::Submit).then_some(payload);
     if screen_has_dialog_or_menu_markers_with_context(contents, target, None, route_keys) {
-        return Err(composer_occupied_error());
+        return Err(composer_occupied_error_for_screen(contents));
     }
     let owned = match phase {
         BoundInputPhase::Payload => !composer_has_unsubmitted_content_for_style(
@@ -4676,7 +4752,7 @@ fn prepare_clean_composer_before_paste_impl(
         return Err(composer_unlocated_error());
     }
     if screen_has_dialog_or_menu_markers_with_context(&contents1, None, None, route_keys) {
-        return Err(composer_occupied_error());
+        return Err(composer_occupied_error_for_screen(&contents1));
     }
     if !composer_has_unsubmitted_content_for_style(
         &contents1,
@@ -4700,7 +4776,7 @@ fn prepare_clean_composer_before_paste_impl(
     }
     let Some((contents2, cursor2)) = capture_rendered_only() else {
         if !composer_equals_recorded_wire_deliveries(&contents1, route_keys) {
-            return Err(composer_occupied_error());
+            return Err(composer_occupied_error_for_screen(&contents1));
         }
         return Err("prompt submission unconfirmed before paste: \
              composer still holds earlier unsubmitted content (rendered capture unavailable)"
@@ -4716,7 +4792,7 @@ fn prepare_clean_composer_before_paste_impl(
         return Err(composer_unlocated_error());
     }
     if screen_has_dialog_or_menu_markers_with_context(&contents2, None, None, route_keys) {
-        return Err(composer_occupied_error());
+        return Err(composer_occupied_error_for_screen(&contents2));
     }
     if !composer_has_unsubmitted_content_for_style(
         &contents2,
@@ -4728,7 +4804,7 @@ fn prepare_clean_composer_before_paste_impl(
         return Ok(PrePasteOutcome::CleanProceedToPaste);
     }
     if !composer_equals_recorded_wire_deliveries(&contents2, route_keys) {
-        return Err(composer_occupied_error());
+        return Err(composer_occupied_error_for_screen(&contents2));
     }
 
     let preexisting_matches_target =
@@ -7659,7 +7735,7 @@ fn dispatch_message_selected_with_status<S: MessageStore>(
         );
         if let Err(ref err) = pushed {
             if is_composer_occupied_error(err.as_str()) {
-                report.record_failure(FailureStage::ComposerOccupiedByNonWireInput);
+                report.record_composer_occupied(err.as_str());
             } else {
                 let dead_explicit = entry.explicit
                     && (matches!(err, PushError::NotConnected(_))
@@ -7695,7 +7771,7 @@ fn dispatch_message_selected_with_status<S: MessageStore>(
                     );
                     if let Err(ref retry_err) = pushed {
                         if is_composer_occupied_error(retry_err.as_str()) {
-                            report.record_failure(FailureStage::ComposerOccupiedByNonWireInput);
+                            report.record_composer_occupied(retry_err.as_str());
                         } else {
                             let retry_dead_explicit = fresh.explicit
                                 && (matches!(retry_err, PushError::NotConnected(_))
@@ -9986,6 +10062,156 @@ mod tests {
                 assert_reset_refusal(serde_json::from_str(&error).unwrap(), vendor);
             }
         }
+    }
+
+    #[test]
+    fn clear_or_reforge_refusal_table_has_zero_dispatch() {
+        let _tmux_lock = TMUX_ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let tmp = TempDir::new().unwrap();
+        let (tmux_bin, tmux_out, _) = write_fake_tmux(tmp.path(), true);
+        let _env = EnvGuard::set("FL_WIRE_TMUX_BIN", &tmux_bin);
+        // Every unconfirmable vendor refuses for both modes before any transport.
+        for (route, vendor) in unsupported_reset_routes() {
+            assert_reset_refusal(
+                serde_json::to_value(preflight_session_reset(&route).unwrap_err()).unwrap(),
+                vendor,
+            );
+            for mode in [SessionResetMode::Clear, SessionResetMode::Reforge] {
+                let error =
+                    clear_or_reforge_session(&route, mode, "owner", Some("hydrate fixture"))
+                        .expect_err("must refuse without dispatch");
+                assert_reset_refusal(serde_json::from_str(&error).unwrap(), vendor);
+            }
+        }
+        assert!(
+            !tmux_out.exists(),
+            "refused resets must not reach tmux (zero dispatch), saw: {}",
+            tmux_out.display()
+        );
+        // Supported vendors remain allowed by preflight.
+        for route in [
+            VendorRoute::Claude {
+                pid: 0,
+                session_id: "".into(),
+                socket_path: "/fixture/absent".into(),
+                key_path: None,
+            },
+            VendorRoute::Agy {
+                conversation_id: "".into(),
+                ls_pid: None,
+                ls_address: None,
+                csrf_token: None,
+                agentapi_exe: None,
+            },
+            VendorRoute::Webhook {
+                socket_path: "/fixture/absent".into(),
+            },
+        ] {
+            assert!(preflight_session_reset(&route).is_ok());
+        }
+    }
+
+    #[test]
+    fn recognised_composer_payload_names_only_clear_and_new() {
+        assert_eq!(recognised_composer_payload("/clear"), Some("/clear"));
+        assert_eq!(recognised_composer_payload("  /new\n"), Some("/new"));
+        assert_eq!(recognised_composer_payload("/clear now"), None);
+        assert_eq!(recognised_composer_payload("/clearx"), None);
+        assert_eq!(recognised_composer_payload("my secret draft"), None);
+        let rule = "─".repeat(20);
+        let clear_screen = format!("◆ Ready.\n{rule}\n❯ /clear\n{rule}\n  status");
+        let err = composer_occupied_error_for_screen(&clear_screen);
+        assert!(err.contains("holds \"/clear\""), "{err}");
+        assert!(err.contains("Backspace, then Ctrl-U"), "{err}");
+        assert!(is_composer_occupied_zero_keys_error(&err), "{err}");
+        let secret_screen = format!("◆ Ready.\n{rule}\n❯ my secret draft\n{rule}\n  status");
+        let err = composer_occupied_error_for_screen(&secret_screen);
+        assert_eq!(err, composer_occupied_error());
+        assert!(!err.contains("my secret draft"), "{err}");
+        assert!(!err.contains("Backspace"), "{err}");
+        // Exact RAW match only: whitespace-stripped compact forms must NOT be named.
+        for screen_payload in ["/ clear", "/cle ar", "/clea r", "/ new", "/ne w"] {
+            let screen = format!("◆ Ready.\n{rule}\n❯ {screen_payload}\n{rule}\n  status");
+            assert_eq!(
+                recognised_composer_payload_in_screen(&screen),
+                None,
+                "screen_payload={screen_payload:?}"
+            );
+            let err = composer_occupied_error_for_screen(&screen);
+            assert_eq!(
+                err,
+                composer_occupied_error(),
+                "screen_payload={screen_payload:?}"
+            );
+            assert!(!err.contains("holds \""), "{err}");
+        }
+        // Split-line forms must NOT be named.
+        for lines in [
+            vec!["❯ /cl", "ear"],
+            vec!["❯ /clear", "x"],
+            vec!["❯ /", "clear"],
+        ] {
+            let screen = format!("◆ Ready.\n{rule}\n{}\n{rule}\n  status", lines.join("\n"));
+            assert_eq!(
+                recognised_composer_payload_in_screen(&screen),
+                None,
+                "lines={lines:?}"
+            );
+        }
+        // Exact forms (including surrounding whitespace trimmed) are still named.
+        assert_eq!(
+            recognised_composer_payload_in_screen(&clear_screen),
+            Some("/clear")
+        );
+        let new_screen = format!("◆ Ready.\n{rule}\n❯ /new\n{rule}\n  status");
+        assert_eq!(
+            recognised_composer_payload_in_screen(&new_screen),
+            Some("/new")
+        );
+        assert_eq!(recognised_composer_payload(" /clear "), Some("/clear"));
+    }
+
+    #[test]
+    fn recognised_composer_payload_handles_sgr_and_incident_shape() {
+        let rule = "─".repeat(20);
+        // SGR-styled tmux capture: escapes on the rule and prompt rows must be
+        // stripped before recognition, as with every other screen consumer.
+        let sgr_rule = format!("\x1b[90m{rule}\x1b[0m");
+        let sgr_screen = format!(
+            "◆ Ready.\n{sgr_rule}\n\x1b[1m❯\x1b[0m \x1b[36m/clear\x1b[0m\n{sgr_rule}\n  status"
+        );
+        assert_eq!(
+            recognised_composer_payload_in_screen(&sgr_screen),
+            Some("/clear")
+        );
+        let err = composer_occupied_error_for_screen(&sgr_screen);
+        assert!(err.contains("holds \"/clear\""), "{err}");
+        // Incident shape: prompt row holds "/clear", cursor on the empty row below.
+        let incident = format!("◆ Ready.\n{rule}\n❯ /clear\n\n{rule}\n  status");
+        assert_eq!(
+            recognised_composer_payload_in_screen(&incident),
+            Some("/clear")
+        );
+        let err = composer_occupied_error_for_screen(&incident);
+        assert!(err.contains("holds \"/clear\""), "{err}");
+        assert!(err.contains("Backspace, then Ctrl-U"), "{err}");
+        // Same shape without a bottom rule (cursor row is the capture tail).
+        let incident_no_bottom = "◆ Ready.\n❯ /clear\n".to_string();
+        assert_eq!(
+            recognised_composer_payload_in_screen(&incident_no_bottom),
+            Some("/clear")
+        );
+        // Equality-only error parsing: arbitrary text embedding the phrase is not named.
+        assert_eq!(
+            recognised_payload_from_error(
+                "composer_occupied_by_non_wire_input: composer holds \"x holds \\\"/clear\\\" y\"; holding delivery without sending keys"
+            ),
+            None
+        );
+        assert_eq!(
+            recognised_payload_from_error(&composer_occupied_error_with_payload(Some("/new"))),
+            Some("/new")
+        );
     }
 
     #[test]
@@ -21597,5 +21823,41 @@ exit 1"#,
             assert!(is_composer_occupied_zero_keys_error(&err));
         }
         assert!(composer_session_busy_error().contains("session_busy"));
+    }
+
+    #[test]
+    fn prepare_clean_names_clear_payload_and_hides_arbitrary_text() {
+        let rule = "─".repeat(120);
+        for (text, recognised) in [
+            ("/clear", true),
+            ("/new", true),
+            ("owner secret draft", false),
+        ] {
+            let screen = format!("◆ Ready.\n{rule}\n❯ {text}\n{rule}\n  status");
+            let mut enters = 0u32;
+            let err = prepare_clean_composer_before_paste_impl(
+                "next payload",
+                &[],
+                false,
+                false,
+                ComposerStyle::Ruled,
+                |_| {},
+                || Some((screen.clone(), None)),
+                || false,
+                || {
+                    enters += 1;
+                    Ok(())
+                },
+            )
+            .expect_err("occupied composer must fail closed");
+            assert_eq!(enters, 0, "{text}");
+            if recognised {
+                assert!(err.contains(&format!("holds \"{text}\"")), "{err}");
+                assert!(err.contains("Backspace, then Ctrl-U"), "{err}");
+            } else {
+                assert!(!err.contains("owner secret draft"), "{err}");
+                assert!(!err.contains("Backspace"), "{err}");
+            }
+        }
     }
 }
