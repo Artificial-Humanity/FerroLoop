@@ -21241,11 +21241,14 @@ exit 1"#,
         let tail = &body[body.len() - 200..];
         let tail_compact_chars = tail.chars().filter(|c| !c.is_whitespace()).count();
         assert!(tail_compact_chars >= MIN_SCROLLED_SUFFIX_COMPACT_CHARS);
-        assert!(d
-            .compact_body
-            .as_deref()
-            .expect("header body")
-            .ends_with(&tail.chars().filter(|c| !c.is_whitespace()).collect::<String>()));
+        assert!(
+            d.compact_body.as_deref().expect("header body").ends_with(
+                &tail
+                    .chars()
+                    .filter(|c| !c.is_whitespace())
+                    .collect::<String>()
+            )
+        );
         let raw_body_chars = d.body_chars.expect("header body");
         // Bound in `match_delivery_prefix` is raw body minus compact tail + 1.
         let len = raw_body_chars - tail_compact_chars + 1 + 1;
@@ -21286,7 +21289,12 @@ exit 1"#,
         let d = UnconfirmedWireDelivery::from_payload(trimmed);
         let tail = "q".repeat(40);
         assert!(tail.chars().count() >= MIN_SCROLLED_SUFFIX_COMPACT_CHARS);
-        assert!(!d.compact_body.as_deref().expect("header body").ends_with(&tail));
+        assert!(
+            !d.compact_body
+                .as_deref()
+                .expect("header body")
+                .ends_with(&tail)
+        );
         let len = d.body_chars.expect("header body") - tail.chars().count();
         let screen = format!(
             "◆ Ready.\n\n{rule}\n❯ [fl-wire reply/normal] from ferris (id: urn:uuid:01a1ebc5-4e2b-7764-b6ff-6873d9c91948, thread: urn:uuid:01a1ebc5-4e2b-7764-b6ff-6873d9c91948): Re\n  [Pasted Content {len} chars]{tail}\n\n{rule}\n  muse-wonder-full-1.0"
