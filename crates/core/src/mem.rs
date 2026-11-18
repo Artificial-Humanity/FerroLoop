@@ -1908,7 +1908,9 @@ impl MemStore {
                 if s.wire_messages.contains_key(&id) {
                     return Err(StoreError::AlreadyExists(id.iri().clone()));
                 }
-                s.index_imported_unhanded(Kind::Message, id.iri())?;
+                if !once {
+                    s.index_imported_unhanded(Kind::Message, id.iri())?;
+                }
                 id
             }
             None => MessageId(s.mint_unhanded(Kind::Message)),
@@ -1957,6 +1959,11 @@ impl MemStore {
 
         let areas: Vec<AreaRecord> = s.areas.values().cloned().collect();
         check_group_address(&msg.to, &areas).map_err(StoreError::InvalidState)?;
+        // The send-once operation is atomic on refusal: ownership is its first
+        // mutation, after all validation that can return an error.
+        if once {
+            s.index_imported_unhanded(Kind::Message, msg.id.iri())?;
+        }
         let recipients = resolve_recipients(
             &msg.to,
             msg.sender_id.as_ref(),
@@ -2580,6 +2587,31 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, StoreError::AlreadyExists(_)), "{err:?}");
         assert_eq!(s.get_wire_message(&id).unwrap().unwrap().body, "first");
+    }
+
+    #[test]
+    fn send_once_refusal_does_not_reserve_message_id() {
+        use crate::ferrowire::WireAddress;
+
+        let store = MemStore::default();
+        let id = MessageId(Iri::parse("urn:uuid:00000000-0000-4000-8000-000000000002").unwrap());
+        let mut refused = wire_args(Some(id.clone()), "first");
+        refused.to = WireAddress::Group("missing".into());
+        assert!(store.send_wire_once_awaiting_daemon(refused).is_err());
+        assert!(matches!(
+            store.kind_of(id.iri()),
+            Err(StoreError::NotOwned { .. })
+        ));
+        assert!(store.wire_messages_after(0).unwrap().is_empty());
+        assert!(store.wire_receipts_after(0).unwrap().is_empty());
+        assert!(store.list_wire_awaiting_daemon().unwrap().is_empty());
+
+        let retry = wire_args(Some(id.clone()), "retry");
+        let (message, _) = store
+            .send_wire_once_awaiting_daemon(retry)
+            .unwrap()
+            .unwrap();
+        assert_eq!(message.id, id);
     }
 
     #[test]
