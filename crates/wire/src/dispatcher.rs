@@ -2610,16 +2610,15 @@ pub fn tmux_exact_target(target: &str) -> String {
 /// consulted only when `FL_HOST_SOCK` is explicitly set so hermetic tests never reach a live
 /// host daemon on the machine.
 pub(crate) fn host_discovery_allowed() -> bool {
-    if std::env::var_os("FL_WIRE_TMUX_BIN").is_some() {
-        return false;
-    }
-    #[cfg(test)]
-    {
-        std::env::var_os("FL_HOST_SOCK").is_some()
-    }
-    #[cfg(not(test))]
-    {
-        true
+    std::env::var_os("FL_WIRE_TMUX_BIN").is_none() && {
+        #[cfg(test)]
+        {
+            std::env::var_os("FL_HOST_SOCK").is_some()
+        }
+        #[cfg(not(test))]
+        {
+            cfg!(not(test))
+        }
     }
 }
 
