@@ -50,9 +50,20 @@ def terminate_group(proc):
 def supervise(paths, reserve, command, measure=available, interval=1):
     # The first check runs before starting even the bubblewrap process.
     check_space(paths, reserve, measure)
-    proc = subprocess.Popen(command, close_fds=True, start_new_session=True)
+    # Defer termination signals until the child has been recorded and the
+    # cleanup finally is installed. Restore the inherited mask in the child
+    # before exec so the sandbox itself does not inherit blocked signals.
+    mask = {signal.SIGINT, signal.SIGTERM, signal.SIGHUP}
+    previous = signal.pthread_sigmask(signal.SIG_BLOCK, mask)
+    try:
+        proc = subprocess.Popen(command, close_fds=True, start_new_session=True,
+                                preexec_fn=lambda: signal.pthread_sigmask(signal.SIG_SETMASK, previous))
+    except BaseException:
+        signal.pthread_sigmask(signal.SIG_SETMASK, previous)
+        raise
     completed = False
     try:
+        signal.pthread_sigmask(signal.SIG_SETMASK, previous)
         while True:
             check_space(paths, reserve, measure)
             if child_exited(proc):
@@ -60,19 +71,23 @@ def supervise(paths, reserve, command, measure=available, interval=1):
                 check_space(paths, reserve, measure)
                 # A signal between wait() and setting completed would otherwise
                 # enter cleanup after the leader PID was already released.
-                mask = {signal.SIGINT, signal.SIGTERM, signal.SIGHUP}
-                previous = signal.pthread_sigmask(signal.SIG_BLOCK, mask)
+                wait_mask = signal.pthread_sigmask(signal.SIG_BLOCK, mask)
                 try:
                     status = proc.wait()
                     completed = True
                 finally:
-                    signal.pthread_sigmask(signal.SIG_SETMASK, previous)
+                    signal.pthread_sigmask(signal.SIG_SETMASK, wait_mask)
                 return status if status >= 0 else 128 - status
             time.sleep(interval)
     finally:
         # --die-with-parent ends the bwrap sandbox if the leader is terminated.
         if not completed:
-            terminate_group(proc)
+            # Repeated signals must not interrupt group termination or reap.
+            cleanup_mask = signal.pthread_sigmask(signal.SIG_BLOCK, mask)
+            try:
+                terminate_group(proc)
+            finally:
+                signal.pthread_sigmask(signal.SIG_SETMASK, cleanup_mask)
 
 
 def self_test():
@@ -156,6 +171,60 @@ def self_test():
         finally: os.killpg = actual_killpg
         assert signals == [signal.SIGTERM, signal.SIGKILL]
         assert exited.returncode == 0, 'leader not reaped after group signals'
+
+        # Inject SIGTERM just after Popen returns but before supervise gets the
+        # child handle.  The deferred handler must still clean up that child.
+        pidfile = os.path.join(root, 'spawn-pid')
+        handoff = '''import importlib.util,os,signal,subprocess,sys
+spec=importlib.util.spec_from_file_location("space",sys.argv[1]); m=importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+for sig in (signal.SIGINT,signal.SIGTERM,signal.SIGHUP): signal.signal(sig,m.interrupted)
+real=subprocess.Popen
+def spawn(*args,**kwargs):
+    p=real(*args,**kwargs); open(sys.argv[2],"w").write(str(p.pid)); os.kill(os.getpid(),signal.SIGTERM); return p
+m.subprocess.Popen=spawn
+m.supervise(("/","/target"),1,[sys.executable,"-c","import time; time.sleep(30)"],lambda _:2,.01)
+'''
+        handoff_run = subprocess.run([sys.executable, '-B', '-c', handoff, __file__, pidfile], timeout=12)
+        assert handoff_run.returncode == 128 + signal.SIGTERM, 'spawn-handoff signal not propagated'
+        pid = int(open(pidfile).read())
+        try: os.kill(pid, 0)
+        except ProcessLookupError: pass
+        else: raise AssertionError('spawn-handoff child survived')
+
+        # The supervised child ignores SIGTERM so cleanup stays in progress.
+        # Two signals to the supervisor must be deferred until it has killed
+        # and reaped the child; otherwise the delayed owned write will occur.
+        active = os.path.join(root, 'cleanup-active')
+        survived_again = os.path.join(root, 'repeated-signal-survived')
+        child_pid = os.path.join(root, 'repeated-signal-pid')
+        cleanup_fixture = '''import importlib.util,os,pathlib,signal,sys
+spec=importlib.util.spec_from_file_location("space",sys.argv[1]); m=importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+for sig in (signal.SIGINT,signal.SIGTERM,signal.SIGHUP): signal.signal(sig,m.interrupted)
+child="import os,pathlib,signal,sys,time; signal.signal(signal.SIGTERM,signal.SIG_IGN); pathlib.Path(sys.argv[1]).write_text(str(os.getpid())); time.sleep(7); pathlib.Path(sys.argv[2]).touch()"
+def measure(_):
+    if os.path.exists(sys.argv[3]): pathlib.Path(sys.argv[2]).touch(); return 0
+    return 2
+m.supervise(("/","/target"),1,[sys.executable,"-c",child,sys.argv[3],sys.argv[4]],measure,.01)
+'''
+        wrapper = subprocess.Popen([sys.executable, '-B', '-c', cleanup_fixture, __file__, active, child_pid, survived_again],
+                                   start_new_session=True)
+        try:
+            deadline = time.monotonic() + 10
+            while not os.path.exists(active):
+                if wrapper.poll() is not None or time.monotonic() >= deadline:
+                    raise AssertionError('cleanup signal fixture did not reach abort')
+                time.sleep(.01)
+            time.sleep(.2)
+            os.kill(wrapper.pid, signal.SIGTERM)
+            time.sleep(.05)
+            os.kill(wrapper.pid, signal.SIGTERM)
+            assert wrapper.wait(timeout=12) == 128 + signal.SIGTERM, 'repeated signal not deferred'
+            time.sleep(2.2)
+            assert not os.path.exists(survived_again), 'child survived repeated signal during cleanup'
+        finally:
+            if wrapper.poll() is None:
+                os.killpg(wrapper.pid, signal.SIGKILL)
+                wrapper.wait()
     print('PASS: test-owned free-space preflight and running-process fixtures')
 
 
