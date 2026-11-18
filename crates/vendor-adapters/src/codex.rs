@@ -2330,20 +2330,49 @@ mod tests {
             .collect();
         assert_eq!(methods, ["initialize", "initialized", "thread/archive"]);
     }
+    // CI only under #539: private socket and isolated test subprocess environment.
     #[test]
     fn launch_prerequisite_endpoint_is_pinned_not_delivery_override() {
-        let pinned = Path::new("/isolated/codex");
-        let delivery = resolve_codex_control_socket(
-            Some(OsStr::new("/unrelated/delivery.sock")),
-            Some(pinned.as_os_str()),
-            None,
-        )
-        .unwrap();
-        assert_eq!(
-            codex_launch_control_socket(pinned),
-            pinned.join(CODEX_CONTROL_SOCKET_REL)
+        const CHILD_HOME: &str = "FL_TEST_CODEX_PINNED_PREREQUISITE_HOME";
+        if let Some(pinned) = std::env::var_os(CHILD_HOME) {
+            let delivery = std::env::var_os("FL_WIRE_CODEX_CONTROL_SOCK").unwrap();
+            assert!(UnixStream::connect(Path::new(&delivery)).is_ok());
+            let pinned = Path::new(&pinned);
+            let refusal = CodexHostAdapter::default()
+                .preflight_launch(Some(pinned))
+                .unwrap_err();
+            assert_eq!(refusal.code, "codex_app_server_unavailable");
+            assert_eq!(
+                refusal.detail,
+                format!(
+                    "{}: NotFound",
+                    codex_launch_control_socket(pinned).display()
+                )
+            );
+            return;
+        }
+        let home = tempfile::tempdir().unwrap();
+        let delivery = home.path().join("delivery.sock");
+        let _listener = UnixListener::bind(&delivery).unwrap();
+        let pinned = home.path().join("pinned");
+        // Command-local environment prevents this regression from steering other tests.
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "codex::tests::launch_prerequisite_endpoint_is_pinned_not_delivery_override",
+                "--nocapture",
+            ])
+            .env(CHILD_HOME, &pinned)
+            .env("FL_WIRE_CODEX_CONTROL_SOCK", &delivery)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
         );
-        assert_ne!(codex_launch_control_socket(pinned), delivery);
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"));
     }
 
     #[test]
@@ -2367,13 +2396,9 @@ mod tests {
         let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
         adapter.preflight_launch(Some(home.path())).unwrap();
         drop(listener);
-        assert_eq!(
-            adapter
-                .preflight_launch(Some(home.path()))
-                .unwrap_err()
-                .code,
-            missing.code
-        );
+        let stale = adapter.preflight_launch(Some(home.path())).unwrap_err();
+        assert_eq!(stale.code, missing.code);
+        assert!(stale.detail.ends_with("ConnectionRefused"));
     }
     #[test]
     fn launch_prerequisite_expired_deadline_refuses_before_socket_io() {
