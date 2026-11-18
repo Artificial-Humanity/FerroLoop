@@ -3870,6 +3870,21 @@ fn discover_session_artifact_candidates(
     session_id: &str,
     canonical_session_id: &str,
 ) -> Vec<PathBuf> {
+    let snap = load_discovery_snapshot(state);
+    discover_session_artifact_candidates_from_snapshot(
+        state,
+        &snap,
+        session_id,
+        canonical_session_id,
+    )
+}
+
+fn discover_session_artifact_candidates_from_snapshot(
+    state: &HubState,
+    snap: &DiscoveryStoreSnapshot,
+    session_id: &str,
+    canonical_session_id: &str,
+) -> Vec<PathBuf> {
     let mut candidate_paths: Vec<PathBuf> = Vec::new();
     if let Some(home) = hub_home_dir(state) {
         for candidate_id in [session_id, canonical_session_id] {
@@ -3897,10 +3912,9 @@ fn discover_session_artifact_candidates(
         }
     }
 
-    let snap = load_discovery_snapshot(state);
     let turns = read_session_transcript_from_snapshot(
         session_id,
-        &snap,
+        snap,
         state.config.home_override.as_deref(),
     );
     for turn in turns.iter().rev().take(60) {
@@ -8484,19 +8498,41 @@ fn default_context_window_for(state: &HubState, req: &SpinUpRequest) -> Option<u
     crate::context_window::applicable_default(&defaults, &vendor, model, Some(&home))
 }
 
+#[cfg(test)]
+thread_local! {
+    static AFTER_LIFECYCLE_CANDIDATE_READ: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        std::cell::RefCell::new(None);
+    static BEFORE_LIFECYCLE_ARTIFACT_READ: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        std::cell::RefCell::new(None);
+}
+
 // A saved record locates its persona without probing a runtime before ownership. Discovery
 // remains necessary only for an unmanaged/native target with no matching hosted record.
 fn lifecycle_candidate(
     state: &HubState,
     session_id: &str,
 ) -> Result<SessionTarget, LifecycleError> {
-    let saved = {
+    let (saved, snap) = {
         let store = state.try_open_lifecycle_store()?;
-        lifecycle::find_hosted_session(&*store, &[session_id])?
+        let saved = lifecycle::find_hosted_session(&*store, &[session_id])?;
+        // Unmanaged discovery must reuse this nonblocking read, never reopen through
+        // the generic blocking discovery helper after another operation can take the store.
+        let snap = if saved.is_none() {
+            snapshot_discovery_store(&store)
+        } else {
+            DiscoveryStoreSnapshot::default()
+        };
+        (saved, snap)
     };
+    #[cfg(test)]
+    AFTER_LIFECYCLE_CANDIDATE_READ.with_borrow_mut(|hook| {
+        if let Some(f) = hook.take() {
+            f();
+        }
+    });
     let discovered = saved
         .map(|record| (record.session_id, Some(record.persona)))
-        .unwrap_or_else(|| resolve_session_target(state, session_id));
+        .unwrap_or_else(|| resolve_session_target_from_snapshot(state, &snap, session_id));
     let store = state.try_open_lifecycle_store()?;
     SessionTarget::resolve(&*store, session_id, Some(discovered))
 }
@@ -8540,9 +8576,25 @@ fn handle_post_session_decommission(
     let by = authority.actor_name();
     let env = lifecycle_env(state);
     match lifecycle::with_lifecycle_fence(&env, &persona, "decommission", |env| {
-        // Artifact discovery opens its own store; do it after ownership, before reopening.
+        #[cfg(test)]
+        BEFORE_LIFECYCLE_ARTIFACT_READ.with_borrow_mut(|hook| {
+            if let Some(f) = hook.take() {
+                f();
+            }
+        });
+        // Capture discovery rows without waiting, then release the guard across filesystem
+        // discovery. Reopen without waiting below to revalidate before any teardown effects.
         let artifact_candidates = if mode == DecommissionMode::Teardown {
-            discover_session_artifact_candidates(state, session_id, &discovered_id)
+            let snap = {
+                let store = state.try_open_lifecycle_store()?;
+                snapshot_discovery_store(&store)
+            };
+            discover_session_artifact_candidates_from_snapshot(
+                state,
+                &snap,
+                session_id,
+                &discovered_id,
+            )
         } else {
             Vec::new()
         };
@@ -13906,5 +13958,86 @@ mod claude_registration_binding_tests {
         assert!(
             matches!(result, Err(OperatorPromptError::Push(PushError::NotConnected(ref error))) if error.contains("re-register and resubmit"))
         );
+    }
+}
+
+#[cfg(all(test, unix))]
+mod lifecycle_discovery_contention_tests {
+    use super::*;
+
+    // A bounded holder makes a blocking regression fail instead of hanging the test runner.
+    fn contend_after_read(
+        state: &HubState,
+        artifacts: bool,
+    ) -> (std::sync::mpsc::Sender<()>, std::thread::JoinHandle<bool>) {
+        let lock = state.store_lock.clone();
+        let (release, released) = std::sync::mpsc::channel();
+        let (ready, acquired) = std::sync::mpsc::channel();
+        let (start, started) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            started.recv().unwrap();
+            let _guard = lock.lock().unwrap();
+            ready.send(()).unwrap();
+            released
+                .recv_timeout(std::time::Duration::from_secs(3))
+                .is_ok()
+        });
+        let hook: Box<dyn FnOnce()> = Box::new(move || {
+            start.send(()).unwrap();
+            acquired.recv().unwrap();
+        });
+        if artifacts {
+            BEFORE_LIFECYCLE_ARTIFACT_READ.with_borrow_mut(|slot| *slot = Some(hook));
+        } else {
+            AFTER_LIFECYCLE_CANDIDATE_READ.with_borrow_mut(|slot| *slot = Some(hook));
+        }
+        (release, holder)
+    }
+
+    #[test]
+    fn lifecycle_discovery_refuses_contention_between_candidate_reads() {
+        assert_discovery_contention(false);
+    }
+
+    #[test]
+    fn lifecycle_discovery_refuses_contention_after_teardown_fence() {
+        assert_discovery_contention(true);
+    }
+
+    fn assert_discovery_contention(artifacts: bool) {
+        let root = tempfile::tempdir().unwrap();
+        let state = HubState::new(crate::HubServerConfig {
+            store_path: root.path().join("fixture.fls"),
+            repo_root: root.path().into(),
+            home_override: Some(root.path().into()),
+            ..Default::default()
+        });
+        drop(state.open_store().unwrap());
+        let (release, holder) = contend_after_read(&state, artifacts);
+        let owner = HubAuthority::Owner {
+            login: "owner".into(),
+        };
+        let request =
+            HttpRequest::new("POST", "/unused").with_json_body(&json!({"mode":"teardown"}));
+        let response = handle_post_session_decommission(&state, &owner, "ada", &request);
+        let _ = release.send(());
+        assert!(
+            holder.join().unwrap(),
+            "lifecycle discovery waited for the competing store holder"
+        );
+        assert_eq!(response.status, 409);
+        assert!(
+            response.json_value().unwrap()["error"]
+                .as_str()
+                .unwrap()
+                .contains("store is busy")
+        );
+        assert!(state.session_queue("ada").is_empty());
+        assert!(
+            lifecycle::list_hosted_sessions(&*state.open_store().unwrap())
+                .unwrap()
+                .is_empty()
+        );
+        assert!(!root.path().join("artifacts").exists());
     }
 }
