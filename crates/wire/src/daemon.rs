@@ -1092,6 +1092,15 @@ struct ComposerOccupiedReprobeEntry {
     next_probe_at: At,
     backoff: Duration,
     probes_run: u32,
+    /// Recognised composer payload (`"/clear"`/`"/new"`) at hold time, if any.
+    recognised_payload: Option<&'static str>,
+}
+
+fn recognised_payload_suffix(payload: Option<&'static str>) -> String {
+    match payload {
+        Some(payload) => format!("; holds \"{payload}\"; repair: Backspace, then Ctrl-U"),
+        None => String::new(),
+    }
 }
 
 #[derive(Default)]
@@ -1714,6 +1723,10 @@ where
             let mut unresolved = false;
             let is_composer_occupied_hold =
                 evidence.first_reason == FenceReason::ComposerOccupiedByNonWireInput;
+            let recognised_payload = evidence
+                .recognised_composer_payload
+                .as_deref()
+                .and_then(crate::dispatcher::recognised_composer_payload);
             let job_at = job.1.clone();
             let mut queues = lock(&self.dispatch_queues);
             if let Some(queue) = queues.get_mut(&recipient) {
@@ -1769,7 +1782,11 @@ where
             }
             if unresolved {
                 if is_composer_occupied_hold {
-                    self.schedule_composer_occupied_reprobe(&recipient, &job_at);
+                    self.schedule_composer_occupied_reprobe(
+                        &recipient,
+                        &job_at,
+                        recognised_payload,
+                    );
                 }
                 warn(&format!(
                     "delivery unresolved for message {}; later messages for {} remain pending",
@@ -2045,7 +2062,12 @@ where
         any_pending
     }
 
-    fn schedule_composer_occupied_reprobe(&self, recipient: &str, observed_at: &At) {
+    fn schedule_composer_occupied_reprobe(
+        &self,
+        recipient: &str,
+        observed_at: &At,
+        recognised_payload: Option<&'static str>,
+    ) {
         if !self.recipient_has_zero_attempt_pending_only(recipient) {
             lock(&self.composer_occupied_reprobes).remove(recipient);
             return;
@@ -2055,6 +2077,9 @@ where
         reprobes
             .entry(recipient.to_string())
             .and_modify(|entry| {
+                // Every new hold overwrites the recognised payload: an
+                // unrecognised hold clears a stale "/clear" from an earlier hold.
+                entry.recognised_payload = recognised_payload;
                 // Never reset an exhausted entry here: this is also called by the hold a
                 // reprobe's own dispatch produces, so resetting would defeat the bound.
                 // Only a new message, read/ack (see `reset_composer_occupied_reprobe`), or
@@ -2073,6 +2098,7 @@ where
                     ),
                     backoff,
                     probes_run: 0,
+                    recognised_payload,
                 }
             });
     }
@@ -2083,6 +2109,8 @@ where
         let mut reprobes = lock(&self.composer_occupied_reprobes);
         if let Some(entry) = reprobes.get_mut(&name) {
             entry.probes_run = 0;
+            // Keep `recognised_payload`: a reset re-arms probing but must not erase
+            // what the composer was seen holding; the next real hold overwrites it.
             entry.backoff = COMPOSER_OCCUPIED_REPROBE_INITIAL_BACKOFF;
             entry.next_probe_at = At::from_unix_millis(
                 now.unix_millis()
@@ -2127,16 +2155,17 @@ where
                         entry.next_probe_at = At::from_unix_millis(
                             now_ms.saturating_add(entry.backoff.as_millis() as u64),
                         );
-                        (entry.probes_run, entry.backoff)
+                        (entry.probes_run, entry.backoff, entry.recognised_payload)
                     })
                 };
-                if let Some((probes_run, backoff)) = counted {
+                if let Some((probes_run, backoff, payload)) = counted {
                     warn(&format!(
                         "composer-occupied reprobe {probes_run}/{COMPOSER_OCCUPIED_MAX_REPROBES} for {recipient}: ready=None (no route), next backoff {backoff:?}"
                     ));
                     if probes_run >= COMPOSER_OCCUPIED_MAX_REPROBES {
                         warn(&format!(
-                            "composer-occupied reprobes exhausted for {recipient} after {COMPOSER_OCCUPIED_MAX_REPROBES} probes; holding until new message, read/ack, or daemon restart"
+                            "composer-occupied reprobes exhausted for {recipient} after {COMPOSER_OCCUPIED_MAX_REPROBES} probes; holding until new message, read/ack, or daemon restart{}",
+                            recognised_payload_suffix(payload)
                         ));
                     }
                 }
@@ -2159,7 +2188,7 @@ where
                     crate::dispatcher::probe_route_composer_ready(&route)
                 }
             };
-            let (probes_run, backoff) = {
+            let (probes_run, backoff, payload) = {
                 let mut reprobes = lock(&self.composer_occupied_reprobes);
                 if let Some(entry) = reprobes.get_mut(&recipient) {
                     entry.probes_run = entry.probes_run.saturating_add(1);
@@ -2167,7 +2196,7 @@ where
                     entry.next_probe_at = At::from_unix_millis(
                         now_ms.saturating_add(entry.backoff.as_millis() as u64),
                     );
-                    (entry.probes_run, entry.backoff)
+                    (entry.probes_run, entry.backoff, entry.recognised_payload)
                 } else {
                     continue;
                 }
@@ -2177,7 +2206,8 @@ where
             ));
             if probes_run >= COMPOSER_OCCUPIED_MAX_REPROBES {
                 warn(&format!(
-                    "composer-occupied reprobes exhausted for {recipient} after {COMPOSER_OCCUPIED_MAX_REPROBES} probes; holding until new message, read/ack, or daemon restart"
+                    "composer-occupied reprobes exhausted for {recipient} after {COMPOSER_OCCUPIED_MAX_REPROBES} probes; holding until new message, read/ack, or daemon restart{}",
+                    recognised_payload_suffix(payload)
                 ));
             }
             // Fail closed: only a probe that positively observed a clean composer (or one
@@ -9270,6 +9300,59 @@ mod tests {
     }
 
     #[test]
+    fn composer_occupied_exhausted_log_carries_only_recognised_payload() {
+        assert_eq!(COMPOSER_OCCUPIED_MAX_REPROBES, 16);
+        for (err_text, recognised) in [
+            (
+                "composer_occupied_by_non_wire_input: composer_occupied: composer holds \"/clear\"; repair: Backspace, then Ctrl-U; holding delivery without sending keys",
+                Some("/clear"),
+            ),
+            (
+                "composer_occupied_by_non_wire_input: composer holds owner secret draft; holding delivery without sending keys",
+                None,
+            ),
+        ] {
+            let (_tmp, inner) = fault_rig();
+            let _id = with_transport(Err(err_text.to_string()), || run_fault_job(&inner, "held"));
+            {
+                let entry = &lock(&inner.composer_occupied_reprobes)["held"];
+                assert_eq!(entry.recognised_payload, recognised, "{err_text}");
+            }
+            lock(&inner.routes).entries.remove("held");
+            let _ = take_warnings();
+            loop {
+                let entry = lock(&inner.composer_occupied_reprobes)["held"].clone();
+                if entry.probes_run >= COMPOSER_OCCUPIED_MAX_REPROBES {
+                    break;
+                }
+                inner.poll_composer_occupied_holds(entry.next_probe_at.clone());
+            }
+            let warnings = take_warnings();
+            let exhausted: Vec<_> = warnings
+                .iter()
+                .filter(|w| w.contains("reprobes exhausted"))
+                .collect();
+            assert_eq!(exhausted.len(), 1, "{warnings:?}");
+            if let Some(payload) = recognised {
+                assert!(
+                    exhausted[0].contains(&format!("holds \"{payload}\"")),
+                    "{exhausted:?}"
+                );
+                assert!(
+                    exhausted[0].contains("Backspace, then Ctrl-U"),
+                    "{exhausted:?}"
+                );
+            } else {
+                assert!(!exhausted[0].contains("holds \""), "{exhausted:?}");
+                assert!(
+                    !exhausted[0].contains("owner secret draft"),
+                    "{exhausted:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn composer_occupied_fresh_hold_does_not_rearm_exhausted_reprobe_entry() {
         let (_tmp, inner) = fault_rig();
         let occupied_err =
@@ -9285,7 +9368,7 @@ mod tests {
         }
         // A fresh zero-key hold (e.g. from a reprobe's own dispatch) must NOT reset an
         // exhausted entry, or the 16-probe bound defeats itself.
-        inner.schedule_composer_occupied_reprobe("held", &At::from_unix_millis(500_000));
+        inner.schedule_composer_occupied_reprobe("held", &At::from_unix_millis(500_000), None);
         let entry = lock(&inner.composer_occupied_reprobes)["held"].clone();
         assert_eq!(
             entry.probes_run, COMPOSER_OCCUPIED_MAX_REPROBES,
@@ -9306,9 +9389,76 @@ mod tests {
             let mut reprobes = lock(&inner.composer_occupied_reprobes);
             reprobes.get_mut("held").unwrap().probes_run = 3;
         }
-        inner.schedule_composer_occupied_reprobe("held", &At::from_unix_millis(600_000));
+        inner.schedule_composer_occupied_reprobe("held", &At::from_unix_millis(600_000), None);
         let entry = lock(&inner.composer_occupied_reprobes)["held"].clone();
         assert_eq!(entry.probes_run, 3, "live entry must keep its probe count");
+    }
+
+    #[test]
+    fn composer_occupied_new_hold_overwrites_recognised_payload() {
+        let (_tmp, inner) = fault_rig();
+        let clear_err = "composer_occupied_by_non_wire_input: composer_occupied: composer holds \"/clear\"; repair: Backspace, then Ctrl-U; holding delivery without sending keys".to_string();
+        let _id = with_transport(Err(clear_err), || run_fault_job(&inner, "held"));
+        assert_eq!(
+            lock(&inner.composer_occupied_reprobes)["held"].recognised_payload,
+            Some("/clear")
+        );
+        // Unrecognised hold clears the stale "/clear".
+        inner.schedule_composer_occupied_reprobe("held", &At::from_unix_millis(500_000), None);
+        assert_eq!(
+            lock(&inner.composer_occupied_reprobes)["held"].recognised_payload,
+            None,
+            "unrecognised hold must clear stale recognised payload"
+        );
+        // Recognised hold overwrites with the new payload.
+        inner.schedule_composer_occupied_reprobe(
+            "held",
+            &At::from_unix_millis(600_000),
+            Some("/new"),
+        );
+        assert_eq!(
+            lock(&inner.composer_occupied_reprobes)["held"].recognised_payload,
+            Some("/new")
+        );
+        inner.schedule_composer_occupied_reprobe("held", &At::from_unix_millis(700_000), None);
+        assert_eq!(
+            lock(&inner.composer_occupied_reprobes)["held"].recognised_payload,
+            None
+        );
+    }
+
+    #[test]
+    fn composer_occupied_reset_preserves_recognised_payload_through_exhaustion() {
+        let (_tmp, inner) = fault_rig();
+        let clear_err = "composer_occupied_by_non_wire_input: composer_occupied: composer holds \"/clear\"; repair: Backspace, then Ctrl-U; holding delivery without sending keys".to_string();
+        let _id = with_transport(Err(clear_err), || run_fault_job(&inner, "held"));
+        assert_eq!(
+            lock(&inner.composer_occupied_reprobes)["held"].recognised_payload,
+            Some("/clear")
+        );
+        // Reset (new message / read / ack) re-arms but must not erase the payload.
+        inner.reset_composer_occupied_reprobe("held", &At::from_unix_millis(500_000));
+        {
+            let entry = &lock(&inner.composer_occupied_reprobes)["held"];
+            assert_eq!(entry.probes_run, 0);
+            assert_eq!(entry.recognised_payload, Some("/clear"));
+        }
+        lock(&inner.routes).entries.remove("held");
+        let _ = take_warnings();
+        loop {
+            let entry = lock(&inner.composer_occupied_reprobes)["held"].clone();
+            if entry.probes_run >= COMPOSER_OCCUPIED_MAX_REPROBES {
+                break;
+            }
+            inner.poll_composer_occupied_holds(entry.next_probe_at.clone());
+        }
+        let warnings = take_warnings();
+        let exhausted: Vec<_> = warnings
+            .iter()
+            .filter(|w| w.contains("reprobes exhausted"))
+            .collect();
+        assert_eq!(exhausted.len(), 1, "{warnings:?}");
+        assert!(exhausted[0].contains("; holds \"/clear\""), "{exhausted:?}");
     }
 
     #[test]
