@@ -2109,7 +2109,8 @@ where
         let mut reprobes = lock(&self.composer_occupied_reprobes);
         if let Some(entry) = reprobes.get_mut(&name) {
             entry.probes_run = 0;
-            entry.recognised_payload = None;
+            // Keep `recognised_payload`: a reset re-arms probing but must not erase
+            // what the composer was seen holding; the next real hold overwrites it.
             entry.backoff = COMPOSER_OCCUPIED_REPROBE_INITIAL_BACKOFF;
             entry.next_probe_at = At::from_unix_millis(
                 now.unix_millis()
@@ -9424,6 +9425,40 @@ mod tests {
             lock(&inner.composer_occupied_reprobes)["held"].recognised_payload,
             None
         );
+    }
+
+    #[test]
+    fn composer_occupied_reset_preserves_recognised_payload_through_exhaustion() {
+        let (_tmp, inner) = fault_rig();
+        let clear_err = "composer_occupied_by_non_wire_input: composer_occupied: composer holds \"/clear\"; repair: Backspace, then Ctrl-U; holding delivery without sending keys".to_string();
+        let _id = with_transport(Err(clear_err), || run_fault_job(&inner, "held"));
+        assert_eq!(
+            lock(&inner.composer_occupied_reprobes)["held"].recognised_payload,
+            Some("/clear")
+        );
+        // Reset (new message / read / ack) re-arms but must not erase the payload.
+        inner.reset_composer_occupied_reprobe("held", &At::from_unix_millis(500_000));
+        {
+            let entry = &lock(&inner.composer_occupied_reprobes)["held"];
+            assert_eq!(entry.probes_run, 0);
+            assert_eq!(entry.recognised_payload, Some("/clear"));
+        }
+        lock(&inner.routes).entries.remove("held");
+        let _ = take_warnings();
+        loop {
+            let entry = lock(&inner.composer_occupied_reprobes)["held"].clone();
+            if entry.probes_run >= COMPOSER_OCCUPIED_MAX_REPROBES {
+                break;
+            }
+            inner.poll_composer_occupied_holds(entry.next_probe_at.clone());
+        }
+        let warnings = take_warnings();
+        let exhausted: Vec<_> = warnings
+            .iter()
+            .filter(|w| w.contains("reprobes exhausted"))
+            .collect();
+        assert_eq!(exhausted.len(), 1, "{warnings:?}");
+        assert!(exhausted[0].contains("; holds \"/clear\""), "{exhausted:?}");
     }
 
     #[test]

@@ -593,8 +593,33 @@ mod tests {
         );
         let json = serde_json::to_value(&diagnostic).unwrap();
         assert_eq!(json["recognised_composer_payload"], "/clear");
-        // No per-route payload: route observations carry no composer text.
-        assert!(diagnostic.route_observations.is_empty());
+        // Route observations carry no composer text even when a call was recorded:
+        // record one, then check its serialised shape is only the allowlisted fields.
+        let mut with_call = DispatchReport::default();
+        let slot = with_call.record_call_started(&codex());
+        with_call.record_call_finished(slot, DispatchCallOutcome::ReturnedError);
+        with_call.record_composer_occupied(
+            "composer_occupied_by_non_wire_input: composer_occupied: composer holds \"/clear\"; repair: Backspace, then Ctrl-U; holding delivery without sending keys",
+        );
+        let diagnostic = row(&with_call);
+        assert_eq!(diagnostic.route_observations.len(), 1);
+        let obs_json = serde_json::to_value(&diagnostic.route_observations[0]).unwrap();
+        let obs_obj = obs_json.as_object().unwrap();
+        let mut keys: Vec<&str> = obs_obj.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "adapter",
+                "explicit",
+                "identity_digest",
+                "outcome",
+                "route_updated_at"
+            ]
+        );
+        let obs_text = serde_json::to_string(&diagnostic.route_observations).unwrap();
+        assert!(!obs_text.contains("/clear"), "{obs_text}");
+        assert!(!obs_text.contains("ROUTE_PERSONA_SECRET"), "{obs_text}");
 
         let mut arbitrary = DispatchReport::default();
         arbitrary.record_composer_occupied(

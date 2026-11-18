@@ -2827,22 +2827,21 @@ pub(crate) fn recognised_composer_payload(text: &str) -> Option<&'static str> {
 /// compact forms such as `"/ clear"`, `"/cle ar"` or a payload split across
 /// lines must NOT be named.
 pub(crate) fn recognised_composer_payload_in_screen(screen: &str) -> Option<&'static str> {
-    let lines: Vec<&str> = screen.lines().collect();
+    let cleaned = normalize_terminal_screen(screen);
+    let lines: Vec<&str> = cleaned.lines().collect();
     if let Some(raw) = extract_composer_raw(&lines) {
         return recognised_composer_payload(&raw);
     }
-    recognised_composer_payload(screen)
+    recognised_composer_payload(&cleaned)
 }
 
 /// Recognised payload carried by a composer-occupied error, if any.
+/// Compares the whole error by equality with the canonical payload error, so
+/// arbitrary composer text that merely contains `holds "/clear"` is not named.
 pub(crate) fn recognised_payload_from_error(err: &str) -> Option<&'static str> {
-    if err.contains("holds \"/clear\"") {
-        Some("/clear")
-    } else if err.contains("holds \"/new\"") {
-        Some("/new")
-    } else {
-        None
-    }
+    ["/clear", "/new"]
+        .into_iter()
+        .find(|payload| err == composer_occupied_error_with_payload(Some(payload)))
 }
 
 fn composer_occupied_error_with_payload(payload: Option<&'static str>) -> String {
@@ -3268,10 +3267,12 @@ fn build_raw_from_composer_slice(slice: &[&str]) -> Option<String> {
     Some(raw)
 }
 
-fn extract_composer_raw(lines: &[&str]) -> Option<String> {
+/// Shared composer slice selection for the raw and compact extractors.
+/// Returns the slice and whether its top rule is at line zero (scrolled).
+fn select_composer_slice<'a>(lines: &'a [&'a str]) -> Option<(Vec<&'a str>, bool)> {
     if lines.iter().any(|l| is_horizontal_rule_line(l)) {
-        let (between, _top) = composer_region_lines(lines)?;
-        return build_raw_from_composer_slice(between);
+        let (between, top) = composer_region_lines(lines)?;
+        return Some((between.to_vec(), top == 0));
     }
     let tail_start = lines
         .iter()
@@ -3300,42 +3301,17 @@ fn extract_composer_raw(lines: &[&str]) -> Option<String> {
     if lines_have_dialog_or_menu_markers(slice) {
         return None;
     }
-    build_raw_from_composer_slice(slice)
+    Some((slice.to_vec(), false))
+}
+
+fn extract_composer_raw(lines: &[&str]) -> Option<String> {
+    let (slice, _is_top_zero) = select_composer_slice(lines)?;
+    build_raw_from_composer_slice(&slice)
 }
 
 fn extract_composer_compact(lines: &[&str]) -> Option<(String, bool)> {
-    if lines.iter().any(|l| is_horizontal_rule_line(l)) {
-        let (between, top) = composer_region_lines(lines)?;
-        return build_compact_from_composer_slice(between, top == 0);
-    }
-    let tail_start = lines
-        .iter()
-        .rposition(|l| line_starts_with_output_marker(l))
-        .map_or(0, |idx| idx + 1);
-    let non_empty_tail: Vec<&str> = lines[tail_start..]
-        .iter()
-        .copied()
-        .filter(|l| !l.trim().is_empty())
-        .collect();
-    let recent = &non_empty_tail[non_empty_tail.len().saturating_sub(3)..];
-    let slice = if let Some(prompt_pos) = recent.iter().rposition(|l| line_starts_with_prompt(l)) {
-        &recent[prompt_pos..]
-    } else if recent.iter().any(|l| line_contains_paste_placeholder(l)) {
-        if let Some(prompt_pos) = non_empty_tail
-            .iter()
-            .rposition(|l| line_starts_with_prompt(l))
-        {
-            &non_empty_tail[prompt_pos..]
-        } else {
-            recent
-        }
-    } else {
-        return None;
-    };
-    if lines_have_dialog_or_menu_markers(slice) {
-        return None;
-    }
-    build_compact_from_composer_slice(slice, false)
+    let (slice, is_top_zero) = select_composer_slice(lines)?;
+    build_compact_from_composer_slice(&slice, is_top_zero)
 }
 
 fn consumes_recorded_deliveries_to_end(
@@ -10151,6 +10127,49 @@ mod tests {
             Some("/new")
         );
         assert_eq!(recognised_composer_payload(" /clear "), Some("/clear"));
+    }
+
+    #[test]
+    fn recognised_composer_payload_handles_sgr_and_incident_shape() {
+        let rule = "─".repeat(20);
+        // SGR-styled tmux capture: escapes on the rule and prompt rows must be
+        // stripped before recognition, as with every other screen consumer.
+        let sgr_rule = format!("\x1b[90m{rule}\x1b[0m");
+        let sgr_screen = format!(
+            "◆ Ready.\n{sgr_rule}\n\x1b[1m❯\x1b[0m \x1b[36m/clear\x1b[0m\n{sgr_rule}\n  status"
+        );
+        assert_eq!(
+            recognised_composer_payload_in_screen(&sgr_screen),
+            Some("/clear")
+        );
+        let err = composer_occupied_error_for_screen(&sgr_screen);
+        assert!(err.contains("holds \"/clear\""), "{err}");
+        // Incident shape: prompt row holds "/clear", cursor on the empty row below.
+        let incident = format!("◆ Ready.\n{rule}\n❯ /clear\n\n{rule}\n  status");
+        assert_eq!(
+            recognised_composer_payload_in_screen(&incident),
+            Some("/clear")
+        );
+        let err = composer_occupied_error_for_screen(&incident);
+        assert!(err.contains("holds \"/clear\""), "{err}");
+        assert!(err.contains("Backspace, then Ctrl-U"), "{err}");
+        // Same shape without a bottom rule (cursor row is the capture tail).
+        let incident_no_bottom = "◆ Ready.\n❯ /clear\n".to_string();
+        assert_eq!(
+            recognised_composer_payload_in_screen(&incident_no_bottom),
+            Some("/clear")
+        );
+        // Equality-only error parsing: arbitrary text embedding the phrase is not named.
+        assert_eq!(
+            recognised_payload_from_error(
+                "composer_occupied_by_non_wire_input: composer holds \"x holds \\\"/clear\\\" y\"; holding delivery without sending keys"
+            ),
+            None
+        );
+        assert_eq!(
+            recognised_payload_from_error(&composer_occupied_error_with_payload(Some("/new"))),
+            Some("/new")
+        );
     }
 
     #[test]

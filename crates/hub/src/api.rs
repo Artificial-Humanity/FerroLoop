@@ -2104,6 +2104,11 @@ impl HubRouteDispatchObservation {
     }
 }
 
+/// Clamp a wire recognised payload to the two named values; anything else is dropped.
+fn clamp_recognised_composer_payload(payload: Option<String>) -> Option<String> {
+    payload.filter(|p| p == "/clear" || p == "/new")
+}
+
 impl HubFenceDiagnostic {
     fn from_wire(record: fl_wire::dispatch_diagnostics::FenceDiagnostic) -> Self {
         let fl_wire::dispatch_diagnostics::FenceDiagnostic {
@@ -2151,7 +2156,9 @@ impl HubFenceDiagnostic {
             route_dispatch_calls,
             route_dispatch_calls_saturated,
             registration_generation,
-            recognised_composer_payload,
+            recognised_composer_payload: clamp_recognised_composer_payload(
+                recognised_composer_payload,
+            ),
         }
     }
 }
@@ -7470,6 +7477,7 @@ fn sanitise_log_field(value: &str) -> String {
     }
     let sanitised: String = value
         .chars()
+        .take(64)
         .map(|c| {
             if c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | ':' | '-') {
                 c
@@ -12381,11 +12389,36 @@ mod council_guidance_tests {
             session_clear_log_line("owner", None, "webhook", "reforge", "dispatched"),
             "hub: session clear actor=owner persona=- vendor=webhook mode=reforge outcome=dispatched"
         );
-        // No composer/prompt content is ever part of the line shape.
-        assert!(
-            !session_clear_log_line("owner", Some("ada"), "claude", "clear", "failed")
-                .contains("prompt")
+        // Exactly the five labelled fields, in order, with no extra field:
+        // composer/prompt content has no field to ride in on.
+        let line = session_clear_log_line("owner", Some("ada"), "claude", "clear", "failed");
+        assert_eq!(
+            line,
+            "hub: session clear actor=owner persona=ada vendor=claude mode=clear outcome=failed"
         );
+        assert_eq!(line.split(' ').count(), 8, "{line}");
+        for label in ["actor=", "persona=", "vendor=", "mode=", "outcome="] {
+            assert_eq!(line.matches(label).count(), 1, "{line}");
+        }
+    }
+
+    #[test]
+    fn hub_fence_diagnostic_clamps_recognised_payload_and_caps_log_fields() {
+        assert_eq!(
+            clamp_recognised_composer_payload(Some("/clear".into())),
+            Some("/clear".to_string())
+        );
+        assert_eq!(
+            clamp_recognised_composer_payload(Some("/new".into())),
+            Some("/new".to_string())
+        );
+        assert_eq!(
+            clamp_recognised_composer_payload(Some("owner secret draft".into())),
+            None
+        );
+        assert_eq!(clamp_recognised_composer_payload(None), None);
+        assert_eq!(sanitise_log_field(&"a".repeat(100)), "a".repeat(64));
+        assert_eq!(sanitise_log_field(&"é".repeat(100)).chars().count(), 64);
     }
 
     #[test]
