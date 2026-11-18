@@ -2617,7 +2617,7 @@ const AGENT_REGISTRY_CASES: usize = 8;
 /// How many cases [`state_store`] runs. Update deliberately — see [`run_suite`].
 const STATE_STORE_CASES: usize = 10;
 /// How many cases [`message_store`] runs. Update deliberately — see [`run_suite`].
-const MESSAGE_STORE_CASES: usize = 10;
+const MESSAGE_STORE_CASES: usize = 11;
 /// How many cases [`workflow_store`] runs. Update deliberately — see [`run_suite`].
 const WORKFLOW_STORE_CASES: usize = 3;
 
@@ -2665,6 +2665,7 @@ pub fn message_store<S: MessageStore + AgentRegistry + Catalog + Handles, G>(
         wire_import_reports_an_id_that_belongs_to_another_kind_and_imports_its_neighbours::<S>,
         offline_agent_id_collision_alias_preserves_wire_inbox_and_ack::<S>,
         prune_wire_removes_only_acked_or_expired_transient_messages_before_cutoff::<S>,
+        send_wire_once_is_atomic_and_deduplicates_until_retention::<S>,
     ];
     run_suite("message-store", MESSAGE_STORE_CASES, cases, make);
 }
@@ -4593,6 +4594,91 @@ fn offline_agent_id_collision_alias_preserves_wire_inbox_and_ack<
         .unwrap()
         .unwrap();
     assert_eq!(acked.status, DeliveryStatus::Acked);
+}
+
+fn send_wire_once_is_atomic_and_deduplicates_until_retention<S: MessageStore + AgentRegistry>(
+    s: &S,
+) {
+    use crate::ferrowire::{
+        DURABLE_WIRE_RETENTION_MS, DeliveryStatus, MessageKind, MessageUrgency, SendWireArgs,
+        WireAddress,
+    };
+    let id = crate::ids::MessageId(crate::ids::seq_iri(987654));
+    let args = SendWireArgs {
+        id: Some(id.clone()),
+        sender_id: None,
+        sender_name: "jarvis".into(),
+        sender_host: None,
+        to: WireAddress::AgentName("ferris".into()),
+        kind: MessageKind::Mail,
+        urgency: MessageUrgency::Normal,
+        durable: true,
+        subject: "Prompt".into(),
+        body: "Pending".into(),
+        reply_to: None,
+        thread_id: None,
+        deadline_at: None,
+        at: At::from_unix_millis(10),
+    };
+    let (message, receipts) = s
+        .send_wire_once_awaiting_daemon(args.clone())
+        .unwrap()
+        .expect("first insert");
+    assert_eq!(message.id, id);
+    assert_eq!(receipts.len(), 1);
+    assert_eq!(s.list_wire_awaiting_daemon().unwrap().len(), 1);
+    s.update_wire_receipt(
+        &id,
+        "ferris",
+        DeliveryStatus::Acked,
+        false,
+        At::from_unix_millis(11),
+    )
+    .unwrap()
+    .unwrap();
+    s.clear_wire_awaiting_daemon(&id).unwrap();
+    let before_messages = s.wire_messages_after(0).unwrap();
+    let before_receipts = s.wire_receipts_after(0).unwrap();
+    assert!(
+        s.send_wire_once_awaiting_daemon(args.clone())
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(s.wire_messages_after(0).unwrap(), before_messages);
+    assert_eq!(s.wire_receipts_after(0).unwrap(), before_receipts);
+    assert_eq!(
+        s.list_wire_receipts(&id).unwrap()[0].status,
+        DeliveryStatus::Acked
+    );
+    assert!(s.list_wire_awaiting_daemon().unwrap().is_empty());
+    let agent = s
+        .register_agent(crate::agent::RegisterAgentArgs {
+            display_name: "Other".into(),
+            email: None,
+            project: "ferroloop".into(),
+            role: crate::agent::AgentRole::Assistant,
+            extra_areas: vec![],
+            create_area: true,
+            replace: false,
+            at: At::from_unix_millis(12),
+            by: "owner".into(),
+        })
+        .unwrap();
+    let mut wrong_kind = args.clone();
+    wrong_kind.id = Some(crate::ids::MessageId(agent.id.iri().clone()));
+    assert!(matches!(
+        s.send_wire_once_awaiting_daemon(wrong_kind),
+        Err(crate::store::StoreError::WrongKind { .. })
+    ));
+    let mut no_id = args.clone();
+    no_id.id = None;
+    assert!(s.send_wire_once_awaiting_daemon(no_id).is_err());
+    assert_eq!(
+        s.prune_wire(At::from_unix_millis(10 + DURABLE_WIRE_RETENTION_MS))
+            .unwrap(),
+        1
+    );
+    assert!(s.send_wire_once_awaiting_daemon(args).unwrap().is_some());
 }
 
 fn prune_wire_removes_only_acked_or_expired_transient_messages_before_cutoff<S: MessageStore>(

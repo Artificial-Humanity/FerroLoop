@@ -1856,7 +1856,13 @@ impl MemStore {
         &self,
         args: SendWireArgs,
         awaiting_daemon: bool,
-    ) -> Result<(WireMessage, Vec<DeliveryReceipt>), StoreError> {
+        once: bool,
+    ) -> Result<Option<(WireMessage, Vec<DeliveryReceipt>)>, StoreError> {
+        if once && args.id.is_none() {
+            return Err(StoreError::InvalidState(
+                "Wire send-once requires a message id".into(),
+            ));
+        }
         let subject =
             validate_subject(&args.subject).map_err(|e| StoreError::InvalidState(e.to_string()))?;
         let body =
@@ -1865,6 +1871,9 @@ impl MemStore {
             .map_err(|e| StoreError::InvalidState(e.to_string()))?;
 
         let mut s = self.inner.borrow_mut();
+        if once && s.wire_messages.contains_key(args.id.as_ref().unwrap()) {
+            return Ok(None);
+        }
 
         let (parent_thread, correlation_id) = match &args.reply_to {
             Some(parent_id) => {
@@ -1899,7 +1908,9 @@ impl MemStore {
                 if s.wire_messages.contains_key(&id) {
                     return Err(StoreError::AlreadyExists(id.iri().clone()));
                 }
-                s.index_imported_unhanded(Kind::Message, id.iri())?;
+                if !once {
+                    s.index_imported_unhanded(Kind::Message, id.iri())?;
+                }
                 id
             }
             None => MessageId(s.mint_unhanded(Kind::Message)),
@@ -1948,6 +1959,11 @@ impl MemStore {
 
         let areas: Vec<AreaRecord> = s.areas.values().cloned().collect();
         check_group_address(&msg.to, &areas).map_err(StoreError::InvalidState)?;
+        // The send-once operation is atomic on refusal: ownership is its first
+        // mutation, after all validation that can return an error.
+        if once {
+            s.index_imported_unhanded(Kind::Message, msg.id.iri())?;
+        }
         let recipients = resolve_recipients(
             &msg.to,
             msg.sender_id.as_ref(),
@@ -1979,7 +1995,7 @@ impl MemStore {
                 .insert(msg.id.clone(), msg.created_at.clone());
         }
 
-        Ok((msg, receipts))
+        Ok(Some((msg, receipts)))
     }
 }
 
@@ -1988,14 +2004,23 @@ impl MessageStore for MemStore {
         &self,
         args: SendWireArgs,
     ) -> Result<(WireMessage, Vec<DeliveryReceipt>), StoreError> {
-        self.send_wire_inner(args, false)
+        self.send_wire_inner(args, false, false)
+            .map(|value| value.expect("ordinary send always inserts"))
     }
 
     fn send_wire_awaiting_daemon(
         &self,
         args: SendWireArgs,
     ) -> Result<(WireMessage, Vec<DeliveryReceipt>), StoreError> {
-        self.send_wire_inner(args, true)
+        self.send_wire_inner(args, true, false)
+            .map(|value| value.expect("ordinary send always inserts"))
+    }
+
+    fn send_wire_once_awaiting_daemon(
+        &self,
+        args: SendWireArgs,
+    ) -> Result<Option<(WireMessage, Vec<DeliveryReceipt>)>, StoreError> {
+        self.send_wire_inner(args, true, true)
     }
 
     fn list_wire_awaiting_daemon(&self) -> Result<Vec<(MessageId, At)>, StoreError> {
@@ -2562,6 +2587,31 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, StoreError::AlreadyExists(_)), "{err:?}");
         assert_eq!(s.get_wire_message(&id).unwrap().unwrap().body, "first");
+    }
+
+    #[test]
+    fn send_once_refusal_does_not_reserve_message_id() {
+        use crate::ferrowire::WireAddress;
+
+        let store = MemStore::default();
+        let id = MessageId(Iri::parse("urn:uuid:00000000-0000-4000-8000-000000000002").unwrap());
+        let mut refused = wire_args(Some(id.clone()), "first");
+        refused.to = WireAddress::Group("missing".into());
+        assert!(store.send_wire_once_awaiting_daemon(refused).is_err());
+        assert!(matches!(
+            store.kind_of(id.iri()),
+            Err(StoreError::NotOwned { .. })
+        ));
+        assert!(store.wire_messages_after(0).unwrap().is_empty());
+        assert!(store.wire_receipts_after(0).unwrap().is_empty());
+        assert!(store.list_wire_awaiting_daemon().unwrap().is_empty());
+
+        let retry = wire_args(Some(id.clone()), "retry");
+        let (message, _) = store
+            .send_wire_once_awaiting_daemon(retry)
+            .unwrap()
+            .unwrap();
+        assert_eq!(message.id, id);
     }
 
     #[test]
