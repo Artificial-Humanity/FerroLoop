@@ -372,6 +372,15 @@ pub trait RuntimePort: fmt::Debug + Send + Sync {
 
 use std::fmt;
 
+/// A launch prerequisite that is unavailable before a vendor process is started.
+/// Separate from launch-plan validation and runtime failures, so schedulers do not spend
+/// their crash budget waiting for an external prerequisite.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LaunchPrerequisiteRefusal {
+    pub code: String,
+    pub detail: String,
+}
+
 /// Dependency-inverted contract implemented by each concrete vendor host adapter
 /// (`CodexHostAdapter`, `AntigravityHostAdapter`, `ClaudeHostAdapter`, `MuseGrokPtyAdapter`, etc.).
 pub trait VendorHostAdapter: fmt::Debug + Send + Sync {
@@ -387,6 +396,16 @@ pub trait VendorHostAdapter: fmt::Debug + Send + Sync {
     }
 
     // --- 1. Identity & Lifecycle -------------------------------------------
+
+    /// Read-only prerequisite check immediately before a hosted launch. `config_home` is
+    /// the effective configuration directory pinned into the child, not a delivery endpoint.
+    /// Launch-plan preparation remains deterministic and performs no availability probes.
+    fn preflight_launch(
+        &self,
+        _config_home: Option<&Path>,
+    ) -> Result<(), LaunchPrerequisiteRefusal> {
+        Ok(())
+    }
 
     /// Build a deterministic launch plan (`argv`, `env`, `cwd`, `remote_control`) for starting a
     /// new hosted session of this vendor.

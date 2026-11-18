@@ -8384,6 +8384,12 @@ fn handle_get_commands(state: &HubState) -> HttpResponse {
 }
 
 fn lifecycle_error_response(err: &LifecycleError) -> HttpResponse {
+    if let LifecycleError::PrerequisiteUnavailable { code, detail } = err {
+        return HttpResponse::json(
+            err.status(),
+            json!({ "error": err.to_string(), "code": code, "detail": detail }),
+        );
+    }
     HttpResponse::json(err.status(), json!({ "error": err.to_string() }))
 }
 
@@ -11356,6 +11362,51 @@ mod tests {
                 r.status
             );
         }
+    }
+    #[test]
+    fn prerequisite_refusal_http_response_has_named_code_and_detail() {
+        let response = lifecycle_error_response(&LifecycleError::PrerequisiteUnavailable {
+            code: "codex_app_server_unavailable".into(),
+            detail: "/private/control.sock: NotFound".into(),
+        });
+        assert_eq!(response.status, 409);
+        let body = response.json_value().unwrap();
+        assert_eq!(body["code"], "codex_app_server_unavailable");
+        assert_eq!(body["detail"], "/private/control.sock: NotFound");
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap()
+                .contains("clean systemd user unit")
+        );
+    }
+
+    // CI only: isolated store response contract consumed by FerroDeck (#577).
+    #[test]
+    fn hosted_sessions_http_response_preserves_launch_prerequisite_fields() {
+        let (_tmp, state) = roles_test_state();
+        let record: lifecycle::HostedSessionRecord = serde_json::from_value(json!({
+            "session_id":"codex:ada", "persona":"ada", "project":"ferroloop", "role":"assistant",
+            "vendor":"codex", "model":null, "node_id":"ai-lab-0", "hosted":true, "status":"stopped",
+            "stop_reason":"prerequisite_unavailable", "launch_prerequisite_detail":"/private/control.sock: NotFound",
+            "restart_policy":"on-failure", "restart_count":0, "tmux_target":null, "cwd":null,
+            "hydration_dispatched":false, "created_at_ms":1, "updated_at_ms":1, "decommission_prepared_at_ms":null
+        })).unwrap();
+        {
+            let store = state.open_store().unwrap();
+            lifecycle::persist_hosted_session(&*store, &record, "test").unwrap();
+        }
+        let response = handle_get_hosted_sessions(&state);
+        assert_eq!(response.status, 200);
+        let json = response.json_value().unwrap();
+        assert_eq!(
+            json["sessions"][0]["stop_reason"],
+            "prerequisite_unavailable"
+        );
+        assert_eq!(
+            json["sessions"][0]["launch_prerequisite_detail"],
+            "/private/control.sock: NotFound"
+        );
     }
 }
 

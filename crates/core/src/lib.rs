@@ -222,8 +222,8 @@ pub use vendor::{
 };
 pub use vendor_adapter::{
     AdapterIdentityBinding, AdapterReadiness, AttachOrResumeOutcome, AttachOrResumeRequest,
-    ConfigEffectiveScope, NormalizedSessionTurn, PostCompactionContext, RuntimePort,
-    TeardownOutcome, TeardownTarget, TranscriptNormalizeReport, TurnDeliveryOutcome,
+    ConfigEffectiveScope, LaunchPrerequisiteRefusal, NormalizedSessionTurn, PostCompactionContext,
+    RuntimePort, TeardownOutcome, TeardownTarget, TranscriptNormalizeReport, TurnDeliveryOutcome,
     TurnDeliveryRequest, VendorAdapterError, VendorConfigSpec, VendorHostAdapter,
     VendorHostAdapterRegistry, VendorLaunchPlan, VendorLaunchRequest, VendorStartupPromptRule,
 };
