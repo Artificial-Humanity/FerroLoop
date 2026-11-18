@@ -20668,4 +20668,75 @@ mod tests {
         assert_eq!(stopped.launch_prerequisite_detail, None);
         TEST_RESPAWN_NOW_MS.with(|clock| clock.set(None));
     }
+    // CI only: a late readiness refusal must not arm either intentional manual stop.
+    #[test]
+    fn failed_manual_codex_startup_preserves_intentional_stop_reason() {
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                TEST_LAUNCH_PREREQUISITE_SEQUENCE.with(|slot| slot.borrow_mut().clear());
+                TEST_RESPAWN_NOW_MS.with(|clock| clock.set(None));
+            }
+        }
+        let _reset = Reset;
+        for reason in [STOP_REASON_CLEAN_EXIT, STOP_REASON_CRASH_LOOP] {
+            for spawn_fails in [true, false] {
+                let home = TempDir::new().unwrap();
+                let _trusted = trusted_codex_home(home.path(), home.path());
+                let store = MemStore::default();
+                let fake = FakeRuntime::default();
+                if spawn_fails {
+                    fake.fail_windows.borrow_mut().push("codex".into());
+                } else {
+                    fake.vanish_windows.borrow_mut().push("codex".into());
+                }
+                let env = fake.env(home.path());
+                let mut record = hosted_record("codex", "manual-startup", STATUS_STOPPED, false);
+                record.cwd = Some(home.path().display().to_string());
+                record.stop_reason = Some(reason.into());
+                persist_hosted_session(&store, &record, "owner").unwrap();
+                let state = HostedRespawnState {
+                    respawn_timestamps_ms: vec![900],
+                    next_allowed_at_ms: Some(99_000),
+                    crash_loop_notified: true,
+                };
+                save_hosted_respawn_state(&store, &record.session_id, &state, "owner").unwrap();
+                TEST_RESPAWN_NOW_MS.with(|clock| clock.set(Some(1_000)));
+                TEST_LAUNCH_PREREQUISITE_SEQUENCE.with(|slot| {
+                    *slot.borrow_mut() = [
+                        Ok(()),
+                        Err(fl_core::LaunchPrerequisiteRefusal {
+                            code: "codex_app_server_unavailable".into(),
+                            detail: "/private/control.sock: NotFound".into(),
+                        }),
+                    ]
+                    .into_iter()
+                    .collect()
+                });
+                assert!(matches!(
+                    restart_hosted_session(&store, &env, &record.session_id, "owner"),
+                    Err(LifecycleError::PrerequisiteUnavailable { .. })
+                ));
+                let stopped = get_hosted_session_by_id(&store, &record.session_id)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(stopped.status, STATUS_STOPPED);
+                assert_eq!(stopped.stop_reason.as_deref(), Some(reason));
+                assert_eq!(stopped.launch_prerequisite_detail, None);
+                assert!(!stopped.runtime_spawned);
+                assert_eq!(load_hosted_respawn_state(&store, &record.session_id), state);
+                let calls = fake.calls.borrow().clone();
+                assert!(
+                    reconcile_and_respawn_hosted_sessions(&store, &env)
+                        .unwrap()
+                        .is_empty()
+                );
+                assert_eq!(
+                    *fake.calls.borrow(),
+                    calls,
+                    "no automatic launch may follow the refused manual attempt"
+                );
+            }
+        }
+    }
 }
