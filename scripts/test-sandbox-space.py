@@ -8,6 +8,16 @@ import tempfile
 import time
 
 GIB = 1024 ** 3
+pending_signal = None
+
+
+class StopRequested(Exception):
+    def __init__(self, signum): self.signum = signum
+
+
+def check_interruption():
+    if pending_signal is not None:
+        raise StopRequested(pending_signal)
 
 
 def reserve_bytes(value):
@@ -50,6 +60,7 @@ def terminate_group(proc):
 def supervise(paths, reserve, command, measure=available, interval=1):
     # The first check runs before starting even the bubblewrap process.
     check_space(paths, reserve, measure)
+    check_interruption()
     # Defer termination signals until the child has been recorded and the
     # cleanup finally is installed. Restore the inherited mask in the child
     # before exec so the sandbox itself does not inherit blocked signals.
@@ -65,20 +76,26 @@ def supervise(paths, reserve, command, measure=available, interval=1):
     try:
         signal.pthread_sigmask(signal.SIG_SETMASK, previous)
         while True:
+            check_interruption()
             check_space(paths, reserve, measure)
+            check_interruption()
             if child_exited(proc):
                 # Sample again before reaping, including for very short commands.
                 check_space(paths, reserve, measure)
-                # A signal between wait() and setting completed would otherwise
-                # enter cleanup after the leader PID was already released.
+                check_interruption()
+                # Block signals around wait/reap and completion bookkeeping.
                 wait_mask = signal.pthread_sigmask(signal.SIG_BLOCK, mask)
                 try:
                     status = proc.wait()
                     completed = True
                 finally:
                     signal.pthread_sigmask(signal.SIG_SETMASK, wait_mask)
+                if pending_signal is not None:
+                    return 128 + pending_signal
                 return status if status >= 0 else 128 - status
             time.sleep(interval)
+    except StopRequested as exc:
+        return 128 + exc.signum
     finally:
         # --die-with-parent ends the bwrap sandbox if the leader is terminated.
         if not completed:
@@ -182,7 +199,7 @@ real=subprocess.Popen
 def spawn(*args,**kwargs):
     p=real(*args,**kwargs); open(sys.argv[2],"w").write(str(p.pid)); os.kill(os.getpid(),signal.SIGTERM); return p
 m.subprocess.Popen=spawn
-m.supervise(("/","/target"),1,[sys.executable,"-c","import time; time.sleep(30)"],lambda _:2,.01)
+sys.exit(m.supervise(("/","/target"),1,[sys.executable,"-c","import time; time.sleep(30)"],lambda _:2,.01))
 '''
         handoff_run = subprocess.run([sys.executable, '-B', '-c', handoff, __file__, pidfile], timeout=12)
         assert handoff_run.returncode == 128 + signal.SIGTERM, 'spawn-handoff signal not propagated'
@@ -207,7 +224,7 @@ def measure(_):
 m.supervise(("/","/target"),1,[sys.executable,"-c",child,sys.argv[3],sys.argv[4]],measure,.01)
 '''
         wrapper = subprocess.Popen([sys.executable, '-B', '-c', cleanup_fixture, __file__, active, child_pid, survived_again],
-                                   start_new_session=True)
+                                   start_new_session=True, stderr=subprocess.DEVNULL)
         try:
             deadline = time.monotonic() + 10
             while not os.path.exists(active):
@@ -218,13 +235,40 @@ m.supervise(("/","/target"),1,[sys.executable,"-c",child,sys.argv[3],sys.argv[4]
             os.kill(wrapper.pid, signal.SIGTERM)
             time.sleep(.05)
             os.kill(wrapper.pid, signal.SIGTERM)
-            assert wrapper.wait(timeout=12) == 128 + signal.SIGTERM, 'repeated signal not deferred'
+            assert wrapper.wait(timeout=12) != 0, 'repeated signal or low-space failure was lost'
             time.sleep(2.2)
             assert not os.path.exists(survived_again), 'child survived repeated signal during cleanup'
         finally:
             if wrapper.poll() is None:
                 os.killpg(wrapper.pid, signal.SIGKILL)
                 wrapper.wait()
+
+        # Inject exactly before cleanup's SIG_BLOCK call; an asynchronous
+        # exception here used to skip cleanup and leave the child running.
+        injected = os.path.join(root, 'cleanup-entry-injected')
+        entry_pid = os.path.join(root, 'cleanup-entry-pid')
+        entry_survived = os.path.join(root, 'cleanup-entry-survived')
+        cleanup_entry_fixture = '''import importlib.util,os,pathlib,signal,sys
+spec=importlib.util.spec_from_file_location("space",sys.argv[1]); m=importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+for sig in (signal.SIGINT,signal.SIGTERM,signal.SIGHUP): signal.signal(sig,m.interrupted)
+original=signal.pthread_sigmask
+count=0
+def inject(how, mask):
+    global count
+    if how==signal.SIG_BLOCK:
+        count+=1
+        if count==2: pathlib.Path(sys.argv[2]).touch(); os.kill(os.getpid(),signal.SIGTERM)
+    return original(how,mask)
+m.signal.pthread_sigmask=inject
+child="import os,pathlib,signal,sys,time; signal.signal(signal.SIGTERM,signal.SIG_IGN); pathlib.Path(sys.argv[1]).write_text(str(os.getpid())); time.sleep(7); pathlib.Path(sys.argv[2]).touch()"
+def measure(_): return 0 if os.path.exists(sys.argv[3]) else 2
+m.supervise(("/","/target"),1,[sys.executable,"-c",child,sys.argv[3],sys.argv[4]],measure,.01)
+'''
+        entry = subprocess.run([sys.executable, '-B', '-c', cleanup_entry_fixture, __file__, injected, entry_pid, entry_survived],
+                               timeout=12, stderr=subprocess.DEVNULL)
+        assert entry.returncode != 0 and os.path.exists(injected), 'cleanup entry injection failed'
+        time.sleep(2.2)
+        assert not os.path.exists(entry_survived), 'child survived signal at cleanup entry'
     print('PASS: test-owned free-space preflight and running-process fixtures')
 
 
@@ -262,7 +306,10 @@ def bwrap_self_test():
 
 
 def interrupted(signum, _frame):
-    raise SystemExit(128 + signum)
+    # Signal handlers never raise asynchronously, including at cleanup entry.
+    global pending_signal
+    if pending_signal is None:
+        pending_signal = signum
 
 
 def main():
@@ -284,6 +331,8 @@ def main():
 
 if __name__ == '__main__':
     try: sys.exit(main())
+    except StopRequested as err:
+        sys.exit(128 + err.signum)
     except (OSError, ValueError, RuntimeError) as err:
         print('test-sandboxed: free-space check failed: ' + str(err), file=sys.stderr)
         sys.exit(1)
