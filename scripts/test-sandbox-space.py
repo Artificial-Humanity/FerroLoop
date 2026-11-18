@@ -28,13 +28,20 @@ def check_space(paths, reserve, measure=available):
             raise RuntimeError(f'{path} has {free} free bytes; reserve is {reserve} bytes')
 
 
+def child_exited(proc):
+    # Observe without reaping: the child PID must remain reserved until every
+    # signal to its process group has been sent.
+    return os.waitid(os.P_PID, proc.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT) is not None
+
+
 def terminate_group(proc):
     try: os.killpg(proc.pid, signal.SIGTERM)
     except ProcessLookupError: pass
-    try: proc.wait(timeout=5)
-    except subprocess.TimeoutExpired: pass
-    # The leader may exit before a SIGTERM-ignoring descendant does.  Always
-    # kill the group, even when wait() has already reaped the leader.
+    deadline = time.monotonic() + 5
+    while not child_exited(proc) and time.monotonic() < deadline:
+        time.sleep(.05)
+    # Keep the group leader waitable and unreaped even if it already exited.
+    # An ignoring descendant can remain after the leader receives SIGTERM.
     try: os.killpg(proc.pid, signal.SIGKILL)
     except ProcessLookupError: pass
     proc.wait()
@@ -48,11 +55,18 @@ def supervise(paths, reserve, command, measure=available, interval=1):
     try:
         while True:
             check_space(paths, reserve, measure)
-            status = proc.poll()
-            if status is not None:
-                # Sample again after exit, including for very short commands.
+            if child_exited(proc):
+                # Sample again before reaping, including for very short commands.
                 check_space(paths, reserve, measure)
-                completed = True
+                # A signal between wait() and setting completed would otherwise
+                # enter cleanup after the leader PID was already released.
+                mask = {signal.SIGINT, signal.SIGTERM, signal.SIGHUP}
+                previous = signal.pthread_sigmask(signal.SIG_BLOCK, mask)
+                try:
+                    status = proc.wait()
+                    completed = True
+                finally:
+                    signal.pthread_sigmask(signal.SIG_SETMASK, previous)
                 return status if status >= 0 else 128 - status
             time.sleep(interval)
     finally:
@@ -122,6 +136,26 @@ def self_test():
             except OSError: pass
             else: raise AssertionError('measurement failure accepted')
         assert supervise(('/', '/target'), reserve, [sys.executable, '-c', 'pass'], lambda _: reserve + 1, .01) == 0
+        # Exercise the exit-before-cleanup race. At each signal the already
+        # exited leader must still be our waitable child; only then may wait()
+        # reap it. The wrapper detects any additional signal after reaping.
+        exited = subprocess.Popen([sys.executable, '-c', 'pass'], start_new_session=True)
+        deadline = time.monotonic() + 5
+        while not child_exited(exited):
+            assert time.monotonic() < deadline, 'owned child did not exit'
+            time.sleep(.01)
+        signals = []
+        actual_killpg = os.killpg
+        def checked_killpg(pgid, sig):
+            assert exited.returncode is None, 'group signal attempted after leader was reaped'
+            assert child_exited(exited), 'owned leader unexpectedly not waitable'
+            signals.append(sig)
+            return actual_killpg(pgid, sig)
+        os.killpg = checked_killpg
+        try: terminate_group(exited)
+        finally: os.killpg = actual_killpg
+        assert signals == [signal.SIGTERM, signal.SIGKILL]
+        assert exited.returncode == 0, 'leader not reaped after group signals'
     print('PASS: test-owned free-space preflight and running-process fixtures')
 
 
