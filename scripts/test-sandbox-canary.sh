@@ -6,7 +6,7 @@ if [[ ${1:-} == --inside && $(readlink /proc/self/fd/0) != /dev/null ]]; then
 fi
 here=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
 exec /usr/bin/python3 - "$here" "$@" <<'PY'
-import errno, os, secrets, signal, socket, subprocess, sys, tempfile, time, tomllib
+import errno, hashlib, os, secrets, signal, socket, stat, subprocess, sys, tempfile, time, tomllib
 
 here, *args = sys.argv[1:]
 
@@ -20,7 +20,7 @@ def require(condition, message):
         raise SystemExit('FAIL: ' + message)
 
 if args and args[0] == '--inside':
-    _, host_net, unix_path, abstract_name, port, filename, pid, *absent = args
+    _, host_net, unix_path, abstract_name, port, filename, pid, nonce, checkout, *absent = args
     port, pid = int(port), int(pid)
     inside_net = os.readlink('/proc/self/ns/net')
     print('host net namespace:', host_net, 'sandbox net namespace:', inside_net, flush=True)
@@ -49,7 +49,17 @@ if args and args[0] == '--inside':
     else: raise SystemExit('FAIL: host sentinel signal accepted')
     for path in absent:
         require(not os.path.lexists(path), 'live path exists inside: ' + path)
-    print('PASS: sandbox negative controls and absent paths', flush=True)
+    require(not os.path.exists(checkout), 'host checkout path visible')
+    require(not os.path.exists('/source/.git'), 'Git metadata visible')
+    require(os.environ.get('FL_RECOVERY_TEST_DIR') == '/recovery', 'recovery path missing')
+    for directory in ('/source', '/recovery', '/etc', '/var/tmp'):
+        path = os.path.join(directory, 'canary-' + nonce)
+        with open(path, 'w') as f: f.write(nonce)
+        with open(path) as f: require(f.read() == nonce, 'writable area control failed: ' + directory)
+    require(socket.getaddrinfo('localhost', None), 'localhost does not resolve')
+    require(os.path.islink('/sandbox-bin/cc'), 'private compiler link missing')
+    require(stat.S_IMODE(os.stat('/usr').st_mode) == 0o755, 'synthetic /usr is not mode 0755')
+    print('PASS: sandbox negative controls, writable fixtures and absent paths', flush=True)
     raise SystemExit(0)
 
 require(not args, 'unexpected arguments')
@@ -59,6 +69,25 @@ subprocess.run(['/usr/bin/python3', os.path.join(here, 'test-sandbox-target.py')
 subprocess.run(['/usr/bin/python3', os.path.join(here, 'test-sandbox-space.py'), '--self-test'], check=True)
 subprocess.run(['/usr/bin/python3', os.path.join(here, 'test-sandbox-space.py'), '--bwrap-self-test'], check=True)
 nonce = secrets.token_hex(16)
+checkout = os.path.dirname(here)
+def checkout_fingerprint():
+    status = subprocess.check_output(['git', '-C', checkout, 'status', '--porcelain=v1', '-z', '--untracked-files=all'])
+    paths = subprocess.check_output(['git', '-C', checkout, 'ls-files', '-z']).split(b'\0')
+    digest = hashlib.sha256()
+    for raw in filter(None, paths):
+        path = os.path.join(os.fsencode(checkout), raw)
+        digest.update(raw + b'\0')
+        try:
+            if os.path.islink(path): digest.update(b'link' + os.readlink(path))
+            elif os.path.isdir(path): digest.update(b'directory')  # gitlink; snapshot omits submodules
+            else:
+                with open(path, 'rb') as f:
+                    for chunk in iter(lambda: f.read(1024 * 1024), b''): digest.update(chunk)
+        except FileNotFoundError: digest.update(b'deleted')
+    return status, digest.hexdigest()
+before = checkout_fingerprint()
+host_markers = [os.path.join(p, 'canary-' + nonce) for p in ('/recovery', '/etc', '/var/tmp')]
+require(all(not os.path.lexists(p) for p in host_markers), 'host marker already exists')
 home = os.path.expanduser('~')
 uid = os.getuid()
 host_net = os.readlink('/proc/self/ns/net')
@@ -157,11 +186,24 @@ with tempfile.TemporaryDirectory(prefix='ferroloop-canary-', dir='/var/tmp') as 
             print('PASS: host positive controls; sentinel nonce', nonce, flush=True)
             command = [os.path.join(here, 'test-sandboxed.sh'), '--', '/usr/bin/bash',
                        '/source/scripts/test-sandbox-canary.sh', '--inside', host_net, unix_path,
-                       abstract_name, str(port), filename, str(child.pid), *absent]
+                       abstract_name, str(port), filename, str(child.pid), nonce, checkout, *absent]
             result = subprocess.run(command, close_fds=True)
             require(result.returncode == 0, 'sandbox canary failed')
             require(open(filename).read() == expected, 'sentinel changed inside sandbox')
             require(child.poll() is None, 'sentinel process exited')
+            require(checkout_fingerprint() == before, 'checkout status or tracked tree changed')
+            require(all(not os.path.lexists(p) for p in host_markers), 'sandbox writable marker reached host path')
+            require(not os.path.exists(os.path.join(checkout, 'canary-' + nonce)), 'sandbox source write reached checkout')
+            print('PASS: checkout status and tracked tree hash unchanged; disposable writes removed')
+            # Launch from a parent that ignores SIGINT. The runner must reset the
+            # sandbox command's disposition, without altering its supervisor.
+            sigprobe = subprocess.run([os.path.join(here, 'test-sandboxed.sh'), '--', '/usr/bin/bash',
+                                       '-c', 'printf READY; kill -INT $$; printf SURVIVED'],
+                                      preexec_fn=lambda: signal.signal(signal.SIGINT, signal.SIG_IGN),
+                                      stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            require(sigprobe.returncode != 0 and b'READY' in sigprobe.stdout and b'SURVIVED' not in sigprobe.stdout,
+                    'sandbox command inherited ignored SIGINT')
+            print('PASS: synthetic /usr mode and inherited SIGINT controls')
             print('PASS: all owned-sentinel controls')
         finally:
             child.terminate()

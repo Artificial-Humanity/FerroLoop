@@ -17,11 +17,9 @@ scripts/test-sandbox-canary.sh
 
 The default command of `scripts/test-sandboxed.sh` is
 `cargo test --workspace --offline`; a command may instead follow `--`.
-**The current #539 hold still prohibits running product tests in this runner.**
-The owner must separately authorize a bounded full-suite experiment. A
-compile-only `cargo test --workspace --offline --no-run` was separately
-authorized; it compiles test executables but does not run them. Cargo build
-scripts and procedural macros can execute during compilation.
+The owner permits local product tests only through this runner. CI remains the
+merge authority; report local results as sandboxed, including failure counts.
+Cargo build scripts and procedural macros can execute during compilation.
 
 On 2026-11-17, this compile-only command completed successfully on ai-lab-0
 in 1 minute 40 seconds (exit status 0):
@@ -38,13 +36,12 @@ The runner builds a new mount namespace from explicit binds, uses separate
 user, PID, network, IPC and UTS namespaces, drops capabilities, clears the
 environment and closes inherited descriptors. It gives the command private
 home, XDG, runtime and temporary directories, proc and devices. System tools,
-libraries, the selected Rust sysroot, cargo registry and a source snapshot are
-read-only; `/usr/libexec` supplies compiler internals and the resolved host C
-compiler is selected explicitly for C builds and the Rust host linker. The only
-writable host-backed mount is the selected target directory. The snapshot includes only Git-tracked files (including
+libraries, the selected Rust sysroot and cargo registry are read-only; `/usr/libexec` supplies compiler internals and the resolved host C
+compiler is selected explicitly for C builds and the Rust host linker. The disposable source snapshot and recovery fixture are writable host-backed
+mounts, alongside the selected target directory. The snapshot includes only Git-tracked files (including
 tracked edits), omits Git metadata, untracked files and submodules, and refuses
 nested mounts in the source tree or any host bind;
-the snapshot and default target are removed on exit. The runner rejects unsafe bind
+the snapshot and default target are removed on exit unless an unsafe recovery fixture must be preserved. The runner rejects unsafe bind
 inputs or missing bubblewrap flags rather than falling back to host execution.
 It refuses to launch when non-ignored untracked files or ignored files in
 source/test/build locations would be omitted. Stage intended inputs first;
@@ -71,6 +68,17 @@ if the command fails. A failed post-run check makes the runner fail; inspect
 or remove the persistent directory yourself before reusing it. The runner does
 not remove a persistent target.
 
+Each run creates a private 0700 recovery fixture on the checked target filesystem,
+requires ext4 or XFS, and mounts it at `/recovery` as `FL_RECOVERY_TEST_DIR`.
+The runner scans it for sockets, special files and nested mounts before removal;
+unsafe fixtures are reported and preserved for inspection. The existing disk
+watchdog covers its filesystem. `/etc` and `/var/tmp` are private tmpfs mounts;
+localhost entries are synthesized and `/sandbox-bin/cc` points to the resolved
+compiler. Synthetic `/usr` is mode 0755 and sandbox commands start with
+the default SIGINT disposition; neither changes host files or supervisor signals.
+The canary writes nonce markers in the writable areas, confirms the
+checkout status and tracked tree hash remain unchanged, and prints mounts.
+
 Before creating the source snapshot, the runner checks available space on `/`
 and on the target filesystem; it refuses to proceed when either is below the
 reserve or cannot be measured. It keeps checking while the sandbox runs and
@@ -95,7 +103,7 @@ Read-only toolchain and registry mounts may become stale during a run; run the
 canary again after changing the host or runner. The snapshot has no `.git`, so
 tests requiring repository metadata may fail; offline dependencies must
 already be present. The compile-only result above does not prove the suite
-passes, and neither it nor a passing canary lifts the local-test hold.
+passes, and neither it nor a passing canary proves the full suite passes.
 The canary checks configured project and state store sockets, configured and
 database-derived Wire paths, and relevant environment overrides. It cannot
 discover arbitrary per-command socket and store paths in other sessions.
