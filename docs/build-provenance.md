@@ -85,8 +85,8 @@ first 12 digits of the commit, then `dirty` for a tree with changes (`dirty unkn
 could not say, `unknown commit` when there was no checkout, `release <id>` when a release id
 was set).
 
-`fl --version --json`, `fl -V --json` and `fl version --json` print one JSON object, the same
-from each:
+`fl --version --json`, `fl -V --json` and `fl version --json` print the same JSON object.
+This example shows the fields and supported formats.
 
 ```json
 {
@@ -105,7 +105,7 @@ from each:
     "vault": { "current": 1 }
   },
   "store_formats": {
-    "redb_schema": { "min": 2, "max": 9 },
+    "redb_schema": { "min": 2, "max": 10 },
     "ferrostore_container": { "min": 1, "max": 2 }
   }
 }
@@ -127,7 +127,7 @@ Version groups hold what the code checks by:
 | `schema.manifest` | `MANIFEST_FORMAT_WITHOUT_LEDGER` ..= `MANIFEST_FORMAT` | Manifest import: outside the range is refused. |
 | `schema.warrant_ledger` | `fl_gate::warrant::WARRANT_SCHEMA_VERSION` | Any other version is refused. |
 | `schema.vault` | `fl_gate::VAULT_SCHEMA_VERSION` | Any other version is refused. |
-| `store_formats.redb_schema` | `FORMAT_VERSION` ..= `FORMAT_WITH_AREA_DELETE` (the ladder `check_format` accepts) | Both engines open this ladder. A new store starts at `min`; the first write of a newer kind raises it, and an older build refuses the raised store. |
+| `store_formats.redb_schema` | `FORMAT_VERSION` ..= `FORMAT_WITH_AREA_PARENT` (the ladder `check_format` accepts) | Both engines open this logical schema range. A new redb store starts at 2. A new FerroStore file starts at 8 (`FORMAT_WITH_WORKFLOW`). The first write that needs a newer format raises the store to that format. |
 | `store_formats.ferrostore_container` | `CONTAINER_FORMAT_OLDEST` ..= `CONTAINER_FORMAT_NEWEST` | The `.fls` container: this build reads both and writes the newest. |
 
 ## `ferrostore --version`

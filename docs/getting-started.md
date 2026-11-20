@@ -2,7 +2,7 @@
 
 This walks through gating one real action — a config file has to parse before you're
 allowed to call a build "ready to launch" — from an empty database to a refused launch and
-back to an allowed one. Every command below was actually run to produce the output shown.
+back to an allowed one. The walkthrough transcripts show output from the versions listed below.
 
 The product is **FerroLoop**. The command you type is `fl` — a short handle, the way
 Claude Code's is `claude`. This document uses "FerroLoop" in prose and `fl` in every
@@ -135,10 +135,11 @@ named `all`. A send to `@<name>` that is not a virtual group is refused, naming 
 (`@area:<slug>` reaches the agents of a project with a path).
 
 ```
-fl project create <name> --path <dir> [--slug <slug>] [--git-init]
+fl project create (<name> | --name <name>) --path <dir> [--slug <slug>] [--create-parent] [--git-init]
                   [--github <owner/repo>] [--credential <app|env>] [--purpose <text>]
                   [--by <author>] [--json]
-fl project create <name> --virtual [--slug <slug>] [--purpose <text>] [--by <author>] [--json]
+fl project create (<name> | --name <name>) --virtual [--slug <slug>] [--create-parent]
+                  [--purpose <text>] [--by <author>] [--json]
 fl project init   <dir>  [--name <name>] ...    the same command; the argument is the directory
 fl project add    <dir>                         register a directory in the current store
 fl project list   [--json]
@@ -178,7 +179,7 @@ A directory-backed project is made in this order, leaving what is already right 
    asked for; creating never rebinds one that has a tracker (the Hub's
    `PATCH /api/v1/projects/<slug>` does).
 
-A virtual group is one write: its area, with no path, in the workspace store. No directory, no
+A virtual group records its area, with no path, in the workspace store. No directory, no
 store file, no config block and no Git; `--virtual` refuses `--path`, `--git-init`, `--github`
 and `--credential`. An area made earlier with `fl agent register --create-area` has no path
 either, so it is a virtual group already; to make a directory-backed project of that slug, first
@@ -189,15 +190,53 @@ Nothing is changed until the request is checked. fl refuses an empty path, a NUL
 a file, a slug that another project's block already has (at another root), a root that is already
 registered under another slug, a store that holds another project, a root that contains the
 stores' directory, and a slug that is the other kind. Running the same command again changes
-nothing. `--json` prints the project as the Hub lists it (`slug`, `name`, `kind`, `path`,
-`has_git`, `purpose`, `tracker`, `store_path`, `active_agent_count`) plus `registered`, `git`
+nothing. `--json` prints the project as the Hub lists it (`slug`, `name`, `parent`,
+`ancestors`, `kind`, `path`, `has_git`, `purpose`, `tracker`, `store_path`,
+`active_agent_count`) plus `registered`, `git`
 (`null` unless `--git-init` ran), `mcp_catalog_created`, `areas` and `config`.
 
 `fl project list` shows every directory-backed project in the config and every virtual group,
-one per line: kind, slug, path (`-` for a group), tracker repository (`-` for none) and the number
-of active agents whose project or extra areas name it. With `--json` it prints the list that
-`GET /api/v1/projects` serves ([hub-home-and-artifacts.md](hub-home-and-artifacts.md)), which
-also creates (`POST`), updates (`PATCH`) and deletes (`DELETE`) them.
+one per line with kind, slug, path (`-` for a group), tracker repository (`-` for none), the
+number of active agents whose project or extra areas name it, and the full display name.
+With `--json` it prints the list that `GET /api/v1/projects` serves. The Hub can also create
+projects with `POST`, update them with `PATCH`, and delete them with `DELETE`.
+[Hub projects API](hub-home-and-artifacts.md)
+
+#### Create nested projects
+
+Use `/` in a display name to create a project or virtual group under a parent. Each name can
+have up to four nonempty segments. A parent can be a directory-backed project or a virtual
+group. In this example, `Kaggle` is a virtual group and `Kaggle/Pokémon` has its own directory.
+
+```sh
+fl project create --virtual --name Kaggle
+fl project create --name "Kaggle/Pokémon" --path ./pokemon
+fl project list
+```
+
+The default slug is flat ASCII. The project above is `kaggle-pokemon` because derivation folds
+Latin accents and joins the segments with hyphens. Supply `--slug` to choose a slug or to use
+a name with letters that cannot be converted to ASCII. If a parent is missing, pass
+`--create-parent` to create missing ancestors as virtual groups. If a missing ancestor needs
+its own explicit slug, create it first.
+
+```sh
+fl project create --virtual --name "Examples/東京" --slug examples-tokyo --create-parent
+```
+
+The JSON list reports the immediate parent's slug in `parent` and the chain from the root to
+that parent in `ancestors`. Existing projects without a saved parent appear at the top level,
+including names that already contain a slash.
+
+In FerroDeck, choose **Create Project / Group** in the Projects settings. Enable
+**Create missing parent groups** when needed. The roster shows a project's agents before
+its children. Each row remembers its own collapse state. Collapsing a parent hides its
+subtree and rolls unread and attention badges into the parent row. The parent link organizes
+the display. Project configuration, agent membership, and access are resolved for each
+project. Renaming and moving linked projects are tracked separately. [Project hierarchy #310](https://github.com/Artificial-Humanity/FerroLoop/issues/310)
+
+Upgrade store readers, writers, and registry replicas before creating or importing the first
+linked project. At that point, affected stores move to schema 10. [Store schema and upgrade](ferrostore-spec.md#schema-version)
 
 ### Delete a project: `fl project delete`
 
@@ -205,6 +244,7 @@ also creates (`POST`), updates (`PATCH`) and deletes (`DELETE`) them.
 from the workspace store, and deletes no file. A virtual group loses its area only. A slug that
 names nothing is refused (exit 1).
 
+* **Child projects.** fl refuses to delete a project or group with registered children.
 * **Agents.** A project whose active agents (project or extra areas equal the slug or the area's
   name, ignoring case) are not dealt with is refused with exit 2, naming them, and nothing
   changes. `--reassign-to <target_slug>` moves them to that project (a project or a virtual group

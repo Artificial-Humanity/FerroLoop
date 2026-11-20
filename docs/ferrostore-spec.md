@@ -52,7 +52,37 @@ A slot is valid only when magic, a known version, padding, and CRC all match, an
 
 ### Schema version
 
-The document `("__meta", "schema_version")` holds the schema version, on the same ladder as `RedbStore` (`FORMAT_VERSION` to `FORMAT_WITH_AREA_DELETE` in `crates/store/src/lib.rs`), so `format_version()` means the same on both. A new store starts at `FORMAT_WITH_WORKFLOW`; the first area deletion (the `area_delete` registry event, written or imported) raises it to `FORMAT_WITH_AREA_DELETE`, so an older build refuses a store it cannot decode. A write that needs a newer schema raises it in the same transaction, and a raise never lowers it. `open` refuses a version off the ladder with `StoreError::FormatVersion`. A store from before `__meta` reads its version from `("meta", "format_version")`, or has none: it opens, and `format_version()` is `None`. No trait method lists `__meta`. A collection whose name starts with `__` is reserved: only the store's own transactions write it. `put_doc` and `delete_doc`, local or over the socket, refuse it, and a cache miss on it is never fetched. Sync carries its ops like any other: an outbound batch holds every op of its commit, so sync sequences have no gaps. An inbound batch never applies a reserved op as it is. A put of `("__meta", "schema_version")` to a version on the ladder above the store's own raises it. A put of a version newer than this build refuses the whole batch with `StoreError::FormatVersion`, as `open` does. Every other reserved op (an older, equal or off-ladder version, another `__meta` id, a delete, another `__` collection) is dropped. The batch's sequence advances even when every op in it is dropped.
+The document `("__meta", "schema_version")` holds the logical schema version. FerroStore and
+`RedbStore` share the same range, from `FORMAT_VERSION` (2) through
+`FORMAT_WITH_AREA_PARENT` (10) in `crates/store/src/lib.rs`. A new FerroStore file starts at
+`FORMAT_WITH_WORKFLOW` (8). A new redb store starts at 2.
+
+The first area deletion or import of an `area_delete` event raises the schema to at least
+`FORMAT_WITH_AREA_DELETE` (9). A local area upsert that saves a parent slug or an import of an
+area-upsert event carrying a parent slug raises it to 10. The version change commits in the
+same transaction as the area change and registry event. Flat area rows and events keep
+their original encoding.
+
+An embedded open refuses a version outside the supported range with
+`StoreError::FormatVersion`. An older FerroStore handle that is already open can refresh
+without rechecking the schema. Before the first linked write or import, use a matching
+build for the CLI, the Hub, FerroWire, the standalone `ferrostore` server if used, other
+store consumers, and registry replicas. Restart the running components on that build.
+Rolling back to a build capped at schema 9 requires that every affected store still use
+a version it supports. After a store reaches schema 10, removing its parent links leaves
+it at 10.
+
+A store from before `__meta` reads its version from `("meta", "format_version")` if present.
+Without either version record, the store opens and `format_version()` returns `None`.
+No trait method lists `__meta`. A collection whose name starts with `__` is reserved for the
+store's own transactions. `put_doc` and `delete_doc`, local or over the socket, refuse it, and
+a cache miss on it is never fetched. The outbound sync batch includes every op of its commit
+so sync sequences have no gaps. Inbound sync checks reserved ops separately. A put of
+`("__meta", "schema_version")` to a supported version above the store's current version
+raises it. A put of a version newer than this build refuses the whole batch with
+`StoreError::FormatVersion`. Every other reserved op (an older, equal or off-ladder version,
+another `__meta` id, a delete, another `__` collection) is dropped. The batch's sequence
+advances even when every op is dropped.
 
 Every committed WAL append and every `checkpoint` publishes a new generation: write the inactive slot (the slot that does not hold the highest valid epoch) with `epoch + 1`, then `fsync`. The live slot is never rewritten in place.
 
