@@ -105,8 +105,12 @@ belongs to a non-author. For every Project Manager review check, including reque
 escalation and approval, the PR's project must be among that manager's registered areas. This
 uses the extra areas a manager already registers and needs no parent link between projects.
 System-level changes (the workspace, the lab host, shared services) stay with the Director.
-The existing Owner authority and the Owner-tier triggers of `pr_policy` (including protected
-paths, missing trailers and instruction files) take precedence over the chain.
+Existing Owner authority and unconditional Owner-tier triggers take precedence over
+the chain. These include protected paths, instruction files, an empty commit list, missing
+trailers, missing or unresolved active-agent co-authorship, and Director co-authorship
+(the former Lab Manager case). For availability-based routing, the chain above replaces
+the old Owner fallback based on missing eligible Leads or Lab Managers. Use the Owner as
+the fallback once the applicable non-Owner tiers have been exhausted.
 
 Request routing checks live routes and records why it skipped a tier for this project and
 head. A tier is absent when it has no eligible agent and offline when none of its eligible
@@ -577,8 +581,9 @@ plan:
 revisions from the state log (`crates/exec/src/state_sync.rs:879–896,955–967`). Workspace
 runtime entries with `role-` keys are the live role catalog. The reader requires the key suffix
 to match the role payload slug. Role upserts and tombstones use the same workspace runtime
-key (`crates/core/src/agent.rs:671–683,753–764,771–794`). A legacy `role-director` revision
-concerns the Project Manager, including when it is a tombstone.
+key (`crates/core/src/agent.rs:671–683,753–764,771–794`). For admission, classify a legacy
+`role-director` revision as targeting the Project Manager. This classification also applies
+to a tombstone, which must still pass the built-in role protection below.
 
 At the epoch, fail closed on import or export of legacy or unclassified role-catalog revisions
 until the P1 plan implements epoch-aware admission and projection. Hold unverifiable Owner
@@ -592,9 +597,13 @@ The P1 plan must specify and validate how the canonical key and payload slug, re
 lineage, and tombstones translate together into the live catalog while the published revision
 log remains append-only. Classify tombstones by their source namespace and key even when the
 payload lacks a slug. Require explicit namespace and verified Owner authorization before
-admitting authority-bearing revisions after cutover (§7.1). Legacy revisions must never set or
-delete the new Director record, and replay must never resurrect a role removed by a later
-tombstone. The fence applies independently of registry-event and store-level sync admission.
+admitting authority-bearing revisions after cutover (§7.1). Refuse tombstones targeting
+deletion-protected built-ins, including a legacy `role-director` tombstone. Preserve the
+protected baseline and any admitted override. If the invalid revision is retained out of
+the live catalog, preserve its identity, source lineage and refusal evidence. Legacy revisions
+must leave the new Director record untouched, and replay must honor a valid later tombstone
+for a deletable role when it encounters an earlier upsert in that lineage. The fence applies
+independently of registry-event and store-level sync admission.
 
 ### 7.4 The `custom:` prefix
 
@@ -723,8 +732,13 @@ count. After a rollback, no pull request is merged on a review posted before the
   in-portfolio manager becomes the target and their approval can count. The Director's
   approval still needs evidence that the in-portfolio tier is unavailable. A new head H2
   needs current-head approval and fresh timeout evidence. Recorded absence or offline status
-  allows immediate escalation to the next eligible tier. Owner-tier triggers continue to route
-  to the Owner first.
+  allows immediate escalation to the next eligible tier. Unconditional Owner-tier triggers
+  continue to route to the Owner first.
+- A Lead opens a PR with no eligible Director and an eligible in-portfolio Project Manager on
+  a live route. The Project Manager receives the request and can approve that head. Repeat
+  with a member author, no eligible Lead or Director, and the same Project Manager. In both
+  cases an unconditional Owner-tier trigger, such as an instruction-file change, routes
+  directly to the Owner.
 - Spin-up with no `permission_policy`: the hosted record shows the role's profile and its
   compile receipt. With a widening override and no Owner authority: refused, naming the rule.
 - Two agents of different roles in one project directory get different compiled rules, and
@@ -770,15 +784,22 @@ count. After a rollback, no pull request is merged on a review posted before the
   `custom:lead` event and resume when the verified mapping is present. Event IDs, payloads and
   recorded statuses stay unchanged. The migration appends no `AgentUpsert`.
 - Role-catalog sync: `fl/state` revisions still reach the catalog path with registry sync
-  disabled. Stage a legacy `role-director` write and its descendant tombstone, alongside a
-  namespace-2 `role-director` revision. Before epoch-aware handling is supported, reject or
-  durably hold the legacy revisions without losing retry progress or
-  touching either live role. After verified admission and replay, the new Director is
-  unchanged, the Project Manager remains deleted, and the source lineage and revision IDs
-  are intact. Attempt the same authority change via dedicated role writes, generic state
-  writes and sync without Owner proof. Each path refuses to activate it, even with `by` set
-  to the Owner or an authenticated transport. Repeat with valid Owner authorization and the
-  right namespace as a positive control.
+  disabled. Stage a legacy `role-director` upsert and a namespace-2 `role-director` upsert.
+  Before epoch-aware handling is supported, reject or durably hold the legacy revision
+  without losing retry progress or touching either live role. After verified legacy
+  admission, the upsert applies to the Project Manager and the new Director keeps its own
+  namespace-2 record. A descendant tombstone for the legacy built-in is refused. Both role
+  records stay intact, including the admitted Project Manager override. Keep original revision
+  IDs and source lineage, including for any durably held refusal.
+- With the same sync configuration, stage a legacy upsert for a deletable custom role and a
+  valid descendant tombstone. Refuse or durably hold the lineage until epoch-aware admission
+  is available. After retry or resumption with verified admission, replay the earlier upsert
+  and check that the custom role remains deleted and the source lineage and revision IDs
+  are intact.
+- Attempt an authority-changing role upsert via dedicated role writes, generic state writes
+  and sync without Owner proof. Each path refuses to activate it, even with `by` set to the
+  Owner or an authenticated transport. Repeat with valid Owner authorization and the right
+  namespace as a positive control.
 - Marker decoding: a posted marker without a namespace field and with role `lab_manager`
   verifies as the Director tier, and one with role `director` verifies as the Project Manager
   tier. A marker with `role_ns: 2` and role `director` verifies as the Director tier. Neither
