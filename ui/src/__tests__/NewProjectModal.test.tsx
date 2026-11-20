@@ -1,6 +1,7 @@
 import { useRef, useState } from "react";
 import { act, fireEvent, render, screen } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
+import { HubApiClient } from "../api/client";
 import {
   NewProjectModal,
   deriveProjectSlug,
@@ -70,6 +71,48 @@ describe("deriveProjectSlug", () => {
 });
 
 describe("NewProjectModal", () => {
+  it.each(["project", "virtual"] as const)(
+    "leaves the Hub to resolve the historical slug for an untouched %s preview",
+    async (kind) => {
+      const name = "Kaggle/Pokémon";
+      const path = "/work/pokemon";
+      const legacySlug = "kaggle-pok-mon";
+      const legacyProject = {
+        ...CREATED,
+        id: legacySlug,
+        slug: legacySlug,
+        name,
+        kind,
+        path: kind === "project" ? path : null,
+      };
+      const fetchImpl = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) =>
+        Response.json(legacyProject),
+      );
+      const client = new HubApiClient({ baseUrl: "http://hub.test", fetchImpl });
+      const { onCreated } = setup((request) => client.createProject(request), [legacySlug]);
+      type("new-project-name", name);
+      if (kind === "virtual") {
+        fireEvent.click(screen.getByTestId("new-project-kind-virtual"));
+      } else {
+        type("new-project-path", path);
+      }
+      fireEvent.click(screen.getByRole("checkbox", { name: "Create missing parent groups" }));
+      expect(screen.getByTestId("new-project-slug")).toHaveValue("kaggle-pokemon");
+      await submit();
+
+      expect(fetchImpl).toHaveBeenCalledTimes(1);
+      const [url, init] = fetchImpl.mock.calls[0];
+      expect(url).toBe("http://hub.test/api/v1/projects");
+      expect(init?.method).toBe("POST");
+      expect(JSON.parse(String(init?.body))).toEqual(
+        kind === "project"
+          ? { name, kind, path, create_parent: true }
+          : { name, kind, create_parent: true },
+      );
+      expect(onCreated).toHaveBeenCalledWith(legacyProject);
+    },
+  );
+
   it("previews a hierarchical slug and only sends parent creation when checked", async () => {
     const { create } = setup();
     type("new-project-name", "Café / R&D / Mobile");
@@ -81,7 +124,6 @@ describe("NewProjectModal", () => {
     await submit();
     expect(create).toHaveBeenCalledWith({
       name: "Café / R&D / Mobile",
-      slug: "cafe-r-d-mobile",
       kind: "project",
       path: "/work/mobile",
       create_parent: true,
@@ -193,7 +235,6 @@ describe("NewProjectModal", () => {
     expect(create).toHaveBeenCalledTimes(1);
     expect(create.mock.calls[0][0]).toStrictEqual({
       name: "Alpha Project",
-      slug: "alpha-project",
       kind: "project",
       purpose: "Does alpha things",
       path: "/work/alpha",
@@ -205,13 +246,12 @@ describe("NewProjectModal", () => {
     expect(onClose).toHaveBeenCalledTimes(1);
   });
 
-  it("sends only name, slug, kind and path for a minimal Directory Project", async () => {
+  it("sends only name, kind and path for a minimal Directory Project", async () => {
     const { create } = setup();
     fillProject();
     await submit();
     expect(create.mock.calls[0][0]).toStrictEqual({
       name: "Alpha",
-      slug: "alpha",
       kind: "project",
       path: "/work/alpha",
     });
@@ -252,8 +292,9 @@ describe("NewProjectModal", () => {
     expect(screen.getByTestId("new-project-slug")).toHaveValue("b");
   });
 
-  it("re-derives an empty slug on blur", () => {
-    setup();
+  it("uses the hub default after an emptied slug is refilled on blur", async () => {
+    const { create } = setup();
+    type("new-project-path", "/work/alpha");
     type("new-project-name", "My App");
     type("new-project-slug", "custom");
     type("new-project-slug", "");
@@ -262,6 +303,17 @@ describe("NewProjectModal", () => {
     // Derivation is live again.
     type("new-project-name", "Third One");
     expect(screen.getByTestId("new-project-slug")).toHaveValue("third-one");
+    await submit();
+    expect(create.mock.calls[0][0]).not.toHaveProperty("slug");
+  });
+
+  it("sends the edited slug even when it matches the original preview", async () => {
+    const { create } = setup();
+    fillProject();
+    type("new-project-slug", "custom");
+    type("new-project-slug", "alpha");
+    await submit();
+    expect(create.mock.calls[0][0]).toHaveProperty("slug", "alpha");
   });
 
   it("does not touch a non-empty slug on blur", () => {
@@ -300,7 +352,6 @@ describe("NewProjectModal", () => {
     await submit();
     expect(create.mock.calls[0][0]).toStrictEqual({
       name: "Alpha",
-      slug: "alpha",
       kind: "virtual",
       purpose: "Council scope",
     });

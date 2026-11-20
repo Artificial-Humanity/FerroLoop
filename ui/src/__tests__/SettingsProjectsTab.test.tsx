@@ -664,7 +664,6 @@ describe("Settings Projects tab", () => {
           ?.body,
       ).toEqual({
         name: "Council",
-        slug: "council",
         kind: "virtual",
         purpose: "Cross-project scope",
       });

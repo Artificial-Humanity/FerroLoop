@@ -71,7 +71,7 @@ function makeHub(initial: ProjectSummary[], mode: ProjectsMode = "ok") {
     }
     if (url.endsWith("/api/v1/projects")) {
       if (method === "POST") {
-        const created = summary(body.slug, body.name, body.kind);
+        const created = summary(body.slug ?? body.name.toLowerCase(), body.name, body.kind);
         state.projects.push(created);
         return json(created, 201);
       }

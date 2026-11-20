@@ -181,9 +181,10 @@ function NewProjectForm({
     // the hub keeps its own default.
     const req: CreateProjectRequest = {
       name: trimmedName,
-      slug: trimmedSlug,
       kind,
     };
+    // Let the hub resolve an untouched preview, including historical project slugs.
+    if (slugManual) req.slug = trimmedSlug;
     if (isNested && createParent) req.create_parent = true;
     if (trimmedPurpose) req.purpose = trimmedPurpose;
     if (isProject) {
