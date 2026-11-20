@@ -224,11 +224,11 @@ fn failure(action: &str, error: impl std::fmt::Display) -> LifecycleError {
     LifecycleError::Store(format!("lifecycle fence {action}: {error}"))
 }
 fn resolve_endpoint(_env: &LifecycleEnv<'_>) -> Result<HostEndpoint, LifecycleError> {
-    // Existing unit fixtures explicitly supply isolated homes; never fall back to a live host.
+    // Unit fixtures with an isolated home keep their own fence even when another
+    // parallel test has registered its mock host for process-wide discovery.
     #[cfg(test)]
     if let Some(home) = _env.home_override {
-        return HostEndpoint::discover()
-            .or_else(|_| HostEndpoint::unix(home.join("test-lifecycle-host.sock")))
+        return HostEndpoint::unix(home.join("test-lifecycle-host.sock"))
             .map_err(|e| failure("discovery", e));
     }
     HostEndpoint::discover().map_err(|e| failure("discovery", e))
