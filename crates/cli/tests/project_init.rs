@@ -1007,6 +1007,153 @@ fn nested_projects_keep_flat_slugs_and_explicit_names() {
 }
 
 #[test]
+fn resume_flat_uses_the_existing_project_store_without_creating_ancestors() {
+    for (name, slug, extension) in [
+        ("Kaggle/Pokémon", "kaggle-pok-mon", "fls"),
+        ("Archive//Old", "archive-old", "redb"),
+    ] {
+        let env = Env::new();
+        let root = env.dir("historical");
+        std::fs::create_dir(&root).unwrap();
+        let ws = env.home.path().join("data/fl/fl.fls");
+        let store = ws.with_file_name(format!("{slug}.{extension}"));
+        let mut seed = env.fl(env.work.path());
+        if extension == "redb" {
+            seed.env("FL_STORE_BACKEND", "redb");
+        }
+        seed.arg("--db")
+            .arg(&store)
+            .args(["project", "add"])
+            .arg(&root)
+            .assert()
+            .success();
+        let args = [
+            "--resume-flat",
+            "--name",
+            name,
+            "--slug",
+            slug,
+            "--path",
+            root.to_str().unwrap(),
+        ];
+        for expected_registered in [true, false] {
+            let resumed = env.run_json("create", &args);
+            assert_eq!(resumed["slug"], slug);
+            assert_eq!(resumed["name"], name);
+            assert_eq!(resumed["parent"], Value::Null);
+            assert_eq!(resumed["ancestors"], serde_json::json!([]));
+            assert_eq!(resumed["registered"], expected_registered);
+        }
+        assert_eq!(env.slugs(), [slug]);
+        assert!(root.join(".fl/mcp.toml").is_file());
+        assert_ne!(
+            fl_store::FerroStore::open(&ws)
+                .unwrap()
+                .format_version()
+                .unwrap(),
+            Some(10)
+        );
+    }
+}
+
+#[test]
+fn resume_flat_refuses_missing_empty_and_wrong_root_stores_before_project_changes() {
+    for fixture in ["missing", "empty", "wrong-root", "wrong-root-redb"] {
+        let env = Env::new();
+        let root = env.dir("requested");
+        let ferro = env.home.path().join("data/fl/historical.fls");
+        let store = if fixture == "wrong-root-redb" {
+            ferro.with_extension("redb")
+        } else {
+            ferro.clone()
+        };
+        match fixture {
+            "empty" => drop(fl_store::open_store(&store).unwrap()),
+            "wrong-root" | "wrong-root-redb" => {
+                let other = env.dir("other");
+                std::fs::create_dir(&other).unwrap();
+                let mut seed = env.fl(env.work.path());
+                if fixture == "wrong-root-redb" {
+                    seed.env("FL_STORE_BACKEND", "redb");
+                }
+                seed.arg("--db")
+                    .arg(&store)
+                    .args(["project", "add"])
+                    .arg(&other)
+                    .assert()
+                    .success();
+            }
+            _ => {}
+        }
+        let before = std::fs::read(&store).ok();
+        env.fl(env.work.path())
+            .args([
+                "project",
+                "create",
+                "--resume-flat",
+                "--name",
+                "Archive/Old",
+                "--slug",
+                "historical",
+                "--git-init",
+                "--path",
+            ])
+            .arg(&root)
+            .assert()
+            .failure()
+            .stderr(contains(if fixture == "missing" {
+                "existing project store"
+            } else {
+                "does not hold exactly the project at"
+            }));
+        assert!(!root.exists());
+        assert!(!env.config_path().exists());
+        assert!(!env.home.path().join("data/fl/fl.fls").exists());
+        assert_eq!(std::fs::read(&store).ok(), before);
+        if fixture == "wrong-root-redb" {
+            assert!(!ferro.exists());
+        }
+    }
+}
+
+#[test]
+fn resume_flat_does_not_flatten_an_existing_linked_project() {
+    let env = Env::new();
+    let root = env.dir("linked");
+    env.run_json(
+        "create",
+        &[
+            "Top/Child",
+            "--path",
+            root.to_str().unwrap(),
+            "--create-parent",
+        ],
+    );
+    env.fl(env.work.path())
+        .args([
+            "project",
+            "create",
+            "--resume-flat",
+            "--name",
+            "Top/Child",
+            "--slug",
+            "top-child",
+            "--path",
+        ])
+        .arg(&root)
+        .assert()
+        .failure()
+        .stderr(contains("linked project"));
+    assert_eq!(
+        env.projects()
+            .iter()
+            .find(|p| p["slug"] == "top-child")
+            .unwrap()["parent"],
+        "top"
+    );
+}
+
+#[test]
 fn nested_area_set_updates_purpose_without_repointing_the_area() {
     let env = Env::new();
     let root = env.dir("child");

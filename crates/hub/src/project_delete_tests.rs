@@ -75,6 +75,7 @@ impl Fx {
             path: root.to_path_buf(),
             slug: None,
             create_parent: false,
+            resume_flat: false,
             display_name: None,
             github: None,
             credential: None,

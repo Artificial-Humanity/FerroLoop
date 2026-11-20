@@ -209,6 +209,8 @@ pub struct InitRequest {
     pub display_name: Option<String>,
     /// Create missing ancestor groups.
     pub create_parent: bool,
+    /// Resume an interrupted flat registration from its existing project store.
+    pub resume_flat: bool,
     /// `owner/repo`: bind the project's tracker to this GitHub repository.
     pub github: Option<String>,
     /// The tracker's credential source; `app` when `github` is given and this is not.
@@ -843,7 +845,16 @@ fn resolve_project(
         (None, Some(e)) => Some(checked_slug(&e.slug().unwrap_or_default())?),
         (None, None) => None,
     };
+    if req.resume_flat && (req.slug.is_none() || req.display_name.is_none() || req.create_parent) {
+        return Err(invalid(
+            "--resume-flat requires --slug, --name and --path, and cannot create ancestors",
+        ));
+    }
     let (slug, display_name) = match &req.display_name {
+        Some(raw) if req.resume_flat => (
+            known_slug.expect("flat recovery requires an explicit slug"),
+            Some(checked_display_name(raw)?),
+        ),
         Some(raw) => {
             let (slug, name) = display_identity(raw, known_slug, |slug, name| {
                 matches_legacy(slug, name, &root)
@@ -876,6 +887,7 @@ fn resolve_project(
 
     let store = match here.and_then(|e| e.store.as_deref()) {
         Some(s) => PathBuf::from(s),
+        None if req.resume_flat => historical_store_path(paths, &slug),
         None => paths.store_dir.join(format!("{slug}.fls")),
     };
     if fl_store::store_identity(&store) == fl_store::store_identity(&paths.workspace_store) {
@@ -974,13 +986,18 @@ fn ensure_git(root: &Path, by: &str) -> Result<GitOutcome, InitError> {
 
 /// Puts the project in its store (once) and gives it the default routing map (if it has none).
 /// Returns the project's IRI and the areas its map declares.
-fn seed_project_store(store: &AnyStore, r: &Resolved) -> Result<(String, Vec<String>), InitError> {
+fn seed_project_store(
+    store: &AnyStore,
+    r: &Resolved,
+    resume_flat: bool,
+) -> Result<(String, Vec<String>), InitError> {
     let st = |e: fl_core::store::StoreError| failed(format!("store: {e}"));
     let root = r.root.to_string_lossy();
     let held = store.list_projects().map_err(st)?;
     let id = match held.as_slice() {
-        [] => store.add_project(&root).map_err(st)?,
         [p] if same_root(&p.root, &r.root) => p.id.clone(),
+        _ if resume_flat => return Err(resume_store_refusal(r)),
+        [] => store.add_project(&root).map_err(st)?,
         _ => {
             return Err(conflict(format!(
                 "the store {} already holds {}, not {}. A project's store holds only that \
@@ -1006,6 +1023,45 @@ fn seed_project_store(store: &AnyStore, r: &Resolved) -> Result<(String, Vec<Str
         id.iri().as_str().to_string(),
         map.areas.iter().map(|a| a.area.clone()).collect(),
     ))
+}
+
+fn historical_store_path(paths: &InitPaths, slug: &str) -> PathBuf {
+    let ferro = paths.store_dir.join(format!("{slug}.fls"));
+    let redb = ferro.with_extension("redb");
+    if std::fs::symlink_metadata(&ferro).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+        && redb.is_file()
+    {
+        redb
+    } else {
+        ferro
+    }
+}
+
+fn resume_store_refusal(resolved: &Resolved) -> InitError {
+    conflict(format!(
+        "the store {} does not hold exactly the project at {}",
+        resolved.store.display(),
+        resolved.root.display()
+    ))
+}
+
+fn check_resume_store(resolved: &Resolved) -> Result<(), InitError> {
+    if !fl_store::store_exists(&resolved.store) {
+        return Err(conflict(format!(
+            "--resume-flat requires an existing project store at {}",
+            resolved.store.display()
+        )));
+    }
+    // A wrong root must not cause a lone redb to be migrated.
+    let store = fl_store::open_store_for_scan(&resolved.store)
+        .map_err(|e| failed(format!("store {}: {e}", resolved.store.display())))?;
+    let projects = store
+        .list_projects()
+        .map_err(|e| failed(format!("store {}: {e}", resolved.store.display())))?;
+    match projects.as_slice() {
+        [project] if same_root(&project.root, &resolved.root) => Ok(()),
+        _ => Err(resume_store_refusal(resolved)),
+    }
 }
 
 /// The registry's refusal when a project's slug is already a virtual group. The way out is
@@ -1302,17 +1358,21 @@ where
         let legacy_root = workspace
             .cached_area(&legacy_slug)
             .and_then(|area| area.path.as_deref());
-        let legacy_store = paths.store_dir.join(format!("{legacy_slug}.fls"));
+        let legacy_store = historical_store_path(paths, &legacy_slug);
         if legacy_root.is_none_or(|path| path.trim().is_empty() || same_root(path, &resolved.root))
             && fl_store::store_exists(&legacy_store)
         {
             return Err(conflict(format!(
                 "the historical store {} may be from an interrupted project setup. Use \
-                 --slug {legacy_slug} to resume it, or --slug {} to create a separate project",
+                 --resume-flat --slug {legacy_slug} with --name and --path to resume it flat, \
+                 or --slug {} to create a separate project",
                 legacy_store.display(),
                 resolved.slug
             )));
         }
+    }
+    if req.resume_flat {
+        check_resume_store(&resolved)?;
     }
     let (workspace_store, registry) = workspace.open()?;
     let before = registry.get(&resolved.slug);
@@ -1321,22 +1381,49 @@ where
         .display_name
         .clone()
         .unwrap_or_else(|| before.map_or_else(|| resolved.slug.clone(), |area| area.name.clone()));
-    let placement = plan_placement(
-        &resolved.slug,
-        name,
-        req.create_parent,
-        &req.by,
-        &registry,
-        |parent| {
-            let doc = read_config(&paths.config_path)?;
-            let entries = config_entries(&doc, &paths.config_path)?;
-            check_virtual_slug(parent, paths, &entries)?;
-            check_held_project(
-                parent,
-                &workspace_store.list_projects().map_err(workspace_error)?,
-            )
-        },
-    )?;
+    let placement = if req.resume_flat {
+        if let Some(area) = before {
+            if area.parent.is_some() {
+                return Err(conflict(format!(
+                    "cannot resume linked project `{}` as flat",
+                    resolved.slug
+                )));
+            }
+            if area.name != name
+                || !area
+                    .path
+                    .as_deref()
+                    .is_some_and(|path| same_root(path, &resolved.root))
+            {
+                return Err(conflict(format!(
+                    "existing flat area `{}` must match --name and --path to resume it",
+                    resolved.slug
+                )));
+            }
+        }
+        Placement {
+            name,
+            parent: None,
+            missing: Vec::new(),
+        }
+    } else {
+        plan_placement(
+            &resolved.slug,
+            name,
+            req.create_parent,
+            &req.by,
+            &registry,
+            |parent| {
+                let doc = read_config(&paths.config_path)?;
+                let entries = config_entries(&doc, &paths.config_path)?;
+                check_virtual_slug(parent, paths, &entries)?;
+                check_held_project(
+                    parent,
+                    &workspace_store.list_projects().map_err(workspace_error)?,
+                )
+            },
+        )?
+    };
     let purpose = match (&req.purpose, before) {
         (Some(purpose), _) => checked_purpose(purpose)?,
         (None, Some(area)) => area.purpose.clone(),
@@ -1360,7 +1447,7 @@ where
             .map_err(|e| failed(format!("could not create {}: {e}", dir.display())))?;
     }
     let project_store = open_project(&resolved)?;
-    let (project, areas) = seed_project_store(&project_store, &resolved)?;
+    let (project, areas) = seed_project_store(&project_store, &resolved, req.resume_flat)?;
     let area = AreaRecord {
         area_key: resolved.slug.clone(),
         name: placement.name,

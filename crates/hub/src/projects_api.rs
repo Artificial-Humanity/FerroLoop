@@ -252,6 +252,7 @@ pub(crate) fn handle_post_projects(
                 slug,
                 display_name: name,
                 create_parent: body.create_parent,
+                resume_flat: false,
                 github: present(body.github),
                 credential,
                 purpose,

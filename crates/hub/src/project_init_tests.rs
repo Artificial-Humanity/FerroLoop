@@ -64,6 +64,7 @@ impl Sandbox {
             slug: None,
             display_name: None,
             create_parent: false,
+            resume_flat: false,
             github: None,
             credential: None,
             purpose: None,
@@ -3622,9 +3623,8 @@ fn legacy_project_retry_preserves_an_unbound_old_slug_and_its_existing_store() {
 }
 
 #[test]
-fn legacy_project_retry_requires_an_explicit_slug_when_only_the_old_store_exists() {
+fn legacy_project_retry_requires_explicit_flat_recovery_when_only_the_old_store_exists() {
     let sb = Sandbox::new();
-    sb.virtual_group(&sb.vrequest("Kaggle")).unwrap();
     let root = sb.dir("existing-work");
     fs::create_dir_all(&root).unwrap();
     let old_slug = "kaggle-pok-mon";
@@ -3637,12 +3637,15 @@ fn legacy_project_retry_requires_an_explicit_slug_when_only_the_old_store_exists
     let old_bytes = fs::read(&old_path).unwrap();
     let registry = sb.workspace().list_areas().unwrap();
     assert!(!sb.paths.config_path.exists());
-    assert_eq!(registry.len(), 1);
+    assert!(registry.is_empty());
 
     let mut request = sb.request(&root);
     request.display_name = Some("Kaggle/Pokémon".into());
     let refusal = conflict(sb.init(&request));
-    assert!(refusal.contains("--slug kaggle-pok-mon"), "{refusal}");
+    assert!(
+        refusal.contains("--resume-flat --slug kaggle-pok-mon"),
+        "{refusal}"
+    );
     assert!(refusal.contains("--slug kaggle-pokemon"), "{refusal}");
     assert!(!root.join(".git").exists());
     assert!(!root.join(".fl").exists());
@@ -3652,10 +3655,11 @@ fn legacy_project_retry_requires_an_explicit_slug_when_only_the_old_store_exists
     assert_eq!(fs::read(&old_path).unwrap(), old_bytes);
 
     request.slug = Some(old_slug.into());
+    request.resume_flat = true;
     request.git_init = false;
     let mut wrong_root = request.clone();
     wrong_root.path = sb.dir("wrong-work");
-    assert!(conflict(sb.init(&wrong_root)).contains("already holds"));
+    assert!(conflict(sb.init(&wrong_root)).contains("does not hold exactly the project"));
     assert_eq!(sb.workspace().list_areas().unwrap(), registry);
     assert!(!sb.paths.config_path.exists());
     assert!(!new_path.exists());
@@ -3664,6 +3668,9 @@ fn legacy_project_retry_requires_an_explicit_slug_when_only_the_old_store_exists
     assert_eq!(resumed.slug, old_slug);
     assert_eq!(resumed.project.as_deref(), Some(original.iri().as_str()));
     assert_eq!(resumed.store.as_deref(), old_path.to_str());
+    let areas = sb.workspace().list_areas().unwrap();
+    assert_eq!(areas.len(), 1);
+    assert_eq!(areas[0].parent, None);
     assert_eq!(sb.blocks().len(), 1);
     assert!(!new_path.exists());
 }

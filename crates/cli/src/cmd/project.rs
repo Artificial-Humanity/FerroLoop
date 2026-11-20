@@ -91,6 +91,9 @@ pub struct CreateArgs {
     /// Create any missing ancestors as virtual groups.
     #[arg(long)]
     create_parent: bool,
+    /// Resume a historical flat project whose existing store already holds --path.
+    #[arg(long, requires_all = ["name", "path", "slug"], conflicts_with = "create_parent")]
+    resume_flat: bool,
     /// The project's slug, when it is not the kebab-case of its name.
     #[arg(long)]
     slug: Option<String>,
@@ -273,6 +276,7 @@ pub fn create(
             slug: args.slug.clone(),
             display_name,
             create_parent: args.create_parent,
+            resume_flat: args.resume_flat,
             github: args.github.clone(),
             credential: args.credential,
             purpose: args.purpose.clone(),
