@@ -626,7 +626,6 @@ import {
 } from "../types/api";
 import { roleLabel, roleOptions, selectedRoleOptions, useRoles } from "../hooks/useRoles";
 import {
-  findProject,
   projectChoices,
   projectLabel,
   projectLabels,
@@ -689,7 +688,7 @@ export interface SettingsModalProps {
   activeCockpitTab?: CockpitTab;
   onSelectCockpitTab?: (tab: CockpitTab) => void;
   onOpenNodesModal?: () => void;
-  onOpenSpinUpModal?: (initialProject?: string | null) => void;
+  onOpenSpinUpModal?: (projectSlug?: string) => void;
   onOpenPairingModal?: () => void;
   onOpenAgentSettings?: (
     nameKey: string,

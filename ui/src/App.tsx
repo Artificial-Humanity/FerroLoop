@@ -103,6 +103,7 @@ import {
   type PrMergeRequest,
   type PromptRequest,
   type PrReviewRequest,
+  type ProjectSummary,
   type PullRequestItem,
   type RemodelSessionResponse,
   type SessionContextUsage,
@@ -733,7 +734,7 @@ export const App: React.FC<AppProps> = ({
   const [helpDrawerOpen, setHelpDrawerOpen] = useState<boolean>(false);
   const [helpTopic, setHelpTopic] = useState<HelpTopicId>("chat");
   const [spinUpModalOpen, setSpinUpModalOpen] = useState<boolean>(false);
-  const [spinUpInitialProject, setSpinUpInitialProject] = useState<string | null>(null);
+  const [spinUpInitialProject, setSpinUpInitialProject] = useState<Pick<ProjectSummary, "slug"> | null>(null);
   const [agentSettingsOpen, setAgentSettingsOpen] = useState<boolean>(false);
   const [nodes, setNodes] = useState<EnrolledNode[]>([]);
   const [wsConnected, setWsConnected] = useState<boolean>(false);
@@ -4108,8 +4109,8 @@ export const App: React.FC<AppProps> = ({
         activeCockpitTab={activeTab}
         onSelectCockpitTab={handleSelectTab}
         onOpenNodesModal={() => setNodesModalOpen(true)}
-        onOpenSpinUpModal={(proj) => {
-          setSpinUpInitialProject(proj ?? null);
+        onOpenSpinUpModal={(slug) => {
+          setSpinUpInitialProject(slug ? { slug } : null);
           setSpinUpModalOpen(true);
         }}
         onOpenPairingModal={() => setPairingOpen(true)}

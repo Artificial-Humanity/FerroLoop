@@ -3,7 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import App from "../App";
 import { HubApiClient } from "../api/client";
 import type { HubWsClient } from "../api/ws";
-import type { AgentRecord, ProjectSummary } from "../types/api";
+import type { AgentRecord, AreaRecord, ProjectSummary } from "../types/api";
 
 function summary(
   slug: string,
@@ -42,6 +42,8 @@ function makeHub(initial: ProjectSummary[], mode: ProjectsMode = "ok") {
   const state = {
     projects: [...initial],
     mode,
+    areas: [] as AreaRecord[],
+    projectsGate: undefined as Promise<void> | undefined,
     agents: [{
       id: "ferris",
       name_key: "ferris",
@@ -63,6 +65,7 @@ function makeHub(initial: ProjectSummary[], mode: ProjectsMode = "ok") {
     if (url.endsWith("/api/v1/agents")) {
       return json({
         agents: state.agents,
+        areas: state.areas,
         routes: [],
       });
     }
@@ -73,6 +76,7 @@ function makeHub(initial: ProjectSummary[], mode: ProjectsMode = "ok") {
         return json(created, 201);
       }
       if (method === "GET") {
+        await state.projectsGate;
         if (state.mode === "error") return json({ error: "boom" }, 500);
         if (state.mode === "missing") return json({ error: "not found" }, 404);
         if (state.mode === "legacy") {
@@ -332,6 +336,57 @@ describe("one project list for the switcher, the roster and Spin-Up", () => {
     expect(screen.getByTestId("settings-project-filter-select")).toHaveValue("analysis");
     expect(screen.getByTestId("settings-agent-row-analysis-lead")).toBeVisible();
     expect(screen.queryByTestId("settings-agent-row-reporting-lead")).toBeNull();
+  });
+
+  it.each([false, true])(
+    "uses the roster project slug when opening New Agent before the project list catches up (manual selection %s)",
+    async (selectManually) => {
+      const reporting = summary("reporting", "Analysis");
+      const modeling = { ...summary("analysis", "Model Runs", "virtual"), parent: "reporting" };
+      const { client, state, calls } = makeHub([reporting]);
+      state.areas = [{
+        area_key: "analysis",
+        name: "Model Runs",
+        parent: "reporting",
+        path: null,
+        purpose: "Modeling work",
+      }];
+      await renderApp(client);
+      await screen.findByTestId("project-settings-btn-analysis");
+      let releaseProjects!: () => void;
+      state.projectsGate = new Promise<void>((resolve) => { releaseProjects = resolve; });
+      fireEvent.click(await screen.findByTestId("project-settings-btn-model runs"));
+      fireEvent.click(screen.getByTestId("project-tab-agents"));
+      fireEvent.click(screen.getByTestId("settings-spin-up-btn"));
+
+      const select = await screen.findByTestId("spin-up-project-select");
+      expect(within(select).getByRole("option", { name: "Analysis" })).toHaveValue("reporting");
+      expect(select).toHaveValue("");
+      fireEvent.change(screen.getByTestId("spin-up-persona-input"), { target: { value: "modeler" } });
+      fireEvent.click(screen.getByTestId("spin-up-submit-btn"));
+      expect(await screen.findByRole("alert")).toHaveTextContent(/select a project/i);
+      expect(calls.some(({ url }) => url.endsWith("/api/v1/sessions/spin-up"))).toBe(false);
+      if (selectManually) {
+        fireEvent.change(select, { target: { value: "reporting" } });
+      }
+
+      state.projects.push(modeling);
+      await act(async () => { releaseProjects(); });
+      expect(await within(select).findByRole("option", { name: "Model Runs" })).toHaveValue("analysis");
+      expect(select).toHaveValue(selectManually ? "reporting" : "analysis");
+    },
+  );
+
+  it("preselects the directory project whose slug is all when New Agent opens from its Settings", async () => {
+    const { client } = makeHub([summary("all", "All Work"), FERRO]);
+    await renderApp(client);
+    fireEvent.click(await screen.findByTestId("project-settings-btn-all work"));
+    fireEvent.click(screen.getByTestId("project-tab-agents"));
+    fireEvent.click(screen.getByTestId("settings-spin-up-btn"));
+
+    const select = await screen.findByTestId("spin-up-project-select");
+    expect(within(select).getByRole("option", { name: "All Work" })).toHaveValue("all");
+    expect(select).toHaveValue("all");
   });
 
   it("follows a project renamed on the hub in the Agents filter", async () => {
