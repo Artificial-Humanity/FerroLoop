@@ -66,7 +66,7 @@ fn lifecycle_fixture_homes_do_not_share_the_discovered_host_fence() {
     }
 
     let root = TempDir::new().unwrap();
-    let socket = root.path().join("host.sock");
+    let socket = root.path().canonicalize().unwrap().join("host.sock");
     let output = Command::new(std::env::current_exe().unwrap())
         .args([
             "--exact",
