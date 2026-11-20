@@ -35,6 +35,35 @@ Attempt rows from the store have no `quota_usage`. Claude Code, Antigravity, and
 fill `quota_usage` from a direct probe, an override JSON value, or a rate-limit error
 in the transcript.
 
+## Clear and Reforge
+
+Clear and Reforge resolve targets only from saved/registered routes. A single request for
+an unknown or unsaved session returns HTTP 404 with guidance to refresh or register the
+session first; it does not actively discover that target. Bulk Clear/Reforge includes only
+saved routes. Compact keeps its existing discovery behavior. Supported saved reset routes
+retain their normal validation and dispatch checks.
+
+Codex, Muse, Grok and every generic `HostCli` route refuse both actions before reset
+commands, startup prompts, queue/model changes or discovery invalidation. FerroLoop cannot
+confirm a changed native session identity bound to the exact terminal for these routes.
+This also applies to a `HostCli` route whose vendor label is Claude or Codex.
+
+Single-session requests return HTTP 409 with `code: reset_unsupported`, the canonical
+`vendor`, `reason: identity_unconfirmable`, `alternative: remodel_same_vendor` and a plain
+`error` message. Bulk actions retain those fields with `session_id`, `ok: false` and
+`status: 409` per refused session. The alternative is an explicit remodel to the same
+vendor to start a fresh session; FerroLoop does not run it automatically.
+
+Claude Reforge requires a native `sessionId` from its session record before sending
+`/clear`. If that identity is unavailable, it refuses before sending keys or a startup
+prompt. After `/clear`, it waits up to 20 seconds for a changed `sessionId`; timeout returns
+an error without sending the startup prompt or broadcasting `session.cleared`.
+
+Antigravity keeps its in-place cascade rewind described below. It does not establish a new
+native session identity and remains outside this confirmation contract, pending a separate
+audit. Webhook routes remain a deterministic test transport, not evidence of native reset
+confirmation.
+
 ## Host reboot behaviour
 
 A host boot can restore tmux sessions (tmux-resurrect with continuum restore). Hub keeps three
@@ -260,6 +289,62 @@ FerroLoop writes an auth frame and a user frame to the session Unix socket.
 
 Home: `~/.codex/`.
 
+
+### Hosted launch prerequisite
+
+Hosted Codex uses `codex --remote unix://` and requires the shared Codex app-server daemon
+before launch. FerroLoop checks that its Unix control socket accepts a connection, with a
+250 ms deadline; it sends no RPC or thread request. The socket is
+`app-server-control/app-server-control.sock` under the effective `CODEX_HOME` pinned into
+the child. `FL_WIRE_CODEX_CONTROL_SOCK` selects delivery traffic, not this launch endpoint.
+Non-Unix remote launches refuse because this transport requires Unix sockets.
+
+Spin-up, restart and remodel return HTTP 409 with `code: codex_app_server_unavailable`
+when this prerequisite is unavailable. Automatic recovery emits a
+`session.prerequisite_unavailable` event. An automatically recoverable stopped record has
+`stop_reason: prerequisite_unavailable` and
+`launch_prerequisite_detail` containing a bounded socket path and probe result. After a
+refusal before any spawn, automatic `on-failure` recovery checks again at most once per
+60 seconds per session; its next deadline is saved across Hub restarts. Such refusals spend
+no automatic respawn attempts. A successful connection is readiness evidence only; the
+launched process must still survive normally.
+A refused manual restart preserves a prior `clean_exit`, `crash_loop` or other intentional
+stop reason and its recovery state; it does not arm automatic recovery. Only an automatic
+restart, or a record already stopped for `runtime_gone` or `prerequisite_unavailable`,
+receives the prerequisite retry reason and deadline. If the daemon disappears during initial
+startup, an immediate re-probe records the unavailable prerequisite. Once a process really
+spawns, its attempt stays charged with the normal deadline of its phase, even if it dies
+immediately. Only a refusal before any spawn is free.
+
+FerroLoop does not start the vendor daemon. Start it through a clean systemd user service,
+not from an agent command shell: a shared daemon and its updater propagate inherited
+`AGENT_PERSONA`, `FL_HOSTED_ID`, `AGENT_HYDRATION_GENERATION` and `CLAUDE_CODE_*` values into
+other agents' command shells. Keep those variables out of the user manager's environment too.
+The reference service orders itself before Hub (adapt the binary path to the installation):
+
+```ini
+# ~/.config/systemd/user/codex-app-server-daemon.service
+[Unit]
+Description=Shared Codex app-server daemon
+Before=ferroloop-hub.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+UnsetEnvironment=AGENT_PERSONA FL_HOSTED_ID AGENT_HYDRATION_GENERATION
+ExecStart=%h/.local/bin/codex app-server daemon start
+
+[Install]
+WantedBy=default.target
+```
+
+Enable both services for boot; ordering applies when both units are started. Ensure the user
+manager supplies no `CLAUDE_CODE_*` identity variables; `UnsetEnvironment` does not accept
+wildcards. On a configured host, `systemctl --user restart codex-app-server-daemon.service` is
+the reference manual recovery command: `start` is a no-op after daemon death while this
+oneshot unit remains active. Avoid starting another daemon from an agent shell. Restarting a
+shared daemon can interrupt active clients and requires coordinated workload handling.
+
 ### Session discovery and liveness
 
 * Rollout: `sessions/YYYY/MM/DD/rollout-<timestamp>-<thread-id>.jsonl`.
@@ -453,3 +538,94 @@ drops the guard, then reads transcripts and dispatches prompts.
 
 `GET /api/v1/prs` reads workspace runtime state keys `pr-*`. This tree has no `gh pr` handler
 and no `list_pr_reviews` call in the hub crate. Those commands are not inserted here.
+
+### Hosted restart and bounded crash-loop recovery
+
+`fl agent restart <persona-or-session-id> [--by owner] [--json]` restarts a hosted
+record from its saved settings, including vendor, model, thinking level, permission
+posture, working directory, node and context. It accepts no launch-setting overrides.
+An exact session id wins; a persona must name one eligible saved record. Retired,
+non-hosted and decommissioning/decommissioned targets are refused. The command uses
+the Owner caller model of `fl agent spin-up` and revalidates selection under the
+session lifecycle fence. Explicit spin-up, restart, prepare, teardown and the entire
+remodel (including rollback) share a nonblocking OS advisory fence between the CLI
+and hub. Its namespace is the canonical host endpoint and normalized persona, so
+aliases, different HOME values and workspace stores sharing that endpoint conflict.
+Legacy tmux fallback also fences its actual server socket; both runtime endpoints
+remain pinned through the operation. A busy persona fence refuses immediately with
+HTTP 409 / CLI exit 2 and diagnostic holder pid, operation and start time. The
+metadata never permits stealing a lock. Private 0700 directories contain user-owned
+0600 lock files that are never removed. Normal fence drop explicitly unlocks the file,
+including any descriptor copy inherited by a fork. An abrupt owner exit before drop
+can leave ownership briefly in a forked child until exec; a contender may receive a
+transient conflict and retry later. Close-on-exec prevents inheritance after exec.
+Unsafe or unsupported lock setup fails closed. Ordinary same-hub store contention
+waits under owned persona fences, including the post-launch survival-watch reopen.
+Different endpoint discoveries accessing one store do not serialize each other;
+use the same actual endpoint identity for every participant.
+
+Balance apply acquires its planned persona fences as one sorted group through the
+history and audit commit. Its nonblocking admission gate serializes applies within
+one hub; `fl watch balance --apply` uses HTTP and has no local apply path. Running
+multiple hubs on one runtime is unsupported: global `min_interval_ms` is not
+serialized across separate hubs applying disjoint persona batches ([#599](https://github.com/Artificial-Humanity/FerroLoop/issues/599)).
+
+Background dead-session reconciliation, recovery health observation, automatic
+classification/restart and PID refresh use the same file fence and normalized persona
+mutex. The GET sessions sweep follows that order too. Candidate snapshots only locate
+records: each sweep releases the store before trying ownership, reopens it under the
+fence, and validates the current record and recovery state before effects. A busy or
+unreadable record is skipped with rate-limited diagnostics so other personas can
+progress. Automatic restart keeps ownership through its survival watch, store reopen,
+recovery notices and final events. Prepare/remodel do not invoke a global sweep while
+holding their transaction. This completes the shared-path implementation of
+[#592](https://github.com/Artificial-Humanity/FerroLoop/issues/592); no deployment is
+authorized by this change. The command prints `runtime_spawned`,
+`runtime_live`, `hydration_dispatched` and `hydration_status`; it exits non-zero when no
+live runtime resulted. `runtime_live` is a serde-default field on the restart response
+and reports current-operation evidence rather than a saved ownership flag.
+
+The fast automatic guard remains three respawns in ten minutes, with the existing
+30/60/120-second backoff. A fourth failure enters a durable recovery incident. The
+first slow launch is due ten minutes later; at most six launches are attempted,
+each at least ten minutes after the previous one. A late reconcile pass attempts
+one launch rather than catching up. When an old `crash_loop` record has no incident
+state at upgrade, its first launch is due about ten minutes after the new hub first
+reconciles it; existing stopped records are eligible automatically.
+After six unsuccessful recoveries the session stays stopped until manual action.
+
+A successful spawn does not refill the incident budget. The incident resets after
+ten minutes of observed healthy running (a proven live process route or an Alive
+runtime observation), or after an explicit manual restart persists a live result.
+Gone or Unknown runtime observations break the healthy interval. Refused or failed
+manual launches retain recovery state. Missing vendor prerequisites before any spawn spend
+neither fast nor slow attempts; their persisted readiness deadline never shortens an
+existing slow deadline. A real spawn stays charged in both phases, including when a
+second readiness probe shows the daemon disappeared during startup, and keeps the normal
+phase deadline (fast backoff or ten-minute slow spacing). Other preparation failures
+consume an attempt and the current phase's backoff, except `Conflict` errors, which are
+not charged. FerroLoop does not start a vendor daemon automatically.
+
+Crash-loop notices go to the active project Lead, using registry project coverage.
+If the stopped persona is a Lead, or the project has no Lead, active Lab Managers
+also receive the notice. No notice goes to the stopped persona itself. Initial
+incident and final exhaustion notices have separate per-recipient delivery state;
+failed recipients and newly registered recipients are retried. Notices include the
+next due time as UTC text or final-stop status and the saved-settings restart command.
+The hub logs fast-guard entry and final exhaustion, emits `session.crash_loop` and
+`session.recovery_exhausted` events, and rate-limits warnings when no eligible recipient
+can be notified. Unchanged reconcile ticks append no recovery or session revisions.
+A recovery-state read or decode error skips that record for the tick rather than resetting
+its budget; a health-state write error likewise leaves other records eligible for inspection.
+
+The disjoint runtime record adds serde-default fields `recovery_started_at_ms`,
+`recovery_attempts`, `recovery_healthy_since_ms` and
+`crash_loop_notified_recipients`. Empty fields are omitted. The existing
+`next_allowed_at_ms` stores the phase deadline, and `crash_loop_notified` is retained
+for old readers. New delivery decisions use recipient keys `recovery:<name>` and
+`exhausted:<name>`, so the legacy aggregate flag cannot suppress required fallback
+or exhaustion delivery.
+
+The seven Codex records affected by the 2026-11-17 reboot were already recovered
+by hand. This policy bounds future recovery incidents; it does not dispatch a
+restart of those sessions during installation or deployment.

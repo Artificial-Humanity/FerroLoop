@@ -774,6 +774,8 @@ pub struct LocalClient {
 
 impl LocalClient {
     pub fn connect(socket_path: &Path, timeout: Duration) -> io::Result<Self> {
+        #[cfg(feature = "wire-test-isolation")]
+        crate::test_isolation::ensure_socket(socket_path)?;
         let stream = UnixStream::connect(socket_path)?;
         stream.set_read_timeout(Some(timeout))?;
         stream.set_write_timeout(Some(timeout))?;
@@ -1090,6 +1092,15 @@ struct ComposerOccupiedReprobeEntry {
     next_probe_at: At,
     backoff: Duration,
     probes_run: u32,
+    /// Recognised composer payload (`"/clear"`/`"/new"`) at hold time, if any.
+    recognised_payload: Option<&'static str>,
+}
+
+fn recognised_payload_suffix(payload: Option<&'static str>) -> String {
+    match payload {
+        Some(payload) => format!("; holds \"{payload}\"; repair: Backspace, then Ctrl-U"),
+        None => String::new(),
+    }
 }
 
 #[derive(Default)]
@@ -1712,6 +1723,10 @@ where
             let mut unresolved = false;
             let is_composer_occupied_hold =
                 evidence.first_reason == FenceReason::ComposerOccupiedByNonWireInput;
+            let recognised_payload = evidence
+                .recognised_composer_payload
+                .as_deref()
+                .and_then(crate::dispatcher::recognised_composer_payload);
             let job_at = job.1.clone();
             let mut queues = lock(&self.dispatch_queues);
             if let Some(queue) = queues.get_mut(&recipient) {
@@ -1767,7 +1782,11 @@ where
             }
             if unresolved {
                 if is_composer_occupied_hold {
-                    self.schedule_composer_occupied_reprobe(&recipient, &job_at);
+                    self.schedule_composer_occupied_reprobe(
+                        &recipient,
+                        &job_at,
+                        recognised_payload,
+                    );
                 }
                 warn(&format!(
                     "delivery unresolved for message {}; later messages for {} remain pending",
@@ -2043,7 +2062,12 @@ where
         any_pending
     }
 
-    fn schedule_composer_occupied_reprobe(&self, recipient: &str, observed_at: &At) {
+    fn schedule_composer_occupied_reprobe(
+        &self,
+        recipient: &str,
+        observed_at: &At,
+        recognised_payload: Option<&'static str>,
+    ) {
         if !self.recipient_has_zero_attempt_pending_only(recipient) {
             lock(&self.composer_occupied_reprobes).remove(recipient);
             return;
@@ -2053,6 +2077,9 @@ where
         reprobes
             .entry(recipient.to_string())
             .and_modify(|entry| {
+                // Every new hold overwrites the recognised payload: an
+                // unrecognised hold clears a stale "/clear" from an earlier hold.
+                entry.recognised_payload = recognised_payload;
                 // Never reset an exhausted entry here: this is also called by the hold a
                 // reprobe's own dispatch produces, so resetting would defeat the bound.
                 // Only a new message, read/ack (see `reset_composer_occupied_reprobe`), or
@@ -2071,6 +2098,7 @@ where
                     ),
                     backoff,
                     probes_run: 0,
+                    recognised_payload,
                 }
             });
     }
@@ -2081,6 +2109,8 @@ where
         let mut reprobes = lock(&self.composer_occupied_reprobes);
         if let Some(entry) = reprobes.get_mut(&name) {
             entry.probes_run = 0;
+            // Keep `recognised_payload`: a reset re-arms probing but must not erase
+            // what the composer was seen holding; the next real hold overwrites it.
             entry.backoff = COMPOSER_OCCUPIED_REPROBE_INITIAL_BACKOFF;
             entry.next_probe_at = At::from_unix_millis(
                 now.unix_millis()
@@ -2125,16 +2155,17 @@ where
                         entry.next_probe_at = At::from_unix_millis(
                             now_ms.saturating_add(entry.backoff.as_millis() as u64),
                         );
-                        (entry.probes_run, entry.backoff)
+                        (entry.probes_run, entry.backoff, entry.recognised_payload)
                     })
                 };
-                if let Some((probes_run, backoff)) = counted {
+                if let Some((probes_run, backoff, payload)) = counted {
                     warn(&format!(
                         "composer-occupied reprobe {probes_run}/{COMPOSER_OCCUPIED_MAX_REPROBES} for {recipient}: ready=None (no route), next backoff {backoff:?}"
                     ));
                     if probes_run >= COMPOSER_OCCUPIED_MAX_REPROBES {
                         warn(&format!(
-                            "composer-occupied reprobes exhausted for {recipient} after {COMPOSER_OCCUPIED_MAX_REPROBES} probes; holding until new message, read/ack, or daemon restart"
+                            "composer-occupied reprobes exhausted for {recipient} after {COMPOSER_OCCUPIED_MAX_REPROBES} probes; holding until new message, read/ack, or daemon restart{}",
+                            recognised_payload_suffix(payload)
                         ));
                     }
                 }
@@ -2157,7 +2188,7 @@ where
                     crate::dispatcher::probe_route_composer_ready(&route)
                 }
             };
-            let (probes_run, backoff) = {
+            let (probes_run, backoff, payload) = {
                 let mut reprobes = lock(&self.composer_occupied_reprobes);
                 if let Some(entry) = reprobes.get_mut(&recipient) {
                     entry.probes_run = entry.probes_run.saturating_add(1);
@@ -2165,7 +2196,7 @@ where
                     entry.next_probe_at = At::from_unix_millis(
                         now_ms.saturating_add(entry.backoff.as_millis() as u64),
                     );
-                    (entry.probes_run, entry.backoff)
+                    (entry.probes_run, entry.backoff, entry.recognised_payload)
                 } else {
                     continue;
                 }
@@ -2175,7 +2206,8 @@ where
             ));
             if probes_run >= COMPOSER_OCCUPIED_MAX_REPROBES {
                 warn(&format!(
-                    "composer-occupied reprobes exhausted for {recipient} after {COMPOSER_OCCUPIED_MAX_REPROBES} probes; holding until new message, read/ack, or daemon restart"
+                    "composer-occupied reprobes exhausted for {recipient} after {COMPOSER_OCCUPIED_MAX_REPROBES} probes; holding until new message, read/ack, or daemon restart{}",
+                    recognised_payload_suffix(payload)
                 ));
             }
             // Fail closed: only a probe that positively observed a clean composer (or one
@@ -3195,6 +3227,10 @@ pub struct DaemonHandle {
     shutdown: Arc<AtomicBool>,
     join_handle: Option<std::thread::JoinHandle<()>>,
     poll_join_handle: Option<std::thread::JoinHandle<()>>,
+    #[cfg(feature = "wire-test-isolation")]
+    _tcp_fixture: Option<crate::test_isolation::TcpFixture>,
+    #[cfg(feature = "wire-test-isolation")]
+    _unix_fixture: Option<crate::test_isolation::UnixFixture>,
 }
 
 impl DaemonHandle {
@@ -3208,9 +3244,33 @@ impl DaemonHandle {
 
     pub fn stop(&mut self) {
         self.shutdown.store(true, Ordering::SeqCst);
-        let _ = UnixStream::connect(&self.socket_path);
+        #[cfg(feature = "wire-test-isolation")]
+        let unix_safe = crate::test_isolation::ensure_socket(&self.socket_path).is_ok();
+        #[cfg(not(feature = "wire-test-isolation"))]
+        let unix_safe = true;
+        if unix_safe {
+            let _ = UnixStream::connect(&self.socket_path);
+        }
         if let Some(ref addr) = self.listen_addr {
-            let _ = TcpStream::connect(addr);
+            #[cfg(feature = "wire-test-isolation")]
+            let tcp_safe = addr
+                .parse()
+                .ok()
+                .is_some_and(|address| crate::test_isolation::ensure_tcp(&address).is_ok());
+            #[cfg(not(feature = "wire-test-isolation"))]
+            let tcp_safe = true;
+            if tcp_safe {
+                #[cfg(feature = "wire-test-isolation")]
+                if crate::test_isolation::is_enabled() {
+                    if let Ok(address) = addr.parse::<std::net::SocketAddr>() {
+                        let _ = TcpStream::connect(address);
+                    }
+                } else {
+                    let _ = TcpStream::connect(addr);
+                }
+                #[cfg(not(feature = "wire-test-isolation"))]
+                let _ = TcpStream::connect(addr);
+            }
         }
         if let Some(h) = self.join_handle.take() {
             let _ = h.join();
@@ -3232,6 +3292,8 @@ pub fn spawn_daemon<S>(store: Arc<S>, mut config: DaemonConfig) -> io::Result<Da
 where
     S: MessageStore + AgentRegistry + StateStore + Send + Sync + 'static,
 {
+    #[cfg(feature = "wire-test-isolation")]
+    crate::test_isolation::ensure_fixture(&config.socket_path)?;
     if config.psk.is_empty() && (config.listen_addr.is_some() || !config.peers.is_empty()) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -3274,8 +3336,26 @@ where
         fs::set_permissions(&config.socket_path, fs::Permissions::from_mode(0o600))?;
     }
     unix_listener.set_nonblocking(true)?;
+    #[cfg(feature = "wire-test-isolation")]
+    let unix_fixture = if crate::test_isolation::is_enabled() {
+        Some(crate::test_isolation::register_unix_socket(
+            &config.socket_path,
+        )?)
+    } else {
+        None
+    };
 
     let tcp_listener = if let Some(ref bind_addr) = config.listen_addr {
+        #[cfg(feature = "wire-test-isolation")]
+        if crate::test_isolation::is_enabled()
+            && bind_addr != "127.0.0.1:0"
+            && bind_addr != "[::1]:0"
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "wire tests must bind a fresh loopback TCP fixture",
+            ));
+        }
         let l = TcpListener::bind(bind_addr)?;
         let actual = l.local_addr()?.to_string();
         config.listen_addr = Some(actual);
@@ -3285,6 +3365,15 @@ where
         None
     };
 
+    #[cfg(feature = "wire-test-isolation")]
+    let tcp_fixture = if crate::test_isolation::is_enabled() {
+        tcp_listener
+            .as_ref()
+            .map(crate::test_isolation::register_tcp_listener)
+            .transpose()?
+    } else {
+        None
+    };
     let initial_routes = RouteTable::load(config.routes_path.as_deref());
     let initial_pending = seed_pending_map_from_store(store.as_ref());
     let inner = Arc::new(DaemonInner {
@@ -3470,6 +3559,10 @@ where
         shutdown: shutdown_flag,
         join_handle: Some(join_handle),
         poll_join_handle: Some(poll_join_handle),
+        #[cfg(feature = "wire-test-isolation")]
+        _tcp_fixture: tcp_fixture,
+        #[cfg(feature = "wire-test-isolation")]
+        _unix_fixture: unix_fixture,
     })
 }
 
@@ -4212,7 +4305,7 @@ mod tests {
 
             // Remodel: a new vendor route replaces the old Codex route (`--replace`).
             let socket = tmp.path().join("remodel.sock");
-            let listener = UnixListener::bind(&socket).unwrap();
+            let listener = crate::test_isolation::bind_unix_fixture(&socket).unwrap();
             listener.set_nonblocking(true).unwrap();
             let (response, _) = inner.handle_local_request(LocalRequest::RegisterRoute {
                 persona: "held".into(),
@@ -4896,7 +4989,7 @@ mod tests {
             },
         );
         let socket = rig._tmp.path().join("overflow.sock");
-        let listener = UnixListener::bind(&socket).unwrap();
+        let listener = crate::test_isolation::bind_unix_fixture(&socket).unwrap();
         listener.set_nonblocking(true).unwrap();
         let (response, _) = rig.inner.handle_local_request(LocalRequest::register(
             "overflow",
@@ -4977,7 +5070,7 @@ mod tests {
         }
         assert_eq!(rig.inner.diagnostics_snapshot().records[0], first_hold);
         let socket = rig._tmp.path().join("limited.sock");
-        let listener = UnixListener::bind(&socket).unwrap();
+        let listener = crate::test_isolation::bind_unix_fixture(&socket).unwrap();
         listener.set_nonblocking(true).unwrap();
         let (response, _) = rig.inner.handle_local_request(LocalRequest::register(
             "limited",
@@ -5031,7 +5124,7 @@ mod tests {
         };
         no_route_rx.recv_timeout(Duration::from_secs(3)).unwrap();
         let socket = rig._tmp.path().join("register-race.sock");
-        let listener = UnixListener::bind(&socket).unwrap();
+        let listener = crate::test_isolation::bind_unix_fixture(&socket).unwrap();
         listener.set_nonblocking(true).unwrap();
         let (locked_tx, locked_rx) = mpsc::channel();
         let (resume_register_tx, resume_register_rx) = mpsc::channel();
@@ -5163,7 +5256,7 @@ mod tests {
     fn enqueue_racing_empty_worker_exit_starts_a_new_worker() {
         let rig = rig();
         let socket = rig._tmp.path().join("empty-exit.sock");
-        let listener = UnixListener::bind(&socket).unwrap();
+        let listener = crate::test_isolation::bind_unix_fixture(&socket).unwrap();
         listener.set_nonblocking(true).unwrap();
         lock(&rig.inner.routes).upsert_explicit(
             "live",
@@ -5241,7 +5334,7 @@ mod tests {
         assert!(lock(&rig.inner.dispatch_queues).is_empty());
         assert!(lock(&rig.inner.overflow_recipients).is_empty());
         let socket = rig._tmp.path().join("live.sock");
-        let listener = UnixListener::bind(&socket).unwrap();
+        let listener = crate::test_isolation::bind_unix_fixture(&socket).unwrap();
         listener.set_nonblocking(true).unwrap();
         lock(&rig.inner.routes).upsert_explicit(
             "live",
@@ -5323,7 +5416,7 @@ mod tests {
             );
         }
         let socket = rig._tmp.path().join("capacity.sock");
-        let listener = UnixListener::bind(&socket).unwrap();
+        let listener = crate::test_isolation::bind_unix_fixture(&socket).unwrap();
         listener.set_nonblocking(true).unwrap();
         lock(&rig.inner.routes).upsert_explicit(
             "live",
@@ -5371,10 +5464,10 @@ mod tests {
             assert!(Instant::now() < deadline, "first push never failed");
             std::thread::sleep(Duration::from_millis(10));
         }
-        let slow_listener = UnixListener::bind(&slow_socket).unwrap();
+        let slow_listener = crate::test_isolation::bind_unix_fixture(&slow_socket).unwrap();
         slow_listener.set_nonblocking(true).unwrap();
         let fast_socket = rig._tmp.path().join("other.sock");
-        let fast_listener = UnixListener::bind(&fast_socket).unwrap();
+        let fast_listener = crate::test_isolation::bind_unix_fixture(&fast_socket).unwrap();
         fast_listener.set_nonblocking(true).unwrap();
         lock(&rig.inner.routes).upsert_explicit(
             "other",
@@ -5458,7 +5551,7 @@ mod tests {
                 .unwrap();
         }
         let socket = rig._tmp.path().join("broadcast-fast.sock");
-        let listener = UnixListener::bind(&socket).unwrap();
+        let listener = crate::test_isolation::bind_unix_fixture(&socket).unwrap();
         listener.set_nonblocking(true).unwrap();
         lock(&rig.inner.routes).upsert_explicit(
             "fast",
@@ -5496,7 +5589,7 @@ mod tests {
     fn startup_warns_about_inbox_recovery_without_dispatch() {
         let tmp = TempDir::new().unwrap();
         let socket = tmp.path().join("saved-route.sock");
-        let listener = UnixListener::bind(&socket).unwrap();
+        let listener = crate::test_isolation::bind_unix_fixture(&socket).unwrap();
         listener.set_nonblocking(true).unwrap();
         let store = Arc::new(RedbStore::open(&tmp.path().join("s.redb")).unwrap());
         let (pending, _) = store.send_wire(mail("slow", "pending")).unwrap();
@@ -5565,7 +5658,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         let socket = rig._tmp.path().join("late-route.sock");
-        let listener = UnixListener::bind(&socket).unwrap();
+        let listener = crate::test_isolation::bind_unix_fixture(&socket).unwrap();
         listener.set_nonblocking(true).unwrap();
         let (response, _) = rig.inner.handle_local_request(LocalRequest::register(
             "new-route",
@@ -5600,7 +5693,7 @@ mod tests {
             .recv_timeout(Duration::from_secs(3))
             .expect("no-route discovery did not pause");
         let socket = rig._tmp.path().join("racing-route.sock");
-        let listener = UnixListener::bind(&socket).unwrap();
+        let listener = crate::test_isolation::bind_unix_fixture(&socket).unwrap();
         listener.set_nonblocking(true).unwrap();
         let (response, _) = rig.inner.handle_local_request(LocalRequest::register(
             "racing-route",
@@ -5644,7 +5737,7 @@ mod tests {
         };
         entered_rx.recv_timeout(Duration::from_secs(3)).unwrap();
         let socket = rig._tmp.path().join("passive-race.sock");
-        let listener = UnixListener::bind(&socket).unwrap();
+        let listener = crate::test_isolation::bind_unix_fixture(&socket).unwrap();
         listener.set_nonblocking(true).unwrap();
         // Model a route becoming passively discoverable, without RegisterRoute.
         lock(&rig.inner.routes).upsert_explicit(
@@ -6228,7 +6321,7 @@ mod tests {
 
         // Set up a webhook Unix listener for Kayla on host B to verify push delivery + auto-Ack propagation
         let webhook_sock = tmp.path().join("kayla-webhook.sock");
-        let webhook_listener = UnixListener::bind(&webhook_sock).unwrap();
+        let webhook_listener = crate::test_isolation::bind_unix_fixture(&webhook_sock).unwrap();
         let routes_b = tmp.path().join("routes-b.json");
         let mut routes = RouteTable::load(Some(&routes_b));
         routes.upsert_explicit(
@@ -6490,6 +6583,7 @@ mod tests {
         )
         .unwrap();
         fs::set_permissions(&slow, fs::Permissions::from_mode(0o755)).unwrap();
+        let _slow_fixture = crate::test_isolation::register_executable(&slow).unwrap();
 
         let store = Arc::new(RedbStore::open(&tmp.path().join("s.redb")).unwrap());
         let cfg = test_config(tmp.path(), "slow");
@@ -6549,7 +6643,7 @@ mod tests {
             })
             .unwrap();
         let other_socket = tmp.path().join("other.sock");
-        let other_listener = UnixListener::bind(&other_socket).unwrap();
+        let other_listener = crate::test_isolation::bind_unix_fixture(&other_socket).unwrap();
         other_listener.set_nonblocking(true).unwrap();
         // The daemon serves one request per connection.
         let mut probe = LocalClient::connect(&sock, Duration::from_secs(5)).unwrap();
@@ -6606,6 +6700,7 @@ mod tests {
         let release = tmp.path().join("release");
         fs::write(&script, format!("#!/bin/sh\nprintf '%s\\n' \"$5\" >> '{}'\ncase \"$5\" in *first*) while [ ! -e '{}' ]; do sleep 0.02; done ;; esac\n", log.display(), release.display())).unwrap();
         fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        let _script_fixture = crate::test_isolation::register_executable(&script).unwrap();
         let prev = std::env::var_os("FL_WIRE_CODEX_BIN");
         unsafe { std::env::set_var("FL_WIRE_CODEX_BIN", &script) };
         let store = Arc::new(RedbStore::open(&tmp.path().join("s.redb")).unwrap());
@@ -6694,6 +6789,7 @@ mod tests {
         )
         .unwrap();
         fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        let _script_fixture = crate::test_isolation::register_executable(&script).unwrap();
         let prev = std::env::var_os("FL_WIRE_CODEX_BIN");
         unsafe { std::env::set_var("FL_WIRE_CODEX_BIN", &script) };
         let store = Arc::new(RedbStore::open(&tmp.path().join("s.redb")).unwrap());
@@ -6716,7 +6812,7 @@ mod tests {
         let sock = cfg.socket_path.clone();
         let _daemon = spawn_daemon(Arc::clone(&store), cfg).unwrap();
         let fast_socket = tmp.path().join("fast.sock");
-        let listener = UnixListener::bind(&fast_socket).unwrap();
+        let listener = crate::test_isolation::bind_unix_fixture(&fast_socket).unwrap();
         listener.set_nonblocking(true).unwrap();
         for (persona, route) in [
             (
@@ -6781,6 +6877,7 @@ mod tests {
         let sock = cfg.socket_path.clone();
         let _daemon = spawn_daemon(store, cfg).unwrap();
 
+        crate::test_isolation::ensure_socket(&sock).unwrap();
         let mut raw = UnixStream::connect(&sock).unwrap();
         raw.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
         let chunk = vec![b'a'; 64 * 1024];
@@ -6819,6 +6916,7 @@ mod tests {
             "{\"op\":\"nope\"}\n",
             "{\"op\":\"send\"}\n",
         ] {
+            crate::test_isolation::ensure_socket(&sock).unwrap();
             let mut raw = UnixStream::connect(&sock).unwrap();
             raw.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
             raw.write_all(line.as_bytes()).unwrap();
@@ -6827,6 +6925,7 @@ mod tests {
             assert!(resp.contains("invalid request JSON"), "{line:?} -> {resp}");
         }
         // A client that connects and hangs up sends nothing; the daemon must shrug it off.
+        crate::test_isolation::ensure_socket(&sock).unwrap();
         drop(UnixStream::connect(&sock).unwrap());
         let mut ok = LocalClient::connect(&sock, Duration::from_secs(2)).unwrap();
         assert!(
@@ -6885,7 +6984,9 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::AddrInUse);
         drop(first);
         // A socket file left behind by a crashed daemon is stale and gets replaced.
-        drop(UnixListener::bind(&cfg.socket_path).unwrap());
+        let stale_listener = UnixListener::bind(&cfg.socket_path).unwrap();
+        let _stale_fixture = crate::test_isolation::register_unix_socket(&cfg.socket_path).unwrap();
+        drop(stale_listener);
         assert!(cfg.socket_path.exists());
         let deadline = Instant::now() + Duration::from_secs(10);
         let replaced = loop {
@@ -7010,7 +7111,7 @@ mod tests {
     fn a_request_to_a_slow_daemon_succeeds_with_the_default_timeout() {
         let dir = TempDir::new().unwrap();
         let sock = dir.path().join("slow.sock");
-        let listener = UnixListener::bind(&sock).unwrap();
+        let listener = crate::test_isolation::bind_unix_fixture(&sock).unwrap();
         let fake = std::thread::spawn(move || {
             let (stream, _) = listener.accept().unwrap();
             let mut reader = BufReader::new(stream.try_clone().unwrap());
@@ -7040,7 +7141,9 @@ mod tests {
         let dir = TempDir::new().unwrap();
         // A socket file that nothing listens on any more refuses the connect.
         let stale = dir.path().join("stale.sock");
-        drop(UnixListener::bind(&stale).unwrap());
+        let stale_listener = UnixListener::bind(&stale).unwrap();
+        let _stale_fixture = crate::test_isolation::register_unix_socket(&stale).unwrap();
+        drop(stale_listener);
         for sock in [dir.path().join("none.sock"), stale] {
             let started = Instant::now();
             let err = LocalClient::connect(&sock, DEFAULT_LOCAL_RPC_TIMEOUT);
@@ -7078,7 +7181,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
 
-        let ack_listener = UnixListener::bind(&ack_socket).unwrap();
+        let ack_listener = crate::test_isolation::bind_unix_fixture(&ack_socket).unwrap();
         ack_listener.set_nonblocking(true).unwrap();
 
         let (resp2, _) = rig.inner.handle_local_request(LocalRequest::Send {
@@ -7142,7 +7245,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
 
-        let read_listener = UnixListener::bind(&read_socket).unwrap();
+        let read_listener = crate::test_isolation::bind_unix_fixture(&read_socket).unwrap();
         read_listener.set_nonblocking(true).unwrap();
 
         let (read_resp, _) = rig.inner.handle_local_request(LocalRequest::Read {
@@ -7650,7 +7753,7 @@ mod tests {
             .path()
             .join(".codex/app-server-control/app-server-control.sock");
         fs::create_dir_all(control_sock.parent().unwrap()).unwrap();
-        let listener = UnixListener::bind(&control_sock).unwrap();
+        let listener = crate::test_isolation::bind_unix_fixture(&control_sock).unwrap();
         listener.set_nonblocking(true).unwrap();
 
         let accept_count = Arc::new(AtomicUsize::new(0));
@@ -7704,6 +7807,7 @@ mod tests {
         assert!(st1.codex_queues.is_empty());
 
         // Legacy raw `{"op":"status"}` line from an older client.
+        crate::test_isolation::ensure_socket(&daemon_sock).unwrap();
         let mut raw = UnixStream::connect(&daemon_sock).unwrap();
         raw.set_read_timeout(Some(DEFAULT_LOCAL_RPC_TIMEOUT))
             .unwrap();
@@ -8020,6 +8124,9 @@ mod tests {
         let _ = child.wait();
 
         let probe_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+
+        let _probe_listener_fixture =
+            crate::test_isolation::register_tcp_listener(&probe_listener).unwrap();
         probe_listener.set_nonblocking(true).unwrap();
         let probe_addr = probe_listener.local_addr().unwrap();
 
@@ -8656,7 +8763,7 @@ mod tests {
         RouteTable::default().save(Some(&routes_file)).unwrap();
 
         let hook_sock = tmp.path().join("felicia-hook.sock");
-        let hook_listener = UnixListener::bind(&hook_sock).unwrap();
+        let hook_listener = crate::test_isolation::bind_unix_fixture(&hook_sock).unwrap();
         hook_listener.set_nonblocking(true).unwrap();
 
         let base_ms = now_at().unix_millis();
@@ -9006,7 +9113,7 @@ mod tests {
     fn composer_occupied_zero_key_hold_auto_retries_with_backoff_and_delivers_when_cleared() {
         let (tmp, inner) = fault_rig();
         let webhook_sock = tmp.path().join("held-webhook.sock");
-        let webhook_listener = std::os::unix::net::UnixListener::bind(&webhook_sock).unwrap();
+        let webhook_listener = crate::test_isolation::bind_unix_fixture(&webhook_sock).unwrap();
         webhook_listener.set_nonblocking(true).unwrap();
         lock(&inner.routes).upsert_explicit(
             "held",
@@ -9193,6 +9300,59 @@ mod tests {
     }
 
     #[test]
+    fn composer_occupied_exhausted_log_carries_only_recognised_payload() {
+        assert_eq!(COMPOSER_OCCUPIED_MAX_REPROBES, 16);
+        for (err_text, recognised) in [
+            (
+                "composer_occupied_by_non_wire_input: composer_occupied: composer holds \"/clear\"; repair: Backspace, then Ctrl-U; holding delivery without sending keys",
+                Some("/clear"),
+            ),
+            (
+                "composer_occupied_by_non_wire_input: composer holds owner secret draft; holding delivery without sending keys",
+                None,
+            ),
+        ] {
+            let (_tmp, inner) = fault_rig();
+            let _id = with_transport(Err(err_text.to_string()), || run_fault_job(&inner, "held"));
+            {
+                let entry = &lock(&inner.composer_occupied_reprobes)["held"];
+                assert_eq!(entry.recognised_payload, recognised, "{err_text}");
+            }
+            lock(&inner.routes).entries.remove("held");
+            let _ = take_warnings();
+            loop {
+                let entry = lock(&inner.composer_occupied_reprobes)["held"].clone();
+                if entry.probes_run >= COMPOSER_OCCUPIED_MAX_REPROBES {
+                    break;
+                }
+                inner.poll_composer_occupied_holds(entry.next_probe_at.clone());
+            }
+            let warnings = take_warnings();
+            let exhausted: Vec<_> = warnings
+                .iter()
+                .filter(|w| w.contains("reprobes exhausted"))
+                .collect();
+            assert_eq!(exhausted.len(), 1, "{warnings:?}");
+            if let Some(payload) = recognised {
+                assert!(
+                    exhausted[0].contains(&format!("holds \"{payload}\"")),
+                    "{exhausted:?}"
+                );
+                assert!(
+                    exhausted[0].contains("Backspace, then Ctrl-U"),
+                    "{exhausted:?}"
+                );
+            } else {
+                assert!(!exhausted[0].contains("holds \""), "{exhausted:?}");
+                assert!(
+                    !exhausted[0].contains("owner secret draft"),
+                    "{exhausted:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn composer_occupied_fresh_hold_does_not_rearm_exhausted_reprobe_entry() {
         let (_tmp, inner) = fault_rig();
         let occupied_err =
@@ -9208,7 +9368,7 @@ mod tests {
         }
         // A fresh zero-key hold (e.g. from a reprobe's own dispatch) must NOT reset an
         // exhausted entry, or the 16-probe bound defeats itself.
-        inner.schedule_composer_occupied_reprobe("held", &At::from_unix_millis(500_000));
+        inner.schedule_composer_occupied_reprobe("held", &At::from_unix_millis(500_000), None);
         let entry = lock(&inner.composer_occupied_reprobes)["held"].clone();
         assert_eq!(
             entry.probes_run, COMPOSER_OCCUPIED_MAX_REPROBES,
@@ -9229,9 +9389,76 @@ mod tests {
             let mut reprobes = lock(&inner.composer_occupied_reprobes);
             reprobes.get_mut("held").unwrap().probes_run = 3;
         }
-        inner.schedule_composer_occupied_reprobe("held", &At::from_unix_millis(600_000));
+        inner.schedule_composer_occupied_reprobe("held", &At::from_unix_millis(600_000), None);
         let entry = lock(&inner.composer_occupied_reprobes)["held"].clone();
         assert_eq!(entry.probes_run, 3, "live entry must keep its probe count");
+    }
+
+    #[test]
+    fn composer_occupied_new_hold_overwrites_recognised_payload() {
+        let (_tmp, inner) = fault_rig();
+        let clear_err = "composer_occupied_by_non_wire_input: composer_occupied: composer holds \"/clear\"; repair: Backspace, then Ctrl-U; holding delivery without sending keys".to_string();
+        let _id = with_transport(Err(clear_err), || run_fault_job(&inner, "held"));
+        assert_eq!(
+            lock(&inner.composer_occupied_reprobes)["held"].recognised_payload,
+            Some("/clear")
+        );
+        // Unrecognised hold clears the stale "/clear".
+        inner.schedule_composer_occupied_reprobe("held", &At::from_unix_millis(500_000), None);
+        assert_eq!(
+            lock(&inner.composer_occupied_reprobes)["held"].recognised_payload,
+            None,
+            "unrecognised hold must clear stale recognised payload"
+        );
+        // Recognised hold overwrites with the new payload.
+        inner.schedule_composer_occupied_reprobe(
+            "held",
+            &At::from_unix_millis(600_000),
+            Some("/new"),
+        );
+        assert_eq!(
+            lock(&inner.composer_occupied_reprobes)["held"].recognised_payload,
+            Some("/new")
+        );
+        inner.schedule_composer_occupied_reprobe("held", &At::from_unix_millis(700_000), None);
+        assert_eq!(
+            lock(&inner.composer_occupied_reprobes)["held"].recognised_payload,
+            None
+        );
+    }
+
+    #[test]
+    fn composer_occupied_reset_preserves_recognised_payload_through_exhaustion() {
+        let (_tmp, inner) = fault_rig();
+        let clear_err = "composer_occupied_by_non_wire_input: composer_occupied: composer holds \"/clear\"; repair: Backspace, then Ctrl-U; holding delivery without sending keys".to_string();
+        let _id = with_transport(Err(clear_err), || run_fault_job(&inner, "held"));
+        assert_eq!(
+            lock(&inner.composer_occupied_reprobes)["held"].recognised_payload,
+            Some("/clear")
+        );
+        // Reset (new message / read / ack) re-arms but must not erase the payload.
+        inner.reset_composer_occupied_reprobe("held", &At::from_unix_millis(500_000));
+        {
+            let entry = &lock(&inner.composer_occupied_reprobes)["held"];
+            assert_eq!(entry.probes_run, 0);
+            assert_eq!(entry.recognised_payload, Some("/clear"));
+        }
+        lock(&inner.routes).entries.remove("held");
+        let _ = take_warnings();
+        loop {
+            let entry = lock(&inner.composer_occupied_reprobes)["held"].clone();
+            if entry.probes_run >= COMPOSER_OCCUPIED_MAX_REPROBES {
+                break;
+            }
+            inner.poll_composer_occupied_holds(entry.next_probe_at.clone());
+        }
+        let warnings = take_warnings();
+        let exhausted: Vec<_> = warnings
+            .iter()
+            .filter(|w| w.contains("reprobes exhausted"))
+            .collect();
+        assert_eq!(exhausted.len(), 1, "{warnings:?}");
+        assert!(exhausted[0].contains("; holds \"/clear\""), "{exhausted:?}");
     }
 
     #[test]

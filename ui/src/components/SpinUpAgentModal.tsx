@@ -62,7 +62,7 @@ export function resolveSpinUpNodeId(
     return explicit;
   }
   const hubNode = nodes.find((n) => n.role === "hub") ?? nodes[0];
-  return (hubNode?.node_id || hubNode?.display_name || "").trim();
+  return (hubNode?.node_id || "").trim();
 }
 
 export function resolveSpinUpProject(
@@ -912,11 +912,17 @@ export const SpinUpAgentModal: React.FC<SpinUpAgentModalProps> = ({
   }, [isOpen, projectTouched, project, projects, resolvedDefaultProject]);
 
   const resolvedDefaultNodeId = resolveSpinUpNodeId(defaultNodeId, nodes);
+  const selectedNodeIsKnown = !nodeId.trim() || nodeId.trim() === defaultNodeId?.trim() ||
+    nodes.some((node) => node.node_id.trim() === nodeId.trim());
   useEffect(() => {
-    if (isOpen && !nodeIdTouched && !nodeId.trim() && resolvedDefaultNodeId) {
+    if (isOpen && !selectedNodeIsKnown) {
+      // Do not keep a node selected after the registry no longer offers it.
+      setNodeId("");
+      setNodeIdTouched(true);
+    } else if (isOpen && !nodeIdTouched && !nodeId.trim() && resolvedDefaultNodeId) {
       setNodeId(resolvedDefaultNodeId);
     }
-  }, [isOpen, nodeIdTouched, nodeId, resolvedDefaultNodeId]);
+  }, [isOpen, nodeIdTouched, nodeId, resolvedDefaultNodeId, selectedNodeIsKnown]);
 
   useEffect(() => {
     setError(null);
@@ -940,14 +946,13 @@ export const SpinUpAgentModal: React.FC<SpinUpAgentModalProps> = ({
     projectDropdownOptions.unshift({ value: project, label: project });
   }
 
-  const nodeOptions = Array.from(
-    new Set(
-      [
-        defaultNodeId?.trim(),
-        ...nodes.map((n) => (n.node_id || n.display_name).trim()),
-      ].filter((v): v is string => Boolean(v)),
-    ),
-  );
+  const nodeOptions = new Map<string, string>();
+  for (const node of nodes) {
+    const id = node.node_id.trim();
+    if (id) nodeOptions.set(id, node.display_name?.trim() || id);
+  }
+  const defaultId = defaultNodeId?.trim();
+  if (defaultId && !nodeOptions.has(defaultId)) nodeOptions.set(defaultId, defaultId);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -971,7 +976,7 @@ export const SpinUpAgentModal: React.FC<SpinUpAgentModalProps> = ({
       worktreePolicy,
     );
 
-    const trimmedNodeId = nodeId.trim();
+    const trimmedNodeId = selectedNodeIsKnown ? nodeId.trim() : "";
     const payload: SpinUpSessionRequest = {
       persona: trimmedPersona,
       project: trimmedProject,
@@ -1230,7 +1235,7 @@ export const SpinUpAgentModal: React.FC<SpinUpAgentModalProps> = ({
                   const nextVendor = e.target.value;
                   setVendor(nextVendor);
                   const nextOpts = getVendorModelOptions(nextVendor);
-                  if (model.trim() && nextOpts.length > 0 && !nextOpts.includes(model.trim())) {
+                  if (model.trim() && !nextOpts.includes(model.trim())) {
                     setModel("");
                   }
                 }}
@@ -1259,40 +1264,22 @@ export const SpinUpAgentModal: React.FC<SpinUpAgentModalProps> = ({
               >
                 Model (Optional)
               </label>
-              <input
+              <select
                 id="fd-spin-up-model"
-                type="text"
-                list="fd-spin-up-model-options"
                 name="fd-spin-up-model"
-                autoComplete="off"
-                autoCorrect="off"
-                autoCapitalize="off"
-                spellCheck={false}
-                data-1p-ignore="true"
-                data-lpignore="true"
-                data-form-type="other"
                 data-testid="spin-up-model-input"
-                className="fd-input fd-mono"
-                placeholder={
-                  getVendorModelOptions(vendor)[0]
-                    ? `e.g. ${getVendorModelOptions(vendor)[0]}`
-                    : "e.g. claude-opus-5-5"
-                }
+                className="fd-select fd-mono"
                 value={model}
                 onChange={(e) => setModel(e.target.value)}
                 disabled={submitting}
                 style={{ width: "100%" }}
-              />
-              <datalist id="fd-spin-up-model-options" data-testid="spin-up-model-options">
+              >
+                <option value="">Vendor default</option>
                 {getVendorModelOptions(vendor).map((opt) => {
                   const label = formatModelOptionLabel(opt);
-                  return (
-                    <option key={opt} value={opt} label={label}>
-                      {label}
-                    </option>
-                  );
+                  return <option key={opt} value={opt} label={label}>{label}</option>;
                 })}
-              </datalist>
+              </select>
             </div>
           </div>
 
@@ -1310,33 +1297,24 @@ export const SpinUpAgentModal: React.FC<SpinUpAgentModalProps> = ({
             >
               Target Node
             </label>
-            <input
+            <select
               id="fd-spin-up-node"
-              type="text"
-              list="fd-spin-up-node-options"
               name="fd-spin-up-node"
-              autoComplete="off"
-              autoCorrect="off"
-              autoCapitalize="off"
-              spellCheck={false}
-              data-1p-ignore="true"
-              data-lpignore="true"
-              data-form-type="other"
               data-testid="spin-up-node-select"
-              className="fd-input fd-mono"
-              value={nodeId}
+              className="fd-select fd-mono"
+              value={selectedNodeIsKnown ? nodeId : ""}
               onChange={(e) => {
                 setNodeId(e.target.value);
                 setNodeIdTouched(true);
               }}
               disabled={submitting}
               style={{ width: "100%" }}
-            />
-            <datalist id="fd-spin-up-node-options">
-              {nodeOptions.map((n) => (
-                <option key={n} value={n} />
+            >
+              <option value="">Hub default</option>
+              {Array.from(nodeOptions, ([id, label]) => (
+                <option key={id} value={id}>{label}</option>
               ))}
-            </datalist>
+            </select>
           </div>
 
           {/* Record #72: Local Model & API-Key Endpoint Preset */}

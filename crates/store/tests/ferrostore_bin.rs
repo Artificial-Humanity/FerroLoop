@@ -1568,3 +1568,39 @@ fn version_prints_the_build_and_json_prints_the_stamp_and_formats() {
         serde_json::from_str::<Value>(&run(&["-V", "--json"])).unwrap()
     );
 }
+
+#[test]
+fn status_exposes_restore_guard_and_mutation_refusal_names_recovery_status() {
+    let sb = Sandbox::new();
+    ferro_store(&sb.fls());
+    let guard = sb.fls().with_extension("fls.restore-guard");
+    std::fs::write(&guard, b"malformed private contents").unwrap();
+    let before = std::fs::read(sb.fls()).unwrap();
+    let out = sb.on_store("status", &["--json"]).output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let report: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        report["restore_guard"]["guard_path"],
+        guard.to_str().unwrap()
+    );
+    assert!(report["restore_guard"]["operation_id"].is_null());
+    let out = sb.on_store("status", &[]).output().unwrap();
+    assert!(out.status.success());
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert!(text.contains("active; operation unknown"));
+    assert!(text.contains(&guard.display().to_string()));
+    let out = sb.on_store("compact", &[]).output().unwrap();
+    assert!(!out.status.success());
+    let error = String::from_utf8(out.stderr).unwrap();
+    assert!(error.contains(&guard.display().to_string()));
+    assert!(error.contains(
+        "ferrostore recovery --root <ROOT> --lease <LEASE> --request <CONTINUATION.json> status"
+    ));
+    assert!(!error.contains("malformed private contents"));
+    assert_eq!(std::fs::read(sb.fls()).unwrap(), before);
+    assert_eq!(std::fs::read(guard).unwrap(), b"malformed private contents");
+}

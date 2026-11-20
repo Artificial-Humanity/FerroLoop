@@ -2,6 +2,7 @@ import { act, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import { describe, expect, it, vi } from "vitest";
 import { App } from "../App";
 import { HubApiClient } from "../lib/api";
+import { getVendorModelOptions } from "../components/ChatPane";
 import type { HubWsClient } from "../api/ws";
 import {
   resolveSpinUpProject,
@@ -45,6 +46,7 @@ describe("SpinUpAgentModal", () => {
         onClose={onClose}
         onSpinUp={onSpinUp}
         projects={TEST_PROJECTS}
+        defaultNodeId="ai-lab-0"
       />,
     );
 
@@ -69,7 +71,7 @@ describe("SpinUpAgentModal", () => {
       Array.from(roleSelect.options).map((o) => o.value),
     ).toContain("strategist");
     expect(vendorSelect.value).toBe("claude");
-    expect(nodeSelect.value).toBe("");
+    expect(nodeSelect.value).toBe("ai-lab-0");
     expect(hostedCheckbox.checked).toBe(true);
 
     // Submitting without persona shows validation error
@@ -135,8 +137,8 @@ describe("SpinUpAgentModal", () => {
 
     const nodeSelect = screen.getByTestId("spin-up-node-select") as HTMLInputElement;
     expect(nodeSelect.value).toBe("");
-    const emptyDatalist = document.getElementById("fd-spin-up-node-options");
-    expect(emptyDatalist?.querySelectorAll("option").length ?? 0).toBe(0);
+    expect(nodeSelect.tagName).toBe("SELECT");
+    expect(screen.getByRole("option", { name: /hub default/i })).toHaveValue("");
 
     fireEvent.change(screen.getByTestId("spin-up-persona-input"), {
       target: { value: "kacey" },
@@ -209,16 +211,15 @@ describe("SpinUpAgentModal", () => {
 
     const seededNodeSelect = screen.getByTestId("spin-up-node-select") as HTMLInputElement;
     expect(seededNodeSelect.value).toBe("hub-local-0");
-    const populatedDatalist = document.getElementById("fd-spin-up-node-options");
-    expect(
-      Array.from(populatedDatalist?.querySelectorAll("option") ?? []).map((o) =>
-        o.getAttribute("value"),
-      ),
-    ).toEqual(["worker-mac-1", "hub-local-0"]);
+    const nodeChoices = Array.from((seededNodeSelect as unknown as HTMLSelectElement).options);
+    expect(nodeChoices.map((o) => o.value)).toEqual(["", "worker-mac-1", "hub-local-0"]);
+    expect(nodeChoices.find((o) => o.value === "worker-mac-1")).toHaveTextContent("Mac Worker");
+    expect(nodeChoices.find((o) => o.value === "hub-local-0")).toHaveTextContent("Local Hub");
 
     fireEvent.change(screen.getByTestId("spin-up-persona-input"), {
       target: { value: "felix" },
     });
+    fireEvent.change(seededNodeSelect, { target: { value: "worker-mac-1" } });
     fireEvent.click(screen.getByTestId("spin-up-submit-btn"));
 
     await waitFor(() => {
@@ -230,7 +231,7 @@ describe("SpinUpAgentModal", () => {
       role: "assistant",
       vendor: "claude",
       posture: "auto",
-      node_id: "hub-local-0",
+      node_id: "worker-mac-1",
       hosted: true,
     });
 
@@ -262,6 +263,55 @@ describe("SpinUpAgentModal", () => {
     unmount();
   });
 
+  it("offers a native vendor model select and clears a previous vendor model", () => {
+    render(<SpinUpAgentModal isOpen onClose={() => {}} />);
+    const vendor = screen.getByTestId("spin-up-vendor-select");
+    const model = screen.getByTestId("spin-up-model-input") as HTMLSelectElement;
+    expect(model.tagName).toBe("SELECT");
+    expect(model.value).toBe("");
+    fireEvent.change(vendor, { target: { value: "grok" } });
+    expect(Array.from(model.options).map((option) => option.value)).toEqual([
+      "", ...getVendorModelOptions("grok"),
+    ]);
+    fireEvent.change(model, { target: { value: "grok-4.7" } });
+    expect(model.value).toBe("grok-4.7");
+    fireEvent.change(vendor, { target: { value: "claude" } });
+    expect(model.value).toBe("");
+    expect(Array.from(model.options).some((option) => option.value === "grok-4.7")).toBe(false);
+  });
+
+  it("selects a node arriving late unless the operator chose the hub default", () => {
+    const node: EnrolledNode = { node_id: "late-hub", display_name: "Late Hub", role: "hub", hostname: "late", os: "linux", arch: "x86_64", capabilities: [], labels: [], status: "online", enrolled_at_ms: 1, last_seen_at_ms: 2 };
+    const { rerender } = render(<SpinUpAgentModal isOpen onClose={() => {}} />);
+    const select = screen.getByTestId("spin-up-node-select") as HTMLSelectElement;
+    expect(select.tagName).toBe("SELECT");
+    rerender(<SpinUpAgentModal isOpen onClose={() => {}} nodes={[node]} />);
+    expect(select.value).toBe("late-hub");
+    expect(screen.getByRole("option", { name: "Late Hub" })).toHaveValue("late-hub");
+    fireEvent.change(select, { target: { value: "" } });
+    rerender(<SpinUpAgentModal isOpen onClose={() => {}} nodes={[node]} defaultNodeId="other" />);
+    expect(select.value).toBe("");
+  });
+
+  it("clears a node removed from the registry and omits it from the submitted request", async () => {
+    const node: EnrolledNode = { node_id: "removed-node", display_name: "Removed Node", role: "hub", hostname: "test", os: "linux", arch: "x86_64", capabilities: [], labels: [], status: "online", enrolled_at_ms: 1, last_seen_at_ms: 2 };
+    const onSpinUp = vi.fn(async (req: SpinUpSessionRequest): Promise<SpinUpSessionResponse> => ({ session_id: "fixture", persona: req.persona, project: req.project, role: req.role, vendor: req.vendor, model: req.model ?? null, node_id: req.node_id ?? "", hosted: true, status: "running", hydration_dispatched: true }));
+    const common = { isOpen: true, onClose: vi.fn(), initialProject: "ai-lab-amd", projects: TEST_PROJECTS, onSpinUp };
+    const { rerender } = render(<SpinUpAgentModal {...common} nodes={[node]} />);
+    const select = screen.getByTestId("spin-up-node-select") as HTMLSelectElement;
+    expect(select.value).toBe("removed-node");
+    rerender(<SpinUpAgentModal {...common} nodes={[]} />);
+    expect(select.value).toBe("");
+    expect(Array.from(select.options).map((option) => option.value)).toEqual([""]);
+    fireEvent.change(screen.getByTestId("spin-up-persona-input"), { target: { value: "fixture-persona" } });
+    fireEvent.change(screen.getByTestId("spin-up-vendor-select"), { target: { value: "grok" } });
+    fireEvent.change(screen.getByTestId("spin-up-model-input"), { target: { value: "grok-4.7" } });
+    fireEvent.click(screen.getByTestId("spin-up-submit-btn"));
+    await waitFor(() => expect(onSpinUp).toHaveBeenCalledTimes(1));
+    expect(onSpinUp.mock.calls[0][0]).toMatchObject({ vendor: "grok", model: "grok-4.7" });
+    expect(onSpinUp.mock.calls[0][0]).not.toHaveProperty("node_id");
+  });
+
   it("clears validation/API errors when closed and reopened", async () => {
     const onClose = vi.fn();
     const { rerender } = render(<SpinUpAgentModal isOpen onClose={onClose} />);
@@ -281,8 +331,8 @@ describe("SpinUpAgentModal", () => {
     const vendorSelect = screen.getByTestId("spin-up-vendor-select") as HTMLSelectElement;
     fireEvent.change(vendorSelect, { target: { value: "muse" } });
 
-    const datalist = screen.getByTestId("spin-up-model-options");
-    const options = Array.from(datalist.querySelectorAll("option")).map((opt) => ({
+    const datalist = screen.getByTestId("spin-up-model-input");
+    const options = Array.from(datalist.querySelectorAll("option")).slice(1).map((opt) => ({
       value: opt.getAttribute("value"),
       label: opt.getAttribute("label"),
       text: opt.textContent,
@@ -352,8 +402,8 @@ describe("SpinUpAgentModal", () => {
     const vendorSelect = screen.getByTestId("spin-up-vendor-select") as HTMLSelectElement;
     fireEvent.change(vendorSelect, { target: { value: "codex" } });
 
-    const datalist = screen.getByTestId("spin-up-model-options");
-    const codexOptions = Array.from(datalist.querySelectorAll("option")).map((opt) => ({
+    const datalist = screen.getByTestId("spin-up-model-input");
+    const codexOptions = Array.from(datalist.querySelectorAll("option")).slice(1).map((opt) => ({
       value: opt.getAttribute("value"),
       label: opt.getAttribute("label"),
       text: opt.textContent,
@@ -373,102 +423,124 @@ describe("SpinUpAgentModal", () => {
     ]);
   });
 
-  it("clears transcript state and avoids re-fetching torn-down session transcript in App on teardown", async () => {
-    const transcriptFetches: string[] = [];
-
+  it.each([false, true])("clears transcript and avoids teardown refetches (stale response in flight: %s)", async (holdStaleResponse) => {
+    type Phase = "initial" | "pre-submit" | "submitting" | "pending" | "after-success";
+    const transcriptFetches: Array<{ phase: Phase; url: string }> = [];
+    let phase: Phase = "initial";
+    let deferNextTranscript = false;
+    let resolveStaleTranscript!: (response: Response) => void;
+    const staleTranscript = new Promise<Response>((resolve) => { resolveStaleTranscript = resolve; });
+    let resolveDecommission!: (response: Response) => void;
+    const decommission = new Promise<Response>((resolve) => { resolveDecommission = resolve; });
+    const json = (body: unknown) => new Response(JSON.stringify(body), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    });
+    const oldTranscript = () => json({
+      turns: [{ index: 0, role: "assistant", content: "Active session turn before teardown", thinking: null, tool_calls: [] }],
+      is_busy: true,
+    });
     const fetchImpl = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input);
       const method = init?.method ?? "GET";
-      const json = (body: unknown) =>
-        new Response(JSON.stringify(body), {
-          status: 200,
-          headers: { "Content-Type": "application/json" },
-        });
-
       if (url.includes("/api/v1/auth/session")) {
-        return json({
-          authenticated: true,
-          authority: { tier: "owner", login: "lmcfarlin" },
-        });
+        return json({ authenticated: true, authority: { tier: "owner", login: "lmcfarlin" } });
       }
       if (url.endsWith("/api/v1/sessions")) {
-        return json({
-          sessions: [
-            {
-              id: "sess-ferris-live",
-              persona: "ferris",
-              adapter: "claude",
-              status: "running",
-            },
-          ],
-        });
+        // Discovery remains stale even after the teardown has succeeded.
+        return json({ sessions: [{ id: "sess-ferris-live", persona: "ferris", adapter: "claude", status: "running" }] });
       }
       if (url.includes("/api/v1/sessions/") && url.endsWith("/transcript")) {
-        transcriptFetches.push(url);
-        return json({
-          turns: [
-            {
-              index: 0,
-              role: "assistant",
-              content: "Active session turn before teardown",
-              thinking: null,
-              tool_calls: [],
-            },
-          ],
-          is_busy: true,
-        });
+        transcriptFetches.push({ phase, url });
+        if (deferNextTranscript) {
+          deferNextTranscript = false;
+          return staleTranscript;
+        }
+        return oldTranscript();
       }
       if (url.endsWith("/api/v1/sessions/sess-ferris-live/decommission") && method === "POST") {
-        return json({
-          session_id: "sess-ferris-live",
-          persona: "ferris",
-          mode: "teardown",
-          status: "decommissioned",
-          unregistered: true,
-          runtime_stopped: true,
-        });
+        phase = "pending";
+        return decommission;
       }
-      if (url.endsWith("/api/v1/projects")) {
-        return json({ projects: TEST_PROJECTS });
-      }
+      if (url.endsWith("/api/v1/projects")) return json({ projects: TEST_PROJECTS });
       return json({});
     });
-
-    const apiClient = new HubApiClient({
-      fetchImpl: fetchImpl as unknown as typeof fetch,
-    });
+    const apiClient = new HubApiClient({ fetchImpl: fetchImpl as unknown as typeof fetch });
     const wsStub = {
-      setToken: vi.fn(),
-      connect: vi.fn(),
-      disconnect: vi.fn(),
-      onStatusChange: () => () => {},
-      subscribe: () => () => {},
+      setToken: vi.fn(), connect: vi.fn(), disconnect: vi.fn(),
+      onStatusChange: () => () => {}, subscribe: () => () => {},
     } as unknown as HubWsClient;
 
-    const { unmount } = render(<App apiClient={apiClient} wsClient={wsStub} />);
+    vi.useFakeTimers();
+    let unmount: (() => void) | undefined;
+    try {
+      await act(async () => { ({ unmount } = render(<App apiClient={apiClient} wsClient={wsStub} />)); });
+      expect(screen.getByText("Active session turn before teardown")).toBeInTheDocument();
+      expect(transcriptFetches.some((call) => call.phase === "initial")).toBe(true);
 
-    expect(
-      await screen.findByText("Active session turn before teardown"),
-    ).toBeInTheDocument();
+      // Foreground refresh is legitimate before submission. In one case the poll
+      // completes before submission, so it cannot mask a pending teardown fetch.
+      // The other case retains a stale response across successful teardown.
+      phase = "pre-submit";
+      const beforeFocus = transcriptFetches.length;
+      await act(async () => { fireEvent.focus(window); });
+      expect(transcriptFetches.length).toBeGreaterThan(beforeFocus);
+      deferNextTranscript = holdStaleResponse;
+      const beforePoll = transcriptFetches.length;
+      await act(async () => { await vi.advanceTimersByTimeAsync(3500); });
+      expect(transcriptFetches.length).toBeGreaterThan(beforePoll);
+      expect(deferNextTranscript).toBe(false);
 
-    transcriptFetches.length = 0;
-
-    fireEvent.click(screen.getByTestId("agent-settings-btn-ferris"));
-    fireEvent.click(screen.getByTestId("open-decommission-modal-btn"));
-    fireEvent.click(screen.getByTestId("decommission-teardown-btn"));
-    // Decommission asks for a second confirmation before it stops the session (Record #128).
-    expect(screen.getByTestId("decommission-confirm-dialog")).toBeInTheDocument();
-    expect(screen.getByText("Active session turn before teardown")).toBeInTheDocument();
-    fireEvent.click(screen.getByTestId("decommission-confirm-submit-btn"));
-
-    await waitFor(() => {
+      fireEvent.click(screen.getByTestId("agent-settings-btn-ferris"));
+      fireEvent.click(screen.getByTestId("open-decommission-modal-btn"));
+      fireEvent.click(screen.getByTestId("decommission-teardown-btn"));
+      expect(screen.getByTestId("decommission-confirm-dialog")).toBeInTheDocument();
+      expect(screen.getByText("Active session turn before teardown")).toBeInTheDocument();
+      phase = "submitting";
+      await act(async () => { fireEvent.click(screen.getByTestId("decommission-confirm-submit-btn")); });
+      expect(phase).toBe("pending");
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(5000);
+        fireEvent.focus(window);
+      });
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(50);
+        fireEvent(document, new Event("visibilitychange"));
+      });
       expect(
-        screen.queryByText("Active session turn before teardown"),
-      ).toBeNull();
-    });
-    expect(transcriptFetches).toEqual([]);
+        transcriptFetches.filter(
+          (call) => call.phase === "submitting" || call.phase === "pending" || call.phase === "after-success",
+        ),
+      ).toEqual([]);
+      expect(screen.getByText("Active session turn before teardown")).toBeInTheDocument();
 
-    unmount();
+      phase = "after-success";
+      await act(async () => {
+        resolveDecommission(json({ session_id: "sess-ferris-live", persona: "ferris", mode: "teardown", status: "decommissioned", unregistered: true, runtime_stopped: true }));
+      });
+      expect(screen.queryByText("Active session turn before teardown")).toBeNull();
+      if (holdStaleResponse) {
+        await act(async () => { resolveStaleTranscript(oldTranscript()); });
+        expect(screen.queryByText("Active session turn before teardown")).toBeNull();
+      }
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(5000);
+        fireEvent.focus(window);
+      });
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(50);
+        fireEvent(document, new Event("visibilitychange"));
+      });
+      expect(screen.queryByText("Active session turn before teardown")).toBeNull();
+      expect(
+        transcriptFetches.filter(
+          (call) => call.phase === "submitting" || call.phase === "pending" || call.phase === "after-success",
+        ),
+      ).toEqual([]);
+    } finally {
+      unmount?.();
+      vi.useRealTimers();
+    }
   });
 
   it("opens from the sidebar + Spin Up button in App and dispatches POST /api/v1/sessions/spin-up", async () => {

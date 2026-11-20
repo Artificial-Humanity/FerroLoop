@@ -43,6 +43,11 @@ pub(crate) fn hub_with_ferris(tmp: &TempDir, turns: usize) -> HubState {
         fs::write(&bin, "#!/bin/sh\ncase \"$1 $2\" in\n  'agentapi send-message') printf '%s\\n' \"$4\" >> \"$0.calls\" ;;\nesac\n").unwrap();
         fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
     }
+    // The prompt admission gate validates the selected primary before bare-alias
+    // discovery. This fixture starts with a valid empty primary by default.
+    let routes = crate::discovery::route_table_path(Some(tmp.path())).unwrap();
+    fs::create_dir_all(routes.parent().unwrap()).unwrap();
+    fs::write(&routes, br#"{"entries":{}}"#).unwrap();
     write_ferris_transcript(tmp.path(), turns);
     {
         let store = state.open_store().unwrap();
@@ -886,10 +891,7 @@ fn drain_zero_key_hold_via_real_failing_dispatch_does_not_mark_in_flight_s1() {
     assert_eq!(q.len(), 1);
     assert_eq!(q[0].id, item.id);
     assert!(state.is_composer_held_prompt("conv-ferris-1", &item.id));
-    assert_eq!(
-        q[0].hold_reason.as_deref(),
-        Some("composer_occupied_zero_keys")
-    );
+    assert_eq!(q[0].hold_reason.as_deref(), Some("composer_occupied"));
     assert!(
         !state.session_in_flight_unconfirmed("conv-ferris-1"),
         "zero-key hold must not mark in-flight (S1)"
@@ -900,6 +902,66 @@ fn drain_zero_key_hold_via_real_failing_dispatch_does_not_mark_in_flight_s1() {
     let _probes = crate::api::stub_composer_probes(vec![Some(true)]);
     crate::api::drain_ready_session_queues(&state);
     assert!(state.session_queue("conv-ferris-1").is_empty());
+}
+
+#[test]
+fn distinct_zero_key_holds_map_to_exact_hold_reasons_545() {
+    for (wire_error, want) in [
+        (
+            "composer_occupied_by_non_wire_input: composer_unlocated: composer could not be located; holding delivery without sending keys",
+            "composer_unlocated",
+        ),
+        (
+            "composer_occupied_by_non_wire_input: session_busy: Claude session is not idle; holding delivery without sending keys",
+            "session_busy",
+        ),
+        (
+            "composer_occupied_by_non_wire_input: composer_occupied: composer holds non-wire input or active dialog; holding delivery without sending keys",
+            "composer_occupied",
+        ),
+    ] {
+        let _err = crate::api::stub_queued_delivery_error(wire_error);
+        crate::api::reset_queued_delivery_calls();
+        let tmp = TempDir::new().unwrap();
+        let state = hub_with_ferris(&tmp, 3);
+        let (item, _) = state.enqueue_session_prompt(
+            "conv-ferris-1",
+            Some("ferris".into()),
+            "held".into(),
+            "held".into(),
+            "owner".into(),
+            vec![],
+        );
+        crate::api::drain_ready_session_queues(&state);
+        let q = state.session_queue("conv-ferris-1");
+        assert_eq!(q.len(), 1);
+        assert_eq!(
+            q[0].hold_reason.as_deref(),
+            Some(want),
+            "wire error: {wire_error}"
+        );
+        assert!(state.is_composer_held_prompt("conv-ferris-1", &item.id));
+        drop(_err);
+    }
+    // The mapping itself: exactly the three names, generic falls to occupied.
+    assert_eq!(
+        crate::composer_hold_reason(
+            "composer_occupied_by_non_wire_input: composer holds non-wire input or active dialog; holding delivery without sending keys"
+        ),
+        "composer_occupied"
+    );
+    assert_eq!(
+        crate::composer_hold_reason(
+            "composer_occupied_by_non_wire_input: composer_unlocated: x; holding delivery without sending keys"
+        ),
+        "composer_unlocated"
+    );
+    assert_eq!(
+        crate::composer_hold_reason(
+            "composer_occupied_by_non_wire_input: session_busy: x; holding delivery without sending keys"
+        ),
+        "session_busy"
+    );
 }
 
 #[test]
@@ -1034,6 +1096,9 @@ fn replacement_admission_checks_queue_created_after_its_discovery() {
     let mut replacement = original.clone();
     replacement.id = "conv-ferris-2".into();
     let input = |session: &crate::DiscoveredSessionSummary| crate::DirectPromptInput {
+        claude_terminal: false,
+        claude_binding: None,
+        intended_vendor: None,
         queue_target: crate::PromptQueueTarget::observed(session, "ferris"),
         intended_codex_thread_id: None,
         persona: Some("ferris".into()),
@@ -1310,6 +1375,9 @@ fn retained_alias_is_ambiguous_until_its_original_queue_and_flight_are_gone() {
             false,
             false,
             crate::DirectPromptInput {
+                claude_terminal: false,
+                claude_binding: None,
+                intended_vendor: None,
                 queue_target: crate::PromptQueueTarget::observed(session, "ferris"),
                 intended_codex_thread_id: None,
                 persona: Some("ferris".into()),
@@ -1610,7 +1678,7 @@ fn unknown_prompt_uses_full_attempt_fallback() {
 }
 
 #[test]
-fn prompt_to_recorded_attempt_still_resolves_via_full_fallback() {
+fn prompt_to_unbound_claude_attempt_is_refused() {
     let tmp = TempDir::new().unwrap();
     let state = hub_with_ferris(&tmp, 3);
     let listed = get(&state, "/api/v1/sessions").0.json_value().unwrap();
@@ -1618,7 +1686,52 @@ fn prompt_to_recorded_attempt_still_resolves_via_full_fallback() {
         .as_array()
         .unwrap()
         .iter()
-        .find(|session| session["source"] == "attempt")
+        .find(|session| session["source"] == "attempt" && session["adapter"] == "claude")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap();
+    let response = handle_http_request(
+        &state,
+        &HttpRequest::new("POST", format!("/api/v1/sessions/{attempt}/prompt"))
+            .with_header("Authorization", OWNER)
+            .with_json_body(&json!({ "prompt": "hi", "send_now": true })),
+    );
+    assert_eq!(response.status, 409);
+}
+
+#[test]
+fn prompt_to_recorded_attempt_still_resolves_via_full_fallback() {
+    let tmp = TempDir::new().unwrap();
+    let state = hub_with_ferris(&tmp, 3);
+    // The fallback path is vendor-independent; the shared attempts are Claude and
+    // must be refused without a pinned registration. Use a separate non-Claude
+    // attempt to exercise the normal recorded-attempt lookup.
+    {
+        let store = state.open_store().unwrap();
+        let project = store.add_project("fallback-antigravity").unwrap();
+        store
+            .append_attempt(Attempt {
+                id: None,
+                at: None,
+                project,
+                record: RecordId(seq_iri(9)),
+                adapter: "antigravity".into(),
+                status: AttemptStatus::Completed,
+                duration_ms: 1,
+                tokens_in: 1,
+                tokens_out: 1,
+                cost_usd_micros: 0,
+                paths_touched: PathsTouched::Counted(0),
+                output_excerpt: Some("done".into()),
+            })
+            .unwrap();
+    }
+    let listed = get(&state, "/api/v1/sessions").0.json_value().unwrap();
+    let attempt = listed["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|session| session["source"] == "attempt" && session["adapter"] == "antigravity")
         .unwrap()["id"]
         .as_str()
         .unwrap();

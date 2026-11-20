@@ -1412,6 +1412,16 @@ impl RecoveryScheduler {
         let mut limits = self.accounting_limits(batch.batch_id)?;
         limits.deadline = limits.deadline.min(deadline);
         limits.check()?;
+        // Completed batch records are material catalog references too. Keep the
+        // shared lock from member revalidation through durable publication.
+        let catalog_root = fs::Dir::open(&self.0.policy.destination, &limits)?;
+        let _catalog_access = fs::CatalogLock::acquire(
+            &catalog_root,
+            fs::CatalogLockMode::Shared,
+            true,
+            self.0.io.clone(),
+            &limits,
+        )?;
         for member in &mut batch.members {
             let bundle = backup::VerifiedBundle {
                 path: self

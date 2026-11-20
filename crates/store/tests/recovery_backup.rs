@@ -15,6 +15,7 @@ use fl_store::{
 };
 use serde_json::json;
 use std::{
+    collections::VecDeque,
     fs, io,
     os::unix::fs::{PermissionsExt, symlink},
     path::{Path, PathBuf},
@@ -1423,9 +1424,20 @@ struct MutatePublication {
     event: RecoveryEvent,
     mutation: PublicationMutation,
     done: std::sync::atomic::AtomicBool,
+    seen: Mutex<VecDeque<RecoveryEvent>>,
 }
 impl RecoveryIo for MutatePublication {
     fn before(&self, event: RecoveryEvent) -> io::Result<()> {
+        // Retain at most 16 observed events before the mutation filter so
+        // an `unreached` failure can show what actually flowed. The guard
+        // is scoped to release the lock before the filter/mutation below.
+        {
+            let mut seen = self.seen.lock().unwrap();
+            if seen.len() == 16 {
+                seen.pop_front();
+            }
+            seen.push_back(event);
+        }
         if event != self.event || self.done.swap(true, std::sync::atomic::Ordering::AcqRel) {
             return Ok(());
         }
@@ -1503,10 +1515,23 @@ fn publication_mutation_matrix(reconciliation: Option<bool>) {
             let request = f.request();
             if let Some(existing_receipt) = reconciliation {
                 if existing_receipt {
-                    assert!(matches!(
-                        backup(&f.store, &request, &native, &CancelToken::new()).unwrap(),
-                        PublicationOutcome::Durable(_)
-                    ));
+                    // Retry only ConcurrentBackup for up to 5s: a sibling test's
+                    // forked child briefly holds the physical StoreLock fd between
+                    // fork and exec (the StoreLock file is O_CLOEXEC, fs.rs:595, so
+                    // never after exec). Not reproduced locally (15/15 exact, 6/6
+                    // full binary sandboxed).
+                    let deadline = Instant::now() + Duration::from_secs(5);
+                    let second = loop {
+                        match backup(&f.store, &request, &native, &CancelToken::new()) {
+                            Err(RecoveryError::ConcurrentBackup { .. })
+                                if Instant::now() < deadline =>
+                            {
+                                std::thread::sleep(Duration::from_millis(25));
+                            }
+                            result => break result,
+                        }
+                    };
+                    assert!(matches!(second.unwrap(), PublicationOutcome::Durable(_)));
                 } else {
                     let fault = Arc::new(Fault::default());
                     *fault.failure.lock().unwrap() =
@@ -1536,6 +1561,7 @@ fn publication_mutation_matrix(reconciliation: Option<bool>) {
                 event,
                 mutation,
                 done: Default::default(),
+                seen: Default::default(),
             });
             let filesystem = FaultFs {
                 root: f.destination.clone(),
@@ -1547,9 +1573,15 @@ fn publication_mutation_matrix(reconciliation: Option<bool>) {
             } else {
                 backup(&f.store, &request, &filesystem, &CancelToken::new())
             };
+            let seen_tail: Vec<RecoveryEvent> = {
+                let seen = hook.seen.lock().unwrap();
+                seen.iter().copied().collect()
+            };
             assert!(
                 hook.done.load(std::sync::atomic::Ordering::Acquire),
-                "unreached: {reconciliation:?} {event:?} {mutation:?}"
+                "unreached: {reconciliation:?} {event:?} {mutation:?} result={result:?} \
+                 seen_tail(last {}): {seen_tail:?}",
+                seen_tail.len()
             );
             if !matches!(result, Err(fl_store::recovery::RecoveryError::Quarantined { operation_id }) if operation_id == request.operation_id)
             {
@@ -1766,26 +1798,64 @@ fn default_ceiling_is_admitted_with_bounded_reserve() {
         PublicationOutcome::Durable(_)
     ));
 }
+fn assert_exact_retained_locks(f: &Fixture) -> fs::File {
+    use std::os::unix::fs::MetadataExt;
+    let source = fs::metadata(&f.source).unwrap();
+    let store_name = format!("{}:{}.lock", source.dev(), source.ino());
+    let locks = f.destination.join(".locks");
+    let names: std::collections::BTreeSet<_> = fs::read_dir(&locks)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert_eq!(
+        names,
+        [std::ffi::OsString::from("catalog.lock"), store_name.into()]
+            .into_iter()
+            .collect(),
+        "only the physical store lock and stable catalog lock may remain"
+    );
+    let catalog_path = locks.join("catalog.lock");
+    let metadata = fs::symlink_metadata(&catalog_path).unwrap();
+    assert!(metadata.is_file());
+    assert_eq!(metadata.mode() & 0o7777, 0o600);
+    assert_eq!(metadata.uid(), unsafe { libc::geteuid() });
+    assert_eq!(metadata.nlink(), 1);
+    assert_eq!(metadata.len(), 0);
+    let held = fs::File::open(catalog_path).unwrap();
+    assert_eq!(
+        (
+            held.metadata().unwrap().dev(),
+            held.metadata().unwrap().ino()
+        ),
+        (metadata.dev(), metadata.ino())
+    );
+    held
+}
+
 #[test]
 fn operation_lock_is_reclaimed_and_store_lock_has_diagnostics() {
+    use std::os::unix::fs::MetadataExt;
     let f = Fixture::new();
     let r = f.request();
-    backup(
-        &f.store,
-        &r,
-        &NativeRecoveryFs::new(f.destination.clone(), reconciliation_limits()),
-        &CancelToken::new(),
-    )
-    .unwrap();
-    let names: Vec<_> = fs::read_dir(f.destination.join(".locks"))
-        .unwrap()
-        .map(|e| e.unwrap().path())
-        .collect();
-    assert_eq!(names.len(), 1);
-    let v: serde_json::Value = serde_json::from_slice(&fs::read(&names[0]).unwrap()).unwrap();
+    let native = NativeRecoveryFs::new(f.destination.clone(), reconciliation_limits());
+    backup(&f.store, &r, &native, &CancelToken::new()).unwrap();
+    let catalog = assert_exact_retained_locks(&f);
+    let identity = fs::metadata(&f.source).unwrap();
+    let store_lock =
+        f.destination
+            .join(".locks")
+            .join(format!("{}:{}.lock", identity.dev(), identity.ino()));
+    let v: serde_json::Value = serde_json::from_slice(&fs::read(store_lock).unwrap()).unwrap();
     assert_eq!(v["operation_id"], r.operation_id.to_string());
     assert_eq!(v["pid"], std::process::id());
     assert!(v["started_at_unix_ms"].as_u64().unwrap() > 0);
+    backup(&f.store, &f.request(), &native, &CancelToken::new()).unwrap();
+    let retained = assert_exact_retained_locks(&f).metadata().unwrap();
+    let original = catalog.metadata().unwrap();
+    assert_eq!(
+        (retained.dev(), retained.ino()),
+        (original.dev(), original.ino())
+    );
 }
 
 struct ExhaustedOpen;
@@ -1928,6 +1998,7 @@ fn thousand_operations_do_not_exhaust_shared_directories() {
     }
     let mut total_growth = 0u64;
     let mut maximum_growth = 0u64;
+    let mut catalog_lock = None;
     let mut stat = std::mem::MaybeUninit::<libc::statvfs>::uninit();
     use std::os::fd::AsRawFd;
     let held = fs::File::open(&f.destination).unwrap();
@@ -1994,6 +2065,9 @@ fn thousand_operations_do_not_exhaust_shared_directories() {
             growth <= directory_reserve,
             "operation={n} actual_directory_growth={growth} reserve={directory_reserve}"
         );
+        if n == 0 {
+            catalog_lock = Some(assert_exact_retained_locks(&f));
+        }
         total_growth += growth;
         maximum_growth = maximum_growth.max(growth);
     }
@@ -2002,9 +2076,11 @@ fn thousand_operations_do_not_exhaust_shared_directories() {
         1000 * directory_reserve,
         total_growth as f64 / (1000 * directory_reserve) as f64
     );
+    let retained = assert_exact_retained_locks(&f).metadata().unwrap();
+    let original = catalog_lock.unwrap().metadata().unwrap();
     assert_eq!(
-        fs::read_dir(f.destination.join(".locks")).unwrap().count(),
-        1
+        (retained.dev(), retained.ino()),
+        (original.dev(), original.ino())
     );
     assert!(matches!(
         backup(&f.store, &f.request(), &native, &CancelToken::new()).unwrap(),
@@ -2075,7 +2151,24 @@ struct AllocationFault {
 }
 impl RecoveryIo for AllocationFault {
     fn before(&self, e: RecoveryEvent) -> io::Result<()> {
-        if matches!(e, RecoveryEvent::Flush(_)) {
+        // Admission lock durability is not publication preparation. Only bundle
+        // and receipt flushes cross the boundary used by the exact outcome oracle.
+        if matches!(
+            e,
+            RecoveryEvent::Flush(
+                Member::Image
+                    | Member::VerificationCopy
+                    | Member::Validation
+                    | Member::Report
+                    | Member::Manifest
+                    | Member::Profile
+                    | Member::IndexConfig
+                    | Member::Config
+                    | Member::Warrants
+                    | Member::VaultCiphertext
+                    | Member::Receipt
+            )
+        ) {
             self.prepared
                 .store(true, std::sync::atomic::Ordering::Release);
         }
@@ -2093,6 +2186,25 @@ impl RecoveryIo for AllocationFault {
         Ok(())
     }
 }
+#[test]
+fn allocation_fault_preparation_tracks_publication_flushes_only() {
+    for member in [Member::Image, Member::Manifest, Member::Receipt] {
+        let fault = AllocationFault {
+            target: None,
+            errno: 0,
+            seen: Mutex::new(vec![]),
+            reached: Default::default(),
+            prepared: Default::default(),
+        };
+        for admission in [Member::CatalogLock, Member::LockDiagnostics] {
+            fault.before(RecoveryEvent::Flush(admission)).unwrap();
+            assert!(!fault.prepared.load(std::sync::atomic::Ordering::Acquire));
+        }
+        fault.before(RecoveryEvent::Flush(member)).unwrap();
+        assert!(fault.prepared.load(std::sync::atomic::Ordering::Acquire));
+    }
+}
+
 fn complete_bundle(path: &Path) {
     use sha2::{Digest, Sha256};
     let manifest: serde_json::Value =

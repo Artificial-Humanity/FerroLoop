@@ -12,6 +12,8 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
+#[path = "../src/recovery/test_support.rs"]
+mod test_support;
 struct Meter;
 static LIVE: AtomicUsize = AtomicUsize::new(0);
 static PEAK: AtomicUsize = AtomicUsize::new(0);
@@ -72,8 +74,8 @@ fn mixed_eighty_mib_capture_fits_one_gib() {
                 .spawn()
                 .unwrap();
             // Aggregate watchdog covers fixture setup plus five separately
-            // bounded phases; each operation retains its 120s/1GiB limits.
-            let deadline = Instant::now() + Duration::from_secs(600);
+            // bounded phases, each with a 1GiB memory ceiling.
+            let deadline = Instant::now() + Duration::from_secs(1200);
             loop {
                 if let Some(status) = child.try_wait().unwrap() {
                     assert!(status.success(), "isolated {shape} measurement failed");
@@ -94,7 +96,7 @@ fn mixed_eighty_mib_capture_fits_one_gib() {
         "many" => (1024, 2048),
         _ => panic!("unknown fixture shape"),
     };
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = test_support::fixture_root();
     std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     let path = tmp.path().join("mixed.fls");
     let store = FerroStore::open(&path).unwrap();
@@ -256,19 +258,45 @@ fn mixed_eighty_mib_capture_fits_one_gib() {
     measured("write_image", &mut |l| {
         capture.write_image(&mut file, l).unwrap();
     });
-    let profile = ValidationProfile::new(ProfileKind::MixedTablesVectors, "fixture-memory");
+    let inventory = fl_store::recovery::collect_inventory(&fl_store::recovery::InventoryInputs {
+        roots: vec![tmp.path().to_path_buf()],
+        bindings: vec![fl_store::recovery::BindingInput::config(
+            "memory",
+            path.clone(),
+            Some("ferro".into()),
+            "memory fixture",
+        )],
+        ..Default::default()
+    })
+    .unwrap();
+    let identity = inventory
+        .stores
+        .iter()
+        .find(|s| s.identity.canonical_path.as_deref() == Some(&path))
+        .unwrap()
+        .identity
+        .clone();
+    let profile = ValidationProfile::new(
+        ProfileKind::MixedTablesVectors,
+        identity.catalog_key.clone(),
+    );
     let mut expected = None;
     measured("expectations", &mut |l| {
         expected = Some(capture.expectations(&profile, l).unwrap());
     });
     let expected = expected.unwrap();
+    let mut profile_hash = None;
     if cfg!(target_os = "linux") {
         let copy = tmp.path().join("copy.fls");
         measured("copy_and_verify", &mut |l| {
             copy_and_verify(&image, &copy, &expected, &profile, l).unwrap();
         });
         measured("verify_existing", &mut |l| {
-            verify_existing_copy(&copy, &expected, &profile, l).unwrap();
+            profile_hash = Some(
+                verify_existing_copy(&copy, &expected, &profile, l)
+                    .unwrap()
+                    .profile_sha256,
+            );
         });
     }
     println!(
@@ -276,4 +304,180 @@ fn mixed_eighty_mib_capture_fits_one_gib() {
         pipeline_peak - pipeline_baseline
     );
     assert!(pipeline_peak - pipeline_baseline <= 1 << 30);
+    // The offline attestation excludes cached owners. Drop the fixture writer,
+    // pin and expectations before measuring the actual cold offline operations;
+    // their operation-created live objects all remain inside each measured peak.
+    drop(expected);
+    drop(capture);
+    drop(store);
+    drop(file);
+    #[cfg(target_os = "linux")]
+    offline_source_and_original_memory(
+        &tmp,
+        &path,
+        identity,
+        profile,
+        profile_hash.unwrap(),
+        shape.as_str(),
+    );
+}
+#[cfg(target_os = "linux")]
+fn offline_source_and_original_memory(
+    tmp: &tempfile::TempDir,
+    path: &std::path::Path,
+    identity: fl_store::recovery::StoreIdentity,
+    profile: ValidationProfile,
+    profile_sha256: String,
+    shape: &str,
+) {
+    use fl_store::recovery::{
+        admission::*,
+        backup::*,
+        fs::{NativeRecoveryFs, RecoveryFs},
+        manifest::{Availability, BuildIdentity},
+        restore::*,
+    };
+    use std::os::unix::fs::MetadataExt;
+    let root = tmp.path().join("offline-backups");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+    // Linux CI's wide cold backup exhausted its 120s deadline after earlier
+    // phases took ~185s; charge was 846676376 bytes, below the 1GiB ceiling.
+    // Give this fixture 3x that observed deadline, keeping a finite bound.
+    let new_limits = || {
+        OperationLimits::new(
+            Instant::now() + Duration::from_secs(360),
+            1 << 30,
+            1 << 30,
+            CancelToken::new(),
+        )
+    };
+    let filesystem = NativeRecoveryFs::new(root.clone(), new_limits());
+    let lease = |action, op, hash: String| {
+        let id = |p: &std::path::Path| {
+            let m = std::fs::metadata(p).unwrap();
+            (m.dev(), m.ino())
+        };
+        let now = filesystem.io().unix_ms().unwrap();
+        create_offline_lease(
+            &OfflineLeaseRequest {
+                version: 1,
+                operation_id: op,
+                action,
+                catalog_identity: identity.catalog_key.clone(),
+                approved_root_identity: id(&root),
+                physical_path: path.to_path_buf(),
+                parent_identity: id(path.parent().unwrap()),
+                expected_file: inspect_file_binding(path, &new_limits()).unwrap(),
+                profile_sha256: hash,
+                build: BuildIdentity {
+                    package_version: env!("CARGO_PKG_VERSION").into(),
+                    source_revision: Availability::Unavailable,
+                    executable_sha256: Availability::Unavailable,
+                },
+                issued_at_unix_ms: now,
+                expires_at_unix_ms: now + 600000,
+                operator: "memory fixture operator".into(),
+                exclusion: ExclusionAttestation {
+                    legacy_and_cached_handles_excluded: true,
+                    external_dispatch_excluded: true,
+                    active_owner_excluded: true,
+                    evidence: "fixture cached writer and captured pin dropped; no dispatch".into(),
+                },
+            },
+            &filesystem,
+            &new_limits(),
+        )
+        .unwrap()
+    };
+    let measure = |phase: &str, l: &OperationLimits, action: &mut dyn FnMut()| {
+        let baseline = LIVE.load(Ordering::SeqCst);
+        PEAK.store(baseline, Ordering::SeqCst);
+        action();
+        let absolute = PEAK.load(Ordering::SeqCst);
+        let extra = absolute.saturating_sub(baseline);
+        let charge = l.admitted_memory_bytes();
+        println!(
+            "offline_memory shape={shape} phase={phase} baseline={baseline} peak_extra={extra} charged={charge} budget={} cached_fixture_owner_retained=false",
+            1u64 << 30
+        );
+        assert!(
+            charge >= 2 * extra as u64,
+            "{phase}: charge {charge} < 2x measured {extra}"
+        );
+        assert!(charge <= 1 << 30);
+        assert!(extra <= 1 << 30);
+    };
+    let l = new_limits();
+    let request = BackupRequest {
+        operation_id: l.operation_id,
+        store: identity.clone(),
+        source_map_sha256: "a".repeat(64),
+        profile,
+        batch_id: None,
+        destination: root.clone(),
+        capture: CaptureBudget::new(l.deadline, 1 << 30, 1 << 30, Duration::from_secs(1)),
+        limits: l.clone(),
+        image_byte_limit: None,
+        metadata_byte_limit: 1 << 20,
+        space_margin_bytes: 4096,
+        configs: vec![],
+        excluded_vault_key: None,
+        code_index_configuration: Availability::Unavailable,
+    };
+    let backup_lease = lease(
+        OfflineAction::Backup,
+        request.operation_id,
+        profile_sha256.clone(),
+    );
+    let mut bundle = None;
+    measure("bounded_cold_offline_backup", &l, &mut || {
+        let outcome =
+            backup_offline(&request, &backup_lease, &filesystem, &CancelToken::new()).unwrap();
+        let PublicationOutcome::Durable(selected) = outcome else {
+            panic!("offline publication unknown")
+        };
+        bundle = Some(selected);
+    });
+    let bundle = bundle.unwrap();
+    use sha2::{Digest, Sha256};
+    let digest = format!(
+        "{:x}",
+        Sha256::digest(std::fs::read(bundle.path().join("manifest.json")).unwrap())
+    );
+    let bundle_op =
+        uuid::Uuid::parse_str(bundle.path().file_name().unwrap().to_str().unwrap()).unwrap();
+    let l = new_limits();
+    let restore_lease = lease(
+        OfflineAction::Restore {
+            bundle_operation: bundle_op,
+            bundle_sha256: digest,
+        },
+        l.operation_id,
+        profile_sha256,
+    );
+    let request = RestoreRequest {
+        operation_id: l.operation_id,
+        store: identity,
+        destination: path.to_path_buf(),
+        staging_parent: tmp.path().to_path_buf(),
+        selected_bundle: bundle,
+        limits: l.clone(),
+        metadata_byte_limit: 1 << 20,
+        space_margin_bytes: 4096,
+        original_profile: request.profile.clone(),
+        available_dependencies: vec![],
+    };
+    measure("bounded_physical_original_and_candidate", &l, &mut || {
+        let outcome = restore_offline(&request, &restore_lease, &filesystem).unwrap();
+        let RestoreOutcome::Installed { journal } = outcome else {
+            panic!("restore outcome unknown")
+        };
+        assert!(journal.original_verification.is_some());
+        assert_eq!(journal.budget.rollback_new_bytes, 0);
+        assert!(
+            journal.budget.candidate_bytes + journal.budget.metadata_bytes
+                <= 2 * journal.budget.baseline_bytes
+        );
+    });
 }

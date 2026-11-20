@@ -940,6 +940,75 @@ impl Clock for FakeClock {
     }
 }
 
+/// Existing physical snapshot+WAL preparation, with every decoder allocation
+/// admitted by Task2's preparation model. No creation, repair, writer or fsync.
+pub(super) fn bounded_existing_cache(
+    file: &dyn ContainerIo,
+    file_id: (u64, u64),
+    limits: &OperationLimits,
+) -> Result<super::DiskCache, RecoveryError> {
+    let check = Check {
+        id: limits.operation_id,
+        deadline: limits.deadline,
+        cancel: &limits.cancel,
+        clock: &RealClock,
+    };
+    check.check()?;
+    quota(
+        file.len().map_err(|_| check.verify())?,
+        limits.byte_limit,
+        &check,
+        "source bytes",
+    )?;
+    let published = publication(file, &check)?;
+    let budget = CaptureBudget::new(
+        limits.deadline,
+        limits.memory_byte_limit,
+        limits.memory_byte_limit,
+        Duration::from_secs(1),
+    );
+    let (state, preparation) = prepare(file, &published.sb, &budget, &check)?;
+    limits.admit_memory(preparation)?;
+    validation::descriptor(&state, published, 0, &check)?;
+    Ok(super::DiskCache {
+        file_id,
+        sb: published.sb,
+        state: Arc::new(state),
+        wal_applied: published.sb.wal_length,
+    })
+}
+/// Read-only detached physical-store reader, including published WAL. It is
+/// used solely for original-generation verification, never as a backup image.
+pub(crate) fn decode_physical_existing(
+    file: &std::fs::File,
+    limits: &OperationLimits,
+) -> Result<(FerroStore, ImageDescriptor), RecoveryError> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = file.metadata().map_err(|_| limits.verification())?;
+    let cache = bounded_existing_cache(file, (metadata.dev(), metadata.ino()), limits)?;
+    let check = Check {
+        id: limits.operation_id,
+        deadline: limits.deadline,
+        cancel: &limits.cancel,
+        clock: &RealClock,
+    };
+    let published = publication(file, &check)?;
+    if cache.sb.snapshot_seq != published.sb.snapshot_seq
+        || cache.sb.wal_length != published.sb.wal_length
+        || cache.sb.epoch != published.sb.epoch
+    {
+        return Err(check.verify());
+    }
+    let descriptor = validation::descriptor(&cache.state, published, metadata.len(), &check)?;
+    Ok((
+        FerroStore::assemble(
+            Inner::Memory(Mutex::new(cache.state)),
+            "physical-recovery-reader".into(),
+        ),
+        descriptor,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::crash_sim::{IoOp, SimFs};

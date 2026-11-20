@@ -175,6 +175,8 @@ pub(crate) fn open_local_locked(
     w: &Wording,
 ) -> Result<(FerroStore, Option<crate::MigrationLock>)> {
     let physical = physical_path(path, BackendKind::Ferro);
+    crate::recovery::admission::check_restore_admission(&physical)
+        .map_err(|e| Error::Refused(e.to_string()))?;
     if present(&physical) {
         return Ok((FerroStore::open(&physical)?, None));
     }

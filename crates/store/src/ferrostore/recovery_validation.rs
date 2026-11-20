@@ -85,7 +85,7 @@ pub(crate) fn expectations_from_reader(
     };
     memory::validation(&state, profile, profile_bytes, l, &check)?;
     let mut out = ValidationExpectations {
-        version: 1,
+        version: crate::recovery::manifest::VALIDATION_FORMAT_VERSION,
         source_file_identity: None,
         captured_at_unix_ms: None,
         descriptor,
@@ -535,7 +535,11 @@ fn vector_probe(
         l.check()?;
         let mut h = Canonical::new(l);
         h.bytes(6, id.as_bytes())?;
-        private_hits.push((h.finish(), score));
+        private_hits.push((
+            h.finish(),
+            crate::recovery::manifest::VectorScoreBits::new(score)
+                .ok_or_else(|| l.verification())?,
+        ));
     }
     out.vector_results.push(private_hits);
     Ok(())

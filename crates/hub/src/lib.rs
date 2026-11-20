@@ -118,6 +118,16 @@ pub struct QueuedOperatorPrompt {
     /// Captured at admission; persona rediscovery must never retarget an explicit Codex send.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub intended_codex_thread_id: Option<String>,
+    /// Persisted intent only; it never authorizes delivery after deserialization.
+    #[serde(default)]
+    pub(crate) claude_terminal: bool,
+    #[serde(skip)]
+    pub(crate) claude_binding: Option<fl_wire::vendor_adapter::ClaudeRegistrationBinding>,
+    /// Process-local admission evidence; a deserialized item must not manufacture it.
+    #[serde(skip)]
+    pub(crate) admitted_current: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) intended_vendor: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub persona: Option<String>,
     pub prompt: String,
@@ -208,6 +218,19 @@ fn is_composer_occupied_error(error: &str) -> bool {
     fl_wire::is_composer_occupied_zero_keys_error(error)
 }
 
+/// Hold reason stored on a queue item for a zero-keys wire hold (#545-3): exactly
+/// `composer_occupied`, `composer_unlocated`, or `session_busy`. A generic zero-keys
+/// hold (including the legacy generic text) is an occupied composer.
+fn composer_hold_reason(error: &str) -> &'static str {
+    if error.contains("composer_unlocated") {
+        "composer_unlocated"
+    } else if error.contains("session_busy") {
+        "session_busy"
+    } else {
+        "composer_occupied"
+    }
+}
+
 #[derive(Debug, Default)]
 struct PromptQueueState {
     queues: BTreeMap<String, Vec<QueuedOperatorPrompt>>,
@@ -278,6 +301,9 @@ impl Drop for SessionDispatchGuard<'_> {
 
 pub(crate) struct DirectPromptInput {
     pub queue_target: Option<PromptQueueTarget>,
+    pub claude_terminal: bool,
+    pub claude_binding: Option<fl_wire::vendor_adapter::ClaudeRegistrationBinding>,
+    pub intended_vendor: Option<String>,
     pub intended_codex_thread_id: Option<String>,
     pub persona: Option<String>,
     pub prompt: String,
@@ -315,6 +341,10 @@ impl PromptQueueState {
             id: format!("qp-{}-{}", now.unix_millis(), self.next_seq),
             session_id: session_key.to_string(),
             intended_codex_thread_id: input.intended_codex_thread_id,
+            claude_terminal: input.claude_terminal,
+            claude_binding: input.claude_binding,
+            admitted_current: true,
+            intended_vendor: input.intended_vendor,
             persona: input.persona,
             prompt: input.prompt,
             effective_body: input.effective_body,
@@ -393,6 +423,7 @@ pub struct HubState {
     pub auth: AuthManager,
     pub ws_tx: broadcast::Sender<HubWsFrame>,
     store_lock: Arc<Mutex<()>>,
+    balance_apply_lock: Arc<Mutex<()>>,
     /// One lock per per-project store file (see [`HubState::open_project_store_at`]).
     path_locks: Arc<Mutex<HashMap<PathBuf, Arc<PathLock>>>>,
     prompt_queues: Arc<Mutex<PromptQueueState>>,
@@ -568,6 +599,7 @@ impl HubState {
             auth,
             ws_tx,
             store_lock: Arc::new(Mutex::new(())),
+            balance_apply_lock: Arc::new(Mutex::new(())),
             path_locks: Arc::new(Mutex::new(HashMap::new())),
             prompt_queues: Arc::new(Mutex::new(PromptQueueState::default())),
             model_overrides: Arc::new(Mutex::new(BTreeMap::new())),
@@ -780,6 +812,10 @@ impl HubState {
                     .as_ref()
                     .and_then(|session| PromptQueueTarget::observed(session, session_key)),
                 intended_codex_thread_id,
+                claude_terminal: observed.as_ref().is_some_and(|s| s.adapter == "claude")
+                    && fl_wire::dispatcher::is_owner_sender(&by),
+                claude_binding: None,
+                intended_vendor: None,
                 persona,
                 prompt,
                 effective_body,
@@ -973,9 +1009,11 @@ impl HubState {
                 Err(fl_wire::dispatcher::PushError::Failed(error)) => {
                     if is_composer_occupied_error(&error) {
                         queue[pos].delivery_state = QueuedDeliveryState::Pending;
+                        queue[pos].hold_reason = Some(composer_hold_reason(&error).to_string());
                         queue[pos].delivery_error = Some(error);
-                        queue[pos].hold_reason = Some("composer_occupied_zero_keys".to_string());
-                        queue[pos].retries_exhausted = false;
+                        // Bound Claude holds do not use the generic composer probe.
+                        // The UI's exhausted state provides the Send Now guidance.
+                        queue[pos].retries_exhausted = queue[pos].claude_terminal;
                     } else {
                         queue[pos].delivery_state = QueuedDeliveryState::Unconfirmed;
                         queue[pos].delivery_error = Some(error);
@@ -1420,6 +1458,53 @@ impl HubState {
         Err(last_err.expect("at least one attempt ran"))
     }
 
+    /// Pre-fence candidate selection may refuse a busy local guard. Owned operations use
+    /// `open_store` so polling and post-watch reopen contention wait in rank order.
+    pub(crate) fn try_open_lifecycle_store(
+        &self,
+    ) -> Result<HubStoreGuard<'_>, lifecycle::LifecycleError> {
+        let guard = match self.store_lock.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                return Err(lifecycle::LifecycleError::Conflict(
+                    "workspace store is busy with another operation; retry".into(),
+                ));
+            }
+        };
+        if let Some(parent) = self.config.store_path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            let _ = fl_store::private::create_private_dir_all(parent);
+        }
+        let mut last_err = None;
+        for attempt in 0..200 {
+            match fl_store::open_store_with(
+                &self.config.store_path,
+                &fl_store::StoreOptions {
+                    backend: self.store_backend,
+                    ..fl_store::StoreOptions::default()
+                },
+            ) {
+                Ok(store) => {
+                    return Ok(HubStoreGuard {
+                        store: Some(store),
+                        _guard: Some(guard),
+                    });
+                }
+                Err(e) => {
+                    last_err = Some(e);
+                    if attempt < 199 {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                }
+            }
+        }
+        Err(lifecycle::LifecycleError::from(
+            last_err.expect("at least one attempt ran"),
+        ))
+    }
+
     /// Open a per-project store (`<slug>.redb`) for one operation, waiting at most
     /// [`PROJECT_OPEN_BUDGET`] (about 2 s) in all, and failing with [`ProjectOpenError::Busy`]
     /// when the file stays held. Unlike [`HubState::open_store_at`] it does not take the
@@ -1711,6 +1796,9 @@ mod tests {
                 false,
                 false,
                 DirectPromptInput {
+                    claude_terminal: false,
+                    claude_binding: None,
+                    intended_vendor: None,
                     queue_target: None,
                     intended_codex_thread_id: None,
                     persona: None,
@@ -1733,6 +1821,9 @@ mod tests {
             false,
             false,
             DirectPromptInput {
+                claude_terminal: false,
+                claude_binding: None,
+                intended_vendor: None,
                 queue_target: None,
                 intended_codex_thread_id: None,
                 persona: None,
@@ -2265,6 +2356,13 @@ mod tests {
         )
         .unwrap();
         fs::write(ui_dir.join("app.js"), "console.log('ferrodeck');").unwrap();
+        // Most prompt fixtures use a bare persona. Supply a valid primary source;
+        // tests of source failure construct or remove it explicitly.
+        let routes = crate::discovery::route_table_path(Some(home)).unwrap();
+        fs::create_dir_all(routes.parent().unwrap()).unwrap();
+        if !routes.exists() {
+            fs::write(routes, br#"{"entries":{}}"#).unwrap();
+        }
 
         HubState::new(HubServerConfig {
             listen: "127.0.0.1:0".into(),
@@ -4834,8 +4932,8 @@ mod tests {
                 .with_json_body(&json!({ "mode": "clear" })),
         );
         assert_eq!(missing_route.status, 404);
-        assert!(state.session_queue("felicia").is_empty());
-        assert!(!state.is_session_busy_from_turns("felicia", &[]));
+        assert_eq!(state.session_queue("felicia").len(), 1);
+        assert!(state.is_session_busy_from_turns("felicia", &[]));
 
         state.enqueue_session_prompt(
             "felicia",
@@ -4932,6 +5030,9 @@ mod tests {
         let mut bad_cases: Vec<(&str, Value)> = Vec::new();
         for (field, value) in [
             ("persona", json!("")),
+            ("persona", json!("   ")),
+            ("persona", json!("-invalid")),
+            ("persona", json!("a".repeat(37))),
             ("persona", json!("Felicity")),
             ("persona", json!("fel icity")),
             ("project", json!("  ")),
@@ -9561,27 +9662,28 @@ mod tests {
     }
 
     #[test]
-    fn owner_prompt_reaches_a_claude_tmux_pane_but_a_peer_never_does() {
+    fn unbound_owner_prompt_is_refused_but_peer_uses_claude_socket() {
         let _lock = TMUX_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = TempDir::new().unwrap();
         let state = test_hub_state(&tmp);
         let tmux = FakeTmux::install(tmp.path());
         let listener = install_claude_tmux_route(tmp.path(), "felicity");
 
-        // The Owner token: pasted into the pane, nothing on the peer socket.
-        let sent = post_prompt(
+        // This legacy tmux-only registration cannot establish hosted terminal authority.
+        let refused = call(
             &state,
-            "felicity",
+            "POST",
+            "/api/v1/sessions/felicity/prompt",
             OWNER,
-            None,
             &json!({ "prompt": "hello from the owner", "send_now": true }),
         );
-        assert_eq!(sent["delivered"], true, "{sent}");
-        assert_eq!(sent["by"], "lmcfarlin");
-        let log = tmux.log();
-        assert!(log.contains("paste-buffer -d -b"), "{log}");
-        assert!(log.contains("send-keys -t %12 Enter"), "{log}");
-        assert_eq!(socket_from(&listener), None, "owner prompt used the socket");
+        assert_eq!(refused.status, 409);
+        assert!(tmux.log().is_empty());
+        assert_eq!(
+            socket_from(&listener),
+            None,
+            "refused owner prompt used the socket"
+        );
 
         // A Peer token that claims to be the owner, however it spells the claim, takes the
         // peer-session socket and never the pane.

@@ -495,6 +495,13 @@ fn remodel_ran(status: SwitchStatus) -> bool {
     matches!(status, SwitchStatus::Ok | SwitchStatus::Failed)
 }
 
+#[cfg(test)]
+pub(crate) fn before_apply_fence(hook: impl FnOnce() + 'static) {
+    BEFORE_APPLY_FENCE.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+#[cfg(test)]
+thread_local! { static BEFORE_APPLY_FENCE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) }; }
+
 fn handle_apply(state: &HubState, authority: &HubAuthority, req: &HttpRequest) -> HttpResponse {
     let body: ApplyBody = match body_object(req).and_then(|m| {
         serde_json::from_value(Value::Object(m)).map_err(|e| error(400, e.to_string()))
@@ -505,6 +512,19 @@ fn handle_apply(state: &HubState, authority: &HubAuthority, req: &HttpRequest) -
     let auth = match authorize_apply(state, authority, body.warrant.as_deref()) {
         Ok(a) => a,
         Err(resp) => return resp,
+    };
+    // Apply transactions kept their history atomic under the old long-lived store guard.
+    // Rank 0 is an admission gate only: acquire immediately after authorization,
+    // never while holding a lifecycle fence/local mutex/store guard. No lifecycle
+    // operation acquires this gate. It never waits and is process-local; the
+    // per-persona fences and fresh policy/history checks below remain authoritative.
+    debug_assert!(crate::lifecycle::lifecycle_runtime_unpinned());
+    let _apply = match state.balance_apply_lock.try_lock() {
+        Ok(guard) => guard,
+        Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => {
+            return error(409, "another balance apply is in progress");
+        }
     };
     let (caller, authority_kind, grant_id) = match &auth {
         ApplyAuthority::Owner => (Caller::Owner, "owner", None),
@@ -531,7 +551,7 @@ fn handle_apply(state: &HubState, authority: &HubAuthority, req: &HttpRequest) -
         Err(resp) => return resp,
     };
     let now_ms = stamp::now().unix_millis();
-    let (plan, mut targets) = match checked_plan(
+    let (plan, _) = match checked_plan(
         &store,
         &env,
         &sessions,
@@ -557,127 +577,262 @@ fn handle_apply(state: &HubState, authority: &HubAuthority, req: &HttpRequest) -
         );
     }
 
-    let mut results: Vec<SwitchResult> = Vec::new();
-    let mut down = false;
-    let mut grant_checked = false;
-    for sw in &plan.switches {
-        let mut result = SwitchResult {
-            persona: sw.persona.clone(),
-            session_id: sw.session_id.clone(),
-            from_vendor: sw.from_vendor.clone(),
-            to_vendor: sw.to_vendor.clone(),
-            status: SwitchStatus::NotRun,
-            new_session_id: None,
-            outcome: None,
-            restored_session_id: None,
-            error: None,
-        };
-        if down {
-            result.error = Some("not run: an earlier switch left its persona down".into());
-            results.push(result);
-            continue;
-        }
-        // Every planned switch passed its precheck, which resolved its target.
-        let Some(target) = targets.remove(&sw.session_id) else {
-            result.status = SwitchStatus::Refused;
-            result.error = Some(format!("`{}` was not prechecked", sw.session_id));
-            results.push(result);
-            continue;
-        };
-        // A single-use grant is spent only now, under the guard, just before the first remodel.
-        if !grant_checked {
-            grant_checked = true;
-            if let ApplyAuthority::Warrant {
-                id_or_token,
-                single_use: true,
-                ..
-            } = &auth
-                && let Err(e) = fl_gate::verify_owner_grant(home, id_or_token, Some(by), true)
-            {
-                return warrant_refused(e);
-            }
-        }
-        match run_remodel(
-            state,
-            &store,
-            &target,
-            &switch_request(&sw.to_vendor),
-            by,
-            caller,
-        ) {
-            RemodelRun::Done { out, .. } => {
-                result.status = SwitchStatus::Ok;
-                result.new_session_id = Some(out.session_id);
-                result.outcome = Some("remodeled".into());
-            }
-            RemodelRun::Failed {
-                message,
-                restored_session_id,
-                ..
-            } => {
-                result.status = SwitchStatus::Failed;
-                down = restored_session_id.is_none();
-                result.outcome = Some(if down { "down" } else { "restored" }.into());
-                result.restored_session_id = restored_session_id;
-                result.error = Some(message);
-            }
-            RemodelRun::Refused(e) => {
-                result.status = SwitchStatus::Refused;
-                result.error = Some(e.to_string());
-            }
-        }
-        results.push(result);
-    }
-
-    let mut warnings = Vec::new();
-    let mut history = inputs.history.clone();
-    let history_changed = history.record(
-        now_ms,
-        results
-            .iter()
-            .filter(|r| remodel_ran(r.status))
-            .map(|r| r.persona.as_str()),
-    );
-    let audit = BalanceAudit {
-        applied_at_ms: now_ms,
-        by: by.to_string(),
-        authority: authority_kind.to_string(),
-        warrant_grant_id: grant_id,
-        plan: plan.clone(),
-        results: results.clone(),
-    };
-    let audit_slug = match write_audit(&*store, &audit, stamp::now()) {
-        Ok(slug) => Some(slug),
-        Err(e) => {
-            warnings.push(format!("the audit entry was not written: {e}"));
-            None
-        }
-    };
-    if history_changed && let Err(e) = write_history(&*store, &history, stamp::now(), by) {
-        warnings.push(format!("the balance history was not updated: {e}"));
-    }
-    let data = json!({
-        "plan": plan,
-        "results": results,
-        "audit_slug": audit_slug,
-        "warnings": warnings,
-    });
-    state.broadcast(
-        "watch",
-        "watch.balance.applied",
-        json!({
-            "audit_slug": audit_slug,
-            "by": by,
-            "authority": authority_kind,
-            "results": results,
-        }),
-    );
-    // Every write above belongs to this apply; the next watch or discovery read starts fresh.
     drop(store);
-    state.watch_caches.invalidate();
-    state.discovery_snapshots.invalidate();
-    crate::discovery::invalidate_route_discovery_cache();
-    HttpResponse::json(200, data)
+    #[cfg(test)]
+    BEFORE_APPLY_FENCE.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().take() {
+            hook();
+        }
+    });
+    let personas: Vec<String> = plan.switches.iter().map(|sw| sw.persona.clone()).collect();
+    let run = lifecycle::with_lifecycle_fences(&env, &personas, "balance-apply", |env| {
+        Ok((|| -> HttpResponse {
+            let snap = {
+                let store = match state.open_store() {
+                    Ok(store) => store,
+                    Err(e) => return store_error(e),
+                };
+                crate::discovery::snapshot_discovery_store(&store)
+            };
+            let sessions = discover_route_sessions_without_model_info(&snap, home);
+            let store = match state.open_store() {
+                Ok(store) => store,
+                Err(e) => return store_error(e),
+            };
+            let current = match read_store_inputs(&store) {
+                Ok(v) => v,
+                Err(e) => return e,
+            };
+            let (fresh_plan, mut targets) = match checked_plan(
+                &store,
+                env,
+                &sessions,
+                caller,
+                &current.policy,
+                &current,
+                &live,
+                stamp::now().unix_millis(),
+            ) {
+                Ok(plan) => plan,
+                Err(e) => return e,
+            };
+            if fresh_plan.blocked.is_some()
+                || fresh_plan.switches != plan.switches
+                || fresh_plan
+                    .switches
+                    .iter()
+                    .any(|sw| !personas.contains(&sw.persona))
+            {
+                return error(
+                    409,
+                    "balance plan changed during lifecycle selection; re-plan",
+                );
+            }
+            let validated_policy = current.policy.clone();
+            let validated_history = current.history.clone();
+            drop(store);
+            let mut results: Vec<SwitchResult> = Vec::new();
+            let mut down = false;
+            let mut grant_checked = false;
+            for sw in &plan.switches {
+                let mut result = SwitchResult {
+                    persona: sw.persona.clone(),
+                    session_id: sw.session_id.clone(),
+                    from_vendor: sw.from_vendor.clone(),
+                    to_vendor: sw.to_vendor.clone(),
+                    status: SwitchStatus::NotRun,
+                    new_session_id: None,
+                    outcome: None,
+                    restored_session_id: None,
+                    error: None,
+                };
+                if down {
+                    result.error = Some("not run: an earlier switch left its persona down".into());
+                    results.push(result);
+                    continue;
+                }
+                // Every planned switch passed its precheck, which resolved its target.
+                let Some(target) = targets.remove(&sw.session_id) else {
+                    result.status = SwitchStatus::Refused;
+                    result.error = Some(format!("`{}` was not prechecked", sw.session_id));
+                    results.push(result);
+                    continue;
+                };
+                let mut warrant_error = None;
+                let run = crate::lifecycle::with_lifecycle_fence(
+                    env,
+                    &target.persona,
+                    "balance-remodel",
+                    |env| {
+                        let (store, target) = crate::api::owned_lifecycle_target(
+                            state,
+                            &target.raw_id,
+                            &target.persona,
+                        )?;
+                        // Policy and cooldown may have changed while file ownership was acquired.
+                        let current = read_store_inputs(&store).map_err(|response| {
+                            crate::lifecycle::LifecycleError::Store(
+                                String::from_utf8_lossy(&response.body).into_owned(),
+                            )
+                        })?;
+                        // Preserve this batch's target allocation after its own earlier moves.
+                        // Policy/cooldown edits still force a fresh plan before the next effect.
+                        if current.policy != validated_policy
+                            || current.history != validated_history
+                        {
+                            let (current_plan, _) = checked_plan(
+                                &store,
+                                env,
+                                &sessions,
+                                caller,
+                                &current.policy,
+                                &current,
+                                &live,
+                                stamp::now().unix_millis(),
+                            )
+                            .map_err(|response| {
+                                crate::lifecycle::LifecycleError::Conflict(
+                                    String::from_utf8_lossy(&response.body).into_owned(),
+                                )
+                            })?;
+                            if current_plan.blocked.is_some()
+                                || !current_plan.switches.iter().any(|current| {
+                                    current.persona == sw.persona
+                                        && current.session_id == sw.session_id
+                                        && current.from_vendor == sw.from_vendor
+                                        && current.to_vendor == sw.to_vendor
+                                })
+                            {
+                                return Err(crate::lifecycle::LifecycleError::Conflict(
+                                    "balance policy or cooldown changed; re-plan".into(),
+                                ));
+                            }
+                        }
+                        let target = crate::lifecycle::reload_lifecycle_target(&*store, &target)?;
+                        crate::lifecycle::remodel_precheck(
+                            &*store,
+                            env,
+                            &target,
+                            &switch_request(&sw.to_vendor),
+                            caller,
+                        )?;
+                        // A single-use grant is spent only now, under the guard, just before the first remodel.
+                        if !grant_checked {
+                            grant_checked = true;
+                            if let ApplyAuthority::Warrant {
+                                id_or_token,
+                                single_use: true,
+                                ..
+                            } = &auth
+                                && let Err(e) =
+                                    fl_gate::verify_owner_grant(home, id_or_token, Some(by), true)
+                            {
+                                warrant_error = Some(warrant_refused(e));
+                                return Err(crate::lifecycle::LifecycleError::Forbidden(
+                                    "owner grant refused".into(),
+                                ));
+                            }
+                        }
+                        Ok(run_remodel(
+                            state,
+                            &store,
+                            env,
+                            &target,
+                            &switch_request(&sw.to_vendor),
+                            by,
+                            caller,
+                        ))
+                    },
+                );
+                if let Some(response) = warrant_error {
+                    return response;
+                }
+                match run.unwrap_or_else(RemodelRun::Refused) {
+                    RemodelRun::Done { out, .. } => {
+                        result.status = SwitchStatus::Ok;
+                        result.new_session_id = Some(out.session_id);
+                        result.outcome = Some("remodeled".into());
+                    }
+                    RemodelRun::Failed {
+                        message,
+                        restored_session_id,
+                        ..
+                    } => {
+                        result.status = SwitchStatus::Failed;
+                        down = restored_session_id.is_none();
+                        result.outcome = Some(if down { "down" } else { "restored" }.into());
+                        result.restored_session_id = restored_session_id;
+                        result.error = Some(message);
+                    }
+                    RemodelRun::Refused(e) => {
+                        result.status = SwitchStatus::Refused;
+                        result.error = Some(e.to_string());
+                    }
+                }
+                results.push(result);
+            }
+
+            let Ok(store) = state.open_store() else {
+                return store_open_failure();
+            };
+            let mut warnings = Vec::new();
+            let mut history = match read_history(&*store) {
+                Ok(history) => history,
+                Err(error) => return balance_error(error),
+            };
+            let history_changed = history.record(
+                now_ms,
+                results
+                    .iter()
+                    .filter(|r| remodel_ran(r.status))
+                    .map(|r| r.persona.as_str()),
+            );
+            let audit = BalanceAudit {
+                applied_at_ms: now_ms,
+                by: by.to_string(),
+                authority: authority_kind.to_string(),
+                warrant_grant_id: grant_id,
+                plan: plan.clone(),
+                results: results.clone(),
+            };
+            let audit_slug = match write_audit(&*store, &audit, stamp::now()) {
+                Ok(slug) => Some(slug),
+                Err(e) => {
+                    warnings.push(format!("the audit entry was not written: {e}"));
+                    None
+                }
+            };
+            if history_changed && let Err(e) = write_history(&*store, &history, stamp::now(), by) {
+                warnings.push(format!("the balance history was not updated: {e}"));
+            }
+            let data = json!({
+                "plan": plan,
+                "results": results,
+                "audit_slug": audit_slug,
+                "warnings": warnings,
+            });
+            state.broadcast(
+                "watch",
+                "watch.balance.applied",
+                json!({
+                    "audit_slug": audit_slug,
+                    "by": by,
+                    "authority": authority_kind,
+                    "results": results,
+                }),
+            );
+            // Every write above belongs to this apply; the next watch or discovery read starts fresh.
+            drop(store);
+            state.watch_caches.invalidate();
+            state.discovery_snapshots.invalidate();
+            crate::discovery::invalidate_route_discovery_cache();
+            HttpResponse::json(200, data)
+        })())
+    });
+    match run {
+        Ok(response) => response,
+        Err(e) => error(e.status(), e.to_string()),
+    }
 }
 
 #[cfg(test)]

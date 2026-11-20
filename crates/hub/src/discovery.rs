@@ -786,6 +786,42 @@ pub fn discover_route_sessions_without_model_info(
     discover_sessions_impl(snap, home_override, false)
 }
 
+/// Saved reset targets, without discovery, transcript reads or terminal probes.
+/// Keep session discovery's ordering, retirement/tombstone filters and native-ID deduplication.
+/// Unsupported saved routes remain visible so reset preflight can return an actionable refusal.
+pub(crate) fn saved_reset_targets(
+    snap: &DiscoveryStoreSnapshot,
+    home_override: Option<&Path>,
+) -> Vec<(String, String, VendorRoute)> {
+    let routes = RouteTable::load(route_table_path(home_override).as_deref());
+    let file_decommissioned = fl_wire::identity::load_decommissioned_session_ids(home_override);
+    let mut ordered: Vec<_> = routes.entries.into_iter().collect();
+    ordered.sort_by_key(|(persona, entry)| {
+        (
+            !snap
+                .registered_names
+                .contains(&persona.to_ascii_lowercase()),
+            std::cmp::Reverse(entry.updated_at.unix_millis()),
+            persona.clone(),
+        )
+    });
+    let mut seen = BTreeSet::new();
+    ordered
+        .into_iter()
+        .filter_map(|(persona, entry)| {
+            if (!entry.explicit && snap.retired_names.contains(&persona.to_ascii_lowercase()))
+                || route_was_decommissioned(&snap.decommissioned_session_ids, &entry.route)
+                || route_was_decommissioned(&file_decommissioned, &entry.route)
+            {
+                return None;
+            }
+            let id = route_session_id(&persona, &entry.route);
+            seen.insert(id.clone())
+                .then_some((id, persona, entry.route))
+        })
+        .collect()
+}
+
 /// Retain all route claims for usage attribution, including conflicting personas.
 /// Unlike session discovery, this deliberately does not deduplicate native IDs.
 pub(crate) fn usage_route_claims(
@@ -11034,6 +11070,74 @@ mod tests {
         assert!(
             sessions.iter().any(|session| session.adapter == "webhook"),
             "{sessions:?}"
+        );
+    }
+
+    #[test]
+    fn saved_reset_targets_preserve_identity_filters_and_dedup_without_discovery() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path();
+        let mut routes = RouteTable::default();
+        for (persona, id, millis) in [
+            ("registered", "shared-thread", 1),
+            ("newer-unregistered", "shared-thread", 50),
+            ("older", "another-thread", 2),
+            ("newest", "another-thread", 40),
+            ("retired-passive", "retired-thread", 3),
+            ("snapshot-banned", "snapshot-thread", 4),
+            ("file-banned", "file-thread", 5),
+        ] {
+            // Model conflicting claims already present in a saved file. Normal upsert
+            // transfers ownership of a native identity, so seed with distinct IDs first.
+            routes.upsert(
+                persona,
+                VendorRoute::Codex {
+                    thread_id: format!("initial-{persona}"),
+                    cwd: None,
+                },
+                fl_core::at::At::from_unix_millis(millis),
+            );
+            routes.entries.get_mut(persona).unwrap().route = VendorRoute::Codex {
+                thread_id: id.into(),
+                cwd: None,
+            };
+        }
+        routes.upsert_explicit(
+            "retired-explicit",
+            VendorRoute::Muse {
+                session_id: String::new(),
+                cwd: None,
+                tmux_target: Some("must-not-probe".into()),
+                tmux_pane: None,
+            },
+            fl_core::at::At::from_unix_millis(6),
+        );
+        routes
+            .save(Some(&home.join(".cache/agent-bus/routes.json")))
+            .unwrap();
+        fl_wire::identity::save_decommissioned_session_ids(
+            Some(home),
+            &BTreeSet::from(["file-thread".into()]),
+        )
+        .unwrap();
+        let snap = DiscoveryStoreSnapshot {
+            registered_names: BTreeSet::from(["registered".into()]),
+            retired_names: BTreeSet::from(["retired-passive".into(), "retired-explicit".into()]),
+            decommissioned_session_ids: BTreeSet::from(["snapshot-thread".into()]),
+            ..DiscoveryStoreSnapshot::default()
+        };
+        let (targets, costs) = cost_counters::measure(|| saved_reset_targets(&snap, Some(home)));
+        assert_eq!(costs.route_scans, 0);
+        assert_eq!(
+            targets
+                .iter()
+                .map(|(id, persona, _)| (id.as_str(), persona.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("shared-thread", "registered"),
+                ("another-thread", "newest"),
+                ("muse-retired-explicit", "retired-explicit"),
+            ]
         );
     }
 

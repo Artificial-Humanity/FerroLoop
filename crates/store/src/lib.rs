@@ -13,6 +13,20 @@ use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition, TableHand
 use std::collections::BTreeSet;
 use std::path::Path;
 
+#[cfg(feature = "wire-test-isolation")]
+#[doc(hidden)]
+pub mod test_isolation;
+
+#[cfg(unix)]
+pub(crate) fn guarded_unix_connect(
+    path: impl AsRef<Path>,
+) -> std::io::Result<std::os::unix::net::UnixStream> {
+    let path = path.as_ref();
+    #[cfg(feature = "wire-test-isolation")]
+    test_isolation::validate_unix(path)?;
+    std::os::unix::net::UnixStream::connect(path)
+}
+
 pub mod any;
 pub mod cli;
 pub mod code_knowledge;
@@ -2724,6 +2738,79 @@ mod tests {
             err.to_string().contains(&path.display().to_string()),
             "{err}"
         );
+    }
+
+    #[test]
+    fn wire_send_once_process_crash_rolls_back_both_backends() {
+        use fl_core::at::At;
+        use fl_core::ferrowire::{MessageKind, MessageUrgency, SendWireArgs, WireAddress};
+        use fl_core::ids::{MessageId, seq_iri};
+        use fl_core::store::MessageStore;
+        fn args() -> SendWireArgs {
+            SendWireArgs {
+                id: Some(MessageId(seq_iri(91737))),
+                sender_id: None,
+                sender_name: "jarvis".into(),
+                sender_host: None,
+                to: WireAddress::AgentName("ferris".into()),
+                kind: MessageKind::Mail,
+                urgency: MessageUrgency::Normal,
+                durable: true,
+                subject: "Prompt".into(),
+                body: "Pending".into(),
+                reply_to: None,
+                thread_id: None,
+                deadline_at: None,
+                at: At::from_unix_millis(10),
+            }
+        }
+        if let Some(path) = std::env::var_os("FL_TEST_WIRE_ONCE_CRASH") {
+            let path = std::path::PathBuf::from(path);
+            if path.extension().unwrap() == "redb" {
+                RedbStore::open(&path)
+                    .unwrap()
+                    .send_wire_once_awaiting_daemon(args())
+                    .unwrap();
+            } else {
+                crate::ferrostore::FerroStore::open(&path)
+                    .unwrap()
+                    .send_wire_once_awaiting_daemon(args())
+                    .unwrap();
+            }
+            panic!("the child should exit after message insertion");
+        }
+        let dir = tempfile::tempdir().unwrap();
+        for ext in ["redb", "fls"] {
+            let path = dir.path().join(format!("wire.{ext}"));
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tests::wire_send_once_process_crash_rolls_back_both_backends",
+                ])
+                .env("FL_TEST_WIRE_ONCE_CRASH", &path)
+                .status()
+                .unwrap();
+            assert_eq!(status.code(), Some(75));
+            let store: Box<dyn MessageStore> = if ext == "redb" {
+                Box::new(RedbStore::open(&path).unwrap())
+            } else {
+                Box::new(crate::ferrostore::FerroStore::open(&path).unwrap())
+            };
+            let id = args().id.unwrap();
+            assert!(store.get_wire_message(&id).unwrap().is_none());
+            match store.list_wire_receipts(&id) {
+                Ok(receipts) => assert!(receipts.is_empty()),
+                Err(StoreError::MessageNotFound(missing)) => assert_eq!(missing, id),
+                Err(other) => panic!("unexpected receipt error: {other}"),
+            }
+            assert!(store.list_wire_awaiting_daemon().unwrap().is_empty());
+            assert!(
+                store
+                    .send_wire_once_awaiting_daemon(args())
+                    .unwrap()
+                    .is_some()
+            );
+        }
     }
 
     #[test]

@@ -1,10 +1,15 @@
 //! Recovery inventory and explicitly bounded physical capture primitives.
+pub mod admission;
 pub mod backup;
 pub mod catalog;
 pub mod fs;
 pub mod inventory;
 mod inventory_metadata;
 mod inventory_types;
+pub mod purge;
+pub mod readiness;
+pub mod restore;
+mod restore_metadata;
 pub use inventory::{
     BindingEdge, BindingInput, ConsumerEdge, InventoryInputs, StoreIdentity, StoreMap,
     collect_inventory,
@@ -12,6 +17,31 @@ pub use inventory::{
 
 #[derive(Debug, thiserror::Error)]
 pub enum RecoveryError {
+    #[error(
+        "restore admission fenced by {guard_path:?} (operation {operation_id:?}); inspect with `ferrostore recovery --root <ROOT> --lease <LEASE> --request <CONTINUATION.json> status`; administrative exclusion and reconciliation required"
+    )]
+    RestoreFenced {
+        guard_path: std::path::PathBuf,
+        operation_id: Option<uuid::Uuid>,
+    },
+    #[error("could not resolve physical store path {path:?}: {source}")]
+    PhysicalPathResolution {
+        path: std::path::PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error(
+        "recovery {operation_id}: admission failed; store is {fence_state}; retained metadata requires operator review"
+    )]
+    RestoreAdmissionArtifactsRetained {
+        operation_id: uuid::Uuid,
+        fence_state: RestoreAdmissionFenceState,
+        staging: std::path::PathBuf,
+        staging_identity: Option<(u64, u64)>,
+        operation_lock_identity: Option<(u64, u64)>,
+        #[source]
+        source: Box<RecoveryError>,
+    },
     #[error("recovery {operation_id}: image exceeds admitted ceiling")]
     ImageExceedsCeiling { operation_id: uuid::Uuid },
     #[error("recovery {operation_id}: another backup holds the physical store lock")]
@@ -39,12 +69,59 @@ pub enum RecoveryError {
         operation_id: uuid::Uuid,
         resource: &'static str,
     },
+    #[error(
+        "recovery {operation_id}: metadata_byte_limit offers {offered_bytes} bytes; restore terminal reservation requires at least {required_bytes} bytes; {action}"
+    )]
+    RestoreMetadataReservationQuota {
+        operation_id: uuid::Uuid,
+        offered_bytes: u64,
+        required_bytes: u64,
+        action: &'static str,
+    },
+    #[error(
+        "recovery {operation_id}: {resource} offers {offered_bytes} encoded bytes; limit {limit_bytes} encoded bytes (JSON quotes and escaping included); journal unchanged"
+    )]
+    RestoreTerminalInputQuota {
+        operation_id: uuid::Uuid,
+        resource: &'static str,
+        offered_bytes: u64,
+        limit_bytes: u64,
+    },
+    #[error(
+        "recovery {operation_id}: journal {journal:?} frame at offset {offset} declares {declared_bytes} bytes above cap {cap}; no repair or unfence attempted"
+    )]
+    RestoreJournalFrameQuota {
+        operation_id: uuid::Uuid,
+        journal: std::path::PathBuf,
+        offset: u64,
+        declared_bytes: u64,
+        cap: u64,
+    },
+    #[error(
+        "recovery {operation_id}: journal {journal:?} frame {frame_index} at offset {offset} declares {declared_bytes} bytes above frame count cap {cap}; no repair or unfence attempted"
+    )]
+    RestoreJournalFrameCountQuota {
+        operation_id: uuid::Uuid,
+        journal: std::path::PathBuf,
+        offset: u64,
+        frame_index: u64,
+        cap: u64,
+        declared_bytes: u64,
+    },
     #[error("recovery {operation_id}: deadline exceeded")]
     Deadline { operation_id: uuid::Uuid },
     #[error("recovery {operation_id}: cancelled")]
     Cancelled { operation_id: uuid::Uuid },
     #[error("recovery {operation_id}: image or captured expectations verification failed")]
     Verification { operation_id: uuid::Uuid },
+    #[error("recovery {operation_id}: metadata verification failed at {entry:?}")]
+    MetadataVerification {
+        operation_id: uuid::Uuid,
+        /// Lexical entry path relative to the approved recovery root.
+        entry: std::path::PathBuf,
+        #[source]
+        source: Box<RecoveryError>,
+    },
     #[error("recovery {operation_id}: transient resource failure ({errno})")]
     Transient {
         operation_id: uuid::Uuid,
@@ -56,6 +133,39 @@ pub enum RecoveryError {
     OutcomeUnknown { operation_id: uuid::Uuid },
     #[error("inventory metadata unavailable: {0}")]
     Metadata(String),
+}
+
+/// Observation of the admission name after an interrupted admission. No guard
+/// contents are read, repaired or removed to produce this diagnostic.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RestoreAdmissionFenceState {
+    Fenced,
+    Unfenced,
+    Uncertain,
+}
+impl std::fmt::Display for RestoreAdmissionFenceState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Fenced => "fenced",
+            Self::Unfenced => "unfenced",
+            Self::Uncertain => "of uncertain fence state",
+        })
+    }
+}
+impl RecoveryError {
+    /// Call only after private O_NOFOLLOW descriptor checks. Construct the
+    /// lexical entry path lazily: resource/authority refusals keep their type
+    /// and do not allocate diagnostic paths, including on memory exhaustion.
+    pub(crate) fn at_metadata_entry(self, entry: impl FnOnce() -> std::path::PathBuf) -> Self {
+        match self {
+            Self::Verification { operation_id } => Self::MetadataVerification {
+                operation_id,
+                entry: entry(),
+                source: Box::new(self),
+            },
+            other => other,
+        }
+    }
 }
 
 /// A shared cooperative cancellation flag. Cancellation never writes the source.
@@ -129,6 +239,7 @@ pub struct OperationLimits {
     query_work_used: std::sync::Arc<std::sync::atomic::AtomicU64>,
     pub(crate) publication_io: Option<std::sync::Arc<fs::PublicationIo>>,
     memory_admission: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    retained_memory_bytes: u64,
 }
 impl OperationLimits {
     pub fn new(
@@ -147,6 +258,7 @@ impl OperationLimits {
             query_work_used: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             publication_io: None,
             memory_admission: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            retained_memory_bytes: 0,
         }
     }
 }
@@ -171,7 +283,21 @@ impl OperationLimits {
         self.memory_admission
             .load(std::sync::atomic::Ordering::Acquire)
     }
+    /// A scoped clone charges nested scratch alongside already retained values.
+    /// The caller admits this reservation before allocating those values.
+    pub(crate) fn with_retained_memory(&self, bytes: u64) -> Result<Self, RecoveryError> {
+        let mut scoped = self.clone();
+        scoped.retained_memory_bytes = self
+            .retained_memory_bytes
+            .checked_add(bytes)
+            .ok_or_else(|| self.verification())?;
+        scoped.admit_memory(0)?;
+        Ok(scoped)
+    }
     pub(crate) fn admit_memory(&self, bytes: u64) -> Result<(), RecoveryError> {
+        let bytes = bytes
+            .checked_add(self.retained_memory_bytes)
+            .ok_or_else(|| self.verification())?;
         self.quota(bytes, self.memory_byte_limit, "working memory")?;
         self.memory_admission
             .fetch_max(bytes, std::sync::atomic::Ordering::AcqRel);
@@ -235,3 +361,6 @@ impl OperationLimits {
         }
     }
 }
+
+#[cfg(test)]
+pub(crate) mod test_support;

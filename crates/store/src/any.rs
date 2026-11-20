@@ -205,6 +205,8 @@ pub(crate) fn open_store_sink_env(
         None => choose_backend(path, env)?,
     };
     let physical = physical_path(path, kind);
+    crate::recovery::admission::check_restore_admission(&physical)
+        .map_err(|e| backend(e.to_string()))?;
     let (backend_store, label) = match kind {
         BackendKind::Redb => {
             warn_if_fls_beside(&physical, sink);
@@ -463,6 +465,7 @@ fn lock_failed(physical: &Path, err: &std::io::Error) -> StoreError {
 /// (what `fl store migrate` runs; [`crate::migrate::migrate_verified`] itself
 /// takes no lock). Forgets an earlier automatic fallback of this store.
 pub fn migrate_locked(redb: &Path, fls: &Path) -> Result<crate::migrate::ParityReport, StoreError> {
+    crate::recovery::admission::check_restore_admission(fls).map_err(|e| backend(e.to_string()))?;
     let _lock = MigrationLock::acquire(fls, true)
         .map_err(|err| {
             backend(format!(
@@ -489,7 +492,14 @@ fn refuse_if_served_without_file(fls: &Path) -> Result<(), StoreError> {
     if !crate::ferrostore::socket_path_fits(&sock) {
         return Ok(());
     }
-    match std::os::unix::net::UnixStream::connect(&sock) {
+    #[cfg(feature = "wire-test-isolation")]
+    if let Err(err) = crate::test_isolation::validate_unix(&sock) {
+        if err.kind() == std::io::ErrorKind::NotFound {
+            return Ok(());
+        }
+        return Err(backend(err.to_string()));
+    }
+    match crate::guarded_unix_connect(&sock) {
         Ok(_) => Err(backend(format!(
             "a FerroStore server at {} is serving a store whose file {} does not exist: \
              stop that server before migrating, or the migration would write a {} that \
@@ -1250,6 +1260,7 @@ delegate! {
     }
     MessageStore {
         fn send_wire(&self, args: SendWireArgs) -> Result<(WireMessage, Vec<DeliveryReceipt>), StoreError>;
+        fn send_wire_once_awaiting_daemon(&self, args: SendWireArgs) -> Result<Option<(WireMessage, Vec<DeliveryReceipt>)>, StoreError>;
         fn get_wire_message(&self, id: &MessageId) -> Result<Option<WireMessage>, StoreError>;
         fn list_wire_inbox(&self, filter: &WireFilter) -> Result<Vec<WireInboxItem>, StoreError>;
         fn list_wire_thread(&self, thread_id: &ThreadId) -> Result<Vec<WireMessage>, StoreError>;

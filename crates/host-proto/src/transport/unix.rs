@@ -367,6 +367,8 @@ fn prepare_socket(dir: RawFd, name: &CStr, path: &Path, euid: u32) -> Result<(),
         return Err(HostError::EndpointBusy);
     }
     let before = dev_ino(&st);
+    #[cfg(feature = "hub-test-isolation")]
+    crate::client::validate_test_endpoint(&crate::HostEndpoint::unix(path)?)?;
     match StdUnix::connect(path) {
         Ok(_) => Err(HostError::EndpointBusy),
         Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),

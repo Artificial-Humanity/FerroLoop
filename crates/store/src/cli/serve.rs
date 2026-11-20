@@ -147,6 +147,8 @@ pub fn serve(
     w: &Wording,
     ready: impl FnOnce(&Serving) -> Result<()>,
 ) -> Result<(Serving, &'static str)> {
+    crate::recovery::admission::check_restore_admission(&physical_path(path, BackendKind::Ferro))
+        .map_err(|e| Error::Refused(e.to_string()))?;
     check(options)?;
     // Recovery is optional. A bad policy disables recovery, never data serving.
     let recovery = options

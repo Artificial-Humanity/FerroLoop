@@ -268,6 +268,7 @@ mod tests {
     #[test]
     fn mutual_psk_handshake_succeeds_for_matching_token_and_rejects_mismatch() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let _listener_fixture = crate::test_isolation::register_tcp_listener(&listener).unwrap();
         let addr = listener.local_addr().unwrap();
 
         // 1. Matching PSK
@@ -290,6 +291,7 @@ mod tests {
 
         // 2. Mismatched PSK fails authentication
         let listener2 = TcpListener::bind("127.0.0.1:0").unwrap();
+        let _listener2_fixture = crate::test_isolation::register_tcp_listener(&listener2).unwrap();
         let addr2 = listener2.local_addr().unwrap();
         let srv2 = std::thread::spawn(move || {
             let (tcp, _) = listener2.accept().unwrap();
@@ -310,6 +312,7 @@ mod tests {
     #[test]
     fn psk_handshake_is_not_open_to_a_reflection_attack() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let _listener_fixture = crate::test_isolation::register_tcp_listener(&listener).unwrap();
         let addr = listener.local_addr().unwrap();
         let victim = std::thread::spawn(move || {
             let mut handles = Vec::new();

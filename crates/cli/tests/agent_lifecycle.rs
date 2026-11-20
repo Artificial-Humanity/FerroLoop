@@ -38,6 +38,11 @@ impl Env {
         c.current_dir(self.path())
             .env("HOME", self.path())
             .env("XDG_RUNTIME_DIR", self.path())
+            .env("FL_HOST_SOCK", self.path().join("host.sock"))
+            .env(
+                "TMUX",
+                format!("{},1,0", self.path().join("tmux.sock").display()),
+            )
             .env("XDG_CONFIG_HOME", self.path().join("config"))
             .env("XDG_DATA_HOME", self.path().join("data"))
             .env("FL_WIRE_DISABLE_HOST_DISCOVERY", "1")
@@ -1039,4 +1044,122 @@ fn area_set_preserves_nested_competition_path() {
         .find(|row| row["area_key"] == "competition")
         .unwrap();
     assert_eq!(area["path"], "Kaggle/Competition/");
+}
+
+// CI-only under #539: isolated subprocess/store regression, never a local pure filter.
+#[test]
+fn restart_reuses_saved_configuration_and_changes_only_selected_session() {
+    let e = Env::new();
+    let cwd = e.path().join("saved-worktree");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let mut spin = e.spin_up("ada", "assistant", "claude");
+    spin.args([
+        "--model",
+        "claude-opus-4-6",
+        "--thinking-level",
+        "high",
+        "--posture",
+        "plan",
+        "--node-id",
+        "saved-node",
+        "--cwd",
+    ])
+    .arg(&cwd);
+    Env::json_of(spin);
+    Env::json_of(e.spin_up("bea", "assistant", "claude"));
+    let untouched = e
+        .hosted_records()
+        .into_iter()
+        .find(|r| r["persona"] == "bea")
+        .unwrap();
+    let saved = {
+        let store = fl_store::open_store(&e.store()).unwrap();
+        let mut record = fl_hub::lifecycle::find_hosted_session(&store, &["claude:ada"])
+            .unwrap()
+            .unwrap();
+        record.context_window = Some(200_000);
+        record.status = "stopped".into();
+        fl_hub::lifecycle::persist_hosted_session(&store, &record, "test").unwrap();
+        serde_json::to_value(record).unwrap()
+    };
+    let mut restart = e.fl();
+    restart.args(["agent", "restart", "ada", "--json"]);
+    let output = restart.assert().failure().get_output().clone();
+    let out: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(out["runtime_live"], false);
+    assert_eq!(out["runtime_spawned"], false);
+    assert!(String::from_utf8_lossy(&output.stderr).contains("no live runtime"));
+    for key in [
+        "session_id",
+        "persona",
+        "project",
+        "role",
+        "vendor",
+        "model",
+        "thinking_level",
+        "posture",
+        "node_id",
+        "cwd",
+        "context_window",
+        "hosted",
+    ] {
+        assert_eq!(out[key], saved[key], "{key}");
+    }
+    assert_eq!(
+        out["restart_count"],
+        saved["restart_count"].as_u64().unwrap() + 1
+    );
+    assert_eq!(out["status"], "stopped");
+    assert_eq!(
+        e.hosted_records()
+            .into_iter()
+            .find(|r| r["persona"] == "bea")
+            .unwrap(),
+        untouched
+    );
+    e.fl()
+        .args(["agent", "restart", "ada", "--model", "other"])
+        .assert()
+        .failure();
+}
+
+// CI-only: selection failure must exit before touching either saved record or host.
+#[test]
+fn restart_cli_refuses_ambiguous_persona_without_effects() {
+    let e = Env::new();
+    Env::json_of(e.spin_up("ada", "assistant", "claude"));
+    {
+        let store = fl_store::open_store(&e.store()).unwrap();
+        let mut duplicate = fl_hub::lifecycle::find_hosted_session(&store, &["claude:ada"])
+            .unwrap()
+            .unwrap();
+        duplicate.session_id = "codex:ada".into();
+        duplicate.vendor = "codex".into();
+        fl_hub::lifecycle::persist_hosted_session(&store, &duplicate, "test").unwrap();
+    }
+    let before = e.hosted_records();
+    e.fl()
+        .args(["agent", "restart", "ada", "--json"])
+        .assert()
+        .code(2)
+        .stderr(contains("multiple saved sessions"));
+    assert_eq!(e.hosted_records(), before);
+}
+
+#[test]
+fn restart_no_spawn_text_reports_spawn_hydration_and_failure() {
+    let e = Env::new();
+    Env::json_of(e.spin_up("ada", "assistant", "claude"));
+    e.fl()
+        .args(["agent", "restart", "ada"])
+        .assert()
+        .failure()
+        .stdout(
+            contains("stopped")
+                .and(contains("runtime_spawned=false"))
+                .and(contains("runtime_live=false"))
+                .and(contains("hydration_dispatched="))
+                .and(contains("hydration_status=")),
+        )
+        .stderr(contains("no live runtime"));
 }

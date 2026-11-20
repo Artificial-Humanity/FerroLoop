@@ -29,6 +29,53 @@ pub enum SessionResetMode {
     Reforge,
 }
 
+/// A reset cannot safely establish a new native conversation on this route.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct SessionResetRefusal {
+    pub code: &'static str,
+    pub vendor: String,
+    pub reason: &'static str,
+    pub alternative: &'static str,
+    pub error: String,
+}
+
+impl std::fmt::Display for SessionResetRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&serde_json::to_string(self).map_err(|_| std::fmt::Error)?)
+    }
+}
+
+impl std::error::Error for SessionResetRefusal {}
+
+/// Check reset support without inspecting or changing any transport or runtime.
+pub fn preflight_session_reset(route: &VendorRoute) -> Result<(), SessionResetRefusal> {
+    match route {
+        VendorRoute::Codex { .. }
+        | VendorRoute::Muse { .. }
+        | VendorRoute::Grok { .. }
+        | VendorRoute::HostCli { .. } => {
+            Err(SessionResetRefusal::for_vendor(route.canonical_vendor()))
+        }
+        VendorRoute::Claude { .. } | VendorRoute::Agy { .. } | VendorRoute::Webhook { .. } => {
+            Ok(())
+        }
+    }
+}
+
+impl SessionResetRefusal {
+    fn for_vendor(vendor: &str) -> Self {
+        Self {
+            code: "reset_unsupported",
+            vendor: vendor.to_string(),
+            reason: "identity_unconfirmable",
+            alternative: "remodel_same_vendor",
+            error: format!(
+                "Clear/Reforge is unavailable for {vendor}: the native session identity cannot be confirmed. Use remodel with the same vendor to start a fresh session."
+            ),
+        }
+    }
+}
+
 /// Maximum automatic push delivery attempts before leaving a message `Pending` for explicit poll.
 pub const MAX_DELIVER: u32 = 5;
 
@@ -36,6 +83,13 @@ pub const MAX_DELIVER: u32 = 5;
 /// older than this, even when every recipient has a route. That bounds how long a route can point
 /// at a replaced session that still accepts input, and how long dead routes stay listed.
 pub const ROUTE_REDISCOVERY_INTERVAL: Duration = Duration::from_secs(60);
+
+/// How long a Claude reforge waits for `/clear` to produce a new native session id
+/// before the reforge prompt is withheld and the reset is reported unconfirmed.
+const CLAUDE_REFORGE_SETTLE_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Poll interval for the Claude reforge settle wait.
+const CLAUDE_REFORGE_SETTLE_POLL: Duration = Duration::from_millis(100);
 
 pub fn format_push_header(msg: &WireMessage) -> String {
     format!(
@@ -397,6 +451,9 @@ fn push_webhook_operator_prompt(
 
 /// Write `line` and a newline on one new connection to the webhook socket.
 fn push_webhook_line(socket_path: &Path, mut line: String) -> Result<(), PushError> {
+    #[cfg(feature = "wire-test-isolation")]
+    crate::test_isolation::ensure_socket(socket_path)
+        .map_err(|e| PushError::Failed(e.to_string()))?;
     let mut stream = UnixStream::connect(socket_path).map_err(|e| {
         let text = format!(
             "failed to connect to webhook socket {}: {e}",
@@ -460,6 +517,7 @@ fn dispatch_to_claude(
                             verify_submission: true,
                             session_id: Some(session_id).filter(|s| !s.trim().is_empty()),
                             is_muse_route: false,
+                            is_claude_route: true,
                             composer_style: ComposerStyle::Ruled,
                         },
                     );
@@ -491,6 +549,8 @@ fn push_claude_socket(
         .and_then(|v| v.as_str())
         .ok_or_else(|| format!("missing `peerToken` in {}", kpath.display()))?;
 
+    #[cfg(feature = "wire-test-isolation")]
+    crate::test_isolation::ensure_socket(socket_path).map_err(|e| e.to_string())?;
     let mut stream = UnixStream::connect(socket_path).map_err(|e| {
         format!(
             "failed to connect to claude socket {}: {e}",
@@ -531,14 +591,161 @@ fn read_claude_session_record(pid: u32, key_path: Option<&Path>) -> Option<serde
     serde_json::from_str(&raw).ok()
 }
 
+fn claude_record_status(record: Option<&serde_json::Value>) -> Option<&str> {
+    record
+        .and_then(|r| r.get("status"))
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+}
+
+fn claude_record_session_id(record: Option<&serde_json::Value>) -> Option<String> {
+    record
+        .and_then(|r| r.get("sessionId"))
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+fn claude_record_matches_native_session(record: Option<&serde_json::Value>, native: &str) -> bool {
+    claude_record_session_id(record).as_deref() == Some(native)
+}
+
 /// `true` when the session record says Claude is waiting for input. An absent or unreadable
 /// record, or any other status, is "not idle": pasting into a busy turn would interleave the
 /// message with whatever is being typed or run.
 fn claude_session_idle(record: Option<&serde_json::Value>) -> bool {
-    record
-        .and_then(|r| r.get("status"))
-        .and_then(|v| v.as_str())
-        .is_some_and(|s| s.eq_ignore_ascii_case("idle"))
+    claude_record_status(record).is_some_and(|s| s.eq_ignore_ascii_case("idle"))
+}
+
+/// Deliverable statuses (#545): `idle`, and `shell` (main turn idle with only background
+/// shells running). `busy` is not deliverable from the record alone: it covers both a busy
+/// main turn and a main turn waiting only on a background agent, and the record carries no
+/// field that separates them. Any absent or other status is not deliverable.
+fn claude_session_deliverable(record: Option<&serde_json::Value>) -> bool {
+    claude_session_idle(record)
+        || claude_record_status(record).is_some_and(|s| s.eq_ignore_ascii_case("shell"))
+}
+
+fn claude_session_busy(record: Option<&serde_json::Value>) -> bool {
+    claude_record_status(record).is_some_and(|s| s.eq_ignore_ascii_case("busy"))
+}
+
+/// Where a Claude background-wait proof captures its screen from: a `%<n>` tmux
+/// pane, or a hosted session id resolved through `fl-host`. Anything else cannot
+/// be captured for proof and stays held.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ClaudeProofTarget {
+    TmuxPane(String),
+    HostSession(String),
+    Unsupported,
+}
+
+fn claude_proof_target(target: &str) -> ClaudeProofTarget {
+    let target = target.trim();
+    if target.starts_with('%') {
+        ClaudeProofTarget::TmuxPane(target.to_string())
+    } else if let Some(host) = claude_host_target(target) {
+        ClaudeProofTarget::HostSession(host)
+    } else {
+        ClaudeProofTarget::Unsupported
+    }
+}
+
+/// Capture `target` (tmux pane or hosted session) and prove a background wait from
+/// its screen. Fail-closed: a non-`busy` record, an uncapturable target, a missing
+/// panel, or `esc to interrupt` in the footer all stay held.
+fn claude_tmux_pane_proves_background_wait(pane: &str, record: Option<&serde_json::Value>) -> bool {
+    claude_target_proves_background_wait(pane, record)
+}
+
+fn claude_target_proves_background_wait(target: &str, record: Option<&serde_json::Value>) -> bool {
+    if !claude_session_busy(record) {
+        return false;
+    }
+    match claude_proof_target(target) {
+        ClaudeProofTarget::TmuxPane(pane) => {
+            capture_tmux_rendered_screen(&tmux_bin(), &tmux_exact_target(&pane))
+                .is_some_and(|screen| screen_proves_claude_background_wait(&screen.contents))
+        }
+        ClaudeProofTarget::HostSession(host) => {
+            if std::env::var_os("FL_WIRE_TMUX_BIN").is_some() {
+                return false;
+            }
+            resolve_live_host_session_with_mode(&host)
+                .filter(|(_, stream, _)| {
+                    stream
+                        .session
+                        .as_str()
+                        .rsplit_once('.')
+                        .is_some_and(|(_, vendor)| vendor.eq_ignore_ascii_case("claude"))
+                })
+                .and_then(|(mut client, stream, _)| {
+                    capture_host_rendered_screen(&mut client, &stream)
+                })
+                .is_some_and(|screen| screen_proves_claude_background_wait(&screen.contents))
+        }
+        ClaudeProofTarget::Unsupported => false,
+    }
+}
+
+/// `true` when the footer below the bottom rule (status line and any panel lines)
+/// carries `esc to interrupt`: the main Claude turn itself is running, so the
+/// composer must not be pasted into even though it looks empty.
+fn claude_footer_contains_esc_to_interrupt(screen: &str) -> bool {
+    let cleaned = normalize_terminal_screen(screen);
+    let lines: Vec<&str> = cleaned.lines().collect();
+    let Some(bottom) = lines.iter().rposition(|line| is_horizontal_rule_line(line)) else {
+        return false;
+    };
+    lines[bottom + 1..]
+        .iter()
+        .any(|line| line.contains("esc to interrupt"))
+}
+
+fn claude_screen_is_busy_main(screen: &str) -> bool {
+    claude_footer_contains_esc_to_interrupt(screen)
+}
+
+/// `true` only when `screen` proves a background wait (#545): the strict background-agent
+/// panel is present below the bottom rule, the composer is located, and it holds no
+/// unsubmitted content and no dialog/menu markers. A merely empty composer does not prove
+/// this: a busy main turn also shows an empty composer while it streams.
+fn screen_proves_claude_background_wait(screen: &str) -> bool {
+    let cleaned = normalize_terminal_screen(screen);
+    let lines: Vec<&str> = cleaned.lines().collect();
+    let Some(panel_blank) = claude_background_panel_start(&lines) else {
+        return false;
+    };
+    if composer_region_lines(&lines).is_none() {
+        return false;
+    }
+    // The status line above the panel blank still says `esc to interrupt` while the main
+    // turn itself is running (verbatim capture 17:29:33 in ferris-545-captures); only a
+    // status line without it proves the main turn is waiting on background work alone.
+    let status_line = panel_blank.checked_sub(1).map(|i| lines[i]).unwrap_or("");
+    if status_line.contains("esc to interrupt") || claude_footer_contains_esc_to_interrupt(screen) {
+        return false;
+    }
+    !screen_has_dialog_or_menu_markers_with_context(screen, None, None, &[])
+        && !composer_has_unsubmitted_content_for_route(screen, None, false)
+}
+
+fn line_contains_paste_placeholder(line: &str) -> bool {
+    line.contains("[Pasted Content") || line.contains("[Pasted text")
+}
+
+/// Line count a Claude `[Pasted text #N +M lines]` placeholder reports for a payload:
+/// the number of logical lines in the trimmed payload (`str::lines().count()`), so a
+/// trailing newline does not add a line and a single-line payload counts as 1.
+fn payload_line_count(payload: &str) -> usize {
+    let trimmed = payload.trim();
+    if trimmed.is_empty() {
+        0
+    } else {
+        trimmed.lines().count()
+    }
 }
 
 /// Drop every control character except `\n` and `\t` from text that a peer controls, so a pasted
@@ -581,7 +788,9 @@ fn push_claude_tmux(
             "no live tmux pane for this session".to_string()
         }
     })?;
-    if !claude_session_idle(record.as_ref()) {
+    if !claude_session_deliverable(record.as_ref())
+        && !claude_tmux_pane_proves_background_wait(&pane, record.as_ref())
+    {
         return Err(format!(
             "session in pane {pane} is not idle; leaving the message pending"
         ));
@@ -594,6 +803,7 @@ fn push_claude_tmux(
             verify_submission: true,
             session_id: Some(session_id).filter(|s| !s.trim().is_empty()),
             is_muse_route: false,
+            is_claude_route: true,
             composer_style: ComposerStyle::Ruled,
         },
     )
@@ -635,7 +845,7 @@ fn parent_pid(pid: u32) -> Option<u32> {
 /// or the chain is cut.
 pub(crate) fn tmux_pane_for_pid(pid: u32) -> Option<String> {
     if host_discovery_allowed()
-        && let Ok(endpoint) = fl_host_proto::HostEndpoint::discover()
+        && let Ok(endpoint) = crate::runtime_context::host_endpoint()
         && let Ok(mut client) = fl_host_proto::BlockingHostClient::connect(&endpoint)
         && let Ok(sessions) = client.list_sessions()
     {
@@ -655,7 +865,8 @@ pub(crate) fn tmux_pane_for_pid(pid: u32) -> Option<String> {
             cur = next;
         }
     }
-    let out = Command::new(tmux_bin())
+    let out = crate::runtime_context::tmux_command(&tmux_bin())
+        .ok()?
         .args(["list-panes", "-a", "-F", "#{pane_id} #{pane_pid}"])
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
@@ -998,6 +1209,13 @@ fn deliver_to_codex_route(
     cwd: Option<&PathBuf>,
     text: &str,
 ) -> Result<(), String> {
+    if ["/new", "/clear"]
+        .iter()
+        .any(|slash| text.trim().eq_ignore_ascii_case(slash))
+    {
+        return Err(SessionResetRefusal::for_vendor("codex").to_string());
+    }
+
     // `codex queue --message` bypasses the TUI slash-command parser and would send the literal
     // text as a chat turn, so `/compact` goes through the app-server RPC instead. A failure is
     // returned as is: falling back to `codex queue` would be the bug.
@@ -1065,6 +1283,9 @@ fn run_codex_queue(
     cwd: Option<&PathBuf>,
     text: &str,
 ) -> Result<(), CodexQueueError> {
+    #[cfg(feature = "wire-test-isolation")]
+    crate::test_isolation::ensure_executable(bin)
+        .map_err(|err| CodexQueueError::Spawn(err.to_string()))?;
     let mut cmd = Command::new(bin);
     cmd.args(["queue", "--thread", thread_id, "--message", text])
         .stdout(std::process::Stdio::null())
@@ -1147,6 +1368,8 @@ fn run_muse_exec(
     cwd: Option<&PathBuf>,
     text: &str,
 ) -> Result<(), String> {
+    #[cfg(feature = "wire-test-isolation")]
+    crate::test_isolation::ensure_executable(bin).map_err(|err| err.to_string())?;
     let mut cmd = Command::new(bin);
     cmd.args(["exec", "--session-id", session_id, "--json", text])
         .stdout(std::process::Stdio::null())
@@ -1257,6 +1480,8 @@ fn run_grok_turn(
     cwd: Option<&PathBuf>,
     text: &str,
 ) -> Result<CapturedRun, String> {
+    #[cfg(feature = "wire-test-isolation")]
+    crate::test_isolation::ensure_executable(bin).map_err(|err| err.to_string())?;
     let mut cmd = Command::new(bin);
     cmd.args([
         "--no-auto-update",
@@ -1437,6 +1662,8 @@ fn deliver_to_agy_route(
         (String::new(), r_csrf)
     };
 
+    #[cfg(feature = "wire-test-isolation")]
+    crate::test_isolation::ensure_executable(&exe).map_err(|err| err.to_string())?;
     let mut cmd = Command::new(&exe);
     // `agy agentapi send-message [--title=<title>] <recipient_id> <content>`: a bare title
     // would be read as the recipient.
@@ -1799,6 +2026,8 @@ fn post_agy_connect_rpc_with_deadline(
         body.len()
     );
     let target = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
+    #[cfg(feature = "wire-test-isolation")]
+    crate::test_isolation::ensure_tcp(&target).map_err(|e| e.to_string())?;
     let mut stream = TcpStream::connect_timeout(&target, timeout)
         .map_err(|err| format!("antigravity revert connect to {host} failed: {err}"))?;
     stream
@@ -1983,18 +2212,12 @@ fn truncate_agy_transcript_file(path: &Path) -> Result<(), String> {
     fs::write(path, keep).map_err(|err| format!("failed to truncate {}: {err}", path.display()))
 }
 
-/// Reset a live vendor session. Tmux-backed Muse and Grok routes send `C-u`,
-/// the slash command, and `Enter` through `tmux send-keys`. Codex and Grok use
-/// `/new`. Claude, Muse, and Webhook use `/clear`.
+/// Reset a supported live vendor session, then deliver the hydration prompt for Reforge.
 ///
-/// Antigravity rewinds the open cascade with `RevertToCascadeStep`
-/// (`stepIndex` 0, `conversationOnly` true) and keeps only the `step_index` 0
-/// transcript line. A mock `FL_WIRE_AGY_BIN` without a listening address and
-/// csrf token still sends `/clear`.
-///
-/// Reforge requires a non-empty prompt before any tmux or vendor dispatch.
-/// It waits 2s after a tmux reset (skipped when `FL_WIRE_TMUX_BIN` is set)
-/// and then delivers that prompt on the same route.
+/// Codex, Muse, Grok and all HostCli routes refuse before any transport or probe because
+/// their native session identity cannot be confirmed. Antigravity retains its in-place
+/// cascade rewind; Claude and the deterministic Webhook transport keep their current paths.
+/// Reforge requires a non-empty prompt before checking route support.
 pub fn clear_or_reforge_session(
     route: &VendorRoute,
     mode: SessionResetMode,
@@ -2003,6 +2226,34 @@ pub fn clear_or_reforge_session(
 ) -> Result<(), String> {
     let prompt = if mode == SessionResetMode::Reforge {
         Some(require_reforge_prompt(reforge_prompt)?)
+    } else {
+        None
+    };
+    preflight_session_reset(route).map_err(|refusal| refusal.to_string())?;
+    // Production Claude Reforge must prove the pre-`/clear` session id before
+    // any slash or hydration dispatch; without a confirmable id it refuses
+    // with zero keys. The only bypass is the explicit `FL_WIRE_TMUX_BIN`
+    // fixture seam (test fakes cannot produce a real session record).
+    let claude_before_session_id: Option<String> = if mode == SessionResetMode::Reforge
+        && matches!(route, VendorRoute::Claude { .. })
+        && std::env::var_os("FL_WIRE_TMUX_BIN").is_none()
+    {
+        let before = match route {
+            VendorRoute::Claude { pid, key_path, .. } if *pid != 0 => {
+                let record = read_claude_session_record(*pid, key_path.as_deref());
+                claude_record_session_id(record.as_ref())
+            }
+            _ => None,
+        };
+        match before {
+                Some(id) => Some(id),
+                None => {
+                    return Err(
+                        "reforge unconfirmed: Claude session record/session id unavailable before /clear; refusing to reset or send the reforge prompt"
+                            .to_string(),
+                    )
+                }
+            }
     } else {
         None
     };
@@ -2019,22 +2270,78 @@ pub fn clear_or_reforge_session(
         }
         return Ok(());
     }
-    let slash = session_reset_slash(route);
-    if let Some(target) = alive_tmux_reset_target(route) {
-        send_tmux_reset_keys(&target, slash)?;
-        if let Some(prompt) = prompt {
-            if std::env::var_os("FL_WIRE_TMUX_BIN").is_none() {
-                std::thread::sleep(Duration::from_millis(2000));
-            }
-            dispatch_operator_prompt_to_route(route, sender_name, prompt)?;
-        }
-        return Ok(());
-    }
-    dispatch_operator_prompt_to_route(route, sender_name, slash)?;
+    dispatch_operator_prompt_to_route(route, sender_name, "/clear")?;
     if let Some(prompt) = prompt {
+        if let Some(before_id) = claude_before_session_id.as_deref() {
+            // On timeout this errors and the reforge prompt is not dispatched.
+            wait_for_claude_reforge_settle(route, before_id)?;
+        }
         dispatch_operator_prompt_to_route(route, sender_name, prompt)?;
     }
     Ok(())
+}
+
+/// Whether a post-`/clear` Claude record proves the reset landed: only a changed
+/// native session id confirms it. Idle/`shell` status alone confirms nothing, and an
+/// absent or unreadable record is not confirmation.
+fn claude_reforge_settled(before_session_id: &str, record: Option<&serde_json::Value>) -> bool {
+    matches!(claude_record_session_id(record), Some(id) if id != before_session_id)
+}
+
+fn claude_reforge_timeout_error(timeout: Duration) -> String {
+    format!(
+        "reforge unconfirmed: Claude session id did not change within {} seconds after /clear; the reforge prompt was not sent",
+        timeout.as_secs()
+    )
+}
+
+/// Poll `read_record` every `poll` for at most `timeout` until the session id changes.
+/// Returns `false` on timeout, including when the record becomes absent mid-poll.
+fn claude_reforge_settle_with<F: FnMut() -> Option<serde_json::Value>>(
+    before_session_id: &str,
+    timeout: Duration,
+    poll: Duration,
+    mut read_record: F,
+) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if claude_reforge_settled(before_session_id, read_record().as_ref()) {
+            return true;
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return false;
+        }
+        std::thread::sleep(poll.min(deadline - now));
+    }
+}
+
+/// Bounded settle wait after `/clear` on a Claude reforge: poll the session record
+/// every ~100 ms for [`CLAUDE_REFORGE_SETTLE_TIMEOUT`] until the session id changes.
+/// Skip cases (`FL_WIRE_TMUX_BIN` set, `pid == 0`, non-Claude route) proceed without
+/// waiting, as test seams cannot produce a record. On timeout returns an error so the
+/// caller does not dispatch the reforge prompt.
+fn wait_for_claude_reforge_settle(
+    route: &VendorRoute,
+    before_session_id: &str,
+) -> Result<(), String> {
+    let VendorRoute::Claude { pid, key_path, .. } = route else {
+        return Ok(());
+    };
+    if *pid == 0 || std::env::var_os("FL_WIRE_TMUX_BIN").is_some() {
+        return Ok(());
+    }
+    let (pid, key_path) = (*pid, key_path.clone());
+    if claude_reforge_settle_with(
+        before_session_id,
+        CLAUDE_REFORGE_SETTLE_TIMEOUT,
+        CLAUDE_REFORGE_SETTLE_POLL,
+        || read_claude_session_record(pid, key_path.as_deref()),
+    ) {
+        Ok(())
+    } else {
+        Err(claude_reforge_timeout_error(CLAUDE_REFORGE_SETTLE_TIMEOUT))
+    }
 }
 
 fn require_reforge_prompt(reforge_prompt: Option<&str>) -> Result<&str, String> {
@@ -2042,105 +2349,6 @@ fn require_reforge_prompt(reforge_prompt: Option<&str>) -> Result<&str, String> 
         .map(str::trim)
         .filter(|prompt| !prompt.is_empty())
         .ok_or_else(|| "missing reforge prompt".to_string())
-}
-
-fn session_reset_slash(route: &VendorRoute) -> &'static str {
-    match route {
-        VendorRoute::Codex { .. } | VendorRoute::Grok { .. } => "/new",
-        VendorRoute::HostCli { vendor, .. }
-            if vendor.eq_ignore_ascii_case("codex") || vendor.eq_ignore_ascii_case("grok") =>
-        {
-            "/new"
-        }
-        VendorRoute::Claude { .. }
-        | VendorRoute::Muse { .. }
-        | VendorRoute::Agy { .. }
-        | VendorRoute::HostCli { .. }
-        | VendorRoute::Webhook { .. } => "/clear",
-    }
-}
-
-fn alive_tmux_reset_target(route: &VendorRoute) -> Option<String> {
-    let ordered: [&Option<String>; 2] = match route {
-        VendorRoute::Grok {
-            tmux_pane,
-            tmux_target,
-            ..
-        }
-        | VendorRoute::HostCli {
-            tmux_pane,
-            tmux_target,
-            ..
-        } => [tmux_pane, tmux_target],
-        VendorRoute::Muse {
-            tmux_target,
-            tmux_pane,
-            ..
-        } => [tmux_target, tmux_pane],
-        VendorRoute::Claude { .. }
-        | VendorRoute::Codex { .. }
-        | VendorRoute::Agy { .. }
-        | VendorRoute::Webhook { .. } => return None,
-    };
-    let mut seen = Vec::new();
-    for slot in ordered {
-        let Some(raw) = slot else {
-            continue;
-        };
-        let target = raw.trim();
-        if target.is_empty() || seen.iter().any(|seen| seen == target) {
-            continue;
-        }
-        seen.push(target.to_string());
-        if tmux_target_alive(target) {
-            return Some(target.to_string());
-        }
-    }
-    None
-}
-
-fn send_tmux_reset_keys(target: &str, slash: &str) -> Result<(), String> {
-    if std::env::var_os("FL_WIRE_TMUX_BIN").is_none()
-        && let Some((mut client, stream)) = resolve_live_host_session(target)
-    {
-        let grant = client
-            .claim_controller(stream.clone())
-            .map_err(|e| format!("failed to claim fl-host controller for {target}: {e}"))?;
-        let outcome = client
-            .write_raw(stream.clone(), grant.lease, b"\x15".to_vec())
-            .map_err(|e| format!("fl-host write_raw C-u failed: {e}"))?;
-        if !matches!(outcome, fl_host_proto::SendOutcome::Written) {
-            return Err(format!("fl-host write_raw C-u returned {outcome:?}"));
-        }
-        let outcome = client
-            .write_raw(stream.clone(), grant.lease, slash.as_bytes().to_vec())
-            .map_err(|e| format!("fl-host write_raw {slash} failed: {e}"))?;
-        if !matches!(outcome, fl_host_proto::SendOutcome::Written) {
-            return Err(format!("fl-host write_raw {slash} returned {outcome:?}"));
-        }
-        std::thread::sleep(TMUX_PASTE_SETTLE_DELAY);
-        let outcome = client
-            .write_raw(stream, grant.lease, b"\r".to_vec())
-            .map_err(|e| format!("fl-host write_raw Enter failed: {e}"))?;
-        if !matches!(outcome, fl_host_proto::SendOutcome::Written) {
-            return Err(format!("fl-host write_raw Enter returned {outcome:?}"));
-        }
-        return Ok(());
-    }
-    let tmux = tmux_bin();
-    let target = tmux_exact_target(target);
-    for key in ["C-u", slash, "Enter"] {
-        let status = Command::new(&tmux)
-            .args(["send-keys", "-t", &target, key])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .map_err(|e| format!("failed to spawn tmux send-keys: {e}"))?;
-        if !status.success() {
-            return Err(format!("tmux send-keys {key} exited with {status}"));
-        }
-    }
-    Ok(())
 }
 
 /// Method label of [`InterruptPlan::TmuxKey`].
@@ -2288,7 +2496,7 @@ pub fn run_interrupt(plan: &InterruptPlan) -> Result<(), String> {
                 .iter()
                 .find(|t| tmux_target_alive(t))
                 .ok_or_else(|| "no live tmux target for the session".to_string())?;
-            let status = Command::new(tmux_bin())
+            let status = crate::runtime_context::tmux_command(&tmux_bin())?
                 .args(["send-keys", "-t", &tmux_exact_target(target), key])
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
@@ -2352,6 +2560,10 @@ pub fn run_interrupt(plan: &InterruptPlan) -> Result<(), String> {
 }
 
 pub(crate) fn tmux_bin() -> PathBuf {
+    #[cfg(feature = "wire-test-isolation")]
+    if crate::test_isolation::is_enabled() {
+        return crate::test_isolation::tmux_fixture();
+    }
     std::env::var_os("FL_WIRE_TMUX_BIN")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("tmux"))
@@ -2398,16 +2610,15 @@ pub fn tmux_exact_target(target: &str) -> String {
 /// consulted only when `FL_HOST_SOCK` is explicitly set so hermetic tests never reach a live
 /// host daemon on the machine.
 pub(crate) fn host_discovery_allowed() -> bool {
-    if std::env::var_os("FL_WIRE_TMUX_BIN").is_some() {
-        return false;
-    }
-    #[cfg(test)]
-    {
-        std::env::var_os("FL_HOST_SOCK").is_some()
-    }
-    #[cfg(not(test))]
-    {
-        true
+    std::env::var_os("FL_WIRE_TMUX_BIN").is_none() && {
+        #[cfg(test)]
+        {
+            std::env::var_os("FL_HOST_SOCK").is_some()
+        }
+        #[cfg(not(test))]
+        {
+            cfg!(not(test))
+        }
     }
 }
 
@@ -2421,7 +2632,7 @@ fn resolve_live_host_session_with_mode(
     if !host_discovery_allowed() {
         return None;
     }
-    let endpoint = fl_host_proto::HostEndpoint::discover().ok()?;
+    let endpoint = crate::runtime_context::host_endpoint().ok()?;
     let mut client = fl_host_proto::BlockingHostClient::connect(&endpoint).ok()?;
     let sessions = client.list_sessions().ok()?;
     let matched_ids = crate::vendor_adapter::matching_live_host_sessions(&sessions, target);
@@ -2447,6 +2658,68 @@ fn resolve_live_host_session(
     resolve_live_host_session_with_mode(target).map(|(client, stream, _)| (client, stream))
 }
 
+/// A Claude host target selected from the currently connected host's own list.
+/// This handle is private so a raw session name cannot certify its provenance.
+struct ResolvedClaudeHost {
+    client: fl_host_proto::BlockingHostClient,
+    stream: fl_host_proto::StreamId,
+    is_pty: bool,
+}
+
+fn resolve_claude_host(target: &str, pid: u32) -> Result<ResolvedClaudeHost, String> {
+    if !host_discovery_allowed() {
+        return Err("Claude host discovery is unavailable".into());
+    }
+    let endpoint = crate::runtime_context::host_endpoint().map_err(|e| e.to_string())?;
+    let mut client =
+        fl_host_proto::BlockingHostClient::connect(&endpoint).map_err(|e| e.to_string())?;
+    let sessions = client.list_sessions().map_err(|e| e.to_string())?;
+    let summary = crate::vendor_adapter::select_claude_host_session(&sessions, target)
+        .map_err(str::to_string)?
+        .ok_or_else(|| "no running canonical Claude host session".to_string())?;
+    if pid != 0 {
+        let mut ancestry = Vec::new();
+        let mut current = pid;
+        for _ in 0..64 {
+            ancestry.push(current);
+            let Some(parent) = parent_pid(current).filter(|p| *p > 1) else {
+                break;
+            };
+            current = parent;
+        }
+        let mut matching = sessions.iter().filter(|session| {
+            matches!(&session.state, fl_host_proto::ChildState::Running(record) if ancestry.contains(&record.pid))
+        });
+        if !matching
+            .next()
+            .is_some_and(|session| session.stream == summary.stream)
+            || matching.next().is_some()
+        {
+            return Err("Claude host PID identity is unconfirmed or ambiguous".into());
+        }
+    }
+    Ok(ResolvedClaudeHost {
+        stream: summary.stream.clone(),
+        is_pty: summary.mode == fl_host_proto::SessionMode::Pty,
+        client,
+    })
+}
+
+fn deliver_resolved_claude_host(
+    target: &str,
+    text: &str,
+    opts: TmuxPasteOptions<'_>,
+    host: ResolvedClaudeHost,
+) -> Result<(), String> {
+    deliver_via_tmux_paste_with_resolved_host(
+        target,
+        text,
+        opts,
+        Some((host.client, host.stream, host.is_pty)),
+        None,
+    )
+}
+
 const TMUX_PROBE_TIMEOUT: Duration = Duration::from_millis(300);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2465,7 +2738,9 @@ fn probe_tmux_target(target: &str, timeout: Duration) -> TmuxProbeOutcome {
     // `display-message` answers for the current window when an exact `session:window` target
     // matches nothing, so a window-qualified target is asked with `list-panes`, which fails.
     let by_window = exact != target;
-    let mut cmd = Command::new(tmux_bin());
+    let Ok(mut cmd) = crate::runtime_context::tmux_command(&tmux_bin()) else {
+        return TmuxProbeOutcome::Dead;
+    };
     if by_window {
         cmd.args(["list-panes", "-t", &exact, "-F", "#{pane_id}"]);
     } else {
@@ -2539,10 +2814,56 @@ fn is_composer_occupied_error(err: &str) -> bool {
     err.starts_with(COMPOSER_OCCUPIED_BY_NON_WIRE_INPUT_PREFIX)
 }
 
+/// Recognised composer payloads for the narrowed hold diagnostic (#575):
+/// only the exact strings `"/clear"` and `"/new"` (after trimming) are named.
+pub(crate) fn recognised_composer_payload(text: &str) -> Option<&'static str> {
+    match text.trim() {
+        "/clear" => Some("/clear"),
+        "/new" => Some("/new"),
+        _ => None,
+    }
+}
+
+/// Recognised payload in a captured screen, or `None` for any other composer text.
+/// Matches the RAW composer text exactly (after trimming): whitespace-stripped
+/// compact forms such as `"/ clear"`, `"/cle ar"` or a payload split across
+/// lines must NOT be named.
+pub(crate) fn recognised_composer_payload_in_screen(screen: &str) -> Option<&'static str> {
+    let cleaned = normalize_terminal_screen(screen);
+    let lines: Vec<&str> = cleaned.lines().collect();
+    if let Some(raw) = extract_composer_raw(&lines) {
+        return recognised_composer_payload(&raw);
+    }
+    recognised_composer_payload(&cleaned)
+}
+
+/// Recognised payload carried by a composer-occupied error, if any.
+/// Compares the whole error by equality with the canonical payload error, so
+/// arbitrary composer text that merely contains `holds "/clear"` is not named.
+pub(crate) fn recognised_payload_from_error(err: &str) -> Option<&'static str> {
+    ["/clear", "/new"]
+        .into_iter()
+        .find(|payload| err == composer_occupied_error_with_payload(Some(payload)))
+}
+
+fn composer_occupied_error_with_payload(payload: Option<&'static str>) -> String {
+    match payload {
+        Some(payload) => format!(
+            "{COMPOSER_OCCUPIED_BY_NON_WIRE_INPUT_PREFIX} composer_occupied: composer holds \"{payload}\"; repair: Backspace, then Ctrl-U; holding delivery without sending keys"
+        ),
+        None => composer_occupied_error(),
+    }
+}
+
+fn composer_occupied_error_for_screen(screen: &str) -> String {
+    composer_occupied_error_with_payload(recognised_composer_payload_in_screen(screen))
+}
+
 pub fn is_composer_occupied_zero_keys_error(err: &str) -> bool {
     is_composer_occupied_error(err) && err.contains("without sending keys")
 }
 
+#[cfg(test)]
 fn composer_occupied_by_non_wire_input_error() -> String {
     format!(
         "{COMPOSER_OCCUPIED_BY_NON_WIRE_INPUT_PREFIX} composer holds non-wire input or active dialog; holding delivery without sending keys"
@@ -2561,13 +2882,42 @@ fn composer_occupied_after_paste_error() -> String {
     )
 }
 
+/// Located composer holding non-wire input (#545-3). Keeps the shared prefix and the
+/// `without sending keys` substring so zero-key hold handling is unchanged.
+fn composer_occupied_error() -> String {
+    format!(
+        "{COMPOSER_OCCUPIED_BY_NON_WIRE_INPUT_PREFIX} composer_occupied: composer holds non-wire input or active dialog; holding delivery without sending keys"
+    )
+}
+
+/// Composer could not be located, so nothing was proven about its contents (#545-3).
+fn composer_unlocated_error() -> String {
+    format!(
+        "{COMPOSER_OCCUPIED_BY_NON_WIRE_INPUT_PREFIX} composer_unlocated: composer could not be located; holding delivery without sending keys"
+    )
+}
+
+/// Claude session record is not in a deliverable status (#545-3).
+fn composer_session_busy_error() -> String {
+    format!(
+        "{COMPOSER_OCCUPIED_BY_NON_WIRE_INPUT_PREFIX} session_busy: Claude session is not idle; holding delivery without sending keys"
+    )
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct UnconfirmedWireDelivery {
     wire_id: String,
     compact_full: String,
     compact_header: Option<String>,
+    compact_body: Option<String>,
+    body_chars: Option<usize>,
     full_placeholder_lengths: Vec<usize>,
     body_placeholder_lengths: Vec<usize>,
+    /// `payload_line_count` values a Claude `[Pasted text #N +M lines]` placeholder may
+    /// report for the whole payload (trimmed, plus the raw form when it differs).
+    full_placeholder_line_counts: Vec<usize>,
+    /// Same, for the body below a visible delivery header line.
+    body_placeholder_line_counts: Vec<usize>,
 }
 
 type RouteDeliveryLedger =
@@ -2609,8 +2959,25 @@ fn build_delivery_descriptor(
         push_len_and_plus_one(&mut full_placeholder_lengths, raw);
     }
 
+    let mut full_placeholder_line_counts = Vec::new();
+    let full_lines = payload_line_count(trimmed_clean);
+    if full_lines > 0 {
+        full_placeholder_line_counts.push(full_lines);
+    }
+    if let Some(raw) = raw_text
+        && raw != trimmed_clean
+    {
+        let raw_lines = payload_line_count(raw);
+        if raw_lines > 0 && !full_placeholder_line_counts.contains(&raw_lines) {
+            full_placeholder_line_counts.push(raw_lines);
+        }
+    }
+
     let mut compact_header = None;
+    let mut compact_body = None;
+    let mut body_chars = None;
     let mut body_placeholder_lengths = Vec::new();
+    let mut body_placeholder_line_counts = Vec::new();
     if (trimmed_clean.starts_with("[fl-wire ")
         || trimmed_clean.starts_with("[Operator Prompt via FerroDeck"))
         && let Some((first_line, rest)) = trimmed_clean.split_once('\n')
@@ -2620,7 +2987,13 @@ fn build_delivery_descriptor(
             let hdr_compact: String = first_line.chars().filter(|c| !c.is_whitespace()).collect();
             if !hdr_compact.is_empty() {
                 compact_header = Some(hdr_compact);
+                compact_body = Some(body.chars().filter(|c| !c.is_whitespace()).collect());
+                body_chars = Some(body.chars().count());
                 push_len_and_plus_one(&mut body_placeholder_lengths, body);
+                let body_lines = payload_line_count(body);
+                if body_lines > 0 {
+                    body_placeholder_line_counts.push(body_lines);
+                }
             }
         }
     }
@@ -2629,8 +3002,12 @@ fn build_delivery_descriptor(
         wire_id: wire_id.to_string(),
         compact_full,
         compact_header,
+        compact_body,
+        body_chars,
         full_placeholder_lengths,
         body_placeholder_lengths,
+        full_placeholder_line_counts,
+        body_placeholder_line_counts,
     }
 }
 
@@ -2727,11 +3104,51 @@ fn route_has_unconfirmed_wire_deliveries(route_keys: &[String]) -> bool {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CompactPlaceholderPrefix<'a> {
-    Chars { len: usize, rest: &'a str },
-    Bare { rest: &'a str },
+    Chars {
+        len: usize,
+        rest: &'a str,
+    },
+    /// Claude form `[Pastedtext#N+Mlines]` in compact (whitespace-free) form (#544).
+    ClaudeLines {
+        lines: usize,
+        rest: &'a str,
+    },
+    Bare {
+        rest: &'a str,
+    },
+}
+
+/// Parse the compact Claude placeholder `[Pastedtext#<id>+<M>lines]` at the start of
+/// `rem`, returning `(M, rest)`. The paste id is any non-zero digit run; only `M` is
+/// checked against a target. No other `[Pasted text...]` shape qualifies.
+fn strip_claude_pasted_text_prefix(rem: &str) -> Option<(usize, &str)> {
+    let after_open = rem.strip_prefix("[Pastedtext#")?;
+    let id_bytes = after_open
+        .bytes()
+        .take_while(|b| b.is_ascii_digit())
+        .count();
+    if id_bytes == 0 || after_open[..id_bytes].parse::<usize>().ok()? == 0 {
+        return None;
+    }
+    let after_id = after_open[id_bytes..].strip_prefix('+')?;
+    let line_bytes = after_id.bytes().take_while(|b| b.is_ascii_digit()).count();
+    if line_bytes == 0 {
+        return None;
+    }
+    let lines = after_id[..line_bytes].parse::<usize>().ok()?;
+    if lines == 0 {
+        return None;
+    }
+    let rest = after_id[line_bytes..]
+        .strip_prefix("lines]")
+        .or_else(|| after_id[line_bytes..].strip_prefix("line]"))?;
+    Some((lines, rest))
 }
 
 fn strip_compact_placeholder_prefix(rem: &str) -> Option<CompactPlaceholderPrefix<'_>> {
+    if let Some((lines, rest)) = strip_claude_pasted_text_prefix(rem) {
+        return Some(CompactPlaceholderPrefix::ClaudeLines { lines, rest });
+    }
     let after_open = rem.strip_prefix("[PastedContent")?;
     if let Some(rest) = after_open.strip_prefix(']') {
         return Some(CompactPlaceholderPrefix::Bare { rest });
@@ -2788,6 +3205,11 @@ fn match_delivery_prefix<'a>(
         {
             push_unique(&mut out, rest, true);
         }
+        Some(CompactPlaceholderPrefix::ClaudeLines { lines, rest })
+            if d.full_placeholder_line_counts.contains(&lines) =>
+        {
+            push_unique(&mut out, rest, true);
+        }
         Some(CompactPlaceholderPrefix::Bare { rest }) if allow_bare_placeholder => {
             push_unique(&mut out, rest, true);
         }
@@ -2803,10 +3225,38 @@ fn match_delivery_prefix<'a>(
             {
                 push_unique(&mut out, rest, true);
             }
+            Some(CompactPlaceholderPrefix::ClaudeLines { lines, rest })
+                if d.body_placeholder_line_counts.contains(&lines) =>
+            {
+                push_unique(&mut out, rest, true);
+            }
             Some(CompactPlaceholderPrefix::Bare { rest }) if allow_bare_placeholder => {
                 push_unique(&mut out, rest, true);
             }
             _ => {}
+        }
+        // Long Muse paste (#575): header + `[Pasted Content N chars]` + visible
+        // tail. Accept only when the tail is a suffix of the body of at least
+        // MIN_SCROLLED_SUFFIX_COMPACT_CHARS compact chars and the elided count
+        // does not exceed the non-tail body (+1: Muse may count a trailing
+        // newline). Text after the tail is folded into `tail` (the
+        // placeholder's rest), so `body.ends_with(tail)` fails.
+        if let Some(CompactPlaceholderPrefix::Chars { len, rest: tail }) =
+            strip_compact_placeholder_prefix(after_hdr)
+            && let Some(body) = &d.compact_body
+        {
+            let tail_chars = tail.chars().count();
+            // Tolerance: tail is compact (whitespace removed) while the
+            // placeholder count is over raw text, so the bound uses the raw
+            // body count minus the compact tail, plus 1 for a trailing
+            // newline Muse may count.
+            let raw_body_chars = d.body_chars.unwrap_or(0);
+            if tail_chars >= MIN_SCROLLED_SUFFIX_COMPACT_CHARS
+                && body.ends_with(tail)
+                && len <= raw_body_chars.saturating_sub(tail_chars) + 1
+            {
+                push_unique(&mut out, &tail[tail.len()..], true);
+            }
         }
     }
     out
@@ -2831,10 +3281,31 @@ fn build_compact_from_composer_slice(slice: &[&str], top_is_zero: bool) -> Optio
     Some((compact, is_top_zero_scrolled))
 }
 
-fn extract_composer_compact(lines: &[&str]) -> Option<(String, bool)> {
+fn build_raw_from_composer_slice(slice: &[&str]) -> Option<String> {
+    let first_non_empty = slice.iter().position(|l| !l.trim().is_empty())?;
+    let first_has_prompt = line_starts_with_prompt(slice[first_non_empty]);
+    let mut parts: Vec<&str> = Vec::new();
+    for (idx, &line) in slice[first_non_empty..].iter().enumerate() {
+        let seg = if idx == 0 && first_has_prompt {
+            strip_composer_prompt_prefix(line)
+        } else {
+            line
+        };
+        parts.push(seg);
+    }
+    let raw = parts.join("\n");
+    if raw.trim().is_empty() {
+        return None;
+    }
+    Some(raw)
+}
+
+/// Shared composer slice selection for the raw and compact extractors.
+/// Returns the slice and whether its top rule is at line zero (scrolled).
+fn select_composer_slice<'a>(lines: &'a [&'a str]) -> Option<(Vec<&'a str>, bool)> {
     if lines.iter().any(|l| is_horizontal_rule_line(l)) {
         let (between, top) = composer_region_lines(lines)?;
-        return build_compact_from_composer_slice(between, top == 0);
+        return Some((between.to_vec(), top == 0));
     }
     let tail_start = lines
         .iter()
@@ -2848,7 +3319,7 @@ fn extract_composer_compact(lines: &[&str]) -> Option<(String, bool)> {
     let recent = &non_empty_tail[non_empty_tail.len().saturating_sub(3)..];
     let slice = if let Some(prompt_pos) = recent.iter().rposition(|l| line_starts_with_prompt(l)) {
         &recent[prompt_pos..]
-    } else if recent.iter().any(|l| l.contains("[Pasted Content")) {
+    } else if recent.iter().any(|l| line_contains_paste_placeholder(l)) {
         if let Some(prompt_pos) = non_empty_tail
             .iter()
             .rposition(|l| line_starts_with_prompt(l))
@@ -2863,7 +3334,17 @@ fn extract_composer_compact(lines: &[&str]) -> Option<(String, bool)> {
     if lines_have_dialog_or_menu_markers(slice) {
         return None;
     }
-    build_compact_from_composer_slice(slice, false)
+    Some((slice.to_vec(), false))
+}
+
+fn extract_composer_raw(lines: &[&str]) -> Option<String> {
+    let (slice, _is_top_zero) = select_composer_slice(lines)?;
+    build_raw_from_composer_slice(&slice)
+}
+
+fn extract_composer_compact(lines: &[&str]) -> Option<(String, bool)> {
+    let (slice, is_top_zero) = select_composer_slice(lines)?;
+    build_compact_from_composer_slice(&slice, is_top_zero)
 }
 
 fn consumes_recorded_deliveries_to_end(
@@ -2965,9 +3446,41 @@ fn composer_is_rendering_target_prefix_on_lines(
     let Some((composer_compact, _is_top_zero_scrolled)) = extract_composer_compact(lines) else {
         return false;
     };
-    !composer_compact.is_empty()
-        && d_target.compact_full.starts_with(&composer_compact)
+    if composer_compact.is_empty() {
+        return false;
+    }
+    if d_target.compact_full.starts_with(&composer_compact)
         && composer_compact.len() < d_target.compact_full.len()
+    {
+        return true;
+    }
+    // A Claude placeholder still being drawn: a strict prefix of
+    // `[Pastedtext#<id>+<M>lines]` whose `M` (once its digits are complete) is a target
+    // line count. A complete placeholder is handled by `composer_equals_single_target`.
+    if let Some(after_open) = composer_compact.strip_prefix("[Pastedtext#") {
+        let id_bytes = after_open
+            .bytes()
+            .take_while(|b| b.is_ascii_digit())
+            .count();
+        if id_bytes > 0
+            && let Some(after_id) = after_open[id_bytes..].strip_prefix('+')
+        {
+            let line_bytes = after_id.bytes().take_while(|b| b.is_ascii_digit()).count();
+            let tail = &after_id[line_bytes..];
+            if line_bytes > 0
+                && ("lines]".starts_with(tail) || "line]".starts_with(tail))
+                && after_id[..line_bytes]
+                    .parse::<usize>()
+                    .is_ok_and(|m| d_target.full_placeholder_line_counts.contains(&m))
+            {
+                return true;
+            }
+            if line_bytes == 0 && tail.is_empty() {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 fn composer_is_rendering_target_prefix(screen: &str, d_target: &UnconfirmedWireDelivery) -> bool {
@@ -3047,6 +3560,7 @@ struct TmuxPasteOptions<'a> {
     verify_submission: bool,
     session_id: Option<&'a str>,
     is_muse_route: bool,
+    is_claude_route: bool,
     composer_style: ComposerStyle,
 }
 
@@ -3057,6 +3571,7 @@ impl<'a> TmuxPasteOptions<'a> {
             verify_submission: true,
             session_id: None,
             is_muse_route: false,
+            is_claude_route: false,
             composer_style: ComposerStyle::Ruleless,
         }
     }
@@ -3067,6 +3582,7 @@ struct VerifiedDeliverySpec<'a> {
     transcript_target: &'a str,
     session_id: Option<&'a str>,
     is_muse_route: bool,
+    is_claude_route: bool,
     composer_style: ComposerStyle,
     bracketed: bool,
     verify_submission: bool,
@@ -3102,6 +3618,7 @@ fn execute_verified_paste_delivery(
             trimmed,
             &spec.route_keys,
             spec.is_muse_route,
+            spec.is_claude_route,
             spec.composer_style,
             &mut wait,
             &mut capture_rendered,
@@ -3207,6 +3724,19 @@ fn execute_verified_paste_delivery(
     }
 }
 
+// Hosted Claude authorization uses only a rendered capture bound to the retained
+// stream. In particular, a session-name-only output tail cannot prove the screen.
+fn capture_bound_host_screen(
+    client: &mut fl_host_proto::BlockingHostClient,
+    stream: &fl_host_proto::StreamId,
+) -> Option<RenderedCursorScreen> {
+    let screen = client.capture_rendered(stream.clone()).ok()?;
+    if screen.stream != *stream {
+        return None;
+    }
+    Some(RenderedCursorScreen::from_host(screen))
+}
+
 fn capture_host_rendered_screen(
     client: &mut fl_host_proto::BlockingHostClient,
     stream: &fl_host_proto::StreamId,
@@ -3219,7 +3749,7 @@ fn capture_host_rendered_screen(
         {
             rendered.ghost_styled = true;
         } else {
-            let raw_hint = fl_host_proto::HostEndpoint::discover()
+            let raw_hint = crate::runtime_context::host_endpoint()
                 .ok()
                 .and_then(|ep| fl_host_proto::BlockingHostClient::connect(&ep).ok())
                 .and_then(|mut ro_client| {
@@ -3272,6 +3802,7 @@ pub fn host_write_text_then_enter(
         transcript_target: &session_str,
         session_id: None,
         is_muse_route: false,
+        is_claude_route: false,
         composer_style: ComposerStyle::for_host_session(&session_str),
         bracketed: false,
         verify_submission: true,
@@ -3552,6 +4083,7 @@ fn deliver_via_tmux_paste_with_session(
             verify_submission: true,
             session_id,
             is_muse_route,
+            is_claude_route: false,
             composer_style: if is_muse_route {
                 ComposerStyle::Ruled
             } else {
@@ -3566,7 +4098,148 @@ fn deliver_via_tmux_paste_with_opts(
     text: &str,
     opts: TmuxPasteOptions<'_>,
 ) -> Result<(), String> {
-    deliver_via_tmux_paste_with_resolved_host(target, text, opts, None)
+    deliver_via_tmux_paste_with_resolved_host(target, text, opts, None, None)
+}
+
+#[cfg(test)]
+#[test]
+fn bound_claude_screen_rejects_blank_and_unlocated_composers() {
+    for contents in ["", "  \n", "a screen without a composer"] {
+        let screen = RenderedCursorScreen {
+            contents: contents.into(),
+            cursor: None,
+            dims: None,
+            ghost_styled: false,
+        };
+        assert!(!usable_bound_claude_screen(&screen));
+    }
+    let screen = RenderedCursorScreen {
+        contents: "────────────────────\n❯ \n────────────────────\n".into(),
+        cursor: None,
+        dims: None,
+        ghost_styled: false,
+    };
+    assert!(usable_bound_claude_screen(&screen));
+}
+
+fn usable_bound_claude_screen(screen: &RenderedCursorScreen) -> bool {
+    !screen.contents.trim().is_empty()
+        && composer_located_for_style(&screen.contents, ComposerStyle::Ruled)
+}
+
+#[derive(Clone, Copy)]
+enum BoundInputPhase {
+    Payload,
+    FlushEarlier,
+    Submit,
+}
+
+// These checks apply to the fresh capture immediately before each mutation. The
+// preparation/confirmation captures cannot authorize a later screen by themselves.
+fn check_bound_claude_input(
+    screen: &RenderedCursorScreen,
+    route_keys: &[String],
+    payload: &str,
+    phase: BoundInputPhase,
+) -> Result<(), String> {
+    let contents = &screen.contents;
+    if !usable_bound_claude_screen(screen) {
+        return Err("hosted Claude screen cannot be confirmed".into());
+    }
+    if claude_screen_is_busy_main(contents) {
+        return Err(composer_session_busy_error());
+    }
+    let target = matches!(phase, BoundInputPhase::Submit).then_some(payload);
+    if screen_has_dialog_or_menu_markers_with_context(contents, target, None, route_keys) {
+        return Err(composer_occupied_error_for_screen(contents));
+    }
+    let owned = match phase {
+        BoundInputPhase::Payload => !composer_has_unsubmitted_content_for_style(
+            contents,
+            screen.cursor_state(),
+            false,
+            ComposerStyle::Ruled,
+        ),
+        BoundInputPhase::FlushEarlier => {
+            composer_equals_recorded_wire_deliveries(contents, route_keys)
+        }
+        BoundInputPhase::Submit => {
+            composer_equals_single_target(contents, &UnconfirmedWireDelivery::from_payload(payload))
+                .0
+        }
+    };
+    if !owned {
+        return Err("prompt submission unconfirmed: Claude composer changed before input".into());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+#[test]
+fn bound_claude_fresh_capture_requires_phase_specific_ownership() {
+    let keys = vec!["host:phase-ownership-fixture".to_string()];
+    let screen = |body: &str| RenderedCursorScreen {
+        contents: format!("────────────────────\n❯ {body}\n────────────────────\n"),
+        cursor: None,
+        dims: None,
+        ghost_styled: false,
+    };
+    let payload = "fixture message";
+    assert!(
+        check_bound_claude_input(&screen(""), &keys, payload, BoundInputPhase::Payload).is_ok()
+    );
+    assert!(
+        check_bound_claude_input(
+            &screen("owner draft"),
+            &keys,
+            payload,
+            BoundInputPhase::Payload
+        )
+        .is_err()
+    );
+    assert!(
+        check_bound_claude_input(
+            &screen("owner draft"),
+            &keys,
+            payload,
+            BoundInputPhase::FlushEarlier
+        )
+        .is_err()
+    );
+    assert!(
+        check_bound_claude_input(&screen(payload), &keys, payload, BoundInputPhase::Submit).is_ok()
+    );
+    assert!(
+        check_bound_claude_input(
+            &screen("fixture message owner edit"),
+            &keys,
+            payload,
+            BoundInputPhase::Submit
+        )
+        .is_err()
+    );
+    record_unconfirmed_wire_delivery(&keys, "phase-test", "earlier message");
+    assert!(
+        check_bound_claude_input(
+            &screen("earlier message"),
+            &keys,
+            payload,
+            BoundInputPhase::FlushEarlier
+        )
+        .is_ok()
+    );
+    clear_unconfirmed_wire_deliveries(&keys);
+    let busy = RenderedCursorScreen {
+        contents: format!("{}\n  esc to interrupt", screen("").contents),
+        cursor: None,
+        dims: None,
+        ghost_styled: false,
+    };
+    assert!(check_bound_claude_input(&busy, &keys, payload, BoundInputPhase::Payload).is_err());
+    assert!(check_bound_claude_input(&busy, &keys, payload, BoundInputPhase::Submit).is_err());
+    let dialog = RenderedCursorScreen { contents: "────────────────────\nDo you want to proceed?\n❯ 1. Yes\n  2. No\n────────────────────\n  Esc to cancel".into(), cursor: None, dims: None, ghost_styled: false };
+    assert!(check_bound_claude_input(&dialog, &keys, payload, BoundInputPhase::Payload).is_err());
+    assert!(check_bound_claude_input(&dialog, &keys, payload, BoundInputPhase::Submit).is_err());
 }
 
 fn deliver_via_tmux_paste_with_resolved_host(
@@ -3578,16 +4251,32 @@ fn deliver_via_tmux_paste_with_resolved_host(
         fl_host_proto::StreamId,
         bool,
     )>,
+    bound_validate: Option<&dyn Fn() -> Result<(), String>>,
 ) -> Result<(), String> {
     let trimmed = text.trim();
     let raw_target = target;
-    if let Some((client, stream, is_pty)) = resolved.or_else(|| {
-        std::env::var_os("FL_WIRE_TMUX_BIN")
-            .is_none()
-            .then(|| resolve_live_host_session_with_mode(target))
-            .flatten()
+    let strict_claude = opts.is_claude_route && resolved.is_some();
+    if let Some((mut client, stream, is_pty)) = resolved.or_else(|| {
+        (std::env::var_os("FL_WIRE_TMUX_BIN").is_none()
+            && !(opts.is_claude_route && target.starts_with('%')))
+        .then(|| resolve_live_host_session_with_mode(target))
+        .flatten()
     }) {
+        if strict_claude
+            && (!is_pty
+                || !capture_bound_host_screen(&mut client, &stream)
+                    .as_ref()
+                    .is_some_and(usable_bound_claude_screen))
+        {
+            return Err("hosted Claude screen cannot be confirmed".into());
+        }
+        if let Some(validate) = bound_validate {
+            validate()?;
+        }
         let client_cell = std::cell::RefCell::new(client);
+        let payload_written = std::cell::Cell::new(false);
+        let keys_written = std::cell::Cell::new(false);
+        let capture_failed = std::cell::Cell::new(false);
         let grant = client_cell
             .borrow_mut()
             .claim_controller(stream.clone())
@@ -3598,11 +4287,13 @@ fn deliver_via_tmux_paste_with_resolved_host(
             route_keys.push(target_key);
         }
         let session_cap = stream.session.clone();
+        let checked_route_keys = route_keys.clone();
         let spec = VerifiedDeliverySpec {
             route_keys,
             transcript_target: raw_target,
             session_id: opts.session_id,
             is_muse_route: opts.is_muse_route,
+            is_claude_route: opts.is_claude_route,
             composer_style: opts.composer_style,
             bracketed: opts.bracketed,
             verify_submission: opts.verify_submission,
@@ -3617,21 +4308,64 @@ fn deliver_via_tmux_paste_with_resolved_host(
                     return None;
                 }
                 let mut client = client_cell.borrow_mut();
-                capture_host_rendered_screen(&mut client, &stream)
-                    .map(RenderedCursorScreen::into_parts)
+                let screen = if strict_claude {
+                    capture_bound_host_screen(&mut client, &stream)
+                } else {
+                    capture_host_rendered_screen(&mut client, &stream)
+                };
+                if strict_claude && !screen.as_ref().is_some_and(usable_bound_claude_screen) {
+                    capture_failed.set(true);
+                    return None;
+                }
+                screen.map(RenderedCursorScreen::into_parts)
             },
             || {
                 let mut client = client_cell.borrow_mut();
-                capture_host_rendered_screen(&mut client, &stream)
-                    .map(ScreenCapture::from_rendered_screen)
-                    .or_else(|| {
-                        client
-                            .capture_output(session_cap.clone(), 4096)
-                            .ok()
-                            .map(ScreenCapture::RawFallback)
-                    })
+                if strict_claude {
+                    let screen = capture_bound_host_screen(&mut client, &stream);
+                    if !screen.as_ref().is_some_and(usable_bound_claude_screen) {
+                        capture_failed.set(true);
+                        return None;
+                    }
+                    screen.map(ScreenCapture::from_rendered_screen)
+                } else {
+                    capture_host_rendered_screen(&mut client, &stream)
+                        .map(ScreenCapture::from_rendered_screen)
+                        .or_else(|| {
+                            client
+                                .capture_output(session_cap.clone(), 4096)
+                                .ok()
+                                .map(ScreenCapture::RawFallback)
+                        })
+                }
             },
             || {
+                if strict_claude
+                    && (capture_failed.get()
+                        || !capture_bound_host_screen(&mut client_cell.borrow_mut(), &stream)
+                            .as_ref()
+                            .is_some_and(usable_bound_claude_screen))
+                {
+                    return Err("hosted Claude screen cannot be confirmed".into());
+                }
+                if let Some(validate) = bound_validate {
+                    let screen = capture_bound_host_screen(&mut client_cell.borrow_mut(), &stream)
+                        .ok_or_else(|| "hosted Claude screen cannot be confirmed".to_string())?;
+                    check_bound_claude_input(
+                        &screen,
+                        &checked_route_keys,
+                        trimmed,
+                        BoundInputPhase::Payload,
+                    )
+                    .map_err(|err| {
+                        if keys_written.get() {
+                            format!("prompt submission unconfirmed: {err}")
+                        } else {
+                            err
+                        }
+                    })?;
+                    validate()?;
+                }
                 let payload: Vec<u8> = if opts.bracketed {
                     format!("\x1b[200~{trimmed}\x1b[201~").into_bytes()
                 } else {
@@ -3645,10 +4379,35 @@ fn deliver_via_tmux_paste_with_resolved_host(
                     if !matches!(outcome, fl_host_proto::SendOutcome::Written) {
                         return Err(format!("fl-host write_raw payload returned {outcome:?}"));
                     }
+                    payload_written.set(true);
+                    keys_written.set(true);
                 }
                 Ok(())
             },
             || {
+                if strict_claude
+                    && (capture_failed.get()
+                        || !capture_bound_host_screen(&mut client_cell.borrow_mut(), &stream)
+                            .as_ref()
+                            .is_some_and(usable_bound_claude_screen))
+                {
+                    return Err("hosted Claude screen cannot be confirmed".into());
+                }
+                if let Some(validate) = bound_validate {
+                    let screen = capture_bound_host_screen(&mut client_cell.borrow_mut(), &stream)
+                        .ok_or_else(|| {
+                            "prompt submission unconfirmed: hosted Claude screen unavailable"
+                                .to_string()
+                        })?;
+                    let phase = if payload_written.get() {
+                        BoundInputPhase::Submit
+                    } else {
+                        BoundInputPhase::FlushEarlier
+                    };
+                    check_bound_claude_input(&screen, &checked_route_keys, trimmed, phase)
+                        .map_err(|err| format!("prompt submission unconfirmed: {err}"))?;
+                    validate()?;
+                }
                 let outcome = client_cell
                     .borrow_mut()
                     .write_raw(stream.clone(), grant.lease, b"\r".to_vec())
@@ -3656,6 +4415,7 @@ fn deliver_via_tmux_paste_with_resolved_host(
                 if !matches!(outcome, fl_host_proto::SendOutcome::Written) {
                     return Err(format!("fl-host write_raw Enter returned {outcome:?}"));
                 }
+                keys_written.set(true);
                 Ok(())
             },
             || {},
@@ -3676,6 +4436,7 @@ fn deliver_via_tmux_paste_with_resolved_host(
         transcript_target: raw_target,
         session_id: opts.session_id,
         is_muse_route: opts.is_muse_route,
+        is_claude_route: opts.is_claude_route,
         composer_style: opts.composer_style,
         bracketed: opts.bracketed,
         verify_submission: opts.verify_submission,
@@ -3712,7 +4473,7 @@ fn deliver_via_tmux_paste_with_resolved_host(
                 .as_nanos();
             let buf_name = format!("fl-wire-muse-{}-{nanos}", std::process::id());
             let payload = format!("{trimmed}\n");
-            let mut load_child = Command::new(&tmux_write)
+            let mut load_child = crate::runtime_context::tmux_command(&tmux_write)?
                 .args(["load-buffer", "-b", &buf_name, "-"])
                 .stdin(std::process::Stdio::piped())
                 .stdout(std::process::Stdio::null())
@@ -3739,14 +4500,14 @@ fn deliver_via_tmux_paste_with_resolved_host(
                 paste_args.push("-p");
             }
             paste_args.extend(["-t", target_write.as_str()]);
-            let paste_status = Command::new(&tmux_write)
+            let paste_status = crate::runtime_context::tmux_command(&tmux_write)?
                 .args(&paste_args)
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
                 .status()
                 .map_err(|e| format!("failed to spawn tmux paste-buffer: {e}"))?;
             if !paste_status.success() {
-                let _ = Command::new(&tmux_write)
+                let _ = crate::runtime_context::tmux_command(&tmux_write)?
                     .args(["delete-buffer", "-b", &buf_name])
                     .stdout(std::process::Stdio::null())
                     .stderr(std::process::Stdio::null())
@@ -3756,7 +4517,7 @@ fn deliver_via_tmux_paste_with_resolved_host(
             Ok(())
         },
         || {
-            let status = Command::new(&tmux_enter)
+            let status = crate::runtime_context::tmux_command(&tmux_enter)?
                 .args(["send-keys", "-t", &target_enter, "Enter"])
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
@@ -3769,7 +4530,10 @@ fn deliver_via_tmux_paste_with_resolved_host(
         },
         || {
             if opts.bracketed {
-                let _ = Command::new(&tmux_err_cu)
+                let Ok(mut command) = crate::runtime_context::tmux_command(&tmux_err_cu) else {
+                    return;
+                };
+                let _ = command
                     .args(["send-keys", "-t", &target_err_cu, "C-u"])
                     .stdout(std::process::Stdio::null())
                     .stderr(std::process::Stdio::null())
@@ -3778,7 +4542,10 @@ fn deliver_via_tmux_paste_with_resolved_host(
         },
         |err| {
             if !err.contains("active dialog or menu detected") && !is_composer_occupied_error(err) {
-                let _ = Command::new(&tmux_abort_cu)
+                let Ok(mut command) = crate::runtime_context::tmux_command(&tmux_abort_cu) else {
+                    return;
+                };
+                let _ = command
                     .args(["send-keys", "-t", &target_abort_cu, "C-u"])
                     .stdout(std::process::Stdio::null())
                     .stderr(std::process::Stdio::null())
@@ -3945,6 +4712,7 @@ fn prepare_clean_composer_before_paste_for_route(
         trimmed,
         route_keys,
         true,
+        false,
         ComposerStyle::Ruled,
         wait,
         capture_rendered_only,
@@ -3958,6 +4726,7 @@ fn prepare_clean_composer_before_paste_impl(
     trimmed: &str,
     route_keys: &[String],
     is_muse_route: bool,
+    is_claude_route: bool,
     composer_style: ComposerStyle,
     mut wait: impl FnMut(Duration),
     mut capture_rendered_only: impl FnMut() -> Option<(String, Option<CursorState>)>,
@@ -3970,14 +4739,19 @@ fn prepare_clean_composer_before_paste_impl(
     let Some((contents1, cursor1)) = capture_rendered_only() else {
         return Ok(PrePasteOutcome::CleanProceedToPaste);
     };
+    // Claude race re-check on the capture immediately before paste: a footer
+    // `esc to interrupt` means the main turn started (or never stopped) running.
+    if is_claude_route && claude_screen_is_busy_main(&contents1) {
+        return Err(composer_session_busy_error());
+    }
     if !contents1.trim().is_empty() && !composer_located_for_style(&contents1, composer_style) {
         if composer_style == ComposerStyle::CodexPrompt {
             log_codex_unlocatable(&contents1);
         }
-        return Err(composer_occupied_by_non_wire_input_error());
+        return Err(composer_unlocated_error());
     }
     if screen_has_dialog_or_menu_markers_with_context(&contents1, None, None, route_keys) {
-        return Err(composer_occupied_by_non_wire_input_error());
+        return Err(composer_occupied_error_for_screen(&contents1));
     }
     if !composer_has_unsubmitted_content_for_style(
         &contents1,
@@ -4001,20 +4775,23 @@ fn prepare_clean_composer_before_paste_impl(
     }
     let Some((contents2, cursor2)) = capture_rendered_only() else {
         if !composer_equals_recorded_wire_deliveries(&contents1, route_keys) {
-            return Err(composer_occupied_by_non_wire_input_error());
+            return Err(composer_occupied_error_for_screen(&contents1));
         }
         return Err("prompt submission unconfirmed before paste: \
              composer still holds earlier unsubmitted content (rendered capture unavailable)"
             .to_string());
     };
+    if is_claude_route && claude_screen_is_busy_main(&contents2) {
+        return Err(composer_session_busy_error());
+    }
     if !contents2.trim().is_empty() && !composer_located_for_style(&contents2, composer_style) {
         if composer_style == ComposerStyle::CodexPrompt {
             log_codex_unlocatable(&contents2);
         }
-        return Err(composer_occupied_by_non_wire_input_error());
+        return Err(composer_unlocated_error());
     }
     if screen_has_dialog_or_menu_markers_with_context(&contents2, None, None, route_keys) {
-        return Err(composer_occupied_by_non_wire_input_error());
+        return Err(composer_occupied_error_for_screen(&contents2));
     }
     if !composer_has_unsubmitted_content_for_style(
         &contents2,
@@ -4026,7 +4803,7 @@ fn prepare_clean_composer_before_paste_impl(
         return Ok(PrePasteOutcome::CleanProceedToPaste);
     }
     if !composer_equals_recorded_wire_deliveries(&contents2, route_keys) {
-        return Err(composer_occupied_by_non_wire_input_error());
+        return Err(composer_occupied_error_for_screen(&contents2));
     }
 
     let preexisting_matches_target =
@@ -4353,7 +5130,7 @@ fn composer_placeholder_lines<'a>(lines: &'a [&'a str]) -> Vec<&'a str> {
         return composer_lines
             .iter()
             .copied()
-            .filter(|l| l.contains("[Pasted Content"))
+            .filter(|l| line_contains_paste_placeholder(l))
             .collect();
     }
     let tail_start = lines
@@ -4366,7 +5143,7 @@ fn composer_placeholder_lines<'a>(lines: &'a [&'a str]) -> Vec<&'a str> {
         .copied()
         .filter(|l| !l.trim().is_empty())
         .take(3)
-        .filter(|l| l.contains("[Pasted Content"))
+        .filter(|l| line_contains_paste_placeholder(l))
         .collect()
 }
 
@@ -4421,7 +5198,7 @@ fn parse_pasted_content_lengths(line: &str) -> Vec<PastedPlaceholderKind> {
 /// horizontal rules, only the last 3 non-empty lines after any assistant output marker count.
 fn composer_shows_pasted_placeholder(screen: &str) -> bool {
     let cleaned = normalize_terminal_screen(screen);
-    if !cleaned.contains("[Pasted Content") {
+    if !cleaned.contains("[Pasted Content") && !cleaned.contains("[Pasted text") {
         return false;
     }
     let lines: Vec<&str> = cleaned.lines().collect();
@@ -4440,9 +5217,26 @@ fn composer_shows_target_placeholder_with_raw(
     is_raw_fallback: bool,
 ) -> bool {
     if is_raw_fallback {
+        // A Claude `[Pasted text #N +M lines]` placeholder in a raw capture is
+        // untrusted: it counts only when target ownership is proven — `M` must
+        // be a target line count (full/body, incl. raw variant, via the
+        // descriptor) and the composer must equal exactly that placeholder
+        // (plus prompt prefix), with no appended text. Any Claude marker
+        // forces strict ownership even when a legacy `[Pasted Content`
+        // marker is also present (mixed markers). A legacy-only screen
+        // (no Claude marker) keeps `composer_shows_pasted_placeholder`.
+        let cleaned = normalize_terminal_screen(screen);
+        let lines: Vec<&str> = cleaned.lines().collect();
+        let placeholder_lines = composer_placeholder_lines(&lines);
+        let has_claude = placeholder_lines.iter().any(|l| l.contains("[Pasted text"));
+        if has_claude {
+            let d_target = build_delivery_descriptor("", trimmed, raw_text);
+            let (matches_target, is_placeholder) = composer_equals_single_target(screen, &d_target);
+            return matches_target && is_placeholder;
+        }
         return composer_shows_pasted_placeholder(screen);
     }
-    if !screen.contains("[Pasted Content") {
+    if !screen.contains("[Pasted Content") && !screen.contains("[Pasted text") {
         return false;
     }
     let d_target = build_delivery_descriptor("", trimmed, raw_text);
@@ -5419,6 +6213,34 @@ fn strip_composer_prompt_prefix(line: &str) -> &str {
 /// scrolled composer (`top == 0`, `between.len() >= 16`, 2-space composer continuation indent or
 /// `[fl-wire ` / `[Pasted Content`, no dialog/menu markers) with no assistant/tool output markers,
 /// followed by at most a short status bar below the bottom rule.
+/// Index of the blank line that opens the Claude background-agent panel inside `after`
+/// (the lines below a composer bottom rule), when `after` has exactly the panel shape
+/// (#545): a status line, a blank line, a line whose trimmed form is exactly `● main`,
+/// then only blank lines or `◯ ` agent rows to the end of the screen. Any other shape
+/// (another `●` row, text after the panel, no status line) is not a panel.
+fn background_panel_blank_index(after: &[&str]) -> Option<usize> {
+    if after.len() < 3 || after[0].trim().is_empty() || !after[1].trim().is_empty() {
+        return None;
+    }
+    if after[2].trim() != "● main" {
+        return None;
+    }
+    after[3..]
+        .iter()
+        .all(|l| l.trim().is_empty() || l.trim_start().starts_with("◯ "))
+        .then_some(1)
+}
+
+/// Absolute line index of the panel-opening blank line in a full screen, when the strict
+/// background-agent panel sits below the last rule. Used to prove a background wait.
+fn claude_background_panel_start(lines: &[&str]) -> Option<usize> {
+    let bottom = lines
+        .iter()
+        .rposition(|line| is_horizontal_rule_line(line))?;
+    let after = &lines[bottom + 1..];
+    background_panel_blank_index(after).map(|idx| bottom + 1 + idx)
+}
+
 fn composer_region_lines<'a>(lines: &'a [&'a str]) -> Option<(&'a [&'a str], usize)> {
     let rule_indices: Vec<usize> = lines
         .iter()
@@ -5431,11 +6253,25 @@ fn composer_region_lines<'a>(lines: &'a [&'a str]) -> Option<(&'a [&'a str], usi
     let top = rule_indices[rule_indices.len() - 2];
     let bottom = rule_indices[rule_indices.len() - 1];
     let between = &lines[top + 1..bottom];
-    let after = &lines[bottom + 1..];
+    let after_full = &lines[bottom + 1..];
+    // Strip a strict background-agent panel (and its preceding blank) from the footer
+    // before the marker/count checks below; the panel is footer, not output (#545).
+    let after: &[&str] = match background_panel_blank_index(after_full) {
+        Some(blank_idx) => &after_full[..blank_idx],
+        None => after_full,
+    };
+    // A `●`/`◯`-led line left in `after` was not consumed by the strict panel
+    // strip above (e.g. a lone `◯ …` row with no `● main`): fail closed.
+    if after.iter().any(|l| {
+        let t = l.trim_start();
+        t.starts_with('●') || t.starts_with('◯')
+    }) {
+        return None;
+    }
     let non_empty_after = after.iter().filter(|l| !l.trim().is_empty()).count();
     let has_prompt_or_paste = between
         .iter()
-        .any(|l| line_starts_with_prompt(l) || l.contains("[Pasted Content"));
+        .any(|l| line_starts_with_prompt(l) || line_contains_paste_placeholder(l));
     let is_tall_scrolled_composer = top == 0
         && between.len() >= 16
         && bottom + 5 >= lines.len()
@@ -5446,6 +6282,7 @@ fn composer_region_lines<'a>(lines: &'a [&'a str]) -> Option<(&'a [&'a str], usi
                 || l.starts_with("[fl-wire ")
                 || l.starts_with("[Operator Prompt via FerroDeck")
                 || l.starts_with("[Pasted Content")
+                || l.starts_with("[Pasted text")
         })
         && !lines_have_dialog_or_menu_markers(after);
     if (!has_prompt_or_paste && !is_tall_scrolled_composer)
@@ -6010,7 +6847,8 @@ fn poll_for_pasted_content(
 }
 
 fn capture_tmux_rendered_screen(tmux: &Path, target: &str) -> Option<RenderedCursorScreen> {
-    let cap = Command::new(tmux)
+    let cap = crate::runtime_context::tmux_command(tmux)
+        .ok()?
         .args(["capture-pane", "-e", "-p", "-t", target])
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
@@ -6020,7 +6858,8 @@ fn capture_tmux_rendered_screen(tmux: &Path, target: &str) -> Option<RenderedCur
         return None;
     }
     let contents = String::from_utf8_lossy(&cap.stdout).into_owned();
-    let (cursor, dims) = Command::new(tmux)
+    let (cursor, dims) = crate::runtime_context::tmux_command(tmux)
+        .ok()?
         .args([
             "display-message",
             "-p",
@@ -6211,6 +7050,9 @@ pub fn probe_route_composer_ready(route: &VendorRoute) -> Option<bool> {
         (contents, cursor, route_keys)
     };
     let is_muse_route = matches!(route, VendorRoute::Muse { .. });
+    if matches!(route, VendorRoute::Claude { .. }) {
+        return probe_claude_composer_ready_from_screen(&contents, cursor, &route_keys);
+    }
     probe_composer_ready_from_screen(
         &contents,
         cursor,
@@ -6218,6 +7060,21 @@ pub fn probe_route_composer_ready(route: &VendorRoute) -> Option<bool> {
         ComposerStyle::for_route(route),
         is_muse_route,
     )
+}
+
+/// Claude-aware probe: a footer `esc to interrupt` (below the bottom rule,
+/// including the background-panel status line) means the main turn is running,
+/// so the empty-looking composer is NOT ready. A background-wait panel without
+/// it stays ready. Non-Claude routes never take this path.
+fn probe_claude_composer_ready_from_screen(
+    contents: &str,
+    cursor: Option<CursorState>,
+    route_keys: &[String],
+) -> Option<bool> {
+    if claude_screen_is_busy_main(contents) {
+        return Some(false);
+    }
+    probe_composer_ready_from_screen(contents, cursor, route_keys, ComposerStyle::Ruled, false)
 }
 
 /// Core of [`probe_route_composer_ready`] on an already-captured screen.
@@ -6304,39 +7161,186 @@ pub fn deliver_to_live_claude_pane(route: &VendorRoute, text: &str) -> Result<()
         .ok()
         .map(|(_, key)| key);
     let record = read_claude_session_record(*pid, key_path.as_deref());
-    if !claude_session_idle(record.as_ref()) {
-        return Err("composer_occupied_by_non_wire_input: Claude session is not idle; holding delivery without sending keys".into());
-    }
-    let discovered = claude_live_pane(*pid, record.as_ref(), || key);
+    let discovered = claude_live_pane(*pid, record.as_ref(), || key.clone());
     let opts = TmuxPasteOptions {
         bracketed: true,
         verify_submission: true,
         session_id: Some(session_id.as_str()).filter(|s| !s.trim().is_empty()),
         is_muse_route: false,
+        is_claude_route: true,
         composer_style: ComposerStyle::Ruled,
     };
-    // Tmux pane IDs are verified by process-tree discovery. A host target must be
-    // resolved as Claude and the exact stream carried through the paste itself.
     if let Some(pane) = discovered.as_deref().filter(|pane| pane.starts_with('%')) {
+        if !claude_session_deliverable(record.as_ref())
+            && !claude_tmux_pane_proves_background_wait(pane, record.as_ref())
+        {
+            return Err(composer_session_busy_error());
+        }
         return deliver_via_tmux_paste_with_opts(pane, &sanitize_for_paste(text), opts);
     }
-    let target = claude_host_target(discovered.as_deref().unwrap_or(session_id))
-        .ok_or_else(|| "the claude route has no live terminal".to_string())?;
-    let resolved = resolve_live_host_session_with_mode(&target)
-        .filter(|(_, stream, _)| {
-            stream
-                .session
-                .as_str()
-                .rsplit_once('.')
-                .is_some_and(|(_, vendor)| vendor.eq_ignore_ascii_case("claude"))
-        })
-        .ok_or_else(|| "the claude route has no live terminal".to_string())?;
+    let target = match claude_host_target(discovered.as_deref().unwrap_or(session_id)) {
+        Some(target) => target,
+        // A busy record cannot establish the background-wait exception when no
+        // terminal can be located. Keep the delivery held without host I/O.
+        None if claude_session_busy(record.as_ref()) => return Err(composer_session_busy_error()),
+        None => return Err("the claude route has no live terminal".to_string()),
+    };
+    let mut host = match resolve_claude_host(&target, *pid) {
+        Ok(host) => host,
+        Err(_) if claude_session_busy(record.as_ref()) => return Err(composer_session_busy_error()),
+        Err(error) => return Err(error),
+    };
+    if !claude_session_deliverable(record.as_ref()) {
+        let proves_wait = claude_session_busy(record.as_ref())
+            && host.is_pty
+            && capture_bound_host_screen(&mut host.client, &host.stream)
+                .is_some_and(|screen| screen_proves_claude_background_wait(&screen.contents));
+        if !proves_wait {
+            return Err(composer_session_busy_error());
+        }
+    }
+    deliver_resolved_claude_host(&target, &sanitize_for_paste(text), opts, host)
+}
+
+/// Deliver a peer message only on the Claude peer socket. There is deliberately no
+/// terminal fallback if peer registration or connection fails.
+pub fn dispatch_claude_peer_prompt(
+    route: &VendorRoute,
+    sender_name: &str,
+    body: &str,
+) -> Result<(), String> {
+    let VendorRoute::Claude {
+        pid,
+        socket_path,
+        key_path,
+        ..
+    } = route
+    else {
+        return Err("not a Claude peer route".into());
+    };
+    let (_, key) = read_claude_key(*pid, socket_path, key_path.as_deref())?;
+    let token = key
+        .get("peerToken")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "Claude peer token unavailable".to_string())?;
+    #[cfg(feature = "wire-test-isolation")]
+    crate::test_isolation::ensure_socket(socket_path).map_err(|e| e.to_string())?;
+    let mut stream = UnixStream::connect(socket_path)
+        .map_err(|e| format!("failed to connect to Claude peer socket: {e}"))?;
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
+    let auth = serde_json::json!({"type": "auth", "token": token});
+    let frame = serde_json::json!({"type": "user", "from": sender_name, "priority": "next", "message": {"role": "user", "content": body}});
+    stream
+        .write_all(format!("{auth}\n{frame}\n").as_bytes())
+        .and_then(|()| stream.flush())
+        .map_err(|e| format!("failed to write to Claude peer socket: {e}"))
+}
+
+/// Dispatch hosted Claude terminal input only through a pinned explicit registration.
+/// This path never falls through to a peer socket, tmux, or a newly discovered route.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClaudeBoundError {
+    Refused(String),
+    Delivery(String),
+}
+
+pub fn dispatch_bound_claude_operator_prompt(
+    binding: &crate::vendor_adapter::ClaudeRegistrationBinding,
+    sender_name: &str,
+    body: &str,
+) -> Result<(), ClaudeBoundError> {
+    let entry = binding
+        .revalidate()
+        .map_err(|e| ClaudeBoundError::Refused(e.to_string()))?;
+    let VendorRoute::Claude {
+        pid,
+        session_id,
+        key_path,
+        ..
+    } = &entry.route
+    else {
+        return Err(ClaudeBoundError::Refused(
+            "Claude registration is no longer current; re-register and resubmit".into(),
+        ));
+    };
+    // A process can switch Claude conversations without replacing its registration.
+    // Bind its current session record to the pinned native UUID before host selection.
+    if !claude_record_matches_native_session(
+        read_claude_session_record(*pid, key_path.as_deref()).as_ref(),
+        binding.native_session(),
+    ) {
+        return Err(ClaudeBoundError::Refused(
+            "Claude process session is unavailable or changed; re-register and resubmit".into(),
+        ));
+    }
+    let target = format!("claude:{}", binding.persona());
+    let mut host = resolve_claude_host(&target, *pid).map_err(ClaudeBoundError::Refused)?;
+    if !host.is_pty
+        || !capture_bound_host_screen(&mut host.client, &host.stream)
+            .as_ref()
+            .is_some_and(usable_bound_claude_screen)
+    {
+        return Err(ClaudeBoundError::Refused(
+            "Claude composer cannot be confirmed".into(),
+        ));
+    }
+    let record = read_claude_session_record(*pid, key_path.as_deref());
+    if !claude_session_deliverable(record.as_ref()) {
+        let proves_wait = claude_session_busy(record.as_ref())
+            && host.is_pty
+            && capture_bound_host_screen(&mut host.client, &host.stream).is_some_and(|screen| {
+                usable_bound_claude_screen(&screen)
+                    && screen_proves_claude_background_wait(&screen.contents)
+            });
+        if !proves_wait {
+            return Err(ClaudeBoundError::Delivery(composer_session_busy_error()));
+        }
+    }
+    // Recheck source after host lookup, directly before acquiring the controller and writing.
+    binding
+        .revalidate()
+        .map_err(|e| ClaudeBoundError::Refused(e.to_string()))?;
+    if !claude_record_matches_native_session(
+        read_claude_session_record(*pid, key_path.as_deref()).as_ref(),
+        binding.native_session(),
+    ) {
+        return Err(ClaudeBoundError::Refused(
+            "Claude process session is unavailable or changed; re-register and resubmit".into(),
+        ));
+    }
+    let opts = TmuxPasteOptions {
+        bracketed: true,
+        verify_submission: true,
+        session_id: Some(session_id.as_str()),
+        is_muse_route: false,
+        is_claude_route: true,
+        composer_style: ComposerStyle::Ruled,
+    };
+    let text = sanitize_for_paste(&prefixed_operator_body(sender_name, body));
+    let validate = || {
+        binding.revalidate().map_err(|_| {
+            "Claude identity changed during terminal delivery; delivery may be unconfirmed"
+                .to_string()
+        })?;
+        if !claude_record_matches_native_session(
+            read_claude_session_record(*pid, key_path.as_deref()).as_ref(),
+            binding.native_session(),
+        ) {
+            return Err(
+                "Claude conversation changed during terminal delivery; delivery may be unconfirmed"
+                    .into(),
+            );
+        }
+        Ok(())
+    };
     deliver_via_tmux_paste_with_resolved_host(
         &target,
-        &sanitize_for_paste(text),
+        &text,
         opts,
-        Some(resolved),
+        Some((host.client, host.stream, host.is_pty)),
+        Some(&validate),
     )
+    .map_err(ClaudeBoundError::Delivery)
 }
 
 pub fn dispatch_operator_prompt_to_route(
@@ -6358,24 +7362,26 @@ pub fn dispatch_operator_prompt_to_route(
                 Ok(pair) => pair,
                 Err(e) => {
                     if std::env::var_os("FL_WIRE_TMUX_BIN").is_none() {
-                        let host_target = (!session_id.trim().is_empty())
-                            .then(|| session_id.trim().to_string())
-                            .filter(|id| resolve_live_host_session(id).is_some())
-                            .or_else(|| (*pid != 0).then(|| tmux_pane_for_pid(*pid)).flatten());
-                        if let Some(target) = host_target {
-                            return deliver_via_tmux_paste_with_opts(
-                                &target,
-                                &sanitize_for_paste(&prefixed_operator_body(sender_name, body)),
-                                TmuxPasteOptions {
-                                    bracketed: true,
-                                    verify_submission: true,
-                                    session_id: Some(session_id.as_str())
-                                        .filter(|s| !s.trim().is_empty()),
-                                    is_muse_route: false,
-                                    composer_style: ComposerStyle::Ruled,
-                                },
-                            );
+                        let target = (*pid != 0)
+                            .then(|| tmux_pane_for_pid(*pid))
+                            .flatten()
+                            .unwrap_or_else(|| session_id.trim().to_string());
+                        let opts = TmuxPasteOptions {
+                            bracketed: true,
+                            verify_submission: true,
+                            session_id: Some(session_id.as_str()).filter(|s| !s.trim().is_empty()),
+                            is_muse_route: false,
+                            is_claude_route: true,
+                            composer_style: ComposerStyle::Ruled,
+                        };
+                        let text = sanitize_for_paste(&prefixed_operator_body(sender_name, body));
+                        if target.starts_with('%') {
+                            return deliver_via_tmux_paste_with_opts(&target, &text, opts);
                         }
+                        let host_target = claude_host_target(&target)
+                            .ok_or_else(|| "the claude route has no live terminal".to_string())?;
+                        let host = resolve_claude_host(&host_target, *pid)?;
+                        return deliver_resolved_claude_host(&host_target, &text, opts, host);
                     }
                     return Err(e);
                 }
@@ -6392,23 +7398,30 @@ pub fn dispatch_operator_prompt_to_route(
                     || Some(key_json.clone()),
                 )
             {
-                return deliver_via_tmux_paste_with_opts(
-                    &pane,
-                    &sanitize_for_paste(&prefixed_operator_body(sender_name, body)),
-                    TmuxPasteOptions {
-                        bracketed: true,
-                        verify_submission: true,
-                        session_id: Some(session_id.as_str()).filter(|s| !s.trim().is_empty()),
-                        is_muse_route: false,
-                        composer_style: ComposerStyle::Ruled,
-                    },
-                );
+                let opts = TmuxPasteOptions {
+                    bracketed: true,
+                    verify_submission: true,
+                    session_id: Some(session_id.as_str()).filter(|s| !s.trim().is_empty()),
+                    is_muse_route: false,
+                    is_claude_route: true,
+                    composer_style: ComposerStyle::Ruled,
+                };
+                let text = sanitize_for_paste(&prefixed_operator_body(sender_name, body));
+                if pane.starts_with('%') {
+                    return deliver_via_tmux_paste_with_opts(&pane, &text, opts);
+                }
+                let host_target = claude_host_target(&pane)
+                    .ok_or_else(|| "the claude route has no live terminal".to_string())?;
+                let host = resolve_claude_host(&host_target, *pid)?;
+                return deliver_resolved_claude_host(&host_target, &text, opts, host);
             }
             let peer_token = key_json
                 .get("peerToken")
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| format!("missing `peerToken` in {}", kpath.display()))?;
 
+            #[cfg(feature = "wire-test-isolation")]
+            crate::test_isolation::ensure_socket(socket_path).map_err(|e| e.to_string())?;
             let mut stream = UnixStream::connect(socket_path).map_err(|e| {
                 format!(
                     "failed to connect to claude socket {}: {e}",
@@ -6721,7 +7734,7 @@ fn dispatch_message_selected_with_status<S: MessageStore>(
         );
         if let Err(ref err) = pushed {
             if is_composer_occupied_error(err.as_str()) {
-                report.record_failure(FailureStage::ComposerOccupiedByNonWireInput);
+                report.record_composer_occupied(err.as_str());
             } else {
                 let dead_explicit = entry.explicit
                     && (matches!(err, PushError::NotConnected(_))
@@ -6757,7 +7770,7 @@ fn dispatch_message_selected_with_status<S: MessageStore>(
                     );
                     if let Err(ref retry_err) = pushed {
                         if is_composer_occupied_error(retry_err.as_str()) {
-                            report.record_failure(FailureStage::ComposerOccupiedByNonWireInput);
+                            report.record_composer_occupied(retry_err.as_str());
                         } else {
                             let retry_dead_explicit = fresh.explicit
                                 && (matches!(retry_err, PushError::NotConnected(_))
@@ -6825,13 +7838,17 @@ mod tests {
     #[test]
     fn claude_model_paste_pins_the_claude_stream_and_refuses_codex_only() {
         use fl_host_proto::{
-            ChildRecord, ChildState, ControllerLease, ExtensionLimits, ExtensionRequest,
-            ExtensionResponse, HostConfig, HostEndpoint, HostInstance, HostListener, HostRequest,
-            HostResponse, InputState, RENDERED_PTY_FEATURE, RenderedScreen, SendOutcome,
-            SessionEpoch, SessionId, SessionMode, SessionSummary, SpawnKind, StreamId,
+            ChildRecord, ChildState, ControllerLease, ExtensionLimits, ExtensionRefusal,
+            ExtensionRequest, ExtensionResponse, HostConfig, HostEndpoint, HostInstance,
+            HostListener, HostRequest, HostResponse, InputState, RENDERED_PTY_FEATURE,
+            RenderedScreen, SendOutcome, SessionEpoch, SessionId, SessionMode, SessionSummary,
+            SpawnKind, StreamId,
         };
         use std::os::unix::fs::PermissionsExt;
-        use std::sync::Arc;
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
         let _lock = TMUX_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = TempDir::new().unwrap();
         fs::set_permissions(tmp.path(), fs::Permissions::from_mode(0o700)).unwrap();
@@ -6867,11 +7884,23 @@ mod tests {
         let sessions = Arc::new(Mutex::new(vec![codex.clone(), claude]));
         let writes = Arc::new(Mutex::new(Vec::<(StreamId, Vec<u8>)>::new()));
         let claims = Arc::new(Mutex::new(Vec::<StreamId>::new()));
+        let composer = Arc::new(Mutex::new(String::new()));
+        let attempted_writes = Arc::new(Mutex::new(Vec::new()));
+        let attempted_server = Arc::clone(&attempted_writes);
+        let record_path = tmp.path().join(format!("{}.json", std::process::id()));
+        let scenario = Arc::new(AtomicUsize::new(0));
+        let raw_captures = Arc::new(AtomicUsize::new(0));
+        let rendered_captures = Arc::new(AtomicUsize::new(0));
+        let rendered_server = Arc::clone(&rendered_captures);
+        let route_source_server = tmp.path().join("registered-routes.json");
+        let scenario_server = Arc::clone(&scenario);
+        let raw_server = Arc::clone(&raw_captures);
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
         let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel::<()>();
         let sessions_server = Arc::clone(&sessions);
         let writes_server = Arc::clone(&writes);
         let claims_server = Arc::clone(&claims);
+        let composer_server = Arc::clone(&composer);
         let server = std::thread::spawn(move || {
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -6881,6 +7910,9 @@ mod tests {
                 let mut config = HostConfig::new(endpoint);
                 config.minor = 1;
                 let mut listener = HostListener::bind(config).await.unwrap();
+                let _socket_fixture =
+                    crate::test_isolation::register_unix_socket(listener.endpoint().socket_path())
+                        .unwrap();
                 ready_tx.send(()).unwrap();
                 loop {
                     let mut conn = tokio::select! {
@@ -6890,6 +7922,13 @@ mod tests {
                     let sessions = Arc::clone(&sessions_server);
                     let writes = Arc::clone(&writes_server);
                     let claims = Arc::clone(&claims_server);
+                    let composer = Arc::clone(&composer_server);
+                    let scenario = Arc::clone(&scenario_server);
+                    let raw_captures = Arc::clone(&raw_server);
+                    let rendered_captures = Arc::clone(&rendered_server);
+                    let route_source = route_source_server.clone();
+                    let attempted_writes = Arc::clone(&attempted_server);
+                    let record_path = record_path.clone();
                     tokio::spawn(async move {
                         while let Ok(HostRequest::Extended { id, request }) = conn.recv().await {
                             let response = match request {
@@ -6898,23 +7937,51 @@ mod tests {
                                 },
                                 ExtensionRequest::Capabilities => ExtensionResponse::Capabilities {
                                     host: HostInstance::new([5; 16]),
-                                    features: RENDERED_PTY_FEATURE,
+                                    features: if scenario.load(Ordering::SeqCst) == 1 {
+                                        0
+                                    } else {
+                                        RENDERED_PTY_FEATURE
+                                    },
                                     limits: ExtensionLimits::default(),
                                 },
                                 ExtensionRequest::ClaimController { stream } => {
                                     claims.lock().unwrap().push(stream);
-                                    ExtensionResponse::Controller {
-                                        lease: ControllerLease(7),
-                                        acked: 0,
-                                        latest: 0,
+                                    if scenario.load(Ordering::SeqCst) == 8 {
+                                        fs::write(&record_path, r#"{"status":"idle","sessionId":"replacement"}"#).unwrap();
+                                    }
+                                    if scenario.load(Ordering::SeqCst) == 10 {
+                                        fs::write(&route_source, "broken registration").unwrap();
+                                    }
+                                    if scenario.load(Ordering::SeqCst) == 3 {
+                                        ExtensionResponse::Refused {
+                                            code: ExtensionRefusal::StaleEpoch,
+                                        }
+                                    } else {
+                                        ExtensionResponse::Controller {
+                                            lease: ControllerLease(7),
+                                            acked: 0,
+                                            latest: 0,
+                                        }
                                     }
                                 }
-                                ExtensionRequest::CaptureRendered { stream } => {
+                                ExtensionRequest::CaptureRendered { mut stream } => {
+                                    let capture_number = rendered_captures.fetch_add(1, Ordering::SeqCst) + 1;
+                                    if scenario.load(Ordering::SeqCst) == 7 {
+                                        fs::write(&record_path, r#"{"status":"idle","sessionId":"replacement"}"#).unwrap();
+                                    }
+                                    if scenario.load(Ordering::SeqCst) == 2 {
+                                        stream.epoch = SessionEpoch(4);
+                                    }
                                     ExtensionResponse::RenderedCapture {
                                         screen: RenderedScreen {
                                             schema: 1,
                                             stream,
-                                            contents: String::new(),
+                                            contents: match scenario.load(Ordering::SeqCst) {
+                                                5 => String::new(),
+                                                6 => "unlocated screen".into(),
+                                                11 if capture_number >= 4 => "────────────────────\n❯ owner draft\n────────────────────\n".into(),
+                                                _ => format!("────────────────────\n❯ {}\n────────────────────\n", composer.lock().unwrap()),
+                                            },
                                             cursor_row: 0,
                                             cursor_col: 0,
                                             rows: 24,
@@ -6925,13 +7992,41 @@ mod tests {
                                         },
                                     }
                                 }
-                                ExtensionRequest::Write { stream, bytes, .. } => {
-                                    writes.lock().unwrap().push((stream, bytes.into_vec()));
-                                    ExtensionResponse::Input {
-                                        outcome: SendOutcome::Written,
+                                ExtensionRequest::Write {
+                                    stream,
+                                    lease,
+                                    bytes,
+                                } => {
+                                    attempted_writes
+                                        .lock()
+                                        .unwrap()
+                                        .push((stream.clone(), lease));
+                                    if scenario.load(Ordering::SeqCst) == 4 {
+                                        ExtensionResponse::Refused {
+                                            code: ExtensionRefusal::StaleEpoch,
+                                        }
+                                    } else {
+                                        let bytes = bytes.into_vec();
+                                        if bytes == b"\r" {
+                                            composer.lock().unwrap().clear();
+                                        } else {
+                                            let text = String::from_utf8_lossy(&bytes);
+                                            *composer.lock().unwrap() = text.trim_start_matches("\x1b[200~").trim_end_matches("\x1b[201~").to_string();
+                                            if scenario.load(Ordering::SeqCst) == 9 {
+                                                fs::write(&record_path, r#"{"status":"idle","sessionId":"replacement"}"#).unwrap();
+                                            }
+                                            if scenario.load(Ordering::SeqCst) == 12 {
+                                                *composer.lock().unwrap() = "owner draft".into();
+                                            }
+                                        }
+                                        writes.lock().unwrap().push((stream, bytes));
+                                        ExtensionResponse::Input {
+                                            outcome: SendOutcome::Written,
+                                        }
                                     }
                                 }
                                 ExtensionRequest::CaptureOutput { .. } => {
+                                    raw_captures.fetch_add(1, Ordering::SeqCst);
                                     ExtensionResponse::CapturedOutput {
                                         text: String::new(),
                                     }
@@ -6971,11 +8066,168 @@ mod tests {
                 .any(|w| w == b"/model sonnet")
         }));
         assert!(actual.iter().any(|(_, bytes)| bytes == b"\r"));
-        assert_eq!(*claims.lock().unwrap(), vec![claude_stream]);
-        *sessions.lock().unwrap() = vec![codex];
+        assert_eq!(*claims.lock().unwrap(), vec![claude_stream.clone()]);
+        // Duplicate canonical identities must never select by ordering.
+        let claude = make_summary("fixture-536.claude");
+        *sessions.lock().unwrap() = vec![claude.clone(), claude.clone()];
         assert!(deliver_to_live_claude_pane(&route, "/model sonnet").is_err());
         assert_eq!(writes.lock().unwrap().len(), actual.len());
         assert_eq!(claims.lock().unwrap().len(), 1);
+        *sessions.lock().unwrap() = vec![claude];
+        // Unsupported or mismatched rendered capture must refuse before claiming.
+        for case in [1, 2, 5, 6] {
+            scenario.store(case, Ordering::SeqCst);
+            assert!(deliver_to_live_claude_pane(&route, "/model sonnet").is_err());
+            assert_eq!(writes.lock().unwrap().len(), actual.len());
+            assert_eq!(claims.lock().unwrap().len(), 1);
+        }
+        // A replacement between capture and claim is rejected by the host fence.
+        scenario.store(3, Ordering::SeqCst);
+        assert!(deliver_to_live_claude_pane(&route, "/model sonnet").is_err());
+        assert_eq!(writes.lock().unwrap().len(), actual.len());
+        assert_eq!(claims.lock().unwrap().last(), Some(&claude_stream));
+        assert_eq!(claims.lock().unwrap().len(), 2);
+        // A replacement after claim is fenced by the retained stream and lease on write.
+        scenario.store(4, Ordering::SeqCst);
+        assert!(deliver_to_live_claude_pane(&route, "/model sonnet").is_err());
+        assert_eq!(writes.lock().unwrap().len(), actual.len());
+        assert_eq!(
+            attempted_writes.lock().unwrap().last(),
+            Some(&(claude_stream.clone(), ControllerLease(7)))
+        );
+        assert_eq!(claims.lock().unwrap().len(), 3);
+        assert_eq!(raw_captures.load(Ordering::SeqCst), 0);
+        scenario.store(0, Ordering::SeqCst);
+        *sessions.lock().unwrap() = vec![codex];
+        assert!(deliver_to_live_claude_pane(&route, "/model sonnet").is_err());
+        assert_eq!(writes.lock().unwrap().len(), actual.len());
+        assert_eq!(claims.lock().unwrap().len(), 3);
+        // The terminal-paste admission must independently pin an explicit source.
+        // PID evidence may corroborate that target, never pick a different persona.
+        #[cfg(target_os = "linux")]
+        {
+            use crate::identity::{RouteEntry, RouteTable, proc_start_time_ticks};
+            use crate::vendor_adapter::ClaudeRegistrationBinding;
+            let pid = std::process::id();
+            let native = "dce797a0-d963-4c1b-a06b-7fa6bffda7fa";
+            let registered = RouteEntry {
+                persona: "fixture-536".into(),
+                route: VendorRoute::Claude {
+                    pid,
+                    session_id: native.into(),
+                    socket_path: tmp.path().join("unused-peer.sock"),
+                    key_path: Some(tmp.path().join("fixture.key")),
+                },
+                updated_at: fl_core::at::At::from_unix_millis(1),
+                identity_at: None,
+                explicit: true,
+                hosted_id: Some("claude:fixture-536".into()),
+                hydration_generation: Some("test-generation".into()),
+                pid_start_time: proc_start_time_ticks(pid),
+            };
+            let source = tmp.path().join("registered-routes.json");
+            let mut table = RouteTable::default();
+            table.entries.insert("fixture-536".into(), registered);
+            fs::write(&source, serde_json::to_vec(&table).unwrap()).unwrap();
+            fs::write(
+                tmp.path().join(format!("{pid}.json")),
+                serde_json::json!({"status":"idle", "sessionId": native}).to_string(),
+            )
+            .unwrap();
+            let binding =
+                ClaudeRegistrationBinding::acquire(source.clone(), native, "fixture-536").unwrap();
+            let mut wrong = make_summary("other.claude");
+            if let ChildState::Running(ref mut child) = wrong.state {
+                child.pid = pid;
+            }
+            *sessions.lock().unwrap() = vec![wrong];
+            let before_claims = claims.lock().unwrap().len();
+            let before_writes = writes.lock().unwrap().len();
+            assert!(
+                dispatch_bound_claude_operator_prompt(&binding, "owner", "fixture message")
+                    .is_err()
+            );
+            assert_eq!(claims.lock().unwrap().len(), before_claims);
+            assert_eq!(writes.lock().unwrap().len(), before_writes);
+            let mut correct = make_summary("fixture-536.claude");
+            if let ChildState::Running(ref mut child) = correct.state {
+                child.pid = pid;
+            }
+            *sessions.lock().unwrap() = vec![correct];
+            dispatch_bound_claude_operator_prompt(&binding, "owner", "fixture message").unwrap();
+            assert!(writes.lock().unwrap().len() > before_writes);
+            assert_eq!(claims.lock().unwrap().last(), Some(&claude_stream));
+            let after_success_claims = claims.lock().unwrap().len();
+            let after_success_writes = writes.lock().unwrap().len();
+            // A conversation change during bound capture must be caught before claim.
+            scenario.store(7, Ordering::SeqCst);
+            assert!(matches!(
+                dispatch_bound_claude_operator_prompt(&binding, "owner", "fixture message"),
+                Err(ClaudeBoundError::Refused(_))
+            ));
+            assert_eq!(claims.lock().unwrap().len(), after_success_claims);
+            assert_eq!(writes.lock().unwrap().len(), after_success_writes);
+            // A native-conversation replacement after the outer recheck, during
+            // claim, must prevent all input despite an unchanged host stream.
+            fs::write(
+                tmp.path().join(format!("{pid}.json")),
+                serde_json::json!({"status":"idle", "sessionId": native}).to_string(),
+            )
+            .unwrap();
+            scenario.store(8, Ordering::SeqCst);
+            let before = writes.lock().unwrap().len();
+            assert!(
+                dispatch_bound_claude_operator_prompt(&binding, "owner", "fixture message")
+                    .is_err()
+            );
+            assert_eq!(writes.lock().unwrap().len(), before);
+            // If the conversation changes after payload write, never send Enter;
+            // report a delivery failure because input already reached the terminal.
+            fs::write(
+                tmp.path().join(format!("{pid}.json")),
+                serde_json::json!({"status":"idle", "sessionId": native}).to_string(),
+            )
+            .unwrap();
+            scenario.store(9, Ordering::SeqCst);
+            let before = writes.lock().unwrap().len();
+            let err = dispatch_bound_claude_operator_prompt(&binding, "owner", "fixture message")
+                .unwrap_err();
+            assert!(matches!(err, ClaudeBoundError::Delivery(_)));
+            let out = writes.lock().unwrap();
+            assert_eq!(out.len(), before + 1);
+            assert_ne!(out.last().unwrap().1, b"\r");
+            drop(out);
+            composer.lock().unwrap().clear();
+            fs::write(
+                tmp.path().join(format!("{pid}.json")),
+                serde_json::json!({"status":"idle", "sessionId": native}).to_string(),
+            )
+            .unwrap();
+            scenario.store(10, Ordering::SeqCst);
+            let before = writes.lock().unwrap().len();
+            assert!(
+                dispatch_bound_claude_operator_prompt(&binding, "owner", "fixture message")
+                    .is_err()
+            );
+            assert_eq!(writes.lock().unwrap().len(), before);
+            fs::write(&source, serde_json::to_vec(&table).unwrap()).unwrap();
+            scenario.store(11, Ordering::SeqCst);
+            rendered_captures.store(0, Ordering::SeqCst);
+            let before = writes.lock().unwrap().len();
+            assert!(
+                dispatch_bound_claude_operator_prompt(&binding, "owner", "fixture message")
+                    .is_err()
+            );
+            assert_eq!(writes.lock().unwrap().len(), before);
+            scenario.store(12, Ordering::SeqCst);
+            let before = writes.lock().unwrap().len();
+            let err = dispatch_bound_claude_operator_prompt(&binding, "owner", "fixture message")
+                .unwrap_err();
+            assert!(matches!(err, ClaudeBoundError::Delivery(_)));
+            let out = writes.lock().unwrap();
+            assert_eq!(out.len(), before + 1);
+            assert_ne!(out.last().unwrap().1, b"\r");
+        }
         let _ = stop_tx.send(());
         server.join().unwrap();
     }
@@ -7596,7 +8848,7 @@ mod tests {
         let key_path = tmp.path().join("0.key");
         fs::write(&key_path, "{\"peerToken\":\"tok-xyz\"}").unwrap();
 
-        let listener = UnixListener::bind(&sock_path).unwrap();
+        let listener = crate::test_isolation::bind_unix_fixture(&sock_path).unwrap();
         let handle = std::thread::spawn(move || {
             let (stream, _) = listener.accept().unwrap();
             let reader = std::io::BufReader::new(stream);
@@ -7866,7 +9118,7 @@ mod tests {
         let key_path = tmp.path().join("0.key");
         fs::write(&key_path, "{\"peerToken\":\"tok-op\"}").unwrap();
 
-        let claude_listener = UnixListener::bind(&claude_sock).unwrap();
+        let claude_listener = crate::test_isolation::bind_unix_fixture(&claude_sock).unwrap();
         let claude_handle = std::thread::spawn(move || {
             let (stream, _) = claude_listener.accept().unwrap();
             let reader = std::io::BufReader::new(stream);
@@ -7901,7 +9153,7 @@ mod tests {
         assert_eq!(user["message"]["content"], "Check the queue status");
 
         let webhook_sock = tmp.path().join("webhook-op.sock");
-        let webhook_listener = UnixListener::bind(&webhook_sock).unwrap();
+        let webhook_listener = crate::test_isolation::bind_unix_fixture(&webhook_sock).unwrap();
         let webhook_handle = std::thread::spawn(move || {
             let (stream, _) = webhook_listener.accept().unwrap();
             let reader = std::io::BufReader::new(stream);
@@ -7951,7 +9203,7 @@ mod tests {
     fn claude_route_with_mock_socket(
         dir: &Path,
         tmux_field: Option<&str>,
-    ) -> (VendorRoute, UnixListener) {
+    ) -> (VendorRoute, crate::test_isolation::RegisteredUnixListener) {
         let sock_path = dir.join("claude-tmux.sock");
         let key_path = dir.join("0.key");
         let key = match tmux_field {
@@ -7959,7 +9211,7 @@ mod tests {
             None => serde_json::json!({ "peerToken": "tok-t" }),
         };
         fs::write(&key_path, key.to_string()).unwrap();
-        let listener = UnixListener::bind(&sock_path).unwrap();
+        let listener = crate::test_isolation::bind_unix_fixture(&sock_path).unwrap();
         listener.set_nonblocking(true).unwrap();
         (
             VendorRoute::Claude {
@@ -8181,12 +9433,16 @@ mod tests {
             let tmp = TempDir::new().unwrap();
             let (tmux_bin, tmux_out, tmux_stdin) = write_fake_tmux(tmp.path(), true);
             let _env = EnvGuard::set("FL_WIRE_TMUX_BIN", &tmux_bin);
+            let mut refused_fixture = None;
             let socket = match case {
                 "empty" => PathBuf::new(),
                 "missing" => tmp.path().join("gone.sock"),
                 _ => {
                     let path = tmp.path().join("refused.sock");
-                    drop(UnixListener::bind(&path).unwrap());
+                    let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+                    refused_fixture =
+                        Some(crate::test_isolation::register_unix_socket(&path).unwrap());
+                    drop(listener);
                     path
                 }
             };
@@ -8195,6 +9451,7 @@ mod tests {
             let msg = claude_fallback_msg(&store, "synthetic-recipient-c");
 
             let rcpt = dispatch_one(route, tmp.path(), &store, &msg);
+            drop(refused_fixture);
             assert_eq!(rcpt.status, DeliveryStatus::Acked, "{case}");
             let cmds = fs::read_to_string(&tmux_out).unwrap();
             assert!(cmds.contains("paste-buffer -d -b"), "{case}: {cmds}");
@@ -8410,7 +9667,7 @@ mod tests {
         let (tmux_bin, tmux_out, _) = write_fake_tmux(tmp.path(), true);
         let _env = EnvGuard::set("FL_WIRE_TMUX_BIN", &tmux_bin);
         let sock = tmp.path().join("live.sock");
-        let listener = UnixListener::bind(&sock).unwrap();
+        let listener = crate::test_isolation::bind_unix_fixture(&sock).unwrap();
         let reader = std::thread::spawn(move || {
             let (stream, _) = listener.accept().unwrap();
             std::io::BufReader::new(stream)
@@ -8692,65 +9949,281 @@ mod tests {
         assert!(!is_owner_sender(""));
     }
 
-    #[test]
-    fn clear_or_reforge_tmux_sends_reset_keys_then_prompt() {
-        use std::os::unix::fs::PermissionsExt;
+    fn unsupported_reset_routes() -> Vec<(VendorRoute, &'static str)> {
+        let mut routes = Vec::new();
+        for id in ["", "placeholder", "Fixture.codex"] {
+            routes.push((
+                VendorRoute::Codex {
+                    thread_id: id.into(),
+                    cwd: None,
+                },
+                "codex",
+            ));
+            routes.push((
+                VendorRoute::Muse {
+                    session_id: id.into(),
+                    cwd: None,
+                    tmux_target: Some("fixture:muse".into()),
+                    tmux_pane: Some("%999999".into()),
+                },
+                "muse",
+            ));
+            routes.push((
+                VendorRoute::Grok {
+                    session_id: id.into(),
+                    cwd: None,
+                    tmux_target: Some("fixture:grok".into()),
+                    tmux_pane: Some("%999999".into()),
+                },
+                "grok",
+            ));
+            for (vendor, canonical) in [
+                (" ClAuDe ", "claude"),
+                (" CoDeX ", "codex"),
+                (" MuSe ", "muse"),
+                (" GrOk ", "grok"),
+                (" AGY ", "antigravity"),
+                (" Lemonade ", "lemonade"),
+                (" OLLAMA ", "ollama"),
+                ("host_cli", "host_cli"),
+                ("custom", "custom"),
+                ("", ""),
+            ] {
+                routes.push((
+                    VendorRoute::HostCli {
+                        vendor: vendor.into(),
+                        session_id: id.into(),
+                        cwd: None,
+                        tmux_target: Some("fixture:host".into()),
+                        tmux_pane: Some("%999999".into()),
+                    },
+                    canonical,
+                ));
+            }
+        }
+        routes
+    }
 
+    fn assert_reset_refusal(value: serde_json::Value, vendor: &str) {
+        assert_eq!(value["code"], "reset_unsupported");
+        assert_eq!(value["vendor"], vendor);
+        assert_eq!(value["reason"], "identity_unconfirmable");
+        assert_eq!(value["alternative"], "remodel_same_vendor");
+        let error = value["error"].as_str().unwrap();
+        assert!(error.contains("identity"), "{error}");
+        assert!(
+            error.contains("remodel") && error.contains("same vendor"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn reset_preflight_refuses_every_unconfirmable_route_without_transport() {
+        for (route, vendor) in unsupported_reset_routes() {
+            let refusal = preflight_session_reset(&route).expect_err("must refuse without probing");
+            assert_reset_refusal(serde_json::to_value(&refusal).unwrap(), vendor);
+            assert_reset_refusal(serde_json::from_str(&refusal.to_string()).unwrap(), vendor);
+        }
+    }
+
+    #[test]
+    fn reset_preflight_preserves_supported_route_paths() {
+        let routes = [
+            VendorRoute::Claude {
+                pid: 0,
+                session_id: "".into(),
+                socket_path: "/fixture/absent".into(),
+                key_path: None,
+            },
+            VendorRoute::Agy {
+                conversation_id: "".into(),
+                ls_pid: None,
+                ls_address: None,
+                csrf_token: None,
+                agentapi_exe: None,
+            },
+            VendorRoute::Webhook {
+                socket_path: "/fixture/absent".into(),
+            },
+        ];
+        for route in routes {
+            assert!(preflight_session_reset(&route).is_ok());
+        }
+    }
+
+    #[test]
+    fn clear_or_reforge_refuses_unconfirmable_routes_before_dispatch() {
+        for (route, vendor) in unsupported_reset_routes() {
+            for mode in [SessionResetMode::Clear, SessionResetMode::Reforge] {
+                let error =
+                    clear_or_reforge_session(&route, mode, "owner", Some("hydrate fixture"))
+                        .expect_err("must refuse without dispatch");
+                assert_reset_refusal(serde_json::from_str(&error).unwrap(), vendor);
+            }
+        }
+    }
+
+    #[test]
+    fn clear_or_reforge_refusal_table_has_zero_dispatch() {
         let _tmux_lock = TMUX_ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
         let tmp = TempDir::new().unwrap();
-        let tmux_out = tmp.path().join("tmux.out");
-        let tmux_stdin = tmp.path().join("tmux.stdin");
-        let tmux_bin = tmp.path().join("fake-tmux.sh");
-        fs::write(
-            &tmux_bin,
-            format!(
-                "#!/bin/sh\necho \"$*\" >> \"{}\"\nif [ \"$1\" = \"display-message\" ] || [ \"$1\" = \"list-panes\" ]; then\n  echo \"%9\"\nelif [ \"$1\" = \"load-buffer\" ]; then\n  cat > \"{}\"\nfi\n",
-                tmux_out.display(),
-                tmux_stdin.display()
-            ),
-        )
-        .unwrap();
-        fs::set_permissions(&tmux_bin, fs::Permissions::from_mode(0o755)).unwrap();
-
-        let grok = VendorRoute::Grok {
-            session_id: "gs-1".into(),
-            cwd: None,
-            tmux_target: Some("grok:felicia".into()),
-            tmux_pane: Some("%9".into()),
-        };
-        let muse = VendorRoute::Muse {
-            session_id: "ms-1".into(),
-            cwd: None,
-            tmux_target: Some("muse:felicia".into()),
-            tmux_pane: None,
-        };
-
-        // SAFETY: this test is the only fl-wire test that keeps FL_WIRE_TMUX_BIN set
-        // for clear/reforge. The guard restores the previous value on drop.
+        let (tmux_bin, tmux_out, _) = write_fake_tmux(tmp.path(), true);
         let _env = EnvGuard::set("FL_WIRE_TMUX_BIN", &tmux_bin);
-        clear_or_reforge_session(&grok, SessionResetMode::Clear, "owner", None).unwrap();
-        clear_or_reforge_session(
-            &muse,
-            SessionResetMode::Reforge,
-            "owner",
-            Some("reforge muse now"),
-        )
-        .unwrap();
-        drop(_env);
+        // Every unconfirmable vendor refuses for both modes before any transport.
+        for (route, vendor) in unsupported_reset_routes() {
+            assert_reset_refusal(
+                serde_json::to_value(preflight_session_reset(&route).unwrap_err()).unwrap(),
+                vendor,
+            );
+            for mode in [SessionResetMode::Clear, SessionResetMode::Reforge] {
+                let error =
+                    clear_or_reforge_session(&route, mode, "owner", Some("hydrate fixture"))
+                        .expect_err("must refuse without dispatch");
+                assert_reset_refusal(serde_json::from_str(&error).unwrap(), vendor);
+            }
+        }
+        assert!(
+            !tmux_out.exists(),
+            "refused resets must not reach tmux (zero dispatch), saw: {}",
+            tmux_out.display()
+        );
+        // Supported vendors remain allowed by preflight.
+        for route in [
+            VendorRoute::Claude {
+                pid: 0,
+                session_id: "".into(),
+                socket_path: "/fixture/absent".into(),
+                key_path: None,
+            },
+            VendorRoute::Agy {
+                conversation_id: "".into(),
+                ls_pid: None,
+                ls_address: None,
+                csrf_token: None,
+                agentapi_exe: None,
+            },
+            VendorRoute::Webhook {
+                socket_path: "/fixture/absent".into(),
+            },
+        ] {
+            assert!(preflight_session_reset(&route).is_ok());
+        }
+    }
 
-        let log = fs::read_to_string(&tmux_out).unwrap();
-        assert!(log.contains("send-keys -t %9 C-u"));
-        assert!(log.contains("send-keys -t %9 /new"));
-        assert!(log.contains("send-keys -t %9 Enter"));
-        assert!(log.contains("send-keys -t =muse:=felicia C-u"));
-        assert!(log.contains("send-keys -t =muse:=felicia /clear"));
-        assert!(log.contains("send-keys -t =muse:=felicia Enter"));
-        assert!(log.contains("load-buffer -b fl-wire-muse-"));
-        let pasted = fs::read_to_string(&tmux_stdin).unwrap();
-        assert_eq!(pasted.trim(), "reforge muse now");
-        let reset_at = log.find("send-keys -t =muse:=felicia /clear").unwrap();
-        let paste_at = log.find("load-buffer -b fl-wire-muse-").unwrap();
-        assert!(reset_at < paste_at);
+    #[test]
+    fn recognised_composer_payload_names_only_clear_and_new() {
+        assert_eq!(recognised_composer_payload("/clear"), Some("/clear"));
+        assert_eq!(recognised_composer_payload("  /new\n"), Some("/new"));
+        assert_eq!(recognised_composer_payload("/clear now"), None);
+        assert_eq!(recognised_composer_payload("/clearx"), None);
+        assert_eq!(recognised_composer_payload("my secret draft"), None);
+        let rule = "─".repeat(20);
+        let clear_screen = format!("◆ Ready.\n{rule}\n❯ /clear\n{rule}\n  status");
+        let err = composer_occupied_error_for_screen(&clear_screen);
+        assert!(err.contains("holds \"/clear\""), "{err}");
+        assert!(err.contains("Backspace, then Ctrl-U"), "{err}");
+        assert!(is_composer_occupied_zero_keys_error(&err), "{err}");
+        let secret_screen = format!("◆ Ready.\n{rule}\n❯ my secret draft\n{rule}\n  status");
+        let err = composer_occupied_error_for_screen(&secret_screen);
+        assert_eq!(err, composer_occupied_error());
+        assert!(!err.contains("my secret draft"), "{err}");
+        assert!(!err.contains("Backspace"), "{err}");
+        // Exact RAW match only: whitespace-stripped compact forms must NOT be named.
+        for screen_payload in ["/ clear", "/cle ar", "/clea r", "/ new", "/ne w"] {
+            let screen = format!("◆ Ready.\n{rule}\n❯ {screen_payload}\n{rule}\n  status");
+            assert_eq!(
+                recognised_composer_payload_in_screen(&screen),
+                None,
+                "screen_payload={screen_payload:?}"
+            );
+            let err = composer_occupied_error_for_screen(&screen);
+            assert_eq!(
+                err,
+                composer_occupied_error(),
+                "screen_payload={screen_payload:?}"
+            );
+            assert!(!err.contains("holds \""), "{err}");
+        }
+        // Split-line forms must NOT be named.
+        for lines in [
+            vec!["❯ /cl", "ear"],
+            vec!["❯ /clear", "x"],
+            vec!["❯ /", "clear"],
+        ] {
+            let screen = format!("◆ Ready.\n{rule}\n{}\n{rule}\n  status", lines.join("\n"));
+            assert_eq!(
+                recognised_composer_payload_in_screen(&screen),
+                None,
+                "lines={lines:?}"
+            );
+        }
+        // Exact forms (including surrounding whitespace trimmed) are still named.
+        assert_eq!(
+            recognised_composer_payload_in_screen(&clear_screen),
+            Some("/clear")
+        );
+        let new_screen = format!("◆ Ready.\n{rule}\n❯ /new\n{rule}\n  status");
+        assert_eq!(
+            recognised_composer_payload_in_screen(&new_screen),
+            Some("/new")
+        );
+        assert_eq!(recognised_composer_payload(" /clear "), Some("/clear"));
+    }
+
+    #[test]
+    fn recognised_composer_payload_handles_sgr_and_incident_shape() {
+        let rule = "─".repeat(20);
+        // SGR-styled tmux capture: escapes on the rule and prompt rows must be
+        // stripped before recognition, as with every other screen consumer.
+        let sgr_rule = format!("\x1b[90m{rule}\x1b[0m");
+        let sgr_screen = format!(
+            "◆ Ready.\n{sgr_rule}\n\x1b[1m❯\x1b[0m \x1b[36m/clear\x1b[0m\n{sgr_rule}\n  status"
+        );
+        assert_eq!(
+            recognised_composer_payload_in_screen(&sgr_screen),
+            Some("/clear")
+        );
+        let err = composer_occupied_error_for_screen(&sgr_screen);
+        assert!(err.contains("holds \"/clear\""), "{err}");
+        // Incident shape: prompt row holds "/clear", cursor on the empty row below.
+        let incident = format!("◆ Ready.\n{rule}\n❯ /clear\n\n{rule}\n  status");
+        assert_eq!(
+            recognised_composer_payload_in_screen(&incident),
+            Some("/clear")
+        );
+        let err = composer_occupied_error_for_screen(&incident);
+        assert!(err.contains("holds \"/clear\""), "{err}");
+        assert!(err.contains("Backspace, then Ctrl-U"), "{err}");
+        // Same shape without a bottom rule (cursor row is the capture tail).
+        let incident_no_bottom = "◆ Ready.\n❯ /clear\n".to_string();
+        assert_eq!(
+            recognised_composer_payload_in_screen(&incident_no_bottom),
+            Some("/clear")
+        );
+        // Equality-only error parsing: arbitrary text embedding the phrase is not named.
+        assert_eq!(
+            recognised_payload_from_error(
+                "composer_occupied_by_non_wire_input: composer holds \"x holds \\\"/clear\\\" y\"; holding delivery without sending keys"
+            ),
+            None
+        );
+        assert_eq!(
+            recognised_payload_from_error(&composer_occupied_error_with_payload(Some("/new"))),
+            Some("/new")
+        );
+    }
+
+    #[test]
+    fn unconfirmable_reset_still_validates_reforge_prompt_first() {
+        for (route, _) in unsupported_reset_routes() {
+            for prompt in [None, Some(""), Some("  \n")] {
+                assert_eq!(
+                    clear_or_reforge_session(&route, SessionResetMode::Reforge, "owner", prompt)
+                        .unwrap_err(),
+                    "missing reforge prompt"
+                );
+            }
+        }
     }
 
     #[test]
@@ -8909,7 +10382,7 @@ mod tests {
     }
 
     #[test]
-    fn interrupt_and_reset_keys_name_the_window_exactly() {
+    fn interrupt_keys_name_the_window_exactly() {
         let _tmux_lock = TMUX_ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
         let tmp = TempDir::new().unwrap();
         let (tmux_bin, out) = write_fake_tmux_prefix_matching(tmp.path());
@@ -8919,12 +10392,9 @@ mod tests {
             key: "Escape",
         };
         run_interrupt(&plan).unwrap();
-        send_tmux_reset_keys("muse:kacey-2", "/clear").unwrap();
-        assert!(send_tmux_reset_keys("muse:kacey", "/clear").is_err());
         drop(_env);
         let log = fs::read_to_string(&out).unwrap();
         assert!(log.contains("send-keys -t =muse:=kacey-2 Escape"), "{log}");
-        assert!(log.contains("send-keys -t =muse:=kacey-2 C-u"), "{log}");
         assert!(!log.contains("send-keys -t muse:kacey"), "{log}");
     }
 
@@ -8972,6 +10442,8 @@ mod tests {
         use std::net::TcpListener;
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+
+        let _listener_fixture = crate::test_isolation::register_tcp_listener(&listener).unwrap();
         let port = listener.local_addr().unwrap().port();
         let (req_tx, req_rx) = std::sync::mpsc::channel::<String>();
         std::thread::spawn(move || {
@@ -9046,49 +10518,6 @@ mod tests {
         let _no_env = EnvGuard::remove("ANTIGRAVITY_CSRF_TOKEN");
         let _no_addr = EnvGuard::remove("ANTIGRAVITY_LS_ADDRESS");
         assert!(run_interrupt(&no_token).is_err());
-    }
-
-    #[test]
-    fn clear_or_reforge_codex_sends_new_then_prompt() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let _codex_lock = CODEX_ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
-        let tmp = TempDir::new().unwrap();
-        let out = tmp.path().join("codex.out");
-        let bin = tmp.path().join("fake-codex.sh");
-        fs::write(
-            &bin,
-            format!(
-                "#!/bin/sh\nprintf '%s\\n' \"$@\" >> \"{}\"\n",
-                out.display()
-            ),
-        )
-        .unwrap();
-        fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
-
-        // SAFETY: restores FL_WIRE_CODEX_BIN when the guard drops.
-        let _env = EnvGuard::set("FL_WIRE_CODEX_BIN", &bin);
-        clear_or_reforge_session(
-            &VendorRoute::Codex {
-                thread_id: "thread-7".into(),
-                cwd: None,
-            },
-            SessionResetMode::Reforge,
-            "owner",
-            Some("reforge codex"),
-        )
-        .unwrap();
-        drop(_env);
-
-        let log = fs::read_to_string(&out).unwrap();
-        let lines: Vec<&str> = log.lines().collect();
-        assert_eq!(lines[0], "queue");
-        assert_eq!(lines[1], "--thread");
-        assert_eq!(lines[2], "thread-7");
-        assert_eq!(lines[3], "--message");
-        assert_eq!(lines[4], "/new");
-        assert_eq!(lines[5], "queue");
-        assert_eq!(lines[9], "reforge codex");
     }
 
     /// A fake `codex` that records its arguments, so a test can tell whether `codex queue` ran.
@@ -9368,10 +10797,11 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let (bin, out) = fake_codex_queue_bin(tmp.path());
         let _bin_env = EnvGuard::set("FL_WIRE_CODEX_BIN", &bin);
-        let _sock_env = EnvGuard::set(
-            "FL_WIRE_CODEX_CONTROL_SOCK",
-            &tmp.path().join("no-such.sock"),
-        );
+        let sock = tmp.path().join("no-such.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        let _socket_fixture = crate::test_isolation::register_unix_socket(&sock).unwrap();
+        drop(listener);
+        let _sock_env = EnvGuard::set("FL_WIRE_CODEX_CONTROL_SOCK", &sock);
 
         let err = dispatch_operator_prompt_to_route(&codex_route("thread-9"), "owner", "/compact")
             .unwrap_err();
@@ -9510,6 +10940,7 @@ mod tests {
         .unwrap();
         fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
 
+        let _bin_fixture = crate::test_isolation::register_executable(&bin).unwrap();
         let _agy_lock = AGY_ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
         let ls_address = Some("127.0.0.1:1".to_string());
         let exe = Some(bin.clone());
@@ -9614,6 +11045,8 @@ mod tests {
         assert!(parse_err.contains("could not parse a port"), "{parse_err}");
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+
+        let _listener_fixture = crate::test_isolation::register_tcp_listener(&listener).unwrap();
         let port = listener.local_addr().unwrap().port();
         let no_csrf = VendorRoute::Agy {
             conversation_id: "conv-no-csrf".into(),
@@ -9752,6 +11185,7 @@ mod tests {
         )
         .unwrap();
         fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
+        let _bin_fixture = crate::test_isolation::register_executable(&bin).unwrap();
         let route = VendorRoute::Agy {
             conversation_id: conversation_id.clone(),
             ls_pid: None,
@@ -9856,17 +11290,42 @@ mod tests {
     struct EnvGuard {
         key: &'static str,
         prev: Option<std::ffi::OsString>,
+        #[cfg(unix)]
+        _host_fixture: Option<fl_host_proto::HubTestHostFixture>,
+        #[cfg(unix)]
+        _exec_fixture: Option<crate::test_isolation::ExecutableFixture>,
     }
 
     impl EnvGuard {
         fn set(key: &'static str, value: &std::path::Path) -> Self {
             let prev = std::env::var_os(key);
+            #[cfg(unix)]
+            let host_fixture = (key == "FL_HOST_SOCK").then(|| {
+                crate::test_isolation::ensure_fixture(value).unwrap();
+                fl_host_proto::register_hub_test_host_fixture(value).unwrap()
+            });
+            #[cfg(unix)]
+            let exec_fixture = if matches!(
+                key,
+                "FL_WIRE_CODEX_BIN" | "FL_WIRE_MUSE_BIN" | "FL_WIRE_GROK_BIN" | "FL_WIRE_AGY_BIN"
+            ) {
+                crate::test_isolation::register_executable(value).ok()
+            } else {
+                None
+            };
             // SAFETY: the guard restores the previous value on drop. Callers hold
             // the matching env lock for the whole test.
             unsafe {
                 std::env::set_var(key, value);
             }
-            Self { key, prev }
+            Self {
+                key,
+                prev,
+                #[cfg(unix)]
+                _host_fixture: host_fixture,
+                #[cfg(unix)]
+                _exec_fixture: exec_fixture,
+            }
         }
 
         fn remove(key: &'static str) -> Self {
@@ -9876,7 +11335,14 @@ mod tests {
             unsafe {
                 std::env::remove_var(key);
             }
-            Self { key, prev }
+            Self {
+                key,
+                prev,
+                #[cfg(unix)]
+                _host_fixture: None,
+                #[cfg(unix)]
+                _exec_fixture: None,
+            }
         }
     }
 
@@ -9897,8 +11363,11 @@ mod tests {
         serve: impl FnOnce(TcpStream) + Send + 'static,
     ) -> (u16, std::thread::JoinHandle<()>) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let listener_fixture = crate::test_isolation::register_tcp_listener(&listener).unwrap();
         let port = listener.local_addr().unwrap().port();
         let handle = std::thread::spawn(move || {
+            // Keep the listener registered until this fixture finishes serving its request.
+            let _listener_fixture = listener_fixture;
             let (stream, _) = listener.accept().unwrap();
             let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
             loop {
@@ -9910,6 +11379,50 @@ mod tests {
             serve(stream);
         });
         (port, handle)
+    }
+
+    #[test]
+    fn raw_agy_stub_retains_its_tcp_registration_until_request_finishes() {
+        assert!(crate::test_isolation::is_enabled());
+        let (port, handle) = spawn_raw_agy_stub(|mut stream| {
+            let address = stream.local_addr().unwrap();
+            assert!(crate::test_isolation::ensure_tcp(&address).is_ok());
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .unwrap();
+        });
+        let address = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
+        assert!(crate::test_isolation::ensure_tcp(&address).is_ok());
+        let (_, _, body) = post_agy_connect_rpc_with_deadline(
+            port,
+            "csrf",
+            "/p",
+            "{}",
+            Duration::from_secs(1),
+            1024,
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        assert_eq!(body, "ok");
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn tcp_registration_is_revoked_while_listener_still_reserves_port() {
+        assert!(crate::test_isolation::is_enabled());
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let fixture = crate::test_isolation::register_tcp_listener(&listener).unwrap();
+        assert!(crate::test_isolation::ensure_tcp(&address).is_ok());
+        drop(fixture);
+        assert_eq!(
+            crate::test_isolation::ensure_tcp(&address)
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        // Keep the listener alive through the assertion so no other test can reuse its port.
+        drop(listener);
     }
 
     #[test]
@@ -10074,7 +11587,30 @@ mod tests {
         let path = dir.join(name);
         fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        crate::test_isolation::retain_executable_fixture(&path);
         path
+    }
+
+    #[test]
+    fn vendor_defaults_are_refused_in_the_wire_test_process() {
+        assert!(matches!(
+            run_codex_queue(Path::new("codex"), "thread", None, "hello"),
+            Err(CodexQueueError::Spawn(_))
+        ));
+        assert!(run_muse_exec(Path::new("muse"), "session", None, "hello").is_err());
+        assert!(run_grok_headless(Path::new("grok"), "session", None, "hello").is_err());
+        assert!(
+            deliver_to_agy_route(
+                None,
+                "conversation",
+                &None,
+                &None,
+                &Some(PathBuf::from("agy")),
+                "title",
+                "hello"
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -10336,9 +11872,9 @@ mod tests {
     /// returns, so every push connects, then reads them with [`pushed_lines`]. A helper thread
     /// that accepted one push and then closed the listener refused any later push, and that
     /// refusal ran the stale-route repair and its discovery.
-    fn webhook(dir: &Path, name: &str) -> (PathBuf, UnixListener) {
+    fn webhook(dir: &Path, name: &str) -> (PathBuf, crate::test_isolation::RegisteredUnixListener) {
         let sock = dir.join(name);
-        let listener = UnixListener::bind(&sock).unwrap();
+        let listener = crate::test_isolation::bind_unix_fixture(&sock).unwrap();
         (sock, listener)
     }
 
@@ -10489,7 +12025,7 @@ mod tests {
             "{\"peerToken\":\"tok-g\"}",
         )
         .unwrap();
-        let listener = UnixListener::bind(&sock_path).unwrap();
+        let listener = crate::test_isolation::bind_unix_fixture(&sock_path).unwrap();
         let handle = std::thread::spawn(move || {
             let (stream, _) = listener.accept().unwrap();
             std::io::BufReader::new(stream)
@@ -11078,6 +12614,9 @@ exit 1"#,
                 let mut cfg = HostConfig::new(ep_srv);
                 cfg.minor = 1;
                 let mut listener = HostListener::bind(cfg).await.unwrap();
+                let _socket_fixture =
+                    crate::test_isolation::register_unix_socket(listener.endpoint().socket_path())
+                        .unwrap();
                 let _ = ready_tx.send(());
                 while let Ok(mut conn) = listener.accept().await {
                     let summaries_conn = summaries_srv.clone();
@@ -11233,22 +12772,17 @@ exit 1"#,
         dispatch_to_route(&eve_route, &eve_msg).unwrap();
 
         let dee_route = table.get("dee").unwrap().route.clone();
-        clear_or_reforge_session(&dee_route, SessionResetMode::Clear, "owner", None).unwrap();
+        let refusal = clear_or_reforge_session(&dee_route, SessionResetMode::Clear, "owner", None)
+            .unwrap_err();
+        assert_reset_refusal(serde_json::from_str(&refusal).unwrap(), "grok");
 
         let plan = plan_interrupt(&fay_route, None).unwrap();
         run_interrupt(&plan).unwrap();
 
         let writes = recorded_writes.lock().unwrap().clone();
-        // The reset is raw writes (C-u, the command, then a separate CR), not `send_line`.
-        let dee: Vec<&[u8]> = writes
-            .iter()
-            .filter(|(s, _)| s == "Dee.grok")
-            .map(|(_, b)| b.as_slice())
-            .collect();
-        let expected: [&[u8]; 3] = [b"\x15", b"/new", b"\r"];
         assert!(
-            dee.windows(3).any(|w| w == expected),
-            "expected grok C-u, /new, CR raw writes, got: {dee:?}"
+            writes.iter().all(|(session, _)| session != "Dee.grok"),
+            "refused reset must not write to the host"
         );
         let writes_str: Vec<(String, String)> = writes
             .iter()
@@ -11339,6 +12873,9 @@ exit 1"#,
                 let mut cfg = HostConfig::new(ep_srv);
                 cfg.minor = 1;
                 let mut listener = HostListener::bind(cfg).await.unwrap();
+                let _socket_fixture =
+                    crate::test_isolation::register_unix_socket(listener.endpoint().socket_path())
+                        .unwrap();
                 let _ = ready_tx.send(());
                 while let Ok(mut conn) = listener.accept().await {
                     let summary = summary.clone();
@@ -11460,6 +12997,9 @@ exit 1"#,
                 let mut cfg = HostConfig::new(ep_srv);
                 cfg.minor = 1;
                 let mut listener = HostListener::bind(cfg).await.unwrap();
+                let _socket_fixture =
+                    crate::test_isolation::register_unix_socket(listener.endpoint().socket_path())
+                        .unwrap();
                 let _ = ready_tx.send(());
                 loop {
                     let mut conn = tokio::select! {
@@ -11739,6 +13279,9 @@ exit 1"#,
                 let mut cfg = HostConfig::new(ep_srv);
                 cfg.minor = 1;
                 let mut listener = HostListener::bind(cfg).await.unwrap();
+                let _socket_fixture =
+                    crate::test_isolation::register_unix_socket(listener.endpoint().socket_path())
+                        .unwrap();
                 let _ = ready_tx.send(());
                 while let Ok(mut conn) = listener.accept().await {
                     let summary = summary.clone();
@@ -12391,6 +13934,9 @@ exit 1"#,
                 let mut cfg = HostConfig::new(ep_srv);
                 cfg.minor = 1;
                 let mut listener = HostListener::bind(cfg).await.unwrap();
+                let _socket_fixture =
+                    crate::test_isolation::register_unix_socket(listener.endpoint().socket_path())
+                        .unwrap();
                 let _ = ready_tx.send(());
                 loop {
                     let mut conn = tokio::select! {
@@ -13142,6 +14688,9 @@ exit 1"#,
                 let mut cfg = HostConfig::new(ep_srv);
                 cfg.minor = 1;
                 let mut listener = HostListener::bind(cfg).await.unwrap();
+                let _socket_fixture =
+                    crate::test_isolation::register_unix_socket(listener.endpoint().socket_path())
+                        .unwrap();
                 let _ = ready_tx.send(());
                 loop {
                     let mut conn = tokio::select! {
@@ -13378,6 +14927,9 @@ exit 1"#,
                 let mut cfg = HostConfig::new(ep_srv);
                 cfg.minor = 1;
                 let mut listener = HostListener::bind(cfg).await.unwrap();
+                let _socket_fixture =
+                    crate::test_isolation::register_unix_socket(listener.endpoint().socket_path())
+                        .unwrap();
                 let _ = ready_tx.send(());
                 loop {
                     let mut conn = tokio::select! {
@@ -13723,6 +15275,7 @@ exit 1"#,
                 let mut cfg = HostConfig::new(ep_srv);
                 cfg.minor = 1;
                 let mut listener = HostListener::bind(cfg).await.unwrap();
+                let _socket_fixture = crate::test_isolation::register_unix_socket(listener.endpoint().socket_path()).unwrap();
                 let _ = ready_tx.send(());
                 loop {
                     let mut conn = tokio::select! {
@@ -14273,6 +15826,9 @@ exit 1"#,
                 let mut cfg = HostConfig::new(ep_srv);
                 cfg.minor = 1;
                 let mut listener = HostListener::bind(cfg).await.unwrap();
+                let _socket_fixture =
+                    crate::test_isolation::register_unix_socket(listener.endpoint().socket_path())
+                        .unwrap();
                 let _ = ready_tx.send(());
                 loop {
                     let mut conn = tokio::select! {
@@ -14469,7 +16025,7 @@ exit 1"#,
         new_path.push(":");
         new_path.push(&old_path);
         let _path = EnvGuard::set("PATH", Path::new(&new_path));
-        let _no_tmux = EnvGuard::remove("FL_WIRE_TMUX_BIN");
+        let _tmux = EnvGuard::set("FL_WIRE_TMUX_BIN", &fake_tmux);
         let missing_sock = tmp.path().join("missing-host.sock");
         let _sock = EnvGuard::set("FL_HOST_SOCK", &missing_sock);
         let home = tmp.path().join("home");
@@ -14712,6 +16268,7 @@ exit 1"#,
                 let mut cfg = HostConfig::new(ep_srv);
                 cfg.minor = 1;
                 let mut listener = HostListener::bind(cfg).await.unwrap();
+                let _socket_fixture = crate::test_isolation::register_unix_socket(listener.endpoint().socket_path()).unwrap();
                 let _ = ready_tx.send(());
                 loop {
                     let mut conn = tokio::select! {
@@ -15319,6 +16876,9 @@ exit 1"#,
                 let mut cfg = HostConfig::new(ep_srv);
                 cfg.minor = 1;
                 let mut listener = HostListener::bind(cfg).await.unwrap();
+                let _socket_fixture =
+                    crate::test_isolation::register_unix_socket(listener.endpoint().socket_path())
+                        .unwrap();
                 let _ = ready_tx.send(());
                 loop {
                     let mut conn = tokio::select! {
@@ -15629,6 +17189,7 @@ exit 1"#,
                 let mut cfg = HostConfig::new(ep_srv);
                 cfg.minor = 1;
                 let mut listener = HostListener::bind(cfg).await.unwrap();
+                let _socket_fixture = crate::test_isolation::register_unix_socket(listener.endpoint().socket_path()).unwrap();
                 let _ = ready_tx.send(());
                 loop {
                     let mut conn = tokio::select! {
@@ -15957,6 +17518,9 @@ exit 1"#,
                 let mut cfg = HostConfig::new(ep_srv);
                 cfg.minor = 1;
                 let mut listener = HostListener::bind(cfg).await.unwrap();
+                let _socket_fixture =
+                    crate::test_isolation::register_unix_socket(listener.endpoint().socket_path())
+                        .unwrap();
                 let _ = ready_tx.send(());
                 loop {
                     let mut conn = tokio::select! {
@@ -16548,6 +18112,9 @@ exit 1"#,
                 let mut cfg = HostConfig::new(ep_srv);
                 cfg.minor = 1;
                 let mut listener = HostListener::bind(cfg).await.unwrap();
+                let _socket_fixture =
+                    crate::test_isolation::register_unix_socket(listener.endpoint().socket_path())
+                        .unwrap();
                 let _ = ready_tx.send(());
                 loop {
                     let mut conn = tokio::select! {
@@ -16831,6 +18398,7 @@ exit 1"#,
                 let mut cfg = HostConfig::new(ep_srv);
                 cfg.minor = 1;
                 let mut listener = HostListener::bind(cfg).await.unwrap();
+                let _socket_fixture = crate::test_isolation::register_unix_socket(listener.endpoint().socket_path()).unwrap();
                 let _ = ready_tx.send(());
                 loop {
                     let mut conn = tokio::select! {
@@ -17199,6 +18767,7 @@ exit 1"#,
                 let mut cfg = HostConfig::new(ep_srv);
                 cfg.minor = 1;
                 let mut listener = HostListener::bind(cfg).await.unwrap();
+                let _socket_fixture = crate::test_isolation::register_unix_socket(listener.endpoint().socket_path()).unwrap();
                 let _ = ready_tx.send(());
                 loop {
                     let mut conn = tokio::select! {
@@ -17474,6 +19043,7 @@ exit 1"#,
                 let mut cfg = HostConfig::new(ep_srv);
                 cfg.minor = 1;
                 let mut listener = HostListener::bind(cfg).await.unwrap();
+                let _socket_fixture = crate::test_isolation::register_unix_socket(listener.endpoint().socket_path()).unwrap();
                 let _ = ready_tx.send(());
                 loop {
                     let mut conn = tokio::select! {
@@ -17999,6 +19569,7 @@ exit 1"#,
                 let mut cfg = HostConfig::new(ep_srv);
                 cfg.minor = 1;
                 let mut listener = HostListener::bind(cfg).await.unwrap();
+                let _socket_fixture = crate::test_isolation::register_unix_socket(listener.endpoint().socket_path()).unwrap();
                 let _ = ready_tx.send(());
                 loop {
                     let mut conn = tokio::select! {
@@ -18214,6 +19785,7 @@ exit 1"#,
             transcript_target: "muse:melisandre.r3",
             session_id: Some(muse_sid),
             is_muse_route: true,
+            is_claude_route: false,
             composer_style: ComposerStyle::Ruled,
             bracketed: false,
             verify_submission: true,
@@ -18477,6 +20049,9 @@ exit 1"#,
                 let mut cfg = HostConfig::new(ep_srv);
                 cfg.minor = 1;
                 let mut listener = HostListener::bind(cfg).await.unwrap();
+                let _socket_fixture =
+                    crate::test_isolation::register_unix_socket(listener.endpoint().socket_path())
+                        .unwrap();
                 let _ = ready_tx.send(());
                 while let Ok(mut conn) = listener.accept().await {
                     let summary = summary.clone();
@@ -18716,6 +20291,7 @@ exit 1"#,
             transcript_target: "muse:melisandre.479",
             session_id: None,
             is_muse_route: true,
+            is_claude_route: false,
             composer_style: ComposerStyle::Ruled,
             bracketed: false,
             verify_submission: true,
@@ -18972,6 +20548,7 @@ exit 1"#,
             "hello codex",
             &[],
             false,
+            false,
             ComposerStyle::Ruleless,
             |_| {},
             || Some((codex_idle.to_string(), None)),
@@ -18991,6 +20568,7 @@ exit 1"#,
         let out = prepare_clean_composer_before_paste_impl(
             "hello codex",
             &[],
+            false,
             false,
             ComposerStyle::Ruleless,
             |_| {},
@@ -19018,6 +20596,7 @@ exit 1"#,
                     "next wire payload",
                     &[],
                     is_muse_route,
+                    false,
                     ComposerStyle::Ruled,
                     |_| {},
                     || Some((screen.clone(), Some(CursorState::new(2, 4)))),
@@ -19059,6 +20638,7 @@ exit 1"#,
         let err = prepare_clean_composer_before_paste_impl(
             "y",
             &[],
+            false,
             false,
             ComposerStyle::Ruled,
             |_| {},
@@ -19134,6 +20714,7 @@ exit 1"#,
             "hello codex",
             &[],
             false,
+            false,
             ComposerStyle::CodexPrompt,
             |_| {},
             || Some((idle.clone(), None)),
@@ -19151,6 +20732,7 @@ exit 1"#,
             let err = prepare_clean_composer_before_paste_impl(
                 "hello codex",
                 &[],
+                false,
                 false,
                 ComposerStyle::CodexPrompt,
                 |_| {},
@@ -19214,6 +20796,7 @@ exit 1"#,
                 "hello codex",
                 &[],
                 false,
+                false,
                 ComposerStyle::CodexPrompt,
                 |_| {},
                 || Some((screen.clone(), None)),
@@ -19233,6 +20816,7 @@ exit 1"#,
             let _ = prepare_clean_composer_before_paste_impl(
                 "hello codex",
                 &[],
+                false,
                 false,
                 ComposerStyle::CodexPrompt,
                 |_| {},
@@ -19598,5 +21182,681 @@ exit 1"#,
             updated[0].attempts, 1,
             "may-have-sent-keys from the first call must survive a later zero-key hold"
         );
+    }
+
+    #[test]
+    fn panel_footer_locates_empty_composer_and_proves_background_wait_545() {
+        // Fixtures built from verbatim captures in ferris-545-captures
+        // (idle-samples-agent.txt, sample headed `17:29:39 status=busy`).
+        let rule = "─".repeat(120);
+        let status = "  ⏵⏵ auto mode on · 2 shells · ← 1 agent · ↓ to manage";
+        let agent_row = "  ◯ general-purpose  Idle timer for screen test                                                   11s · ↓ 37.4k tokens";
+        let panel_one = format!(
+            "✻ Waiting for 1 background agent to finish\n{rule}\n❯ \n{rule}\n{status}\n\n  ● main\n{agent_row}"
+        );
+        let panel_several = format!(
+            "✻ Waiting for 1 background agent to finish\n{rule}\n❯ \n{rule}\n{status}\n\n  ● main\n{agent_row}\n  ◯ general-purpose  Second agent task                                                    3s · ↓ 1.2k tokens\n"
+        );
+        for screen in [&panel_one, &panel_several] {
+            let cleaned = normalize_terminal_screen(screen);
+            let lines: Vec<&str> = cleaned.lines().collect();
+            assert!(
+                composer_region_lines(&lines).is_some(),
+                "panel must locate: {screen}"
+            );
+            assert_eq!(
+                probe_composer_ready_from_screen(screen, None, &[], ComposerStyle::Ruled, false),
+                Some(true)
+            );
+            assert!(screen_proves_claude_background_wait(screen));
+        }
+        // Panel plus typed human text: located, but occupied.
+        let panel_typed = format!(
+            "✻ Waiting for 1 background agent to finish\n{rule}\n❯ hello there\n{rule}\n{status}\n\n  ● main\n{agent_row}"
+        );
+        assert_eq!(
+            probe_composer_ready_from_screen(&panel_typed, None, &[], ComposerStyle::Ruled, false),
+            Some(false)
+        );
+        assert!(!screen_proves_claude_background_wait(&panel_typed));
+        // `● output` that is not the strict panel fails closed (unlocated).
+        let non_panel = format!("◆ Ready.\n{rule}\n❯ \n{rule}\n{status}\n● output from a tool");
+        let cleaned = normalize_terminal_screen(&non_panel);
+        let lines: Vec<&str> = cleaned.lines().collect();
+        assert!(composer_region_lines(&lines).is_none());
+        assert_eq!(
+            probe_composer_ready_from_screen(&non_panel, None, &[], ComposerStyle::Ruled, false),
+            None
+        );
+        // Text after the panel, or another `●` row, is not a panel.
+        for tail in ["hello after panel", "  ● other"] {
+            let bad = format!("{panel_one}\n{tail}");
+            let cleaned = normalize_terminal_screen(&bad);
+            let lines: Vec<&str> = cleaned.lines().collect();
+            assert!(
+                composer_region_lines(&lines).is_none(),
+                "tail {tail:?} must fail closed"
+            );
+        }
+        // Main turn still running: status carries `esc to interrupt` (verbatim
+        // 17:29:33 sample), so the panel does not prove a background wait.
+        let busy_main = format!(
+            "✻ Warping… (1m 2s · ↓ 5.2k tokens · thinking with high effort)\n{rule}\n❯ \n{rule}\n  ⏵⏵ auto mode on · 2 shells · esc to interrupt · ← 1 agent · ↓ to manage\n\n  ● main\n{agent_row}"
+        );
+        assert!(
+            composer_region_lines(
+                &normalize_terminal_screen(&busy_main)
+                    .lines()
+                    .collect::<Vec<_>>()
+            )
+            .is_some()
+        );
+        assert!(!screen_proves_claude_background_wait(&busy_main));
+        // Busy-main probe: Claude-aware probe is not-ready, bg-wait stays ready.
+        assert_eq!(
+            probe_claude_composer_ready_from_screen(&busy_main, None, &[]),
+            Some(false)
+        );
+        assert_eq!(
+            probe_claude_composer_ready_from_screen(&panel_one, None, &[]),
+            Some(true)
+        );
+        assert!(claude_screen_is_busy_main(&busy_main));
+        assert!(!claude_screen_is_busy_main(&panel_one));
+        // Lone `◯ …` below the bottom rule (no `● main`) fails closed.
+        for lone in [
+            format!("◆ Ready.\n{rule}\n❯ \n{rule}\n{status}\n{agent_row}"),
+            format!("◆ Ready.\n{rule}\n❯ \n{rule}\n{status}\n\n{agent_row}"),
+            format!("◆ Ready.\n{rule}\n❯ \n{rule}\n{status}\n  ● main"),
+        ] {
+            let cleaned = normalize_terminal_screen(&lone);
+            let lines: Vec<&str> = cleaned.lines().collect();
+            assert!(composer_region_lines(&lines).is_none(), "lone: {lone}");
+            assert_eq!(
+                probe_claude_composer_ready_from_screen(&lone, None, &[]),
+                None,
+                "lone: {lone}"
+            );
+            assert!(!screen_proves_claude_background_wait(&lone));
+        }
+        // Host-proof branch selection (pure): tmux pane, hosted Claude, rejected.
+        assert_eq!(
+            claude_proof_target("%12"),
+            ClaudeProofTarget::TmuxPane("%12".into())
+        );
+        assert_eq!(
+            claude_proof_target("ferris.claude"),
+            ClaudeProofTarget::HostSession("claude:ferris".into())
+        );
+        assert_eq!(
+            claude_proof_target("claude:ferris"),
+            ClaudeProofTarget::HostSession("claude:ferris".into())
+        );
+        assert_eq!(
+            claude_proof_target("ferris.codex"),
+            ClaudeProofTarget::Unsupported
+        );
+        assert_eq!(claude_proof_target(""), ClaudeProofTarget::Unsupported);
+        // Non-busy record never proves via screen, whatever the target kind.
+        let idle = serde_json::json!({"status": "idle"});
+        assert!(!claude_target_proves_background_wait(
+            "ferris.claude",
+            Some(&idle)
+        ));
+        // Pre-paste Claude race check: busy-main capture held, bg-wait proceeds.
+        let mut enters = 0u32;
+        let err = prepare_clean_composer_before_paste_impl(
+            "next payload",
+            &[],
+            false,
+            true,
+            ComposerStyle::Ruled,
+            |_| {},
+            || Some((busy_main.clone(), None)),
+            || false,
+            || {
+                enters += 1;
+                Ok(())
+            },
+        )
+        .expect_err("busy-main Claude capture must hold before paste");
+        assert!(err.contains("session_busy"), "got: {err}");
+        assert!(is_composer_occupied_zero_keys_error(&err), "got: {err}");
+        assert_eq!(enters, 0);
+        let out = prepare_clean_composer_before_paste_impl(
+            "next payload",
+            &[],
+            false,
+            true,
+            ComposerStyle::Ruled,
+            |_| {},
+            || Some((panel_one.clone(), None)),
+            || false,
+            || {
+                enters += 1;
+                Ok(())
+            },
+        )
+        .expect("bg-wait Claude capture must proceed to paste");
+        assert_eq!(out, PrePasteOutcome::CleanProceedToPaste);
+        // Same busy-main screen on a non-Claude (generic) call keeps old behaviour.
+        let out = prepare_clean_composer_before_paste_impl(
+            "next payload",
+            &[],
+            false,
+            false,
+            ComposerStyle::Ruled,
+            |_| {},
+            || Some((busy_main.clone(), None)),
+            || false,
+            || Ok(()),
+        )
+        .expect("non-Claude call must not take the Claude busy-main gate");
+        assert_eq!(out, PrePasteOutcome::CleanProceedToPaste);
+    }
+
+    #[test]
+    fn pinned_native_session_requires_matching_current_record() {
+        let native = "dce797a0-d963-4c1b-a06b-7fa6bffda7fa";
+        assert!(!claude_record_matches_native_session(None, native));
+        assert!(!claude_record_matches_native_session(
+            Some(&serde_json::json!({"status":"idle"})),
+            native
+        ));
+        assert!(!claude_record_matches_native_session(
+            Some(&serde_json::json!({"sessionId":"  "})),
+            native
+        ));
+        assert!(!claude_record_matches_native_session(
+            Some(&serde_json::json!({"sessionId":"other"})),
+            native
+        ));
+        assert!(claude_record_matches_native_session(
+            Some(&serde_json::json!({"sessionId":native})),
+            native
+        ));
+    }
+
+    #[test]
+    fn claude_status_classification_and_reforge_settle_identity_545_544() {
+        let rec = |status: &str| serde_json::json!({"status": status, "sessionId": "sess-1"});
+        assert!(claude_session_deliverable(Some(&rec("idle"))));
+        assert!(claude_session_deliverable(Some(&rec("shell"))));
+        assert!(claude_session_deliverable(Some(&rec("SHELL"))));
+        assert!(!claude_session_deliverable(Some(&rec("busy"))));
+        assert!(!claude_session_deliverable(Some(&rec("running"))));
+        assert!(!claude_session_deliverable(None));
+        assert!(!claude_session_deliverable(Some(&serde_json::json!({}))));
+        assert!(claude_session_idle(Some(&rec("idle"))));
+        assert!(!claude_session_idle(Some(&rec("shell"))));
+        // Reforge settle: only a changed native session id confirms the reset.
+        assert!(claude_reforge_settled(
+            "sess-1",
+            Some(&serde_json::json!({"status": "busy", "sessionId": "sess-2"}))
+        ));
+        assert!(!claude_reforge_settled("sess-1", Some(&rec("idle"))));
+        assert!(!claude_reforge_settled("sess-1", Some(&rec("shell"))));
+        assert!(!claude_reforge_settled("sess-1", Some(&rec("busy"))));
+        assert!(!claude_reforge_settled("sess-1", None));
+        assert!(!claude_reforge_settled(
+            "sess-1",
+            Some(&serde_json::json!({"status": "idle"}))
+        ));
+    }
+
+    #[test]
+    fn claude_reforge_settle_timeout_and_late_change_545_544() {
+        // Same id (even idle) for the whole window times out quickly under injection.
+        let start = Instant::now();
+        assert!(!claude_reforge_settle_with(
+            "sess-1",
+            Duration::from_millis(30),
+            Duration::from_millis(5),
+            || Some(serde_json::json!({"status": "idle", "sessionId": "sess-1"})),
+        ));
+        assert!(start.elapsed() < Duration::from_secs(2));
+        // A record that becomes absent mid-poll is not confirmation.
+        assert!(!claude_reforge_settle_with(
+            "sess-1",
+            Duration::from_millis(30),
+            Duration::from_millis(5),
+            || None,
+        ));
+        // A changed id on a later poll settles.
+        let mut calls = 0;
+        assert!(claude_reforge_settle_with(
+            "sess-1",
+            Duration::from_secs(2),
+            Duration::from_millis(5),
+            || {
+                calls += 1;
+                let id = if calls < 3 { "sess-1" } else { "sess-2" };
+                Some(serde_json::json!({"status": "busy", "sessionId": id}))
+            },
+        ));
+        assert_eq!(
+            claude_reforge_timeout_error(CLAUDE_REFORGE_SETTLE_TIMEOUT),
+            "reforge unconfirmed: Claude session id did not change within 20 seconds after /clear; the reforge prompt was not sent"
+        );
+    }
+
+    #[test]
+    fn muse_long_paste_header_placeholder_tail_matches_target_575() {
+        let rule = "─".repeat(40);
+        let body = "Long paste body line for elision testing. ".repeat(70);
+        let payload = format!(
+            "[fl-wire reply/normal] from ferris (id: urn:uuid:01a1ebc5-4e2b-7764-b6ff-6873d9c91948, thread: urn:uuid:01a1ebc5-4e2b-7764-b6ff-6873d9c91948): Re\n\n{body}"
+        );
+        let trimmed = payload.trim();
+        let d = UnconfirmedWireDelivery::from_payload(trimmed);
+        let tail = &body[body.len() - 200..];
+        let elided = body.trim().chars().count() - tail.trim().chars().count();
+        let screen = format!(
+            "◆ Ready.\n\n{rule}\n❯ [fl-wire reply/normal] from ferris (id: urn:uuid:01a1ebc5-4e2b-7764-b6ff-6873d9c91948, thread: urn:uuid:01a1ebc5-4e2b-7764-b6ff-6873d9c91948): Re\n  [Pasted Content {elided} chars]{tail}\n\n{rule}\n  muse-wonder-full-1.0"
+        );
+        assert_eq!(composer_equals_single_target(&screen, &d), (true, true));
+        // Text after the tail must fail closed.
+        let appended_screen = format!(
+            "◆ Ready.\n\n{rule}\n❯ [fl-wire reply/normal] from ferris (id: urn:uuid:01a1ebc5-4e2b-7764-b6ff-6873d9c91948, thread: urn:uuid:01a1ebc5-4e2b-7764-b6ff-6873d9c91948): Re\n  [Pasted Content {elided} chars]{tail} human appended\n\n{rule}\n  muse-wonder-full-1.0"
+        );
+        assert_eq!(
+            composer_equals_single_target(&appended_screen, &d),
+            (false, false)
+        );
+    }
+
+    #[test]
+    fn muse_long_paste_placeholder_len_bound_plus_one_rejected_575() {
+        let rule = "─".repeat(40);
+        let body = "Long paste body line for elision testing. ".repeat(70);
+        let payload = format!(
+            "[fl-wire reply/normal] from ferris (id: urn:uuid:01a1ebc5-4e2b-7764-b6ff-6873d9c91948, thread: urn:uuid:01a1ebc5-4e2b-7764-b6ff-6873d9c91948): Re\n\n{body}"
+        );
+        let trimmed = payload.trim();
+        let d = UnconfirmedWireDelivery::from_payload(trimmed);
+        let tail = &body[body.len() - 200..];
+        let tail_compact_chars = tail.chars().filter(|c| !c.is_whitespace()).count();
+        assert!(tail_compact_chars >= MIN_SCROLLED_SUFFIX_COMPACT_CHARS);
+        assert!(
+            d.compact_body.as_deref().expect("header body").ends_with(
+                &tail
+                    .chars()
+                    .filter(|c| !c.is_whitespace())
+                    .collect::<String>()
+            )
+        );
+        let raw_body_chars = d.body_chars.expect("header body");
+        // Bound in `match_delivery_prefix` is raw body minus compact tail + 1.
+        let len = raw_body_chars - tail_compact_chars + 1 + 1;
+        let screen = format!(
+            "◆ Ready.\n\n{rule}\n❯ [fl-wire reply/normal] from ferris (id: urn:uuid:01a1ebc5-4e2b-7764-b6ff-6873d9c91948, thread: urn:uuid:01a1ebc5-4e2b-7764-b6ff-6873d9c91948): Re\n  [Pasted Content {len} chars]{tail}\n\n{rule}\n  muse-wonder-full-1.0"
+        );
+        assert_eq!(composer_equals_single_target(&screen, &d), (false, false));
+    }
+
+    #[test]
+    fn muse_long_paste_31_char_suffix_tail_rejected_575() {
+        let rule = "─".repeat(40);
+        let body = "Long paste body line for elision testing. ".repeat(70);
+        let payload = format!(
+            "[fl-wire reply/normal] from ferris (id: urn:uuid:01a1ebc5-4e2b-7764-b6ff-6873d9c91948, thread: urn:uuid:01a1ebc5-4e2b-7764-b6ff-6873d9c91948): Re\n\n{body}"
+        );
+        let trimmed = payload.trim();
+        let d = UnconfirmedWireDelivery::from_payload(trimmed);
+        let compact_body = d.compact_body.as_deref().expect("header body");
+        let tail = last_n_chars_slice(compact_body, 31).expect("31-char suffix");
+        assert_eq!(tail.chars().count(), 31);
+        assert!(compact_body.ends_with(tail));
+        let len = d.body_chars.expect("header body") - 31;
+        let screen = format!(
+            "◆ Ready.\n\n{rule}\n❯ [fl-wire reply/normal] from ferris (id: urn:uuid:01a1ebc5-4e2b-7764-b6ff-6873d9c91948, thread: urn:uuid:01a1ebc5-4e2b-7764-b6ff-6873d9c91948): Re\n  [Pasted Content {len} chars]{tail}\n\n{rule}\n  muse-wonder-full-1.0"
+        );
+        assert_eq!(composer_equals_single_target(&screen, &d), (false, false));
+    }
+
+    #[test]
+    fn muse_long_paste_non_suffix_tail_rejected_575() {
+        let rule = "─".repeat(40);
+        let body = "Long paste body line for elision testing. ".repeat(70);
+        let payload = format!(
+            "[fl-wire reply/normal] from ferris (id: urn:uuid:01a1ebc5-4e2b-7764-b6ff-6873d9c91948, thread: urn:uuid:01a1ebc5-4e2b-7764-b6ff-6873d9c91948): Re\n\n{body}"
+        );
+        let trimmed = payload.trim();
+        let d = UnconfirmedWireDelivery::from_payload(trimmed);
+        let tail = "q".repeat(40);
+        assert!(tail.chars().count() >= MIN_SCROLLED_SUFFIX_COMPACT_CHARS);
+        assert!(
+            !d.compact_body
+                .as_deref()
+                .expect("header body")
+                .ends_with(&tail)
+        );
+        let len = d.body_chars.expect("header body") - tail.chars().count();
+        let screen = format!(
+            "◆ Ready.\n\n{rule}\n❯ [fl-wire reply/normal] from ferris (id: urn:uuid:01a1ebc5-4e2b-7764-b6ff-6873d9c91948, thread: urn:uuid:01a1ebc5-4e2b-7764-b6ff-6873d9c91948): Re\n  [Pasted Content {len} chars]{tail}\n\n{rule}\n  muse-wonder-full-1.0"
+        );
+        assert_eq!(composer_equals_single_target(&screen, &d), (false, false));
+    }
+
+    #[test]
+    fn claude_pasted_text_placeholder_exact_mismatch_and_human_text_544() {
+        let rule = "─".repeat(120);
+        let target = "line one\nline two\nline three";
+        assert_eq!(payload_line_count(target), 3);
+        assert_eq!(payload_line_count("line one\nline two\n"), 2);
+        assert_eq!(payload_line_count("one"), 1);
+        assert_eq!(payload_line_count("  "), 0);
+        let exact = format!("◆ Ready.\n{rule}\n❯ [Pasted text #1 +3 lines]\n{rule}\n  status");
+        assert!(composer_shows_pasted_placeholder(&exact));
+        assert!(composer_shows_target_placeholder(&exact, target, false));
+        let d = build_delivery_descriptor("", target, None);
+        assert_eq!(composer_equals_single_target(&exact, &d), (true, true));
+        // Header + body form: body of an operator prompt counts its own lines.
+        let op = "[Operator Prompt via FerroDeck — from owner]\n\nline one\nline two";
+        let hdr_body = format!(
+            "◆ Ready.\n{rule}\n❯ [Operator Prompt via FerroDeck — from owner]\n  [Pasted text #2 +2 lines]\n{rule}\n  status"
+        );
+        assert!(composer_shows_target_placeholder(&hdr_body, op, false));
+        // Mismatch and placeholder-plus-human fail closed with 0 retry Enters.
+        for bad in [
+            format!("◆ Ready.\n{rule}\n❯ [Pasted text #1 +4 lines]\n{rule}\n  status"),
+            format!("◆ Ready.\n{rule}\n❯ [Pasted text #1 +3 lines] hold on\n{rule}\n  status"),
+        ] {
+            assert!(composer_shows_pasted_placeholder(&bad));
+            assert!(!composer_shows_target_placeholder(&bad, target, false));
+            let mut retries = 0u32;
+            let err = confirm_paste_submission(
+                target,
+                |_| {},
+                || Some(ScreenCapture::rendered(bad.clone())),
+                || false,
+                || {
+                    retries += 1;
+                    Ok(())
+                },
+            )
+            .expect_err("mismatched or extended Claude placeholder must abort");
+            assert_eq!(retries, 0, "got: {err}");
+            assert!(is_composer_occupied_error(&err), "got: {err}");
+        }
+        // Exact placeholder takes the Enter-retry path: two polls, one Enter, then empty.
+        let empty = format!("◆ Ready.\n{rule}\n❯ \n{rule}\n  status");
+        let screens =
+            std::cell::RefCell::new(vec![exact.clone(), exact.clone(), empty].into_iter());
+        let mut retries = 0u32;
+        confirm_paste_submission(
+            target,
+            |_| {},
+            || {
+                let mut it = screens.borrow_mut();
+                let next = it.next().unwrap_or_else(|| exact.clone());
+                Some(ScreenCapture::rendered(next))
+            },
+            || false,
+            || {
+                retries += 1;
+                Ok(())
+            },
+        )
+        .expect("exact Claude placeholder must retry Enter and then confirm");
+        assert_eq!(retries, 1);
+        // `[Pasted Content` handling is unchanged for a Claude-shaped lines unit.
+        let lines_unit = format!("◆ Ready.\n{rule}\n❯ [Pasted Content 3 lines]\n{rule}\n  status");
+        assert!(!composer_shows_target_placeholder(
+            &lines_unit,
+            target,
+            false
+        ));
+    }
+
+    #[test]
+    fn raw_fallback_claude_placeholder_requires_target_ownership_550() {
+        let rule = "─".repeat(120);
+        let target = "line one\nline two\nline three";
+        let exact = format!("◆ Ready.\n{rule}\n❯ [Pasted text #1 +3 lines]\n{rule}\n  status");
+        assert!(composer_shows_target_placeholder_with_raw(
+            &exact, target, None, true
+        ));
+        // Raw-text variant line count also proves ownership.
+        let raw = "line one\nline two\nline three\nline four";
+        assert!(composer_shows_target_placeholder_with_raw(
+            &format!("◆ Ready.\n{rule}\n❯ [Pasted text #1 +4 lines]\n{rule}\n  status"),
+            target,
+            Some(raw),
+            true
+        ));
+        for bad in [
+            format!("◆ Ready.\n{rule}\n❯ [Pasted text #1 +4 lines]\n{rule}\n  status"),
+            format!("◆ Ready.\n{rule}\n❯ [Pasted text #1 +3 lines] hold on\n{rule}\n  status"),
+        ] {
+            assert!(!composer_shows_target_placeholder_with_raw(
+                &bad, target, None, true
+            ));
+            let mut retries = 0u32;
+            confirm_paste_submission(
+                target,
+                |_| {},
+                || Some(ScreenCapture::RawFallback(bad.clone())),
+                || false,
+                || {
+                    retries += 1;
+                    Ok(())
+                },
+            )
+            .expect("raw mismatched/appended placeholder must not error");
+            assert_eq!(
+                retries, 0,
+                "raw fallback must not Enter-retry unproven placeholder"
+            );
+        }
+        // `[Pasted Content` raw behaviour unchanged.
+        let pc = format!("◆ Ready.\n{rule}\n❯ [Pasted Content 999 chars]\n{rule}\n  status");
+        assert!(composer_shows_target_placeholder_with_raw(
+            &pc, target, None, true
+        ));
+    }
+
+    #[test]
+    fn raw_fallback_mixed_claude_and_legacy_markers_require_ownership() {
+        let rule = "─".repeat(120);
+        let target = "line one\nline two\nline three";
+        // Same-line mixed: mismatched Claude M + legacy marker must fail and
+        // the RawFallback confirm loop must send 0 Enter retries.
+        // Multiline mixed: Claude marker line + legacy marker line must fail.
+        // Matching Claude M plus legacy marker must still fail (composer
+        // does not equal exactly the single Claude placeholder).
+        for bad in [
+            format!(
+                "◆ Ready.\n{rule}\n❯ [Pasted text #1 +4 lines] [Pasted Content 999 chars]\n{rule}\n  status"
+            ),
+            format!(
+                "◆ Ready.\n{rule}\n❯ [Pasted text #1 +4 lines]\n  [Pasted Content 999 chars]\n{rule}\n  status"
+            ),
+            format!(
+                "◆ Ready.\n{rule}\n❯ [Pasted text #1 +3 lines] [Pasted Content 999 chars]\n{rule}\n  status"
+            ),
+            format!(
+                "◆ Ready.\n{rule}\n❯ [Pasted text #1 +3 lines]\n  [Pasted Content 999 chars]\n{rule}\n  status"
+            ),
+        ] {
+            assert!(
+                composer_shows_pasted_placeholder(&bad),
+                "broad placeholder must see mixed screen: {bad}"
+            );
+            assert!(
+                !composer_shows_target_placeholder_with_raw(&bad, target, None, true),
+                "mixed markers must fail strict ownership: {bad}"
+            );
+            let mut retries = 0u32;
+            confirm_paste_submission(
+                target,
+                |_| {},
+                || Some(ScreenCapture::RawFallback(bad.clone())),
+                || false,
+                || {
+                    retries += 1;
+                    Ok(())
+                },
+            )
+            .expect("raw mixed-marker placeholder must not error");
+            assert_eq!(
+                retries, 0,
+                "raw fallback must not Enter-retry mixed-marker placeholder"
+            );
+        }
+        // Legacy-only screen keeps broad raw-fallback behaviour unchanged.
+        let legacy_only =
+            format!("◆ Ready.\n{rule}\n❯ [Pasted Content 999 chars]\n{rule}\n  status");
+        assert!(composer_shows_target_placeholder_with_raw(
+            &legacy_only,
+            target,
+            None,
+            true
+        ));
+    }
+
+    #[test]
+    fn claude_reforge_refuses_unconfirmed_before_dispatch_550() {
+        let _lock = TMUX_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _no_tmux = EnvGuard::remove("FL_WIRE_TMUX_BIN");
+        let tmp = TempDir::new().unwrap();
+        let key_path = tmp.path().join("12345.key");
+        fs::write(&key_path, r#"{"peerToken":"tok"}"#).unwrap();
+        for pid in [12345u32, 0] {
+            let route = VendorRoute::Claude {
+                pid,
+                session_id: "s-x".into(),
+                socket_path: tmp.path().join("gone.sock"),
+                key_path: Some(key_path.clone()),
+            };
+            let err = clear_or_reforge_session(
+                &route,
+                SessionResetMode::Reforge,
+                "owner",
+                Some("hydrate me"),
+            )
+            .unwrap_err();
+            assert_eq!(
+                err,
+                "reforge unconfirmed: Claude session record/session id unavailable before /clear; refusing to reset or send the reforge prompt",
+                "pid={pid}"
+            );
+        }
+    }
+
+    #[test]
+    fn claude_reforge_with_tmux_seam_keeps_fixture_behaviour_550() {
+        let _lock = TMUX_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = TempDir::new().unwrap();
+        let (tmux_bin, tmux_out, tmux_stdin) = write_fake_tmux(tmp.path(), true);
+        let _env = EnvGuard::set("FL_WIRE_TMUX_BIN", &tmux_bin);
+        let route = claude_route_with_record(
+            tmp.path(),
+            tmp.path().join("gone.sock"),
+            "idle",
+            "Wendy:@6.%12",
+        );
+        clear_or_reforge_session(
+            &route,
+            SessionResetMode::Reforge,
+            "owner",
+            Some("hydrate me"),
+        )
+        .unwrap();
+        let cmds = fs::read_to_string(&tmux_out).unwrap();
+        assert!(cmds.contains("paste-buffer"), "{cmds}");
+        let pasted = fs::read_to_string(&tmux_stdin).unwrap();
+        assert!(pasted.contains("hydrate me"), "{pasted}");
+    }
+
+    #[test]
+    fn prepare_clean_distinguishes_unlocated_and_occupied_545() {
+        let rule = "─".repeat(120);
+        let unlocated = "some output without a composer".to_string();
+        let mut enters = 0u32;
+        let err = prepare_clean_composer_before_paste_impl(
+            "next payload",
+            &[],
+            false,
+            false,
+            ComposerStyle::Ruled,
+            |_| {},
+            || Some((unlocated.clone(), None)),
+            || false,
+            || {
+                enters += 1;
+                Ok(())
+            },
+        )
+        .expect_err("unlocated composer must fail closed");
+        assert!(err.contains("composer_unlocated"), "got: {err}");
+        assert!(is_composer_occupied_zero_keys_error(&err), "got: {err}");
+        assert_eq!(enters, 0);
+        let occupied = format!("◆ Ready.\n{rule}\n❯ owner draft\n{rule}\n  status");
+        let err = prepare_clean_composer_before_paste_impl(
+            "next payload",
+            &[],
+            false,
+            false,
+            ComposerStyle::Ruled,
+            |_| {},
+            || Some((occupied.clone(), None)),
+            || false,
+            || {
+                enters += 1;
+                Ok(())
+            },
+        )
+        .expect_err("occupied composer must fail closed");
+        assert!(err.contains("composer_occupied:"), "got: {err}");
+        assert!(is_composer_occupied_zero_keys_error(&err), "got: {err}");
+        assert_eq!(enters, 0);
+        // Distinct not-idle and occupied/unlocated wire strings keep prefix + substring.
+        for err in [
+            composer_session_busy_error(),
+            composer_unlocated_error(),
+            composer_occupied_error(),
+        ] {
+            assert!(err.starts_with(COMPOSER_OCCUPIED_BY_NON_WIRE_INPUT_PREFIX));
+            assert!(err.contains("without sending keys"));
+            assert!(is_composer_occupied_zero_keys_error(&err));
+        }
+        assert!(composer_session_busy_error().contains("session_busy"));
+    }
+
+    #[test]
+    fn prepare_clean_names_clear_payload_and_hides_arbitrary_text() {
+        let rule = "─".repeat(120);
+        for (text, recognised) in [
+            ("/clear", true),
+            ("/new", true),
+            ("owner secret draft", false),
+        ] {
+            let screen = format!("◆ Ready.\n{rule}\n❯ {text}\n{rule}\n  status");
+            let mut enters = 0u32;
+            let err = prepare_clean_composer_before_paste_impl(
+                "next payload",
+                &[],
+                false,
+                false,
+                ComposerStyle::Ruled,
+                |_| {},
+                || Some((screen.clone(), None)),
+                || false,
+                || {
+                    enters += 1;
+                    Ok(())
+                },
+            )
+            .expect_err("occupied composer must fail closed");
+            assert_eq!(enters, 0, "{text}");
+            if recognised {
+                assert!(err.contains(&format!("holds \"{text}\"")), "{err}");
+                assert!(err.contains("Backspace, then Ctrl-U"), "{err}");
+            } else {
+                assert!(!err.contains("owner secret draft"), "{err}");
+                assert!(!err.contains("Backspace"), "{err}");
+            }
+        }
     }
 }

@@ -66,6 +66,11 @@ const RESERVED_GROUP_SLUGS: [&str; 2] = ["all", "fl"];
 /// read, edited and replaced whole, so two at once would lose one edit.
 pub(crate) static CONFIG_LOCK: Mutex<()> = Mutex::new(());
 
+// Independent fixtures still contend on the process-wide production config lock. Keep their
+// lifetimes separate so a deliberate nonblocking delete tests its own contention scenario.
+#[cfg(test)]
+pub(crate) static CONFIG_FIXTURE_LOCK: Mutex<()> = Mutex::new(());
+
 /// Why a request was refused or failed, by who is at fault.
 #[derive(Debug, thiserror::Error)]
 pub enum InitError {

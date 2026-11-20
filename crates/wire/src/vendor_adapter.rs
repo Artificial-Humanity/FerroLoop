@@ -177,6 +177,25 @@ pub trait VendorCliAdapter: Send + Sync + std::fmt::Debug {
     /// `"muse"`, `"lemonade"`, `"ollama"`).
     fn vendor_id(&self) -> &str;
 
+    /// Extract a native identity for source-backed registration. Unsupported by default.
+    fn registration_native_id<'a>(
+        &self,
+        _route: &'a crate::identity::VendorRoute,
+    ) -> Option<&'a str> {
+        None
+    }
+
+    /// Validate vendor-specific route and hosted identity shape. This predicate alone
+    /// never grants authority; the private source loader also checks uniqueness and liveness.
+    fn validate_registration(
+        &self,
+        _entry: &crate::identity::RouteEntry,
+        _persona: &str,
+        _native_id: &str,
+    ) -> bool {
+        false
+    }
+
     /// Whether tool commands execute under the hosted CLI process tree.
     fn tool_processes_descend_from_cli(&self) -> bool {
         true
@@ -685,9 +704,93 @@ fn normalize_claude_resume_effort(level: Option<&str>) -> Result<Option<String>,
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ClaudeCliAdapter;
 
+// Only this module can construct the authority policy. Dynamic or caller-provided
+// adapters may describe policy but cannot mint a source-backed binding.
+pub(crate) struct HostedPastePolicy(ClaudeCliAdapter);
+impl HostedPastePolicy {
+    pub(crate) fn adapter(&self) -> &dyn VendorCliAdapter {
+        &self.0
+    }
+}
+
+/// Source-derived hosted terminal registration. Fields and acquisition policy are private.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct ClaudeRegistrationBinding(crate::registration_evidence::RegistrationBinding);
+
+pub use crate::registration_evidence::RegistrationError as ClaudeRegistrationError;
+
+impl ClaudeRegistrationBinding {
+    pub fn validate_source(source: &Path) -> Result<(), ClaudeRegistrationError> {
+        crate::registration_evidence::RegistrationBinding::validate_source(source)
+    }
+    pub fn from_intent(
+        source: PathBuf,
+        intent: &str,
+    ) -> Result<Option<Self>, ClaudeRegistrationError> {
+        crate::registration_evidence::RegistrationBinding::from_intent(
+            source,
+            intent,
+            &HostedPastePolicy(ClaudeCliAdapter),
+        )
+        .map(|binding| binding.map(Self))
+    }
+    pub fn acquire(
+        source: PathBuf,
+        native_id: &str,
+        persona: &str,
+    ) -> Result<Self, ClaudeRegistrationError> {
+        crate::registration_evidence::RegistrationBinding::acquire(
+            source,
+            native_id,
+            persona,
+            &HostedPastePolicy(ClaudeCliAdapter),
+        )
+        .map(Self)
+    }
+    pub(crate) fn revalidate(
+        &self,
+    ) -> Result<&crate::identity::RouteEntry, ClaudeRegistrationError> {
+        self.0.revalidate(&HostedPastePolicy(ClaudeCliAdapter))
+    }
+    pub(crate) fn persona(&self) -> &str {
+        self.0.persona()
+    }
+    pub fn persona_name(&self) -> &str {
+        self.0.persona()
+    }
+    pub fn native_session(&self) -> &str {
+        self.0.native_session()
+    }
+}
+
 impl VendorCliAdapter for ClaudeCliAdapter {
     fn vendor_id(&self) -> &str {
         "claude"
+    }
+
+    fn registration_native_id<'a>(
+        &self,
+        route: &'a crate::identity::VendorRoute,
+    ) -> Option<&'a str> {
+        match route {
+            crate::identity::VendorRoute::Claude { session_id, .. } => Some(session_id.as_str()),
+            _ => None,
+        }
+    }
+
+    fn validate_registration(
+        &self,
+        entry: &crate::identity::RouteEntry,
+        persona: &str,
+        native_id: &str,
+    ) -> bool {
+        uuid::Uuid::parse_str(native_id).is_ok()
+            && entry
+                .hosted_id
+                .as_deref()
+                .and_then(|id| crate::identity::parse_hosted_identity(id).ok())
+                .is_some_and(|(vendor, name)| vendor == self.vendor_id() && name == persona)
+            && matches!(&entry.route, crate::identity::VendorRoute::Claude { session_id, .. } if session_id.trim() == native_id && !session_id.trim().is_empty())
     }
 
     fn binary_env_var(&self) -> Option<&str> {
@@ -1458,6 +1561,45 @@ pub fn lifecycle_id_to_host_session_id(
     }
 }
 
+/// Select a unique, running canonical Claude session from authoritative host summaries.
+/// Opaque host ids are intentionally excluded: the summary carries no trusted vendor field.
+pub(crate) fn select_claude_host_session<'a>(
+    sessions: &'a [SessionSummary],
+    target: &str,
+) -> Result<Option<&'a SessionSummary>, &'static str> {
+    let target = target.trim();
+    let persona = if let Some(persona) = target.strip_prefix("claude:") {
+        persona
+    } else if let Some((persona, vendor)) = target.split_once('.') {
+        if !vendor.eq_ignore_ascii_case("claude") {
+            return Err("invalid Claude target");
+        }
+        persona
+    } else {
+        target
+    };
+    if persona.is_empty() || persona.contains(['.', ':']) {
+        return Err("invalid Claude target");
+    }
+    let mut matches = sessions.iter().filter(|summary| {
+        if !matches!(summary.state, ChildState::Running(_)) {
+            return false;
+        }
+        let Some((name, vendor)) = summary.stream.session.as_str().split_once('.') else {
+            return false;
+        };
+        !name.is_empty()
+            && !name.contains(':')
+            && vendor.eq_ignore_ascii_case("claude")
+            && name.eq_ignore_ascii_case(persona)
+    });
+    let first = matches.next();
+    if matches.next().is_some() {
+        return Err("ambiguous Claude host session");
+    }
+    Ok(first)
+}
+
 /// Live `SessionId`s in `sessions` that belong to `unit`.
 ///
 /// - `unit == ""` or `unit == "muse"` matches nothing (the shared Muse container is never a single
@@ -1547,6 +1689,30 @@ mod tests {
             latest: 0,
             input: InputState::Writable,
         }
+    }
+
+    #[test]
+    fn claude_host_selector_requires_unique_canonical_running_stream() {
+        let one = summary("Ada.claude", true);
+        let other_vendor = summary("Ada.codex", true);
+        let stopped = summary("Ada.claude", false);
+        assert_eq!(
+            select_claude_host_session(&[one.clone(), other_vendor], "ada")
+                .unwrap()
+                .unwrap()
+                .stream,
+            one.stream
+        );
+        assert!(
+            select_claude_host_session(&[stopped], "ada")
+                .unwrap()
+                .is_none()
+        );
+        assert!(select_claude_host_session(std::slice::from_ref(&one), "Ada.codex").is_err());
+        assert!(
+            select_claude_host_session(std::slice::from_ref(&one), "Ada.claude.extra").is_err()
+        );
+        assert!(select_claude_host_session(&[one.clone(), one], "ada").is_err());
     }
 
     #[test]

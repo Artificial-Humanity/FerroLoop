@@ -143,6 +143,42 @@ jobs:
         shell: bash
         run: cargo test -p fl-host -p fl-host-proto
 
+      - name: cargo check -p fl-browse --tests
+        shell: bash
+        run: cargo check -p fl-browse --tests
+
+      - name: Exact process-free browse detection regressions
+        shell: bash
+        env:
+          CARGO_TERM_COLOR: never
+        run: |
+          set -euo pipefail
+          tests=(
+            engine::tests::executable_detection_rejects_missing_paths_and_directories
+            engine::tests::executable_detection_uses_platform_file_permissions
+            engine::tests::explicit_engine_override_preserves_file_validation
+            engine::tests::candidate_detection_uses_explicit_directories
+          )
+          for test in "${tests[@]}"; do
+            if output=$(cargo test -p fl-browse --lib "$test" -- --exact --color never 2>&1); then
+              :
+            else
+              status=$?
+              printf '%s\n' "$output"
+              exit "$status"
+            fi
+            output=${output//$'\r'/}
+            printf '%s\n' "$output"
+            if ! grep -Fqx "test $test ... ok" <<< "$output"; then
+              echo "::error::Expected exact test $test did not pass"
+              exit 1
+            fi
+            if ! grep -Eq '^test result: ok\. 1 passed; 0 failed;' <<< "$output"; then
+              echo "::error::Expected one passing test for $test"
+              exit 1
+            fi
+          done
+
   # The FerroDeck UI in `ui/` has its own typecheck and test suite, which
   # previously ran only by hand. This job runs them on every pull request
   # and push to `main` alongside the trio above.

@@ -123,6 +123,16 @@ pub enum AgentCmd {
         #[arg(long)]
         json: bool,
     },
+    /// Restart a hosted session using its saved settings.
+    Restart {
+        /// Persona or exact hosted session id (`codex:ada`).
+        session: String,
+        /// Author recording this manual restart.
+        #[arg(long, default_value = "owner")]
+        by: String,
+        #[arg(long)]
+        json: bool,
+    },
     /// Decommission a session in two phases: `prepare` asks it to hand off, `teardown` removes it.
     Decommission {
         /// Session id (`claude:felicity`) or persona.
@@ -574,6 +584,14 @@ pub fn pid_is_alive(pid: u32) -> bool {
     }
 }
 
+fn restart_exit_status(runtime_live: bool) -> Result<(), (i32, String)> {
+    if runtime_live {
+        Ok(())
+    } else {
+        Err((1, "restart resulted in no live runtime; inspect the saved session and vendor prerequisites".into()))
+    }
+}
+
 /// Exit code 2 for a registry conflict (as `register` reports one), 1 for everything else.
 fn lifecycle_failure(e: LifecycleError) -> (i32, String) {
     let code = if matches!(e, LifecycleError::Conflict(_)) {
@@ -772,8 +790,7 @@ pub fn run<S: AgentRegistry + Handles + StateStore + Catalog + fl_core::MessageS
                 hosted: Some(hosted),
                 cwd,
                 context_window: None,
-            }
-            .with_default_cwd(store, &ws_root);
+            };
             let _ = composed_vendor_host_adapters();
             let mut env = LifecycleEnv::new(None);
             env.workspace_root = Some(&ws_root);
@@ -796,6 +813,40 @@ pub fn run<S: AgentRegistry + Handles + StateStore + Catalog + fl_core::MessageS
                 }
             }
             Ok(())
+        }
+        AgentCmd::Restart { session, by, json } => {
+            let _ = composed_vendor_host_adapters();
+            let ws_root =
+                fl_core::resolve_workspace_root(&std::env::current_dir().unwrap_or_default());
+            let mut env = LifecycleEnv::new(None);
+            env.workspace_root = Some(&ws_root);
+            env.log_hydration_warnings = false;
+            let out = lifecycle::restart_agent_session(
+                store,
+                &env,
+                &session,
+                &by,
+                lifecycle::Caller::Owner,
+            )
+            .map_err(lifecycle_failure)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&out).unwrap());
+            } else {
+                println!(
+                    "{}\t{}\trestart_count={}\truntime_spawned={}\truntime_live={}\thydration_dispatched={}\thydration_status={}",
+                    out.record.session_id,
+                    out.record.status,
+                    out.record.restart_count,
+                    out.record.runtime_spawned,
+                    out.runtime_live,
+                    out.record.hydration_dispatched,
+                    out.record.hydration_status
+                );
+                for warning in &out.warnings {
+                    eprintln!("warning: {warning}");
+                }
+            }
+            restart_exit_status(out.runtime_live)
         }
         AgentCmd::Decommission {
             session,
@@ -1161,6 +1212,51 @@ mod tests {
     struct AgentTestCli {
         #[command(subcommand)]
         cmd: AgentCmd,
+    }
+
+    #[test]
+    fn restart_exit_status_requires_current_live_runtime() {
+        assert!(restart_exit_status(true).is_ok());
+        let (code, detail) = restart_exit_status(false).unwrap_err();
+        assert_ne!(code, 0);
+        assert!(detail.contains("no live runtime"));
+    }
+
+    #[test]
+    fn restart_parser_uses_saved_settings_without_override_flags() {
+        use clap::Parser;
+        let AgentCmd::Restart { session, by, json } =
+            AgentTestCli::try_parse_from(["fl", "restart", "ada"])
+                .unwrap()
+                .cmd
+        else {
+            panic!("restart command expected")
+        };
+        assert_eq!(session, "ada");
+        assert_eq!(by, "owner");
+        assert!(!json);
+        assert!(matches!(
+            AgentTestCli::try_parse_from(["fl", "restart", "codex:ada", "--by", "fiona", "--json"]).unwrap().cmd,
+            AgentCmd::Restart { by, json: true, .. } if by == "fiona"
+        ));
+        for flag in [
+            "--model",
+            "--thinking-level",
+            "--effort",
+            "--role",
+            "--project",
+            "--vendor",
+            "--posture",
+            "--cwd",
+            "--node-id",
+            "--hosted",
+            "--context-window",
+        ] {
+            assert!(
+                AgentTestCli::try_parse_from(["fl", "restart", "ada", flag, "override"]).is_err(),
+                "{flag}"
+            );
+        }
     }
 
     #[test]
@@ -1548,6 +1644,25 @@ mod tests {
 
     #[test]
     fn spin_up_and_teardown_with_composed_claude_host_adapter_binds_and_archives_session_uuid() {
+        if std::env::var_os("FL_TEST_COMPOSED_ADAPTER_CHILD").is_none() {
+            let endpoint_root = tempfile::tempdir().unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .env_clear().env("PATH", "/usr/bin:/bin")
+                .env("HOME", endpoint_root.path())
+                .env("FL_HOST_SOCK", endpoint_root.path().join("host.sock"))
+                .env("TMUX", format!("{},1,0", endpoint_root.path().join("tmux.sock").display()))
+                .env("FL_TEST_COMPOSED_ADAPTER_CHILD", "1")
+                .args(["--exact", "cmd::agent::tests::spin_up_and_teardown_with_composed_claude_host_adapter_binds_and_archives_session_uuid", "--nocapture"])
+                .output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+            return;
+        }
         #[derive(Debug, Default)]
         struct RecordingRuntime {
             live: std::cell::RefCell<std::collections::BTreeSet<String>>,

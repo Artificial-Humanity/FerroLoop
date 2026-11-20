@@ -449,7 +449,13 @@ impl RedbStore {
         &self,
         args: SendWireArgs,
         awaiting_daemon: bool,
-    ) -> Result<(WireMessage, Vec<DeliveryReceipt>), StoreError> {
+        once: bool,
+    ) -> Result<Option<(WireMessage, Vec<DeliveryReceipt>)>, StoreError> {
+        if once && args.id.is_none() {
+            return Err(StoreError::InvalidState(
+                "Wire send-once requires a message id".into(),
+            ));
+        }
         let subject =
             validate_subject(&args.subject).map_err(|e| StoreError::InvalidState(e.to_string()))?;
         let body =
@@ -458,6 +464,16 @@ impl RedbStore {
             .map_err(|e| StoreError::InvalidState(e.to_string()))?;
 
         let tx = self.db.begin_write().map_err(backend)?;
+        if once {
+            let table = tx.open_table(WIRE_MESSAGES).map_err(backend)?;
+            if table
+                .get(args.id.as_ref().unwrap().as_str())
+                .map_err(backend)?
+                .is_some()
+            {
+                return Ok(None);
+            }
+        }
         raise_format(&tx, FORMAT_WITH_WIRE)?;
 
         let (parent_thread, correlation_id) = match &args.reply_to {
@@ -557,6 +573,11 @@ impl RedbStore {
         );
 
         self.append_wire_message_in(&tx, &msg)?;
+        // Child-process crash injection exercises the real write transaction.
+        #[cfg(test)]
+        if once && std::env::var_os("FL_TEST_WIRE_ONCE_CRASH").is_some() {
+            std::process::exit(75);
+        }
 
         let mut receipts = Vec::with_capacity(recipients.len());
         {
@@ -588,7 +609,7 @@ impl RedbStore {
         }
 
         tx.commit().map_err(backend)?;
-        Ok((msg, receipts))
+        Ok(Some((msg, receipts)))
     }
 }
 
@@ -597,14 +618,23 @@ impl MessageStore for RedbStore {
         &self,
         args: SendWireArgs,
     ) -> Result<(WireMessage, Vec<DeliveryReceipt>), StoreError> {
-        self.send_wire_inner(args, false)
+        self.send_wire_inner(args, false, false)
+            .map(|value| value.expect("ordinary send always inserts"))
     }
 
     fn send_wire_awaiting_daemon(
         &self,
         args: SendWireArgs,
     ) -> Result<(WireMessage, Vec<DeliveryReceipt>), StoreError> {
-        self.send_wire_inner(args, true)
+        self.send_wire_inner(args, true, false)
+            .map(|value| value.expect("ordinary send always inserts"))
+    }
+
+    fn send_wire_once_awaiting_daemon(
+        &self,
+        args: SendWireArgs,
+    ) -> Result<Option<(WireMessage, Vec<DeliveryReceipt>)>, StoreError> {
+        self.send_wire_inner(args, true, true)
     }
 
     fn list_wire_awaiting_daemon(&self) -> Result<Vec<(MessageId, At)>, StoreError> {

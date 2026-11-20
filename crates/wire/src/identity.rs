@@ -908,6 +908,10 @@ pub fn agy_ls_address_listening(addr: &str) -> bool {
         return false;
     };
     let target = SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, port));
+    #[cfg(feature = "wire-test-isolation")]
+    if crate::test_isolation::ensure_tcp(&target).is_err() {
+        return false;
+    }
     TcpStream::connect_timeout(&target, Duration::from_millis(50)).is_ok()
 }
 
@@ -967,7 +971,7 @@ fn agy_host_session_running(persona: Option<&str>) -> bool {
     let Some(norm) = persona.and_then(normalize_persona) else {
         return false;
     };
-    let Ok(endpoint) = fl_host_proto::HostEndpoint::discover() else {
+    let Ok(endpoint) = crate::runtime_context::host_endpoint() else {
         return false;
     };
     let Ok(mut client) = fl_host_proto::BlockingHostClient::connect(&endpoint) else {
@@ -3781,7 +3785,7 @@ impl RouteTable {
     }
 
     fn discover_host_cli_sessions(&mut self, at: &At) {
-        let Ok(endpoint) = fl_host_proto::HostEndpoint::discover() else {
+        let Ok(endpoint) = crate::runtime_context::host_endpoint() else {
             return;
         };
         let Ok(mut client) = fl_host_proto::BlockingHostClient::connect(&endpoint) else {
@@ -4201,7 +4205,7 @@ fn list_tmux_windows() -> Option<Vec<TmuxWindow>> {
 
 fn list_tmux_windows_within(timeout: Duration) -> Option<Vec<TmuxWindow>> {
     if crate::dispatcher::host_discovery_allowed()
-        && let Ok(endpoint) = fl_host_proto::HostEndpoint::discover()
+        && let Ok(endpoint) = crate::runtime_context::host_endpoint()
         && let Ok(mut client) = fl_host_proto::BlockingHostClient::connect(&endpoint)
         && let Ok(sessions) = client.list_sessions()
     {
@@ -4222,9 +4226,13 @@ fn list_tmux_windows_within(timeout: Duration) -> Option<Vec<TmuxWindow>> {
 
 fn run_tmux_list_windows(timeout: Duration) -> Option<Vec<TmuxWindow>> {
     use std::io::Read;
-    use std::process::{Command, Stdio};
+    use std::process::Stdio;
 
-    let mut child = Command::new(crate::dispatcher::tmux_bin())
+    let Ok(mut command) = crate::runtime_context::tmux_command(&crate::dispatcher::tmux_bin())
+    else {
+        return None;
+    };
+    let mut child = command
         .args(["list-windows", "-a", "-F", "#{session_name}:#{window_name}"])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -7640,6 +7648,7 @@ mod tests {
     #[test]
     fn agy_ls_address_listening_requires_an_open_port() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let _listener_fixture = crate::test_isolation::register_tcp_listener(&listener).unwrap();
         let port = listener.local_addr().unwrap().port();
         assert!(agy_ls_address_listening(&format!("127.0.0.1:{port}")));
         assert!(agy_ls_address_listening(&format!("localhost:{port}")));
@@ -7684,6 +7693,7 @@ mod tests {
     #[test]
     fn agy_ls_address_listening_ignores_a_remote_host_on_a_local_open_port() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let _listener_fixture = crate::test_isolation::register_tcp_listener(&listener).unwrap();
         let port = listener.local_addr().unwrap().port();
         assert!(agy_ls_address_listening(&format!("127.0.0.1:{port}")));
         assert!(!agy_ls_address_listening(&format!("10.0.0.5:{port}")));
@@ -7695,6 +7705,7 @@ mod tests {
     fn note_agy_proc_env_skips_dead_ports_and_old_binaries() {
         let tmp = TempDir::new().unwrap();
         let live = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let _live_fixture = crate::test_isolation::register_tcp_listener(&live).unwrap();
         let live_port = live.local_addr().unwrap().port();
         // Port 1 is closed and is not recycled by other tests that bind port 0.
         let dead_port = 1u16;
@@ -7735,8 +7746,10 @@ mod tests {
     #[test]
     fn note_agy_proc_env_never_mixes_cli_log_address_with_unpaired_csrf_token() {
         let live1 = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let _live1_fixture = crate::test_isolation::register_tcp_listener(&live1).unwrap();
         let port1 = live1.local_addr().unwrap().port();
         let live2 = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let _live2_fixture = crate::test_isolation::register_tcp_listener(&live2).unwrap();
         let port2 = live2.local_addr().unwrap().port();
 
         // Start with an unpaired address from cli.log.
@@ -7778,8 +7791,13 @@ mod tests {
         fs::create_dir_all(agy_dir.join("brain")).unwrap();
 
         let daemon_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+
+        let _daemon_listener_fixture =
+            crate::test_isolation::register_tcp_listener(&daemon_listener).unwrap();
         let daemon_port = daemon_listener.local_addr().unwrap().port();
         let feira_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let _feira_listener_fixture =
+            crate::test_isolation::register_tcp_listener(&feira_listener).unwrap();
         let feira_port = feira_listener.local_addr().unwrap().port();
 
         fs::write(
@@ -7890,14 +7908,22 @@ mod tests {
         // 2. Feira's agy session (39643 in live repro) with csrf `6f09f521`
         // 3. Felix's newly spun-up agy session (42959 in live repro) with csrf `felix-csrf-42959`
         let daemon_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let _daemon_listener_fixture =
+            crate::test_isolation::register_tcp_listener(&daemon_listener).unwrap();
         let daemon_port = daemon_listener.local_addr().unwrap().port();
         let daemon_addr = format!("127.0.0.1:{daemon_port}");
 
         let feira_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+
+        let _feira_listener_fixture =
+            crate::test_isolation::register_tcp_listener(&feira_listener).unwrap();
         let feira_port = feira_listener.local_addr().unwrap().port();
         let feira_addr = format!("127.0.0.1:{feira_port}");
 
         let felix_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+
+        let _felix_listener_fixture =
+            crate::test_isolation::register_tcp_listener(&felix_listener).unwrap();
         let felix_port = felix_listener.local_addr().unwrap().port();
         let felix_addr = format!("127.0.0.1:{felix_port}");
 
@@ -8167,6 +8193,7 @@ mod tests {
     #[test]
     fn discover_agy_routes_ignores_dead_cli_log_port() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let _listener_fixture = crate::test_isolation::register_tcp_listener(&listener).unwrap();
         let live_port = listener.local_addr().unwrap().port();
         let tmp = TempDir::new().unwrap();
         let home = tmp.path();
@@ -11128,6 +11155,9 @@ mod tests {
         fs::create_dir_all(&brain_dir).unwrap();
 
         let feira_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+
+        let _feira_listener_fixture =
+            crate::test_isolation::register_tcp_listener(&feira_listener).unwrap();
         let feira_port = feira_listener.local_addr().unwrap().port();
         let feira_addr = format!("127.0.0.1:{feira_port}");
 
@@ -11275,8 +11305,10 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let home = tmp.path();
         let listener1 = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let _listener1_fixture = crate::test_isolation::register_tcp_listener(&listener1).unwrap();
         let port1 = listener1.local_addr().unwrap().port();
         let listener2 = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let _listener2_fixture = crate::test_isolation::register_tcp_listener(&listener2).unwrap();
         let port2 = listener2.local_addr().unwrap().port();
         let agy_dir = home.join(".gemini/antigravity-cli");
         fs::create_dir_all(&agy_dir).unwrap();
@@ -11369,6 +11401,9 @@ mod tests {
             fs::write(&old_agy, b"#!/bin/sh\n").unwrap();
 
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+
+            let _listener_fixture =
+                crate::test_isolation::register_tcp_listener(&listener).unwrap();
             let live_port = listener.local_addr().unwrap().port();
             fs::write(
                 agy_dir.join("cli.log"),
@@ -11516,6 +11551,9 @@ mod tests {
                 fs::write(&old_agy, b"#!/bin/sh\n").unwrap();
 
                 let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+
+                let _listener_fixture =
+                    crate::test_isolation::register_tcp_listener(&listener).unwrap();
                 let port = listener.local_addr().unwrap().port();
                 let live_addr = format!("127.0.0.1:{port}");
                 fs::write(
@@ -12489,6 +12527,9 @@ mod tests {
             fs::write(&old_agy, b"#!/bin/sh\n").unwrap();
 
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+
+            let _listener_fixture =
+                crate::test_isolation::register_tcp_listener(&listener).unwrap();
             let live_port = listener.local_addr().unwrap().port();
             let live_addr = format!("127.0.0.1:{live_port}");
             fs::write(

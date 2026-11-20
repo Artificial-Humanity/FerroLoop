@@ -62,7 +62,8 @@ use fl_store::AnyStore;
 use fl_wire::dispatcher::{
     CodexSteerError, MAX_DELIVER, OperatorPromptError, OperatorPromptIntent, OperatorPromptOutcome,
     PushError, SessionResetMode, clear_or_reforge_session, deliver_to_live_grok_pane,
-    push_operator_prompt_to_route, push_operator_prompt_with_intent, push_to_route_for_recipient,
+    preflight_session_reset, push_operator_prompt_to_route, push_operator_prompt_with_intent,
+    push_to_route_for_recipient,
 };
 use fl_wire::identity::{RouteTable, normalize_persona};
 use serde::{Deserialize, Serialize};
@@ -1352,9 +1353,7 @@ pub(crate) fn load_discovery_snapshot(state: &HubState) -> DiscoveryStoreSnapsho
 fn handle_get_sessions(state: &HubState) -> HttpResponse {
     drain_ready_session_queues(state);
     // A store error here must not hide the session list.
-    if let Ok(store) = state.open_store() {
-        let _ = lifecycle::reconcile_dead_hosted_sessions(&*store, &lifecycle_env(state), "hub");
-    }
+    let _ = lifecycle::reconcile_dead_hosted_sessions_in_hub(state, "hub");
     let Ok(snap) = state.cached_discovery_snapshot() else {
         return store_open_failure();
     };
@@ -2018,6 +2017,8 @@ pub struct HubFenceDiagnostic {
     pub route_dispatch_calls: u64,
     pub route_dispatch_calls_saturated: bool,
     pub registration_generation: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recognised_composer_payload: Option<String>,
 }
 
 /// Allowlist projection of [`fl_wire::dispatch_diagnostics::RouteDispatchObservation`].
@@ -2101,6 +2102,11 @@ impl HubRouteDispatchObservation {
     }
 }
 
+/// Clamp a wire recognised payload to the two named values; anything else is dropped.
+fn clamp_recognised_composer_payload(payload: Option<String>) -> Option<String> {
+    payload.filter(|p| p == "/clear" || p == "/new")
+}
+
 impl HubFenceDiagnostic {
     fn from_wire(record: fl_wire::dispatch_diagnostics::FenceDiagnostic) -> Self {
         let fl_wire::dispatch_diagnostics::FenceDiagnostic {
@@ -2123,6 +2129,7 @@ impl HubFenceDiagnostic {
             route_dispatch_calls,
             route_dispatch_calls_saturated,
             registration_generation,
+            recognised_composer_payload,
         } = record;
         Self {
             recipient,
@@ -2147,6 +2154,9 @@ impl HubFenceDiagnostic {
             route_dispatch_calls,
             route_dispatch_calls_saturated,
             registration_generation,
+            recognised_composer_payload: clamp_recognised_composer_payload(
+                recognised_composer_payload,
+            ),
         }
     }
 }
@@ -3869,6 +3879,21 @@ fn discover_session_artifact_candidates(
     session_id: &str,
     canonical_session_id: &str,
 ) -> Vec<PathBuf> {
+    let snap = load_discovery_snapshot(state);
+    discover_session_artifact_candidates_from_snapshot(
+        state,
+        &snap,
+        session_id,
+        canonical_session_id,
+    )
+}
+
+fn discover_session_artifact_candidates_from_snapshot(
+    state: &HubState,
+    snap: &DiscoveryStoreSnapshot,
+    session_id: &str,
+    canonical_session_id: &str,
+) -> Vec<PathBuf> {
     let mut candidate_paths: Vec<PathBuf> = Vec::new();
     if let Some(home) = hub_home_dir(state) {
         for candidate_id in [session_id, canonical_session_id] {
@@ -3896,10 +3921,9 @@ fn discover_session_artifact_candidates(
         }
     }
 
-    let snap = load_discovery_snapshot(state);
     let turns = read_session_transcript_from_snapshot(
         session_id,
-        &snap,
+        snap,
         state.config.home_override.as_deref(),
     );
     for turn in turns.iter().rev().take(60) {
@@ -6093,6 +6117,21 @@ pub(crate) fn reset_queued_delivery_calls() {
     QUEUED_DELIVERY_CALLS.with(|c| c.set(0));
 }
 
+// Retained non-Claude classification is only a routing restriction; every
+// actual route must still pass the vendor fence. Serialized strings never grant
+// Claude terminal authority.
+fn queued_non_claude_vendor(item: &crate::QueuedOperatorPrompt) -> Option<&str> {
+    item.intended_vendor
+        .as_deref()
+        .map(fl_wire::identity::canonical_vendor_id)
+        .filter(|vendor| *vendor != "claude" && fl_core::lookup_vendor(vendor).is_some())
+        .or_else(|| item.intended_codex_thread_id.as_ref().map(|_| "codex"))
+}
+
+fn legacy_owner_unclassified(item: &crate::QueuedOperatorPrompt) -> bool {
+    !item.admitted_current && queued_non_claude_vendor(item).is_none()
+}
+
 fn drain_composer_probe(
     home: Option<&std::path::Path>,
     item: &crate::QueuedOperatorPrompt,
@@ -6106,6 +6145,9 @@ fn drain_composer_probe(
             COMPOSER_PROBE_CALLS.with(|c| c.set(c.get() + 1));
             return ready;
         }
+    }
+    if item.claude_terminal {
+        return None;
     }
     crate::lifecycle::find_route(
         home,
@@ -6133,7 +6175,20 @@ fn operator_prompt_intent(authority: &HubAuthority, send_now: bool) -> OperatorP
     }
 }
 
-#[cfg_attr(test, allow(clippy::too_many_arguments))] // Keep test transport scoped to queued calls.
+fn require_intended_vendor(
+    route: &fl_wire::identity::VendorRoute,
+    intended: Option<&str>,
+) -> Result<(), PushError> {
+    if intended.is_some_and(|vendor| route.canonical_vendor() != vendor) {
+        Err(PushError::Failed(
+            "resolved route does not match the requested vendor".into(),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn dispatch_operator_prompt_with_intent_for_session(
     state: &HubState,
     persona: Option<&str>,
@@ -6142,6 +6197,9 @@ fn dispatch_operator_prompt_with_intent_for_session(
     body: &str,
     intent: OperatorPromptIntent,
     intended_codex_thread_id: Option<&str>,
+    claude_terminal: bool,
+    claude_binding: Option<&fl_wire::vendor_adapter::ClaudeRegistrationBinding>,
+    intended_vendor: Option<&str>,
     #[cfg(test)] queued: bool,
 ) -> Result<OperatorPromptOutcome, OperatorPromptError> {
     #[cfg(test)]
@@ -6150,6 +6208,31 @@ fn dispatch_operator_prompt_with_intent_for_session(
             f();
         }
     });
+    if claude_terminal {
+        let binding = claude_binding.ok_or_else(|| {
+            OperatorPromptError::Push(PushError::NotConnected(
+                "Claude registration is unbound; re-register and resubmit".into(),
+            ))
+        })?;
+        return fl_wire::dispatcher::dispatch_bound_claude_operator_prompt(
+            binding,
+            sender_name,
+            body,
+        )
+        .map(|()| OperatorPromptOutcome::TransportAccepted)
+        .map_err(|e| {
+            OperatorPromptError::Push(match e {
+                fl_wire::dispatcher::ClaudeBoundError::Refused(message) => {
+                    PushError::NotConnected(format!(
+                        "Claude terminal delivery refused: {message}; re-register and resubmit"
+                    ))
+                }
+                fl_wire::dispatcher::ClaudeBoundError::Delivery(message) => {
+                    PushError::Failed(message)
+                }
+            })
+        });
+    }
     // Preserve typed steering failures across the ordinary transport's rediscovery boundary.
     // Every steering failure is final: mapping it to Failed prevents a second route attempt.
     let mut steering_error = None;
@@ -6180,27 +6263,42 @@ fn dispatch_operator_prompt_with_intent_for_session(
             }) {
                 return Err(PushError::NotConnected("synthetic connect refusal".into()));
             }
-            #[cfg(test)]
-            if queued && QUEUED_TEST_DELIVERY.with(|flag| flag.get()) {
-                QUEUED_DELIVERY_CALLS.with(|c| c.set(c.get() + 1));
-                return Ok(OperatorPromptOutcome::TransportAccepted);
-            }
-            let delivery = if intent == OperatorPromptIntent::OwnerSendNow
+            // A pinned Codex Send Now remains a typed route refusal even if
+            // rediscovery finds a different vendor before reaching its branch.
+            let codex_mismatch = intent == OperatorPromptIntent::OwnerSendNow
                 && match intended_codex_thread_id {
                     Some(intended) => !matches!(route,
                         fl_wire::identity::VendorRoute::Codex { thread_id, .. } if thread_id == intended),
                     None => matches!(route, fl_wire::identity::VendorRoute::Codex { .. })
                         && !route_matches_session_id(route, session_id),
-                }
-            {
-                Err(OperatorPromptError::Steer(CodexSteerError::Refused {
+                };
+            if codex_mismatch {
+                let error = CodexSteerError::Refused {
                     stage: fl_wire::dispatcher::CodexSteerStage::Route,
                     reason: fl_wire::dispatcher::CodexSteerRefusalReason::InvalidResponse,
                     message: "resolved route does not serve the intended Codex thread".into(),
-                }))
-            } else {
-                push_operator_prompt_with_intent(route, sender_name, body, intent)
-            };
+                };
+                let message = error.to_string();
+                steering_error = Some(error);
+                return Err(PushError::Failed(message));
+            }
+            require_intended_vendor(route, intended_vendor)?;
+            #[cfg(test)]
+            if queued && QUEUED_TEST_DELIVERY.with(|flag| flag.get()) {
+                QUEUED_DELIVERY_CALLS.with(|c| c.set(c.get() + 1));
+                return Ok(OperatorPromptOutcome::TransportAccepted);
+            }
+            // An unbound owner prompt must never obtain Claude terminal authority by
+            // rediscovery. Independently established peer delivery stays peer-only.
+            if matches!(route, fl_wire::identity::VendorRoute::Claude { .. }) {
+                if fl_wire::dispatcher::is_owner_sender(sender_name) {
+                    return Err(PushError::Failed("Claude registration is unbound; re-register and resubmit".into()));
+                }
+                return fl_wire::dispatcher::dispatch_claude_peer_prompt(route, sender_name, body)
+                    .map(|()| OperatorPromptOutcome::TransportAccepted)
+                    .map_err(PushError::Failed);
+            }
+            let delivery = push_operator_prompt_with_intent(route, sender_name, body, intent);
             delivery.map_err(|e| match e {
                 OperatorPromptError::Push(e) => e,
                 OperatorPromptError::Steer(e) => {
@@ -6237,6 +6335,7 @@ fn dispatch_operator_prompt_with_intent_for_session(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn dispatch_queued_operator_prompt_with_intent_for_session(
     state: &HubState,
     persona: Option<&str>,
@@ -6245,6 +6344,9 @@ fn dispatch_queued_operator_prompt_with_intent_for_session(
     body: &str,
     intent: OperatorPromptIntent,
     intended_codex_thread_id: Option<&str>,
+    claude_terminal: bool,
+    claude_binding: Option<&fl_wire::vendor_adapter::ClaudeRegistrationBinding>,
+    intended_vendor: Option<&str>,
 ) -> Result<OperatorPromptOutcome, OperatorPromptError> {
     #[cfg(test)]
     if let Some(err) = QUEUED_TEST_ERROR.with(|e| e.borrow().clone()) {
@@ -6252,7 +6354,11 @@ fn dispatch_queued_operator_prompt_with_intent_for_session(
         return Err(OperatorPromptError::Push(PushError::Failed(err)));
     }
     #[cfg(test)]
-    if QUEUED_TEST_DELIVERY.with(|flag| flag.get())
+    if !claude_terminal
+        && intent != OperatorPromptIntent::OwnerSendNow
+        && intended_codex_thread_id.is_none()
+        && intended_vendor.is_none()
+        && QUEUED_TEST_DELIVERY.with(|flag| flag.get())
         && matches!(state.prompt_queue_target(session_id), Ok(None))
     {
         QUEUED_DELIVERY_CALLS.with(|c| c.set(c.get() + 1));
@@ -6271,6 +6377,9 @@ fn dispatch_queued_operator_prompt_with_intent_for_session(
         body,
         intent,
         intended_codex_thread_id,
+        claude_terminal,
+        claude_binding,
+        intended_vendor,
         #[cfg(test)]
         true,
     )
@@ -6317,12 +6426,16 @@ fn with_operator_delivery(
     data
 }
 
+#[allow(clippy::too_many_arguments)]
 fn dispatch_operator_prompt_for_session_typed(
     state: &HubState,
     persona: Option<&str>,
     session_id: &str,
     sender_name: &str,
     body: &str,
+    claude_terminal: bool,
+    claude_binding: Option<&fl_wire::vendor_adapter::ClaudeRegistrationBinding>,
+    intended_vendor: Option<&str>,
 ) -> Result<OperatorPromptOutcome, PushError> {
     dispatch_queued_operator_prompt_with_intent_for_session(
         state,
@@ -6332,6 +6445,9 @@ fn dispatch_operator_prompt_for_session_typed(
         body,
         OperatorPromptIntent::Ordinary,
         None,
+        claude_terminal,
+        claude_binding,
+        intended_vendor,
     )
     .map_err(|e| match e {
         OperatorPromptError::Push(e) => e,
@@ -6375,23 +6491,57 @@ pub fn drain_ready_session_queues(state: &HubState) {
     for session_id in keys {
         // Keep the discovered path across the dispatch: if the file disappears before
         // the post-send observation, it is unknown rather than a new empty transcript.
-        let sessions = lookup_sessions(&snap, home);
-        let canonical_id = match state.prompt_queue_target(&session_id) {
-            Ok(Some(target)) => target.session_id,
-            Ok(None) => resolve_session_target_in(&sessions, &session_id).0,
-            Err(()) => {
-                let queue = state.note_pending_queue_error(&session_id, "ambiguous queued session alias; use the original session ID to resolve or discard its queue");
+        let head = state.session_queue(&session_id).into_iter().next();
+        if let Some(item) = head.as_ref().filter(|item| {
+            (item.claude_terminal && item.claude_binding.is_none())
+                || legacy_owner_unclassified(item)
+        }) {
+            if let Some((claimed, claim)) =
+                state.claim_queued_for_dispatch(&session_id, &session_id, &item.id, false)
+            {
+                let queue = state.hold_refused_queued_prompt(
+                    &session_id,
+                    &item.id,
+                    "Queue destination is unverified; re-register and resubmit".into(),
+                );
+                claim.finish();
                 state.broadcast(
                     "session",
                     "queue_updated",
                     json!({
-                        "session_id": session_id,
-                        "persona": queue.first().and_then(|item| item.persona.as_deref()),
-                        "is_busy": true,
-                        "queue": queue,
+                        "session_id": claimed.session_id, "persona": claimed.persona,
+                        "is_busy": true, "queue": queue,
                     }),
                 );
-                continue;
+            }
+            continue;
+        }
+        let pinned = head.as_ref().and_then(|item| item.claude_binding.as_ref());
+        let sessions = if pinned.is_some() {
+            Vec::new()
+        } else {
+            lookup_sessions(&snap, home)
+        };
+        let canonical_id = if let Some(binding) = pinned {
+            binding.native_session().to_string()
+        } else {
+            match state.prompt_queue_target(&session_id) {
+                Ok(Some(target)) => target.session_id,
+                Ok(None) => resolve_session_target_in(&sessions, &session_id).0,
+                Err(()) => {
+                    let queue = state.note_pending_queue_error(&session_id, "ambiguous queued session alias; use the original session ID to resolve or discard its queue");
+                    state.broadcast(
+                        "session",
+                        "queue_updated",
+                        json!({
+                            "session_id": session_id,
+                            "persona": queue.first().and_then(|item| item.persona.as_deref()),
+                            "is_busy": true,
+                            "queue": queue,
+                        }),
+                    );
+                    continue;
+                }
             }
         };
         let mut files = TranscriptReads::default();
@@ -6401,12 +6551,57 @@ pub fn drain_ready_session_queues(state: &HubState) {
             .session_queue(&session_id)
             .first()
             .map(|item| item.id.clone());
+        // Old or deserialized Claude items do not carry registration authority.
+        // Keep them visible; never auto-bind them from the current route.
+        let old_unbound_claude = state
+            .session_queue(&session_id)
+            .first()
+            .is_some_and(|item| {
+                item.claude_binding.is_none()
+                    && fl_wire::dispatcher::is_owner_sender(&item.by)
+                    && (item.claude_terminal
+                        || session_id.to_ascii_lowercase().starts_with("claude:")
+                        || sessions.iter().any(|session| {
+                            session.id == canonical_id && session.adapter == "claude"
+                        }))
+            });
+        if old_unbound_claude {
+            if let Some(prompt_id) = next.as_deref()
+                && let Some((item, claim)) =
+                    state.claim_queued_for_dispatch(&canonical_id, &session_id, prompt_id, false)
+            {
+                let queue = state.hold_refused_queued_prompt(
+                    &session_id,
+                    prompt_id,
+                    "Claude registration is unbound; re-register and resubmit".into(),
+                );
+                claim.finish();
+                state.broadcast(
+                    "session",
+                    "queue_updated",
+                    json!({
+                        "session_id": item.session_id, "persona": item.persona,
+                        "is_busy": true, "queue": queue,
+                    }),
+                );
+            }
+            continue;
+        }
         // A composer-occupied hold is retried only when a passive, key-free probe
         // positively observes a clean composer (`Some(true)`), on the bounded
         // backoff schedule in `HubState` — never over non-wire input or a dialog.
         if let Some(prompt_id) = &next
             && state.is_composer_held_prompt(&session_id, prompt_id)
         {
+            // Retained hosted Claude prompts stay held until explicit Send Now;
+            // the generic probe is not bound to their registration or host stream.
+            if state
+                .session_queue(&session_id)
+                .first()
+                .is_some_and(|item| item.claude_terminal)
+            {
+                continue;
+            }
             let now_ms = stamp::now().unix_millis() as i64;
             if !state.composer_hold_probe_due(prompt_id, now_ms) {
                 continue;
@@ -6444,9 +6639,20 @@ pub fn drain_ready_session_queues(state: &HubState) {
                 &canonical_id,
                 &item.by,
                 &item.effective_body,
+                item.claude_terminal,
+                item.claude_binding.as_ref(),
+                queued_non_claude_vendor(&item).or(item.intended_vendor.as_deref()),
             );
-            let queue =
-                state.finish_queued_prompt(&session_id, &item.id, delivery_res.clone().map(|_| ()));
+            let queue = if matches!(&delivery_res, Err(PushError::NotConnected(message) | PushError::Failed(message)) if message.contains("re-register and resubmit"))
+            {
+                state.hold_refused_queued_prompt(
+                    &session_id,
+                    &item.id,
+                    delivery_res.as_ref().unwrap_err().to_string(),
+                )
+            } else {
+                state.finish_queued_prompt(&session_id, &item.id, delivery_res.clone().map(|_| ()))
+            };
             #[cfg(test)]
             AFTER_QUEUE_FINISH.with(|hook| {
                 if let Some(f) = hook.borrow_mut().take() {
@@ -6533,11 +6739,43 @@ fn handle_post_queued_prompt_send_now(
     raw_session_id: &str,
     prompt_id: &str,
 ) -> HttpResponse {
-    let (canonical_id, target_persona) = match state.prompt_queue_target(raw_session_id) {
-        Ok(Some(target)) => (target.session_id, target.persona),
-        Ok(None) => resolve_session_target(state, raw_session_id),
-        Err(()) => {
-            return HttpResponse::json(409, json!({"error": "ambiguous queued session alias"}));
+    // Locate a retained binding by the exact queue id and one of its own aliases,
+    // without consulting discovery or re-resolving its destination.
+    let pinned = state
+        .queued_session_keys()
+        .into_iter()
+        .flat_map(|key| state.session_queue(&key))
+        .find(|item| {
+            item.id == prompt_id && (item.claude_terminal || legacy_owner_unclassified(item)) && {
+                let persona = item
+                    .claude_binding
+                    .as_ref()
+                    .map(|binding| binding.persona_name())
+                    .or(item.persona.as_deref());
+                raw_session_id == item.session_id
+                    || persona.is_some_and(|name| raw_session_id.eq_ignore_ascii_case(name))
+                    || fl_wire::identity::parse_hosted_identity(raw_session_id)
+                        .ok()
+                        .is_some_and(|(vendor, name)| {
+                            vendor == "claude" && persona == Some(name.as_str())
+                        })
+            }
+        });
+    let (canonical_id, target_persona) = if let Some(item) = pinned.as_ref() {
+        (
+            item.claude_binding
+                .as_ref()
+                .map(|binding| binding.native_session().to_string())
+                .unwrap_or_else(|| item.session_id.clone()),
+            item.persona.clone(),
+        )
+    } else {
+        match state.prompt_queue_target(raw_session_id) {
+            Ok(Some(target)) => (target.session_id, target.persona),
+            Ok(None) => resolve_session_target(state, raw_session_id),
+            Err(()) => {
+                return HttpResponse::json(409, json!({"error": "ambiguous queued session alias"}));
+            }
         }
     };
     if let Some(refusal) =
@@ -6568,19 +6806,28 @@ fn handle_post_queued_prompt_send_now(
         canonical_id.as_str()
     };
     let accepted_at = stamp::now().to_string();
-    let delivery_res = dispatch_queued_operator_prompt_with_intent_for_session(
-        state,
-        item.persona.as_deref().or(target_persona.as_deref()),
-        dispatch_session_id,
-        &item.by,
-        &item.effective_body,
-        operator_prompt_intent(authority, true),
-        intended_codex_thread_id,
-    );
+    let delivery_res = if legacy_owner_unclassified(&item) {
+        Err(OperatorPromptError::Push(PushError::NotConnected(
+            "Queue destination is unverified; re-register and resubmit".into(),
+        )))
+    } else {
+        dispatch_queued_operator_prompt_with_intent_for_session(
+            state,
+            item.persona.as_deref().or(target_persona.as_deref()),
+            dispatch_session_id,
+            &item.by,
+            &item.effective_body,
+            operator_prompt_intent(authority, true),
+            intended_codex_thread_id,
+            item.claude_terminal,
+            item.claude_binding.as_ref(),
+            queued_non_claude_vendor(&item).or(item.intended_vendor.as_deref()),
+        )
+    };
     let refused = matches!(
         delivery_res,
         Err(OperatorPromptError::Steer(CodexSteerError::Refused { .. }))
-    );
+    ) || matches!(&delivery_res, Err(OperatorPromptError::Push(PushError::NotConnected(message) | PushError::Failed(message))) if message.contains("re-register and resubmit"));
     let queue = if refused {
         state.hold_refused_queued_prompt(
             &queue_key,
@@ -6596,7 +6843,7 @@ fn handle_post_queued_prompt_send_now(
     };
     // Owner Send-now that lands on an occupied composer arms a new hold: reset its
     // bounded re-probe budget instead of inheriting an exhausted one.
-    if !refused && state.is_composer_held_prompt(&queue_key, prompt_id) {
+    if !refused && !item.claude_terminal && state.is_composer_held_prompt(&queue_key, prompt_id) {
         state.reset_composer_hold_probe(prompt_id, stamp::now().unix_millis() as i64);
     }
     if !refused
@@ -6794,6 +7041,53 @@ fn handle_post_session_prompt(
         );
     }
 
+    // Classify from the selected primary before discovery, attachment writes, or any
+    // route scan. Bare/opaque intent is unclassified if that source cannot be read.
+    let home = state.config.home_override.as_deref();
+    let intended_vendor = fl_wire::identity::parse_hosted_identity(session_id)
+        .ok()
+        .map(|(vendor, _)| vendor);
+    let source = crate::discovery::route_table_path(home).unwrap_or_else(|| {
+        fl_wire::identity::resolve_routes_path(
+            None,
+            std::env::var_os("FL_WIRE_ROUTES").as_deref(),
+            None,
+        )
+    });
+    use fl_wire::vendor_adapter::{ClaudeRegistrationBinding, ClaudeRegistrationError};
+    let refuse = |error: &dyn std::fmt::Display| {
+        HttpResponse::json(
+            409,
+            json!({"error": error.to_string(), "delivered": false, "delivery_stage": "refused"}),
+        )
+    };
+    let claude_binding = if authority.is_owner() {
+        let binding = match ClaudeRegistrationBinding::from_intent(source, session_id) {
+            Ok(binding) => binding,
+            Err(ClaudeRegistrationError::Source(_))
+                if intended_vendor
+                    .as_deref()
+                    .is_some_and(|vendor| vendor != "claude") =>
+            {
+                None
+            }
+            Err(error) => return refuse(&error),
+        };
+        if intended_vendor.as_deref() == Some("claude") && binding.is_none() {
+            return refuse(&"Claude registration is unbound; re-register and resubmit");
+        }
+        binding
+    } else {
+        // Peer delivery is authorized separately and never uses terminal paste. A
+        // bare or opaque target nevertheless requires a valid primary before discovery.
+        if intended_vendor.is_none()
+            && let Err(error) = ClaudeRegistrationBinding::validate_source(&source)
+        {
+            return refuse(&error);
+        }
+        None
+    };
+
     let mut saved_attachments: Vec<SavedPromptAttachment> =
         Vec::with_capacity(payload.attachments.len());
     if !payload.attachments.is_empty() {
@@ -6896,25 +7190,44 @@ fn handle_post_session_prompt(
 
     let sender_name = resolve_prompt_sender(authority, payload.by.as_deref());
 
-    let home = state.config.home_override.as_deref();
     // Most prompts target a live route. Its identity needs agent ordering but not the
     // project's entire attempt history. Preserve the full lookup for unknown targets.
     let names = state
         .open_store()
         .map(|store| snapshot_discovery_names(&store))
         .unwrap_or_default();
-    let fast = lookup_one_route_session(&names, home, session_id);
-    let (snap, sessions) = if let Some(session) = fast {
+    // A vendor-qualified peer target is classified by the adapter registry, but
+    // existing discovery indexes it by persona. Keep the vendor constraint through
+    // dispatch so this lookup cannot retarget another adapter.
+    let peer_persona = (!authority.is_owner())
+        .then(|| fl_wire::identity::parse_hosted_identity(session_id).ok())
+        .flatten()
+        .map(|(_, persona)| persona);
+    let lookup_target = peer_persona.as_deref().unwrap_or(session_id);
+    let (snap, sessions) = if claude_binding.is_some() {
+        // Transcript lookup can use the pinned native UUID directly. Do not merge
+        // passive/legacy route discoveries into this authority path.
+        (names, Vec::new())
+    } else if let Some(session) = lookup_one_route_session(&names, home, lookup_target) {
         (names, vec![session])
     } else {
         let snap = load_discovery_snapshot(state);
         let sessions = lookup_sessions(&snap, home);
         (snap, sessions)
     };
-    let observed_target = sessions
-        .iter()
-        .find(|s| s.id == session_id.trim() || s.persona.as_deref() == Some(session_id.trim()));
-    let retained_target = if observed_target.is_none() {
+    let observed_target = sessions.iter().find(|s| {
+        s.id == lookup_target.trim() || s.persona.as_deref() == Some(lookup_target.trim())
+    });
+    if authority.is_owner()
+        && claude_binding.is_none()
+        && observed_target.is_some_and(|s| s.adapter == "claude")
+    {
+        return HttpResponse::json(
+            409,
+            json!({"error": "Claude registration is unbound; re-register and resubmit", "delivered": false, "delivery_stage": "refused"}),
+        );
+    }
+    let retained_target = if observed_target.is_none() && claude_binding.is_none() {
         match state.prompt_queue_target(session_id.trim()) {
             Ok(target) => target,
             Err(()) => {
@@ -6933,10 +7246,20 @@ fn handle_post_session_prompt(
             }),
         );
     }
-    let (canonical_session_id, target_persona) = retained_target
+    let (canonical_session_id, target_persona) = claude_binding
         .as_ref()
-        .map(|target| (target.session_id.clone(), target.persona.clone()))
-        .unwrap_or_else(|| resolve_session_target_in(&sessions, session_id));
+        .map(|binding| {
+            (
+                binding.native_session().to_string(),
+                Some(binding.persona_name().to_string()),
+            )
+        })
+        .or_else(|| {
+            retained_target
+                .as_ref()
+                .map(|target| (target.session_id.clone(), target.persona.clone()))
+        })
+        .unwrap_or_else(|| resolve_session_target_in(&sessions, lookup_target));
     let intended_codex_thread_id = match sessions
         .iter()
         .find(|session| session.id == canonical_session_id)
@@ -6969,6 +7292,9 @@ fn handle_post_session_prompt(
         payload.send_now,
         busy,
         crate::DirectPromptInput {
+            claude_terminal: claude_binding.is_some(),
+            claude_binding: claude_binding.clone(),
+            intended_vendor: intended_vendor.clone(),
             queue_target: observed_target
                 .and_then(|session| crate::PromptQueueTarget::observed(session, session_id)),
             intended_codex_thread_id: intended_codex_thread_id.clone(),
@@ -7032,11 +7358,17 @@ fn handle_post_session_prompt(
         &effective_body,
         operator_prompt_intent(authority, payload.send_now),
         intended_codex_thread_id.as_deref(),
+        claude_binding.is_some(),
+        claude_binding.as_ref(),
+        intended_vendor.as_deref(),
         #[cfg(test)]
         false,
     );
     match &delivery_res {
         Err(OperatorPromptError::Steer(CodexSteerError::Refused { .. })) => {}
+        Err(OperatorPromptError::Push(
+            PushError::NotConnected(message) | PushError::Failed(message),
+        )) if message.contains("re-register and resubmit") => {}
         Err(OperatorPromptError::Push(PushError::NotConnected(_))) if retained_target.is_some() => {
         }
         Ok(OperatorPromptOutcome::AppServerAccepted { .. })
@@ -7140,6 +7472,68 @@ pub(crate) fn with_hydrate_lock<T>(body: impl FnOnce() -> T) -> T {
     body()
 }
 
+#[cfg(test)]
+thread_local! {
+    static SESSION_CLEAR_LOGS: std::cell::RefCell<Vec<String>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+#[cfg(test)]
+fn take_session_clear_logs() -> Vec<String> {
+    SESSION_CLEAR_LOGS.with(|logs| std::mem::take(&mut *logs.borrow_mut()))
+}
+
+fn sanitise_log_field(value: &str) -> String {
+    if value.is_empty() {
+        return "unknown".to_string();
+    }
+    let sanitised: String = value
+        .chars()
+        .take(64)
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | ':' | '-') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if sanitised.is_empty() {
+        "unknown".to_string()
+    } else {
+        sanitised
+    }
+}
+
+/// One hub log line per session-clear request (#575). No composer or prompt content.
+/// Actor/persona (and the other fields) are sanitised so crafted ids containing
+/// whitespace or control characters cannot forge additional log lines.
+fn session_clear_log_line(
+    actor: &str,
+    persona: Option<&str>,
+    vendor: &str,
+    mode: &str,
+    outcome: &str,
+) -> String {
+    format!(
+        "hub: session clear actor={} persona={} vendor={} mode={} outcome={}",
+        sanitise_log_field(actor),
+        persona
+            .map(sanitise_log_field)
+            .unwrap_or_else(|| "-".to_string()),
+        sanitise_log_field(vendor),
+        sanitise_log_field(mode),
+        sanitise_log_field(outcome)
+    )
+}
+
+fn log_session_clear(actor: &str, persona: Option<&str>, vendor: &str, mode: &str, outcome: &str) {
+    let line = session_clear_log_line(actor, persona, vendor, mode, outcome);
+    #[cfg(test)]
+    SESSION_CLEAR_LOGS.with(|logs| logs.borrow_mut().push(line.clone()));
+    eprintln!("{line}");
+}
+
 /// `POST /api/v1/sessions/:id/clear` (mode `clear` or `reforge`): drop the session's queued
 /// prompts and model override and reset its live route; `reforge` then sends the synthesized
 /// startup prompt. Owner only (403 for a Peer, checked before the body is read and before any
@@ -7178,25 +7572,54 @@ fn handle_post_session_clear(
         }
     };
 
-    let (canonical_id, persona) = resolve_session_target(state, session_id);
+    // Reset target resolution reads saved metadata only. General discovery can probe
+    // terminals, including an unsupported route that is about to refuse the request.
+    let snap = load_discovery_snapshot(state);
+    let targets =
+        crate::discovery::saved_reset_targets(&snap, state.config.home_override.as_deref());
+    let requested = session_id.trim();
+    let Some((canonical_id, persona, route)) = targets.iter().find(|(id, persona, route)| {
+        id == requested
+            || persona.eq_ignore_ascii_case(requested)
+            || route_matches_session_id(route, requested)
+    }) else {
+        log_session_clear(authority.actor_name(), Some(requested), "-", mode, "failed");
+        return HttpResponse::json(
+            404,
+            json!({
+                "error": "no saved route for this session; refresh or register the session, then try again"
+            }),
+        );
+    };
+    if let Err(refusal) = preflight_session_reset(route) {
+        log_session_clear(
+            authority.actor_name(),
+            Some(persona.as_str()),
+            route.canonical_vendor(),
+            mode,
+            "refused",
+        );
+        return HttpResponse::json(409, json!(refusal));
+    }
     match reset_session(
         state,
         authority.actor_name(),
         session_id,
-        &canonical_id,
-        persona.as_deref(),
+        canonical_id,
+        Some(persona.as_str()),
         mode,
     ) {
         Ok(data) => HttpResponse::json(200, data),
-        Err((status, error)) => HttpResponse::json(status, json!({ "error": error })),
+        Err((status, error)) => HttpResponse::json(status, error),
     }
 }
 
-/// Clear or reforge one session: prepare the reforge prompt, then drop queued prompts and model
-/// overrides and reset the live vendor route. `mode` is `"clear"` or `"reforge"`. `raw_session_id`
+/// Clear or reforge one session: select and preflight its route, prepare guidance, then drop
+/// queued prompts and model overrides and reset the live vendor route. `mode` is `"clear"` or `"reforge"`. `raw_session_id`
 /// is the id the caller used (its queue is dropped too); `canonical_id` and `persona` come from
-/// [`resolve_session_target`]. Returns the response body, or `(status, error)`: 404 when there
-/// is no agent record (reforge) or no live route, 502 when the dispatch itself fails.
+/// the saved reset target metadata. Returns the response body, or `(status, error)`: 404 when there
+/// is no agent record (reforge) or no live route, 409 for an unsupported reset, and 502
+/// when the dispatch itself fails. Error bodies retain structured refusal fields.
 /// Shared by the single-session clear handler and the bulk action.
 fn reset_session(
     state: &HubState,
@@ -7205,13 +7628,67 @@ fn reset_session(
     canonical_id: &str,
     persona: Option<&str>,
     mode: &str,
-) -> Result<Value, (u16, String)> {
+) -> Result<Value, (u16, Value)> {
+    reset_session_with_prompt(
+        state,
+        actor,
+        raw_session_id,
+        canonical_id,
+        persona,
+        mode,
+        || build_reforge_prompt(state, persona.unwrap_or(canonical_id)),
+    )
+}
+
+/// Prepare guidance only after the selected route passes the pure reset policy. Retain that
+/// route through dispatch: re-resolving it could send a reset to a different conversation.
+fn reset_session_with_prompt(
+    state: &HubState,
+    actor: &str,
+    raw_session_id: &str,
+    canonical_id: &str,
+    persona: Option<&str>,
+    mode: &str,
+    prepare_prompt: impl FnOnce() -> Result<String, LifecycleError>,
+) -> Result<Value, (u16, Value)> {
+    let route = match crate::lifecycle::lookup_reset_route_read_only(
+        state.config.home_override.as_deref(),
+        session_route_query(persona, canonical_id),
+    ) {
+        Some(route) => route,
+        None => {
+            log_session_clear(actor, persona.or(Some(canonical_id)), "-", mode, "failed");
+            return Err((
+                404,
+                json!({ "error": no_route_error(persona, canonical_id) }),
+            ));
+        }
+    };
+    let vendor = route.canonical_vendor().to_string();
+    if let Err(refusal) = preflight_session_reset(&route) {
+        log_session_clear(
+            actor,
+            persona.or(Some(canonical_id)),
+            &vendor,
+            mode,
+            "refused",
+        );
+        return Err((409, json!(refusal)));
+    }
     // Fallible guidance preparation must not erase queues or model choices on refusal.
     let prompt = if mode == "reforge" {
-        let lookup = persona.unwrap_or(canonical_id);
-        match build_reforge_prompt(state, lookup) {
+        match prepare_prompt() {
             Ok(prompt) => Some(prompt),
-            Err(error) => return Err((error.status(), error.to_string())),
+            Err(error) => {
+                log_session_clear(
+                    actor,
+                    persona.or(Some(canonical_id)),
+                    &vendor,
+                    mode,
+                    "failed",
+                );
+                return Err((error.status(), json!({ "error": error.to_string() })));
+            }
         }
     } else {
         None
@@ -7242,16 +7719,26 @@ fn reset_session(
     };
     // A reset runs once: after its `/clear` or `/new` lands the session has changed, so a reset
     // that then fails is never run again on another route.
-    let reset = crate::lifecycle::dispatch_once(
-        state.config.home_override.as_deref(),
-        session_route_query(persona, canonical_id),
-        |route| clear_or_reforge_session(route, reset_mode, actor, prompt.as_deref()),
-    )
-    .ok_or_else(|| no_route_error(persona, canonical_id))
-    .map_err(|e| (404, e))?;
+    let reset = clear_or_reforge_session(&route, reset_mode, actor, prompt.as_deref());
     // A clear can start a new vendor session (a new id) behind the same persona.
     crate::discovery::invalidate_route_discovery_cache();
-    reset.map_err(|e| (502, e))?;
+    if let Err(e) = reset {
+        log_session_clear(
+            actor,
+            persona.or(Some(canonical_id)),
+            &vendor,
+            mode,
+            "failed",
+        );
+        return Err((502, json!({ "error": e })));
+    }
+    log_session_clear(
+        actor,
+        persona.or(Some(canonical_id)),
+        &vendor,
+        mode,
+        "dispatched",
+    );
 
     let data = json!({
         "ok": true,
@@ -7930,7 +8417,7 @@ fn handle_post_session_context_window(
 }
 
 /// `POST /api/v1/sessions/bulk-action` (Record 44): run `compact`, `clear` or `reforge` on
-/// every discovered session that has a live route. Owner only. One failure never stops the
+/// sessions with saved routes (Clear/Reforge), or discovered live routes (Compact). Owner only. One failure never stops the
 /// batch; each session reports its own result.
 fn handle_post_session_bulk_action(
     state: &HubState,
@@ -7959,24 +8446,39 @@ fn handle_post_session_bulk_action(
     }
 
     let snap = load_discovery_snapshot(state);
-    let targets: Vec<(String, Option<String>)> =
+    let targets: Vec<(String, Option<String>)> = if action == "compact" {
         discover_route_sessions_without_model_info(&snap, state.config.home_override.as_deref())
             .into_iter()
             .filter(|s| s.source == "route")
             .map(|s| (s.id, s.persona))
-            .collect();
+            .collect()
+    } else {
+        // Clear/Reforge enumerate saved routes only; do not probe unsupported sessions
+        // merely to discover that their reset cannot be confirmed.
+        crate::discovery::saved_reset_targets(&snap, state.config.home_override.as_deref())
+            .into_iter()
+            .map(|(id, persona, _)| (id, Some(persona)))
+            .collect()
+    };
     let actor = authority.actor_name();
     let mut results = Vec::with_capacity(targets.len());
     for (id, persona) in &targets {
-        let outcome: Result<(), String> = match action.as_str() {
-            "compact" => compact_session(state, actor, id, persona.as_deref()),
-            mode => reset_session(state, actor, id, id, persona.as_deref(), mode)
-                .map(|_| ())
-                .map_err(|(_, error)| error),
+        let outcome = match action.as_str() {
+            "compact" => compact_session(state, actor, id, persona.as_deref())
+                .map_err(|error| (502, json!({ "error": error }))),
+            mode => reset_session(state, actor, id, id, persona.as_deref(), mode).map(|_| ()),
         };
         results.push(match outcome {
             Ok(()) => json!({ "session_id": id, "ok": true }),
-            Err(error) => json!({ "session_id": id, "ok": false, "error": error }),
+            Err((status, mut error)) => {
+                // Compact and legacy reset errors keep their original per-item shape.
+                if error["code"] == "reset_unsupported" {
+                    error["status"] = json!(status);
+                }
+                error["session_id"] = json!(id);
+                error["ok"] = json!(false);
+                error
+            }
         });
     }
     let succeeded = results.iter().filter(|r| r["ok"] == true).count();
@@ -8013,6 +8515,12 @@ fn handle_get_commands(state: &HubState) -> HttpResponse {
 }
 
 fn lifecycle_error_response(err: &LifecycleError) -> HttpResponse {
+    if let LifecycleError::PrerequisiteUnavailable { code, detail } = err {
+        return HttpResponse::json(
+            err.status(),
+            json!({ "error": err.to_string(), "code": code, "detail": detail }),
+        );
+    }
     HttpResponse::json(err.status(), json!({ "error": err.to_string() }))
 }
 
@@ -8046,26 +8554,31 @@ fn handle_post_session_spin_up(
             json!({ "error": "only Owner authority may choose a session's context window" }),
         );
     }
-    let Ok(store) = open_store_response(state) else {
-        return store_open_failure();
-    };
-    // Resolve project bindings before falling back to the workspace for a virtual scope.
-    let mut payload = payload.with_default_cwd_for_home(
-        &*store,
-        &resolve_workspace_root(&state.config.repo_root),
-        state.config.home_override.as_deref(),
-    );
-    if payload.context_window.is_none() {
-        payload.context_window = default_context_window_for(state, &payload);
+    if let Err(error) = payload.validate_request() {
+        return lifecycle_error_response(&error);
     }
-    match lifecycle::spin_up_with_store(
-        store,
-        || state.open_store().map_err(LifecycleError::from),
-        &lifecycle_env(state),
-        &payload,
-        authority.actor_name(),
-        caller_of(authority),
-    ) {
+    let env = lifecycle_env(state);
+    let persona = payload.persona.clone();
+    match lifecycle::with_lifecycle_fence(&env, &persona, "spin-up", |env| {
+        let store = state.open_store().map_err(LifecycleError::from)?;
+        // Resolve bindings only after ownership, and repeat lifecycle validation under it.
+        let mut payload = payload.with_default_cwd_for_home(
+            &*store,
+            &resolve_workspace_root(&state.config.repo_root),
+            state.config.home_override.as_deref(),
+        );
+        if payload.context_window.is_none() {
+            payload.context_window = default_context_window_for(state, &payload);
+        }
+        lifecycle::spin_up_with_store(
+            store,
+            || state.open_store().map_err(LifecycleError::from),
+            env,
+            &payload,
+            authority.actor_name(),
+            caller_of(authority),
+        )
+    }) {
         Ok(out) => {
             // A new run has its own model: drop what the operator chose for an earlier one.
             state.clear_session_model_override(&out.session_id);
@@ -8105,6 +8618,81 @@ fn default_context_window_for(state: &HubState, req: &SpinUpRequest) -> Option<u
     crate::context_window::applicable_default(&defaults, &vendor, model, Some(&home))
 }
 
+#[cfg(test)]
+thread_local! {
+    static AFTER_LIFECYCLE_CANDIDATE_READ: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        std::cell::RefCell::new(None);
+    static BEFORE_LIFECYCLE_ARTIFACT_READ: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        std::cell::RefCell::new(None);
+    pub(crate) static BEFORE_REMODEL_STORE_READ: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        std::cell::RefCell::new(None);
+}
+
+// A saved record locates its persona without probing a runtime before ownership. Discovery
+// remains necessary only for an unmanaged/native target with no matching hosted record.
+fn lifecycle_candidate(
+    state: &HubState,
+    session_id: &str,
+) -> Result<SessionTarget, LifecycleError> {
+    let (saved, snap) = {
+        let store = state.try_open_lifecycle_store()?;
+        let saved = lifecycle::find_hosted_session(&*store, &[session_id])?;
+        // Unmanaged discovery must reuse this nonblocking read, never reopen through
+        // the generic blocking discovery helper after another operation can take the store.
+        let snap = if saved.is_none() {
+            snapshot_discovery_store(&store)
+        } else {
+            DiscoveryStoreSnapshot::default()
+        };
+        (saved, snap)
+    };
+    #[cfg(test)]
+    AFTER_LIFECYCLE_CANDIDATE_READ.with_borrow_mut(|hook| {
+        if let Some(f) = hook.take() {
+            f();
+        }
+    });
+    let discovered = saved
+        .map(|record| (record.session_id, Some(record.persona)))
+        .unwrap_or_else(|| resolve_session_target_from_snapshot(state, &snap, session_id));
+    let store = state.try_open_lifecycle_store()?;
+    SessionTarget::resolve(&*store, session_id, Some(discovered))
+}
+
+pub(crate) fn owned_lifecycle_target<'a>(
+    state: &'a HubState,
+    session_id: &str,
+    persona: &str,
+) -> Result<(crate::HubStoreGuard<'a>, SessionTarget), LifecycleError> {
+    let store = state.open_store().map_err(LifecycleError::from)?;
+    let saved = lifecycle::find_hosted_session(&*store, &[session_id])?;
+    let discovered = if let Some(record) = saved {
+        (record.session_id, Some(record.persona))
+    } else {
+        let snap = snapshot_discovery_store(&store);
+        drop(store);
+        let discovered = resolve_session_target_from_snapshot(state, &snap, session_id);
+        let store = state.open_store().map_err(LifecycleError::from)?;
+        return checked_owned_target(store, session_id, persona, discovered);
+    };
+    checked_owned_target(store, session_id, persona, discovered)
+}
+
+fn checked_owned_target<'a>(
+    store: crate::HubStoreGuard<'a>,
+    session_id: &str,
+    persona: &str,
+    discovered: (String, Option<String>),
+) -> Result<(crate::HubStoreGuard<'a>, SessionTarget), LifecycleError> {
+    let target = SessionTarget::resolve(&*store, session_id, Some(discovered))?;
+    if !target.persona.eq_ignore_ascii_case(persona) {
+        return Err(LifecycleError::Conflict(
+            "lifecycle target changed during selection".into(),
+        ));
+    }
+    Ok((store, target))
+}
+
 /// `POST /api/v1/sessions/:id/decommission` (`prepare` or `teardown`, see
 /// [`lifecycle::prepare_decommission`] and [`lifecycle::teardown_session`]). Owner only: 403 for
 /// a Peer, checked before the body is read and before any discovery, store access or side effect.
@@ -8135,83 +8723,114 @@ fn handle_post_session_decommission(
         Err(e) => return lifecycle_error_response(&e),
     };
 
-    // Resolve before taking the store guard: discovery opens the store itself.
-    let discovered = resolve_session_target(state, session_id);
-    let discovered_id = discovered.0.clone();
-    // Read-only discovery of what the session's transcript and brain reference; it opens the
-    // store itself, so it runs before the guard below. Nothing is archived until the teardown
-    // gate has passed.
-    let artifact_candidates = if mode == DecommissionMode::Teardown {
-        discover_session_artifact_candidates(state, session_id, &discovered_id)
-    } else {
-        Vec::new()
-    };
-    let by = authority.actor_name();
-    let env = lifecycle_env(state);
-    let Ok(store) = open_store_response(state) else {
-        return store_open_failure();
-    };
-    let target = match SessionTarget::resolve(&*store, session_id, Some(discovered)) {
+    let target = match lifecycle_candidate(state, session_id) {
         Ok(target) => target,
         Err(e) => return lifecycle_error_response(&e),
     };
-    let caller = caller_of(authority);
-    let result = match mode {
-        DecommissionMode::Prepare => {
-            lifecycle::prepare_decommission(&*store, &env, &target, by, caller)
-        }
-        DecommissionMode::Teardown => {
-            // Keep the session's artifacts before the teardown lets its worktree go. Asking the
-            // teardown's own gate first means a refused caller archives nothing. Best effort:
-            // archive_session_artifacts logs and swallows its failures, so the teardown and its
-            // status never depend on it.
-            if lifecycle::authorize_teardown(&*store, &target, caller).is_ok() {
-                archive_session_artifacts(state, &target, &discovered_id, artifact_candidates);
+    let persona = target.persona.clone();
+    let by = authority.actor_name();
+    let env = lifecycle_env(state);
+    match lifecycle::with_lifecycle_fence(&env, &persona, "decommission", |env| {
+        #[cfg(test)]
+        BEFORE_LIFECYCLE_ARTIFACT_READ.with_borrow_mut(|hook| {
+            if let Some(f) = hook.take() {
+                f();
             }
-            lifecycle::teardown_session(&*store, &env, &target, by, caller, |key| {
-                state.clear_session_prompt_queue(key);
-                state.clear_session_model_override(key);
-            })
-        }
-    };
-    let out = match result {
-        Ok(out) => out,
-        Err(e) => return lifecycle_error_response(&e),
-    };
-    if let (DecommissionMode::Prepare, false, Some(prompt)) =
-        (mode, out.handshake_dispatched, out.prompt.as_ref())
-    {
-        // No live route took the handshake: leave it on the session queue for the next idle turn.
-        let (_, queue) = state.enqueue_session_prompt(
-            &target.session_id,
-            Some(target.persona.clone()),
-            prompt.clone(),
-            prompt.clone(),
-            by.to_string(),
-            Vec::new(),
-        );
-        state.broadcast(
-            "session",
-            "queue_updated",
-            json!({
-                "session_id": target.session_id,
-                "persona": target.persona,
-                "is_busy": true,
-                "queue": queue,
-            }),
-        );
+        });
+        let (store, target) = owned_lifecycle_target(state, session_id, &persona)?;
+        let discovered_id = target.discovered_id.clone();
+        let (store, target, artifact_candidates) = if mode == DecommissionMode::Teardown {
+            let snap = snapshot_discovery_store(&store);
+            drop(store);
+            let artifacts = discover_session_artifact_candidates_from_snapshot(
+                state,
+                &snap,
+                session_id,
+                &discovered_id,
+            );
+            let (store, target) = owned_lifecycle_target(state, session_id, &persona)?;
+            if target.discovered_id != discovered_id {
+                return Err(LifecycleError::Conflict(
+                    "lifecycle discovery changed during selection".into(),
+                ));
+            }
+            (store, target, artifacts)
+        } else {
+            (store, target, Vec::new())
+        };
+        let target = lifecycle::reload_lifecycle_target_policy(
+            &*store,
+            &target,
+            mode == DecommissionMode::Teardown,
+        )?;
+        Ok((|| {
+            let caller = caller_of(authority);
+            let result = match mode {
+                DecommissionMode::Prepare => {
+                    lifecycle::prepare_decommission(&*store, env, &target, by, caller)
+                }
+                DecommissionMode::Teardown => {
+                    // Keep the session's artifacts before the teardown lets its worktree go. Asking the
+                    // teardown's own gate first means a refused caller archives nothing. Best effort:
+                    // archive_session_artifacts logs and swallows its failures, so the teardown and its
+                    // status never depend on it.
+                    if lifecycle::authorize_teardown(&*store, &target, caller).is_ok() {
+                        archive_session_artifacts(
+                            state,
+                            &target,
+                            &discovered_id,
+                            artifact_candidates,
+                        );
+                    }
+                    lifecycle::teardown_session(&*store, env, &target, by, caller, |key| {
+                        state.clear_session_prompt_queue(key);
+                        state.clear_session_model_override(key);
+                    })
+                }
+            };
+            let out = match result {
+                Ok(out) => out,
+                Err(e) => return lifecycle_error_response(&e),
+            };
+            if let (DecommissionMode::Prepare, false, Some(prompt)) =
+                (mode, out.handshake_dispatched, out.prompt.as_ref())
+            {
+                // No live route took the handshake: leave it on the session queue for the next idle turn.
+                let (_, queue) = state.enqueue_session_prompt(
+                    &target.session_id,
+                    Some(target.persona.clone()),
+                    prompt.clone(),
+                    prompt.clone(),
+                    by.to_string(),
+                    Vec::new(),
+                );
+                state.broadcast(
+                    "session",
+                    "queue_updated",
+                    json!({
+                        "session_id": target.session_id,
+                        "persona": target.persona,
+                        "is_busy": true,
+                        "queue": queue,
+                    }),
+                );
+            }
+            let data = serde_json::to_value(&out).unwrap_or_default();
+            state.broadcast("sessions", "session.decommission", data.clone());
+            HttpResponse::json(200, data)
+        })())
+    }) {
+        Ok(response) => response,
+        Err(e) => lifecycle_error_response(&e),
     }
-    let data = serde_json::to_value(&out).unwrap_or_default();
-    state.broadcast("sessions", "session.decommission", data.clone());
-    HttpResponse::json(200, data)
 }
 
 /// `POST /api/v1/sessions/:id/remodel` (Local Record 59): move a session to another vendor,
 /// keeping its persona, project, role and worktree (see [`lifecycle::remodel_session`]).
 /// `prepare` asks the session to hand off (queued when no live route takes it); `execute`
-/// replaces it. The store guard is held from target resolution to the end of the handler, past
-/// every queue, model-override and broadcast write, so no other lifecycle request of this hub
-/// runs in between and two remodels of one persona never interleave their writes.
+/// replaces it. The initial store guard is released before acquiring the process-shared
+/// persona fence, then reopened. That fence remains held through rollback, queue, override
+/// and broadcast writes.
 ///
 /// A failed `execute` answers 502 and broadcasts `session.remodel_failed` with its outcome
 /// (`restored` or `down`). When the old session was restored, the operator's model override
@@ -8235,24 +8854,40 @@ fn handle_post_session_remodel(
         Ok(payload) => payload,
         Err(e) => return HttpResponse::json(400, json!({ "error": e })),
     };
-    // Resolve before taking the store guard: discovery opens the store itself.
-    let discovered = resolve_session_target(state, session_id);
-    let by = authority.actor_name();
-    let Ok(store) = open_store_response(state) else {
-        return store_open_failure();
-    };
-    let target = match SessionTarget::resolve(&*store, session_id, Some(discovered)) {
+    let target = match lifecycle_candidate(state, session_id) {
         Ok(target) => target,
         Err(e) => return lifecycle_error_response(&e),
     };
-    let resp = match run_remodel(state, &store, &target, &payload, by, caller_of(authority)) {
-        RemodelRun::Done { data, .. } => HttpResponse::json(200, data),
-        RemodelRun::Failed { data, .. } => HttpResponse::json(502, data),
-        RemodelRun::Refused(e) => lifecycle_error_response(&e),
-    };
-    // Released only now: every write [`run_remodel`] made belongs to this remodel.
-    drop(store);
-    resp
+    let by = authority.actor_name();
+    let persona = target.persona.clone();
+    let env = lifecycle_env(state);
+    match lifecycle::with_lifecycle_fence(&env, &persona, "remodel", |env| {
+        #[cfg(test)]
+        BEFORE_REMODEL_STORE_READ.with_borrow_mut(|hook| {
+            if let Some(f) = hook.take() {
+                f();
+            }
+        });
+        let (store, target) = owned_lifecycle_target(state, session_id, &persona)?;
+        Ok(
+            match run_remodel(
+                state,
+                &store,
+                env,
+                &target,
+                &payload,
+                by,
+                caller_of(authority),
+            ) {
+                RemodelRun::Done { data, .. } => HttpResponse::json(200, data),
+                RemodelRun::Failed { data, .. } => HttpResponse::json(502, data),
+                RemodelRun::Refused(e) => lifecycle_error_response(&e),
+            },
+        )
+    }) {
+        Ok(response) => response,
+        Err(e) => lifecycle_error_response(&e),
+    }
 }
 
 /// How [`run_remodel`] ended.
@@ -8277,20 +8912,20 @@ pub(crate) enum RemodelRun {
 /// teardown's queue and model-override clearing (and putting the overrides back when a failed
 /// remodel restored the old session), the route-scan drop, the new model override, the
 /// handshake queueing for `prepare`, and the `session.remodeled` / `session.remodel_failed`
-/// broadcast. `store` is the caller's [`HubStoreGuard`]: hold it from target resolution until
-/// after this returns (see [`lifecycle::remodel_session`] on concurrency).
+/// broadcast. The caller acquires the persona fence before reopening `store` and passes
+/// its borrowed proof in `env`; both remain held until this returns.
 pub(crate) fn run_remodel(
     state: &HubState,
     store: &AnyStore,
+    env: &LifecycleEnv<'_>,
     target: &SessionTarget,
     payload: &RemodelRequest,
     by: &str,
     caller: lifecycle::Caller,
 ) -> RemodelRun {
-    let env = lifecycle_env(state);
     // The overrides the teardown clears, as they were, so a restore can put them back.
     let mut cleared_overrides: Vec<(String, ModelOverride)> = Vec::new();
-    let result = lifecycle::remodel_session(store, &env, target, payload, by, caller, |key| {
+    let result = lifecycle::remodel_session(store, env, target, payload, by, caller, |key| {
         for k in [key.to_string(), key.to_ascii_lowercase()] {
             if let Some(o) = state.session_model_override(&k)
                 && !cleared_overrides.iter().any(|(seen, _)| *seen == k)
@@ -8404,16 +9039,36 @@ fn handle_post_hosted_session_restart(
             json!({ "error": "only Owner authority may restart a hosted session" }),
         );
     }
-    let Ok(store) = open_store_response(state) else {
-        return store_open_failure();
+    let selected = (|| {
+        let store = state.try_open_lifecycle_store()?;
+        lifecycle::find_hosted_session(&*store, &[id])?
+            .ok_or_else(|| LifecycleError::NotFound(format!("no hosted session `{id}`")))
+    })();
+    let selected = match selected {
+        Ok(record) => record,
+        Err(e) => return lifecycle_error_response(&e),
     };
-    match lifecycle::restart_hosted_session_with_store(
-        store,
-        || state.open_store().map_err(LifecycleError::from),
-        &lifecycle_env(state),
-        id,
-        authority.actor_name(),
-    ) {
+    let env = lifecycle_env(state);
+    let result = lifecycle::with_lifecycle_fence(&env, &selected.persona, "restart", |env| {
+        let store = state.open_store().map_err(LifecycleError::from)?;
+        let current = lifecycle::find_hosted_session(&*store, &[id])?
+            .ok_or_else(|| LifecycleError::NotFound(format!("no hosted session `{id}`")))?;
+        if current.session_id != selected.session_id
+            || !current.persona.eq_ignore_ascii_case(&selected.persona)
+        {
+            return Err(LifecycleError::Conflict(
+                "restart target changed during selection".into(),
+            ));
+        }
+        lifecycle::restart_hosted_session_with_store(
+            store,
+            || state.open_store().map_err(LifecycleError::from),
+            env,
+            &current.session_id,
+            authority.actor_name(),
+        )
+    });
+    match result {
         Ok(out) => {
             let data = serde_json::to_value(&out).unwrap_or_default();
             state.broadcast("sessions", "session.restarted", data.clone());
@@ -10986,6 +11641,51 @@ mod tests {
             );
         }
     }
+    #[test]
+    fn prerequisite_refusal_http_response_has_named_code_and_detail() {
+        let response = lifecycle_error_response(&LifecycleError::PrerequisiteUnavailable {
+            code: "codex_app_server_unavailable".into(),
+            detail: "/private/control.sock: NotFound".into(),
+        });
+        assert_eq!(response.status, 409);
+        let body = response.json_value().unwrap();
+        assert_eq!(body["code"], "codex_app_server_unavailable");
+        assert_eq!(body["detail"], "/private/control.sock: NotFound");
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap()
+                .contains("clean systemd user unit")
+        );
+    }
+
+    // CI only: isolated store response contract consumed by FerroDeck (#577).
+    #[test]
+    fn hosted_sessions_http_response_preserves_launch_prerequisite_fields() {
+        let (_tmp, state) = roles_test_state();
+        let record: lifecycle::HostedSessionRecord = serde_json::from_value(json!({
+            "session_id":"codex:ada", "persona":"ada", "project":"ferroloop", "role":"assistant",
+            "vendor":"codex", "model":null, "node_id":"ai-lab-0", "hosted":true, "status":"stopped",
+            "stop_reason":"prerequisite_unavailable", "launch_prerequisite_detail":"/private/control.sock: NotFound",
+            "restart_policy":"on-failure", "restart_count":0, "tmux_target":null, "cwd":null,
+            "hydration_dispatched":false, "created_at_ms":1, "updated_at_ms":1, "decommission_prepared_at_ms":null
+        })).unwrap();
+        {
+            let store = state.open_store().unwrap();
+            lifecycle::persist_hosted_session(&*store, &record, "test").unwrap();
+        }
+        let response = handle_get_hosted_sessions(&state);
+        assert_eq!(response.status, 200);
+        let json = response.json_value().unwrap();
+        assert_eq!(
+            json["sessions"][0]["stop_reason"],
+            "prerequisite_unavailable"
+        );
+        assert_eq!(
+            json["sessions"][0]["launch_prerequisite_detail"],
+            "/private/control.sock: NotFound"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -11411,6 +12111,706 @@ mod council_guidance_tests {
     }
 
     #[test]
+    fn unsupported_clear_refuses_before_queue_model_or_route_mutation() {
+        use fl_wire::identity::{RouteTable, VendorRoute};
+        let tmp = TempDir::new().unwrap();
+        let state = HubState::new(HubServerConfig {
+            store_path: tmp.path().join("store.redb"),
+            repo_root: tmp.path().into(),
+            home_override: Some(tmp.path().into()),
+            ..HubServerConfig::default()
+        });
+        let mut routes = RouteTable::default();
+        routes.upsert(
+            "ada",
+            VendorRoute::Codex {
+                thread_id: "fixture-thread".into(),
+                cwd: None,
+            },
+            stamp::now(),
+        );
+        let path = tmp.path().join(".cache/agent-bus/routes.json");
+        routes.save(Some(&path)).unwrap();
+        let keys = ["codex-fixture-thread", "raw-alias", "ada"];
+        for key in keys {
+            state.prompt_queues.lock().unwrap().enqueue(
+                key,
+                crate::DirectPromptInput {
+                    claude_terminal: false,
+                    claude_binding: None,
+                    intended_vendor: None,
+                    queue_target: None,
+                    intended_codex_thread_id: None,
+                    persona: Some("ada".into()),
+                    prompt: format!("prompt-{key}"),
+                    effective_body: format!("body-{key}"),
+                    by: "owner".into(),
+                    attachments: vec![],
+                },
+            );
+            state.set_session_model_override(
+                key,
+                session_actions::ModelOverride::new(format!("model-{key}"), None),
+            );
+        }
+        let before: Vec<_> = keys
+            .iter()
+            .map(|key| (state.session_queue(key), state.session_model_override(key)))
+            .collect();
+        let route_bytes = fs::read(&path).unwrap();
+        let invalidations =
+            crate::discovery::cost_counters::ROUTE_CACHE_INVALIDATIONS.with(Cell::get);
+        let mut events = state.subscribe();
+        let error =
+            reset_session(&state, "owner", keys[1], keys[0], Some(keys[2]), "clear").unwrap_err();
+        assert_eq!(error.0, 409, "{error:?}");
+        for (key, expected) in keys.iter().zip(before) {
+            assert_eq!(
+                (state.session_queue(key), state.session_model_override(key)),
+                expected,
+                "{key}"
+            );
+        }
+        assert_eq!(fs::read(path).unwrap(), route_bytes);
+        assert_eq!(
+            crate::discovery::cost_counters::ROUTE_CACHE_INVALIDATIONS.with(Cell::get),
+            invalidations
+        );
+        assert!(events.try_recv().is_err());
+    }
+
+    fn unsupported_reset_routes() -> Vec<fl_wire::identity::VendorRoute> {
+        use fl_wire::identity::VendorRoute;
+        let mut routes = vec![
+            VendorRoute::Codex {
+                thread_id: "thread-fixture".into(),
+                cwd: None,
+            },
+            VendorRoute::Muse {
+                session_id: "muse-fixture".into(),
+                cwd: None,
+                tmux_target: Some("unprobed-muse".into()),
+                tmux_pane: None,
+            },
+            VendorRoute::Grok {
+                session_id: "grok-fixture".into(),
+                cwd: None,
+                tmux_target: Some("unprobed-grok".into()),
+                tmux_pane: None,
+            },
+        ];
+        for vendor in ["host_cli", " ClAuDe ", " CoDeX "] {
+            routes.push(VendorRoute::HostCli {
+                vendor: vendor.into(),
+                session_id: format!("host-fixture-{}", routes.len()),
+                cwd: None,
+                tmux_target: Some("unprobed-host".into()),
+                tmux_pane: Some("%987654".into()),
+            });
+        }
+        routes
+    }
+
+    fn seed_reset_choices(state: &HubState, keys: &[&str]) {
+        for key in keys {
+            state.prompt_queues.lock().unwrap().enqueue(
+                key,
+                crate::DirectPromptInput {
+                    claude_terminal: false,
+                    claude_binding: None,
+                    intended_vendor: None,
+                    queue_target: None,
+                    intended_codex_thread_id: None,
+                    persona: Some("ada".into()),
+                    prompt: format!("prompt-{key}"),
+                    effective_body: format!("body-{key}"),
+                    by: "owner".into(),
+                    attachments: vec![],
+                },
+            );
+            state.set_session_model_override(
+                key,
+                session_actions::ModelOverride::new(
+                    format!("model-{key}"),
+                    Some("thinking-fixture".into()),
+                ),
+            );
+        }
+    }
+
+    fn assert_reset_refusal(body: &Value, vendor: &str) {
+        assert_eq!(body["code"], "reset_unsupported", "{body}");
+        assert_eq!(body["vendor"], vendor, "{body}");
+        assert_eq!(body["reason"], "identity_unconfirmable");
+        assert_eq!(body["alternative"], "remodel_same_vendor");
+        let message = body["error"].as_str().unwrap();
+        assert!(message.contains("same vendor"), "{message}");
+        assert!(!message.starts_with('{'));
+    }
+
+    #[test]
+    fn unsupported_resets_preserve_aliases_and_skip_guidance_and_discovery() {
+        use fl_wire::identity::RouteTable;
+        for route in unsupported_reset_routes() {
+            for mode in ["clear", "reforge"] {
+                let tmp = TempDir::new().unwrap();
+                let state = HubState::new(HubServerConfig {
+                    store_path: tmp.path().join("store.redb"),
+                    repo_root: tmp.path().into(),
+                    home_override: Some(tmp.path().into()),
+                    ..HubServerConfig::default()
+                });
+                let vendor = route.canonical_vendor().to_owned();
+                let id = route.session_identity().unwrap().1.to_owned();
+                let mut routes = RouteTable::default();
+                routes.upsert("ada", route.clone(), stamp::now());
+                let path = tmp.path().join(".cache/agent-bus/routes.json");
+                routes.save(Some(&path)).unwrap();
+                // No scan has ever been saved for this fixture: the saved route is stale.
+                assert!(!crate::discovery::saved_routes_fresh(
+                    Some(tmp.path()),
+                    std::time::Instant::now()
+                ));
+                let keys = [id.as_str(), "raw-alias", "ada"];
+                seed_reset_choices(&state, &keys);
+                let before: Vec<_> = keys
+                    .iter()
+                    .map(|key| (state.session_queue(key), state.session_model_override(key)))
+                    .collect();
+                let route_bytes = fs::read(&path).unwrap();
+                let invalidations =
+                    crate::discovery::cost_counters::ROUTE_CACHE_INVALIDATIONS.with(Cell::get);
+                let mut events = state.subscribe();
+                let (error, costs) = crate::discovery::cost_counters::measure(|| {
+                    reset_session_with_prompt(
+                        &state,
+                        "owner",
+                        keys[1],
+                        keys[0],
+                        Some(keys[2]),
+                        mode,
+                        || panic!("unsupported route must not prepare guidance or run a helper"),
+                    )
+                    .unwrap_err()
+                });
+                assert_eq!(error.0, 409);
+                assert_reset_refusal(&error.1, &vendor);
+                assert_eq!(
+                    costs.route_scans, 0,
+                    "stale unsupported route must never scan/probe"
+                );
+                assert_eq!(
+                    costs.store_opens, 0,
+                    "must refuse before guidance authority lookup"
+                );
+                for (key, expected) in keys.iter().zip(before) {
+                    assert_eq!(
+                        (state.session_queue(key), state.session_model_override(key)),
+                        expected,
+                        "{mode}: {key}"
+                    );
+                }
+                assert_eq!(fs::read(path).unwrap(), route_bytes);
+                assert_eq!(
+                    crate::discovery::cost_counters::ROUTE_CACHE_INVALIDATIONS.with(Cell::get),
+                    invalidations
+                );
+                assert!(
+                    events.try_recv().is_err(),
+                    "no cleared event or startup prompt"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn single_and_bulk_unsupported_resets_expose_structured_conflicts() {
+        use fl_wire::identity::RouteTable;
+        for mode in ["clear", "reforge"] {
+            let tmp = TempDir::new().unwrap();
+            let state = HubState::new(HubServerConfig {
+                store_path: tmp.path().join("store.redb"),
+                repo_root: tmp.path().into(),
+                home_override: Some(tmp.path().into()),
+                ..HubServerConfig::default()
+            });
+            let owner = HubAuthority::Owner {
+                login: "owner".into(),
+            };
+            let peer = HubAuthority::Peer {
+                agent: Some("peer".into()),
+            };
+            let mut routes = RouteTable::default();
+            let mut targets = vec![];
+            for (n, route) in unsupported_reset_routes().into_iter().enumerate() {
+                let persona = format!("fixture-{n}");
+                let vendor = route.canonical_vendor().to_owned();
+                let id = route.session_identity().unwrap().1.to_owned();
+                seed_reset_choices(&state, &[&persona, &id]);
+                routes.upsert(&persona, route, stamp::now());
+                targets.push((persona, id, vendor));
+            }
+            let path = tmp.path().join(".cache/agent-bus/routes.json");
+            routes.save(Some(&path)).unwrap();
+            let route_bytes = fs::read(&path).unwrap();
+            let invalidations =
+                crate::discovery::cost_counters::ROUTE_CACHE_INVALIDATIONS.with(Cell::get);
+            let mut events = state.subscribe();
+            for (persona, id, vendor) in &targets {
+                let req =
+                    HttpRequest::new("POST", "/fixture").with_json_body(&json!({"mode":mode}));
+                let denied = handle_post_session_clear(&state, &peer, persona, &req);
+                assert_eq!(denied.status, 403);
+                for alias in [persona.clone(), id.clone(), persona.to_ascii_uppercase()] {
+                    let (response, costs) = crate::discovery::cost_counters::measure(|| {
+                        handle_post_session_clear(&state, &owner, &alias, &req)
+                    });
+                    assert_eq!(
+                        costs.route_scans, 0,
+                        "unsupported HTTP reset must not discover/probe"
+                    );
+                    assert_eq!(
+                        response.status,
+                        409,
+                        "{}",
+                        String::from_utf8_lossy(&response.body)
+                    );
+                    assert_reset_refusal(&response.json_value().unwrap(), vendor);
+                }
+            }
+            let (bulk, costs) = crate::discovery::cost_counters::measure(|| {
+                handle_post_session_bulk_action(
+                    &state,
+                    &owner,
+                    &HttpRequest::new("POST", "/fixture").with_json_body(&json!({"action":mode})),
+                )
+            });
+            assert_eq!(
+                costs.route_scans, 0,
+                "unsupported bulk reset must not discover/probe"
+            );
+            assert_eq!(bulk.status, 200);
+            let body = bulk.json_value().unwrap();
+            assert_eq!(body["total"], targets.len());
+            assert_eq!(body["succeeded"], 0);
+            for (persona, id, vendor) in &targets {
+                let result = body["results"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|item| item["session_id"] == *id)
+                    .unwrap();
+                assert_eq!(result["status"], 409);
+                assert_eq!(result["ok"], false);
+                assert_reset_refusal(result, vendor);
+                for key in [persona, id] {
+                    assert_eq!(state.session_queue(key).len(), 1);
+                    assert!(state.session_model_override(key).is_some());
+                }
+            }
+            assert_eq!(fs::read(path).unwrap(), route_bytes);
+            assert_eq!(
+                crate::discovery::cost_counters::ROUTE_CACHE_INVALIDATIONS.with(Cell::get),
+                invalidations
+            );
+            let frame = events.try_recv().unwrap();
+            assert_eq!(frame.event, "session.bulk_action");
+            assert!(
+                events.try_recv().is_err(),
+                "no cleared event or startup prompt"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_http_reset_refuses_without_discovery_or_choice_mutation() {
+        let tmp = TempDir::new().unwrap();
+        let state = HubState::new(HubServerConfig {
+            store_path: tmp.path().join("store.redb"),
+            repo_root: tmp.path().into(),
+            home_override: Some(tmp.path().into()),
+            ..HubServerConfig::default()
+        });
+        let owner = HubAuthority::Owner {
+            login: "owner".into(),
+        };
+        seed_reset_choices(&state, &["unsaved-thread"]);
+        let mut events = state.subscribe();
+        for mode in ["clear", "reforge"] {
+            let (response, costs) = crate::discovery::cost_counters::measure(|| {
+                handle_post_session_clear(
+                    &state,
+                    &owner,
+                    "unsaved-thread",
+                    &HttpRequest::new("POST", "/fixture").with_json_body(&json!({"mode":mode})),
+                )
+            });
+            assert_eq!(response.status, 404);
+            assert_eq!(
+                costs.route_scans, 0,
+                "unknown reset must not discover/probe"
+            );
+            let body = response.json_value().unwrap();
+            assert!(
+                body["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("refresh or register")
+            );
+            assert_eq!(state.session_queue("unsaved-thread").len(), 1);
+            assert!(state.session_model_override("unsaved-thread").is_some());
+            assert!(events.try_recv().is_err());
+        }
+    }
+
+    #[test]
+    fn missing_reset_route_preserves_choices_before_prompt_preparation() {
+        let tmp = TempDir::new().unwrap();
+        let state = HubState::new(HubServerConfig {
+            store_path: tmp.path().join("store.redb"),
+            repo_root: tmp.path().into(),
+            home_override: Some(tmp.path().into()),
+            ..HubServerConfig::default()
+        });
+        seed_reset_choices(&state, &["missing"]);
+        for mode in ["clear", "reforge"] {
+            let error = reset_session_with_prompt(
+                &state,
+                "owner",
+                "missing",
+                "missing",
+                Some("missing"),
+                mode,
+                || panic!("missing route must not prepare a prompt"),
+            )
+            .unwrap_err();
+            assert_eq!(error.0, 404);
+            assert_eq!(error.1.as_object().unwrap().len(), 1);
+            assert!(
+                error.1["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("no active vendor route")
+            );
+            assert_eq!(state.session_queue("missing").len(), 1);
+            assert!(state.session_model_override("missing").is_some());
+        }
+    }
+
+    #[test]
+    fn supported_reset_dispatch_failure_retains_plain_error() {
+        use fl_wire::identity::{RouteTable, VendorRoute};
+        let tmp = TempDir::new().unwrap();
+        let state = HubState::new(HubServerConfig {
+            store_path: tmp.path().join("store.redb"),
+            repo_root: tmp.path().into(),
+            home_override: Some(tmp.path().into()),
+            ..HubServerConfig::default()
+        });
+        let mut routes = RouteTable::default();
+        routes.upsert(
+            "ada",
+            VendorRoute::Webhook {
+                socket_path: tmp.path().join("absent-fixture.sock"),
+            },
+            stamp::now(),
+        );
+        routes
+            .save(Some(&tmp.path().join(".cache/agent-bus/routes.json")))
+            .unwrap();
+        let mut events = state.subscribe();
+        let error = reset_session_with_prompt(
+            &state,
+            "owner",
+            "ada",
+            "webhook-ada",
+            Some("ada"),
+            "clear",
+            || panic!("Clear must not prepare guidance"),
+        )
+        .unwrap_err();
+        assert_eq!(error.0, 502);
+        assert_eq!(error.1.as_object().unwrap().len(), 1);
+        assert!(error.1["error"].is_string());
+        assert!(
+            events.try_recv().is_err(),
+            "failed dispatch must not report a clear"
+        );
+    }
+
+    #[test]
+    fn session_clear_log_line_names_actor_persona_vendor_mode_outcome() {
+        assert_eq!(
+            session_clear_log_line("owner", Some("ada"), "codex", "clear", "refused"),
+            "hub: session clear actor=owner persona=ada vendor=codex mode=clear outcome=refused"
+        );
+        assert_eq!(
+            session_clear_log_line("owner", None, "webhook", "reforge", "dispatched"),
+            "hub: session clear actor=owner persona=- vendor=webhook mode=reforge outcome=dispatched"
+        );
+        // Exactly the five labelled fields, in order, with no extra field:
+        // composer/prompt content has no field to ride in on.
+        let line = session_clear_log_line("owner", Some("ada"), "claude", "clear", "failed");
+        assert_eq!(
+            line,
+            "hub: session clear actor=owner persona=ada vendor=claude mode=clear outcome=failed"
+        );
+        assert_eq!(line.split(' ').count(), 8, "{line}");
+        for label in ["actor=", "persona=", "vendor=", "mode=", "outcome="] {
+            assert_eq!(line.matches(label).count(), 1, "{line}");
+        }
+    }
+
+    #[test]
+    fn hub_fence_diagnostic_clamps_recognised_payload_and_caps_log_fields() {
+        assert_eq!(
+            clamp_recognised_composer_payload(Some("/clear".into())),
+            Some("/clear".to_string())
+        );
+        assert_eq!(
+            clamp_recognised_composer_payload(Some("/new".into())),
+            Some("/new".to_string())
+        );
+        assert_eq!(
+            clamp_recognised_composer_payload(Some("owner secret draft".into())),
+            None
+        );
+        assert_eq!(clamp_recognised_composer_payload(None), None);
+        assert_eq!(sanitise_log_field(&"a".repeat(100)), "a".repeat(64));
+        assert_eq!(sanitise_log_field(&"é".repeat(100)).chars().count(), 64);
+    }
+
+    #[test]
+    fn session_clear_log_line_sanitises_crafted_actor_and_persona() {
+        for (actor, persona) in [
+            ("own\ner", Some("ada\n hub: session clear actor=forged")),
+            ("evil actor", Some("a b\tc\rd")),
+            ("a\u{1b}[31m", Some("x\u{0}y")),
+        ] {
+            let line = session_clear_log_line(actor, persona, "codex", "clear", "refused");
+            assert!(!line.contains('\n'), "{line:?}");
+            assert!(!line.contains('\r'), "{line:?}");
+            assert!(!line.contains('\t'), "{line:?}");
+            assert_eq!(line.lines().count(), 1, "{line:?}");
+            // Exactly the five labelled fields, no forged extra field from spaces.
+            assert_eq!(line.matches(" actor=").count(), 1, "{line:?}");
+            assert!(!line.contains(" actor=forged"), "{line:?}");
+            assert!(line.starts_with("hub: session clear actor="), "{line:?}");
+            assert!(
+                line.contains(" vendor=codex mode=clear outcome=refused"),
+                "{line:?}"
+            );
+        }
+        assert_eq!(
+            session_clear_log_line("own\ner", Some("ada lovelace"), "codex", "clear", "refused"),
+            "hub: session clear actor=own_er persona=ada_lovelace vendor=codex mode=clear outcome=refused"
+        );
+        assert_eq!(
+            session_clear_log_line("", Some(""), "codex", "clear", "refused"),
+            "hub: session clear actor=unknown persona=unknown vendor=codex mode=clear outcome=refused"
+        );
+        // Allowed punctuation is preserved.
+        assert_eq!(
+            session_clear_log_line("o.w-n:e_r", Some("a.b-c:d_e"), "codex", "clear", "refused"),
+            "hub: session clear actor=o.w-n:e_r persona=a.b-c:d_e vendor=codex mode=clear outcome=refused"
+        );
+    }
+
+    #[test]
+    fn session_clear_logs_refused_and_dispatched_and_failed() {
+        use fl_wire::identity::{RouteTable, VendorRoute};
+        // Refused: single-session handler with an unsupported route.
+        {
+            let tmp = TempDir::new().unwrap();
+            let state = HubState::new(HubServerConfig {
+                store_path: tmp.path().join("store.redb"),
+                repo_root: tmp.path().into(),
+                home_override: Some(tmp.path().into()),
+                ..HubServerConfig::default()
+            });
+            let owner = HubAuthority::Owner {
+                login: "owner".into(),
+            };
+            let mut routes = RouteTable::default();
+            routes.upsert(
+                "ada",
+                VendorRoute::Codex {
+                    thread_id: "thread-fixture".into(),
+                    cwd: None,
+                },
+                stamp::now(),
+            );
+            routes
+                .save(Some(&tmp.path().join(".cache/agent-bus/routes.json")))
+                .unwrap();
+            let _ = take_session_clear_logs();
+            let response = handle_post_session_clear(
+                &state,
+                &owner,
+                "ada",
+                &HttpRequest::new("POST", "/fixture").with_json_body(&json!({"mode":"clear"})),
+            );
+            assert_eq!(response.status, 409);
+            let logs = take_session_clear_logs();
+            assert_eq!(logs.len(), 1, "{logs:?}");
+            assert!(
+                logs[0].contains("actor=owner")
+                    && logs[0].contains("persona=ada")
+                    && logs[0].contains("vendor=codex")
+                    && logs[0].contains("mode=clear")
+                    && logs[0].contains("outcome=refused"),
+                "{logs:?}"
+            );
+        }
+        // Dispatched: webhook route with a live listener accepts the reset.
+        {
+            let tmp = TempDir::new().unwrap();
+            let state = HubState::new(HubServerConfig {
+                store_path: tmp.path().join("store.redb"),
+                repo_root: tmp.path().into(),
+                home_override: Some(tmp.path().into()),
+                ..HubServerConfig::default()
+            });
+            let sock = tmp.path().join("webhook.sock");
+            let _listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+            let mut routes = RouteTable::default();
+            routes.upsert(
+                "ada",
+                VendorRoute::Webhook { socket_path: sock },
+                stamp::now(),
+            );
+            routes
+                .save(Some(&tmp.path().join(".cache/agent-bus/routes.json")))
+                .unwrap();
+            let _ = take_session_clear_logs();
+            reset_session(&state, "owner", "ada", "webhook-ada", Some("ada"), "clear").unwrap();
+            let logs = take_session_clear_logs();
+            assert_eq!(logs.len(), 1, "{logs:?}");
+            assert!(
+                logs[0].contains("vendor=webhook") && logs[0].contains("outcome=dispatched"),
+                "{logs:?}"
+            );
+        }
+        // Failed: supported route whose dispatch fails (absent webhook socket).
+        {
+            let tmp = TempDir::new().unwrap();
+            let state = HubState::new(HubServerConfig {
+                store_path: tmp.path().join("store.redb"),
+                repo_root: tmp.path().into(),
+                home_override: Some(tmp.path().into()),
+                ..HubServerConfig::default()
+            });
+            let mut routes = RouteTable::default();
+            routes.upsert(
+                "ada",
+                VendorRoute::Webhook {
+                    socket_path: tmp.path().join("absent.sock"),
+                },
+                stamp::now(),
+            );
+            routes
+                .save(Some(&tmp.path().join(".cache/agent-bus/routes.json")))
+                .unwrap();
+            let _ = take_session_clear_logs();
+            let error = reset_session(&state, "owner", "ada", "webhook-ada", Some("ada"), "clear")
+                .unwrap_err();
+            assert_eq!(error.0, 502);
+            let logs = take_session_clear_logs();
+            assert_eq!(logs.len(), 1, "{logs:?}");
+            assert!(logs[0].contains("outcome=failed"), "{logs:?}");
+        }
+        // Bulk refused items each log one refused line via the shared reset path.
+        {
+            let tmp = TempDir::new().unwrap();
+            let state = HubState::new(HubServerConfig {
+                store_path: tmp.path().join("store.redb"),
+                repo_root: tmp.path().into(),
+                home_override: Some(tmp.path().into()),
+                ..HubServerConfig::default()
+            });
+            let owner = HubAuthority::Owner {
+                login: "owner".into(),
+            };
+            let mut routes = RouteTable::default();
+            routes.upsert(
+                "ada",
+                VendorRoute::Codex {
+                    thread_id: "thread-fixture".into(),
+                    cwd: None,
+                },
+                stamp::now(),
+            );
+            routes.upsert(
+                "bob",
+                VendorRoute::Codex {
+                    thread_id: "thread-fixture-bob".into(),
+                    cwd: None,
+                },
+                stamp::now(),
+            );
+            routes
+                .save(Some(&tmp.path().join(".cache/agent-bus/routes.json")))
+                .unwrap();
+            let _ = take_session_clear_logs();
+            let bulk = handle_post_session_bulk_action(
+                &state,
+                &owner,
+                &HttpRequest::new("POST", "/fixture").with_json_body(&json!({"action":"clear"})),
+            );
+            assert_eq!(bulk.status, 200);
+            // Exactly one log line per bulk target (two targets here).
+            let logs = take_session_clear_logs();
+            assert_eq!(logs.len(), 2, "{logs:?}");
+            for persona in ["ada", "bob"] {
+                let count = logs
+                    .iter()
+                    .filter(|l| {
+                        l.contains(&format!("persona={persona}"))
+                            && l.contains("vendor=codex")
+                            && l.contains("outcome=refused")
+                    })
+                    .count();
+                assert_eq!(count, 1, "persona={persona} logs={logs:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn read_only_reset_scan_keeps_supported_session_identity_pinned() {
+        use fl_wire::identity::{RouteTable, VendorRoute};
+        let tmp = TempDir::new().unwrap();
+        let mut routes = RouteTable::default();
+        routes.upsert(
+            "ada",
+            VendorRoute::Claude {
+                pid: 0,
+                session_id: "other-session".into(),
+                socket_path: tmp.path().join("never-connect.sock"),
+                key_path: None,
+            },
+            stamp::now(),
+        );
+        let path = tmp.path().join(".cache/agent-bus/routes.json");
+        routes.save(Some(&path)).unwrap();
+        let before = fs::read(&path).unwrap();
+        let invalidations =
+            crate::discovery::cost_counters::ROUTE_CACHE_INVALIDATIONS.with(Cell::get);
+        let route = crate::lifecycle::lookup_reset_route_read_only(
+            Some(tmp.path()),
+            session_route_query(Some("ada"), "wanted-session"),
+        );
+        assert!(
+            route.is_none(),
+            "a scanned supported route must not cross the requested native ID"
+        );
+        assert_eq!(fs::read(path).unwrap(), before);
+        assert_eq!(
+            crate::discovery::cost_counters::ROUTE_CACHE_INVALIDATIONS.with(Cell::get),
+            invalidations
+        );
+    }
+
+    #[test]
     fn refused_reforge_preflight_preserves_alias_queues_and_model_overrides() {
         use fl_wire::identity::{RouteTable, VendorRoute};
         for corruption in ["deleted", "corrupt"] {
@@ -11473,6 +12873,9 @@ mod council_guidance_tests {
                 state.prompt_queues.lock().unwrap().enqueue(
                     key,
                     crate::DirectPromptInput {
+                        claude_terminal: false,
+                        claude_binding: None,
+                        intended_vendor: None,
                         queue_target: None,
                         intended_codex_thread_id: None,
                         persona: Some("ada".into()),
@@ -11497,7 +12900,13 @@ mod council_guidance_tests {
             let error = reset_session(&state, "owner", keys[1], keys[0], Some(keys[2]), "reforge")
                 .unwrap_err();
             assert_eq!(error.0, 400, "{corruption}: {error:?}");
-            assert!(error.1.contains("missing or deleted"), "{error:?}");
+            assert!(
+                error.1["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("missing or deleted"),
+                "{error:?}"
+            );
             for (key, expected) in keys.iter().zip(before) {
                 assert_eq!(
                     (state.session_queue(key), state.session_model_override(key)),
@@ -12032,6 +13441,7 @@ mod council_guidance_tests {
                         route_dispatch_calls: 2,
                         route_dispatch_calls_saturated: false,
                         registration_generation: None,
+                        recognised_composer_payload: None,
                     }],
                     global_capacity_exhausted: false,
                     diagnostics_partial: false,
@@ -12361,5 +13771,693 @@ mod council_guidance_tests {
             active_body["dispatch_diagnostics"]["records"][0]["decisive_reason"],
             "dead_explicit_route"
         );
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod claude_registration_binding_tests {
+    use super::*;
+    use fl_core::at::At;
+    use fl_wire::identity::{RouteEntry, RouteTable, VendorRoute, proc_start_time_ticks};
+    use fl_wire::vendor_adapter::ClaudeRegistrationBinding;
+
+    fn fixture() -> (
+        tempfile::TempDir,
+        HubState,
+        PathBuf,
+        RouteEntry,
+        ClaudeRegistrationBinding,
+    ) {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("routes.json");
+        let pid = std::process::id();
+        let entry = RouteEntry {
+            persona: "ada".into(),
+            route: VendorRoute::Claude {
+                pid,
+                session_id: "dce797a0-d963-4c1b-a06b-7fa6bffda7fa".into(),
+                socket_path: tmp.path().join("peer.sock"),
+                key_path: Some(tmp.path().join("fixture.key")),
+            },
+            updated_at: At::from_unix_millis(1),
+            identity_at: None,
+            explicit: true,
+            hosted_id: Some("claude:ada".into()),
+            hydration_generation: Some("one".into()),
+            pid_start_time: proc_start_time_ticks(pid),
+        };
+        write(&path, &entry);
+        let binding = ClaudeRegistrationBinding::from_intent(path.clone(), "ada")
+            .unwrap()
+            .unwrap();
+        let config = crate::HubServerConfig {
+            home_override: Some(tmp.path().to_path_buf()),
+            repo_root: tmp.path().to_path_buf(),
+            store_path: tmp.path().join("store.fls"),
+            ..Default::default()
+        };
+        let state = HubState::new(config);
+        (tmp, state, path, entry, binding)
+    }
+    fn write(path: &std::path::Path, entry: &RouteEntry) {
+        let mut table = RouteTable::default();
+        table.entries.insert("ada".into(), entry.clone());
+        std::fs::write(path, serde_json::to_vec(&table).unwrap()).unwrap();
+    }
+    fn changed(mut entry: RouteEntry) -> RouteEntry {
+        entry.hydration_generation = Some("replacement".into());
+        entry
+    }
+    #[test]
+    fn invalid_primary_refuses_unclassified_before_scans_or_attachment_writes() {
+        let (tmp, state, _source, entry, _binding) = fixture();
+        let alternate = tmp.path().join("alternate-routes.json");
+        let mut stale = RouteTable::default();
+        stale.entries.insert("ada".into(), entry.clone());
+        let mut other = entry;
+        other.persona = "bea".into();
+        other.route = VendorRoute::Codex {
+            thread_id: "codex-thread".into(),
+            cwd: None,
+        };
+        stale.entries.insert("bea".into(), other);
+        std::fs::write(&alternate, serde_json::to_vec(&stale).unwrap()).unwrap();
+        let primary = tmp.path().join(".cache/agent-bus/routes.json");
+        std::fs::create_dir_all(primary.parent().unwrap()).unwrap();
+        let owner = HubAuthority::Owner {
+            login: "owner".into(),
+        };
+        for condition in ["missing", "corrupt", "unreadable", "duplicate"] {
+            match condition {
+                "corrupt" => std::fs::write(&primary, b"{broken").unwrap(),
+                "unreadable" => std::fs::create_dir(&primary).unwrap(),
+                "duplicate" => {
+                    std::fs::write(&primary, b"{\"entries\":{},\"entries\":{}}").unwrap()
+                }
+                _ => {}
+            }
+            let before = std::fs::read(&alternate).unwrap();
+            let peer = HubAuthority::Peer {
+                agent: Some("fiona".into()),
+            };
+            for authority in [&owner, &peer] {
+                for requested in [
+                    "ada",
+                    "dce797a0-d963-4c1b-a06b-7fa6bffda7fa",
+                    "unknown:syntax",
+                ] {
+                    let request = HttpRequest::new("POST", "/unused").with_json_body(&json!({
+                    "prompt": "hello", "attachments": [{"name":"evidence.txt", "data_base64":"aGVsbG8="}]
+                }));
+                    let (response, costs) = crate::discovery::cost_counters::measure(|| {
+                        handle_post_session_prompt(&state, authority, requested, &request)
+                    });
+                    assert_eq!(response.status, 409, "{condition}: {requested}");
+                    assert_eq!(costs.route_scans, 0);
+                    assert_eq!(costs.store_opens, 0);
+                    assert_eq!(std::fs::read(&alternate).unwrap(), before);
+                    assert!(!tmp.path().join("attachments").exists());
+                }
+            }
+            if primary.is_dir() {
+                std::fs::remove_dir(&primary).unwrap();
+            } else if primary.exists() {
+                std::fs::remove_file(&primary).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn explicit_non_claude_vendor_cannot_dispatch_a_claude_route() {
+        let (_tmp, _state, _path, entry, _binding) = fixture();
+        assert!(require_intended_vendor(&entry.route, Some("codex")).is_err());
+        let codex = VendorRoute::Codex {
+            thread_id: "thread".into(),
+            cwd: None,
+        };
+        assert!(require_intended_vendor(&codex, Some("codex")).is_ok());
+    }
+
+    #[test]
+    fn queued_success_stub_does_not_bypass_pinned_route_fences() {
+        let (tmp, state, _source, entry, binding) = fixture();
+        let primary = tmp.path().join(".cache/agent-bus/routes.json");
+        std::fs::create_dir_all(primary.parent().unwrap()).unwrap();
+        write(&primary, &entry);
+        crate::discovery::note_route_file_scan(Some(tmp.path()), std::time::Instant::now());
+        let _stub = stub_queued_delivery_success();
+        reset_queued_delivery_calls();
+
+        // The queue has no Antigravity target, so this exercises the wrapper's
+        // fast path as well as the synthetic-success hook at the route boundary.
+        let codex = dispatch_queued_operator_prompt_with_intent_for_session(
+            &state,
+            Some("ada"),
+            binding.native_session(),
+            "owner",
+            "hello",
+            OperatorPromptIntent::OwnerSendNow,
+            Some("original-codex-thread"),
+            false,
+            None,
+            None,
+        );
+        assert!(matches!(
+            codex,
+            Err(OperatorPromptError::Steer(CodexSteerError::Refused {
+                stage: fl_wire::dispatcher::CodexSteerStage::Route,
+                ..
+            }))
+        ));
+        assert_eq!(queued_delivery_calls(), 0);
+
+        let vendor = dispatch_queued_operator_prompt_with_intent_for_session(
+            &state,
+            Some("ada"),
+            binding.native_session(),
+            "owner",
+            "hello",
+            OperatorPromptIntent::Ordinary,
+            None,
+            false,
+            None,
+            Some("codex"),
+        );
+        assert!(
+            matches!(vendor, Err(OperatorPromptError::Push(PushError::Failed(ref error)))
+            if error.contains("requested vendor"))
+        );
+        assert_eq!(queued_delivery_calls(), 0);
+    }
+
+    #[test]
+    fn queued_success_stub_rejects_implicit_codex_thread_replacement() {
+        let (tmp, state, _source, mut entry, _binding) = fixture();
+        let primary = tmp.path().join(".cache/agent-bus/routes.json");
+        std::fs::create_dir_all(primary.parent().unwrap()).unwrap();
+        entry.hosted_id = Some("codex:ada".into());
+        entry.route = VendorRoute::Codex {
+            thread_id: "replacement-thread".into(),
+            cwd: None,
+        };
+        write(&primary, &entry);
+        crate::discovery::note_route_file_scan(Some(tmp.path()), std::time::Instant::now());
+        let _stub = stub_queued_delivery_success();
+        reset_queued_delivery_calls();
+
+        // No optional thread/vendor metadata is retained. Send Now must still
+        // compare the resolved Codex thread to the requested session.
+        let result = dispatch_queued_operator_prompt_with_intent_for_session(
+            &state,
+            Some("ada"),
+            "original-thread",
+            "owner",
+            "hello",
+            OperatorPromptIntent::OwnerSendNow,
+            None,
+            false,
+            None,
+            None,
+        );
+        assert!(matches!(
+            result,
+            Err(OperatorPromptError::Steer(CodexSteerError::Refused {
+                stage: fl_wire::dispatcher::CodexSteerStage::Route,
+                ..
+            }))
+        ));
+        assert_eq!(queued_delivery_calls(), 0);
+    }
+
+    #[test]
+    fn direct_and_queued_native_record_refusals_precede_host_connection() {
+        let (tmp, state, _path, _entry, binding) = fixture();
+        let record = tmp.path().join(format!("{}.json", std::process::id()));
+        for value in [
+            None,
+            Some(json!({"status":"idle"})),
+            Some(json!({"status":"idle", "sessionId":"another-session"})),
+        ] {
+            if let Some(value) = value {
+                std::fs::write(&record, value.to_string()).unwrap();
+            } else if record.exists() {
+                std::fs::remove_file(&record).unwrap();
+            }
+            let direct = dispatch_operator_prompt_with_intent_for_session(
+                &state,
+                Some("ada"),
+                binding.native_session(),
+                "owner",
+                "hello",
+                OperatorPromptIntent::Ordinary,
+                None,
+                true,
+                Some(&binding),
+                None,
+                false,
+            );
+            assert!(
+                matches!(direct, Err(OperatorPromptError::Push(PushError::NotConnected(ref error))) if error.contains("session is unavailable or changed"))
+            );
+            let queued = dispatch_queued_operator_prompt_with_intent_for_session(
+                &state,
+                Some("ada"),
+                binding.native_session(),
+                "owner",
+                "hello",
+                OperatorPromptIntent::OwnerSendNow,
+                None,
+                true,
+                Some(&binding),
+                None,
+            );
+            assert!(
+                matches!(queued, Err(OperatorPromptError::Push(PushError::NotConnected(ref error))) if error.contains("session is unavailable or changed"))
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn peer_route_does_not_require_terminal_binding_and_owner_does_not_fallback() {
+        use std::io::Read;
+        use std::os::unix::net::UnixListener;
+        use std::time::Instant;
+        let (tmp, state, _path, mut entry, _binding) = fixture();
+        let primary = tmp.path().join(".cache/agent-bus/routes.json");
+        std::fs::create_dir_all(primary.parent().unwrap()).unwrap();
+        entry.hosted_id = None;
+        entry.hydration_generation = None;
+        entry.pid_start_time = None;
+        let VendorRoute::Claude {
+            socket_path,
+            key_path,
+            ..
+        } = &entry.route
+        else {
+            unreachable!()
+        };
+        std::fs::write(
+            key_path.as_ref().unwrap(),
+            r#"{"peerToken":"fixture-token"}"#,
+        )
+        .unwrap();
+        let listener = UnixListener::bind(socket_path).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        write(&primary, &entry);
+        crate::discovery::note_route_file_scan(Some(tmp.path()), Instant::now());
+        let request = HttpRequest::new("POST", "/unused")
+            .with_json_body(&json!({"prompt":"hello", "send_now":true}));
+        let owner = HubAuthority::Owner {
+            login: "owner".into(),
+        };
+        let refused = handle_post_session_prompt(&state, &owner, "claude:ada", &request);
+        assert_eq!(refused.status, 409);
+        assert!(matches!(listener.accept(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock));
+        let peer = HubAuthority::Peer {
+            agent: Some("fiona".into()),
+        };
+        let response = handle_post_session_prompt(&state, &peer, "claude:ada", &request);
+        let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(response.status, 200);
+        assert_eq!(body["delivered"], true, "{body}");
+        let (mut socket, _) = listener.accept().unwrap();
+        let mut frames = String::new();
+        socket.read_to_string(&mut frames).unwrap();
+        assert!(frames.contains("fixture-token"));
+        assert!(frames.contains("hello"));
+        assert!(frames.contains("fiona"));
+    }
+
+    #[test]
+    fn direct_route_replacement_refuses_before_any_host_connection() {
+        let (_tmp, state, path, entry, binding) = fixture();
+        before_next_prompt_dispatch(move || write(&path, &changed(entry)));
+        let result = dispatch_operator_prompt_with_intent_for_session(
+            &state,
+            Some("ada"),
+            binding.native_session(),
+            "owner",
+            "hello",
+            OperatorPromptIntent::Ordinary,
+            None,
+            true,
+            Some(&binding),
+            None,
+            false,
+        );
+        assert!(
+            matches!(result, Err(OperatorPromptError::Push(PushError::NotConnected(ref error))) if error.contains("re-register and resubmit"))
+        );
+    }
+    #[test]
+    fn queued_and_send_now_revalidate_original_registration() {
+        let (_tmp, state, path, entry, binding) = fixture();
+        write(&path, &changed(entry));
+        for intent in [
+            OperatorPromptIntent::Ordinary,
+            OperatorPromptIntent::OwnerSendNow,
+        ] {
+            let result = dispatch_queued_operator_prompt_with_intent_for_session(
+                &state,
+                Some("ada"),
+                binding.native_session(),
+                "owner",
+                "hello",
+                intent,
+                None,
+                true,
+                Some(&binding),
+                None,
+            );
+            assert!(
+                matches!(result, Err(OperatorPromptError::Push(PushError::NotConnected(ref error))) if error.contains("re-register and resubmit"))
+            );
+        }
+    }
+    fn enqueue_bound(
+        state: &HubState,
+        binding: ClaudeRegistrationBinding,
+    ) -> crate::QueuedOperatorPrompt {
+        let native = binding.native_session().to_string();
+        let input = crate::DirectPromptInput {
+            queue_target: None,
+            intended_codex_thread_id: None,
+            claude_terminal: true,
+            claude_binding: Some(binding),
+            intended_vendor: None,
+            persona: Some("ada".into()),
+            prompt: "hello".into(),
+            effective_body: "hello".into(),
+            by: "owner".into(),
+            attachments: vec![],
+        };
+        state
+            .prompt_queues
+            .lock()
+            .unwrap()
+            .enqueue(&native, input)
+            .0
+    }
+
+    #[test]
+    fn send_now_refuses_replaced_registration_without_discovery() {
+        let (_tmp, state, path, entry, binding) = fixture();
+        let item = enqueue_bound(&state, binding);
+        write(&path, &changed(entry));
+        let owner = HubAuthority::Owner {
+            login: "owner".into(),
+        };
+        let (_response, costs) = crate::discovery::cost_counters::measure(|| {
+            handle_post_queued_prompt_send_now(&state, &owner, &item.session_id, &item.id)
+        });
+        assert_eq!(costs.route_scans, 0);
+        let queue = state.session_queue(&item.session_id);
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue[0].delivery_state, crate::QueuedDeliveryState::Refused);
+        assert!(
+            queue[0]
+                .delivery_error
+                .as_deref()
+                .unwrap()
+                .contains("re-register and resubmit")
+        );
+    }
+
+    // This fixture uses a store under its private temp home; no host or vendor is started.
+    #[test]
+    fn queue_drain_refuses_replaced_registration_without_discovery() {
+        let (_tmp, mut state, path, entry, binding) = fixture();
+        state.store_backend = Some(fl_store::BackendKind::Redb);
+        let item = enqueue_bound(&state, binding);
+        write(&path, &changed(entry));
+        let (_, costs) =
+            crate::discovery::cost_counters::measure(|| drain_ready_session_queues(&state));
+        assert_eq!(costs.route_scans, 0);
+        let queue = state.session_queue(&item.session_id);
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue[0].delivery_state, crate::QueuedDeliveryState::Refused);
+    }
+
+    #[test]
+    fn legacy_unknown_owner_is_held_and_classified_non_claude_stays_eligible() {
+        let (_tmp, mut state, _path, _entry, binding) = fixture();
+        state.store_backend = Some(fl_store::BackendKind::Redb);
+        let original = enqueue_bound(&state, binding);
+        let mut legacy: crate::QueuedOperatorPrompt =
+            serde_json::from_value(serde_json::to_value(&original).unwrap()).unwrap();
+        legacy.claude_terminal = false;
+        legacy.by = "alice".into();
+        legacy.persona = None;
+        assert!(legacy_owner_unclassified(&legacy));
+        let mut classified = legacy.clone();
+        classified.intended_codex_thread_id = Some("a-codex-thread".into());
+        assert!(!legacy_owner_unclassified(&classified));
+        assert_eq!(queued_non_claude_vendor(&classified), Some("codex"));
+        assert!(
+            require_intended_vendor(
+                &VendorRoute::Claude {
+                    pid: 0,
+                    session_id: "x".into(),
+                    socket_path: "unused".into(),
+                    key_path: None
+                },
+                queued_non_claude_vendor(&classified)
+            )
+            .is_err()
+        );
+        state
+            .prompt_queues
+            .lock()
+            .unwrap()
+            .queues
+            .insert(legacy.session_id.clone(), vec![legacy.clone()]);
+        reset_queued_delivery_calls();
+        let (_, costs) =
+            crate::discovery::cost_counters::measure(|| drain_ready_session_queues(&state));
+        assert_eq!(costs.route_scans, 0);
+        assert_eq!(queued_delivery_calls(), 0);
+        let held = &state.session_queue(&legacy.session_id)[0];
+        assert_eq!(held.delivery_state, crate::QueuedDeliveryState::Refused);
+        assert!(
+            held.delivery_error
+                .as_deref()
+                .unwrap()
+                .contains("re-register and resubmit")
+        );
+        for status in [
+            crate::QueuedDeliveryState::Sending,
+            crate::QueuedDeliveryState::Unconfirmed,
+        ] {
+            legacy.delivery_state = status;
+            state
+                .prompt_queues
+                .lock()
+                .unwrap()
+                .queues
+                .insert(legacy.session_id.clone(), vec![legacy.clone()]);
+            drain_ready_session_queues(&state);
+            assert_eq!(
+                state.session_queue(&legacy.session_id)[0].delivery_state,
+                status
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_unknown_send_now_holds_without_discovery() {
+        let (_tmp, state, _path, _entry, binding) = fixture();
+        let original = enqueue_bound(&state, binding);
+        let mut legacy: crate::QueuedOperatorPrompt =
+            serde_json::from_value(serde_json::to_value(&original).unwrap()).unwrap();
+        legacy.claude_terminal = false;
+        legacy.by = "alice".into();
+        state
+            .prompt_queues
+            .lock()
+            .unwrap()
+            .queues
+            .insert(legacy.session_id.clone(), vec![legacy.clone()]);
+        let owner = HubAuthority::Owner {
+            login: "owner".into(),
+        };
+        reset_queued_delivery_calls();
+        let (_, costs) = crate::discovery::cost_counters::measure(|| {
+            handle_post_queued_prompt_send_now(&state, &owner, &legacy.session_id, &legacy.id)
+        });
+        assert_eq!(costs.route_scans, 0);
+        assert_eq!(queued_delivery_calls(), 0);
+        let held = &state.session_queue(&legacy.session_id)[0];
+        assert_eq!(held.delivery_state, crate::QueuedDeliveryState::Refused);
+        assert!(
+            held.delivery_error
+                .as_deref()
+                .unwrap()
+                .contains("re-register and resubmit")
+        );
+        for status in [
+            crate::QueuedDeliveryState::Sending,
+            crate::QueuedDeliveryState::Unconfirmed,
+        ] {
+            legacy.delivery_state = status;
+            state
+                .prompt_queues
+                .lock()
+                .unwrap()
+                .queues
+                .insert(legacy.session_id.clone(), vec![legacy.clone()]);
+            let (_, costs) = crate::discovery::cost_counters::measure(|| {
+                handle_post_queued_prompt_send_now(&state, &owner, &legacy.session_id, &legacy.id)
+            });
+            assert_eq!(costs.route_scans, 0);
+            assert_eq!(
+                state.session_queue(&legacy.session_id)[0].delivery_state,
+                status
+            );
+        }
+    }
+
+    #[test]
+    fn deserialized_item_cannot_reconstitute_authority() {
+        let (_tmp, state, _path, _entry, binding) = fixture();
+        let input = crate::DirectPromptInput {
+            queue_target: None,
+            intended_codex_thread_id: None,
+            claude_terminal: true,
+            claude_binding: Some(binding),
+            intended_vendor: None,
+            persona: Some("ada".into()),
+            prompt: "hello".into(),
+            effective_body: "hello".into(),
+            by: "owner".into(),
+            attachments: vec![],
+        };
+        let (item, _) = state
+            .prompt_queues
+            .lock()
+            .unwrap()
+            .enqueue("claude:ada", input);
+        let restored: crate::QueuedOperatorPrompt =
+            serde_json::from_value(serde_json::to_value(item).unwrap()).unwrap();
+        assert!(restored.claude_terminal);
+        assert!(restored.claude_binding.is_none());
+        let result = dispatch_queued_operator_prompt_with_intent_for_session(
+            &state,
+            restored.persona.as_deref(),
+            &restored.session_id,
+            &restored.by,
+            &restored.effective_body,
+            OperatorPromptIntent::OwnerSendNow,
+            None,
+            restored.claude_terminal,
+            restored.claude_binding.as_ref(),
+            restored.intended_vendor.as_deref(),
+        );
+        assert!(
+            matches!(result, Err(OperatorPromptError::Push(PushError::NotConnected(ref error))) if error.contains("re-register and resubmit"))
+        );
+    }
+}
+
+#[cfg(all(test, unix))]
+mod lifecycle_discovery_contention_tests {
+    use super::*;
+
+    // A bounded holder makes a blocking regression fail instead of hanging the test runner.
+    fn contend_after_read(
+        state: &HubState,
+        artifacts: bool,
+    ) -> (std::sync::mpsc::Sender<()>, std::thread::JoinHandle<bool>) {
+        let lock = state.store_lock.clone();
+        let (release, released) = std::sync::mpsc::channel();
+        let (ready, acquired) = std::sync::mpsc::channel();
+        let (start, started) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            started.recv().unwrap();
+            let _guard = lock.lock().unwrap();
+            ready.send(()).unwrap();
+            released
+                .recv_timeout(std::time::Duration::from_secs(3))
+                .is_ok()
+        });
+        let release_owned = release.clone();
+        let hook: Box<dyn FnOnce()> = Box::new(move || {
+            start.send(()).unwrap();
+            acquired.recv().unwrap();
+            if artifacts {
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    release_owned.send(()).unwrap();
+                });
+            }
+        });
+        if artifacts {
+            BEFORE_LIFECYCLE_ARTIFACT_READ.with_borrow_mut(|slot| *slot = Some(hook));
+        } else {
+            AFTER_LIFECYCLE_CANDIDATE_READ.with_borrow_mut(|slot| *slot = Some(hook));
+        }
+        (release, holder)
+    }
+
+    #[test]
+    fn lifecycle_discovery_refuses_contention_between_candidate_reads() {
+        assert_discovery_contention(false);
+    }
+
+    #[test]
+    fn lifecycle_discovery_waits_for_contention_after_teardown_fence() {
+        assert_discovery_contention(true);
+    }
+
+    fn assert_discovery_contention(artifacts: bool) {
+        let root = tempfile::tempdir().unwrap();
+        let state = HubState::new(crate::HubServerConfig {
+            store_path: root.path().join("fixture.fls"),
+            repo_root: root.path().into(),
+            home_override: Some(root.path().into()),
+            ..Default::default()
+        });
+        drop(state.open_store().unwrap());
+        let (release, holder) = contend_after_read(&state, artifacts);
+        let owner = HubAuthority::Owner {
+            login: "owner".into(),
+        };
+        let request =
+            HttpRequest::new("POST", "/unused").with_json_body(&json!({"mode":"teardown"}));
+        let response = handle_post_session_decommission(&state, &owner, "ada", &request);
+        let _ = release.send(());
+        assert!(
+            holder.join().unwrap(),
+            "lifecycle discovery waited for the competing store holder"
+        );
+        if artifacts {
+            assert_eq!(
+                response.status,
+                200,
+                "{}",
+                String::from_utf8_lossy(&response.body)
+            );
+            assert_eq!(
+                lifecycle::list_hosted_sessions(&*state.open_store().unwrap())
+                    .unwrap()
+                    .len(),
+                1
+            );
+        } else {
+            assert_eq!(response.status, 409);
+            assert!(
+                response.json_value().unwrap()["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("store is busy")
+            );
+            assert!(
+                lifecycle::list_hosted_sessions(&*state.open_store().unwrap())
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+        assert!(state.session_queue("ada").is_empty());
+        assert!(!root.path().join("artifacts").exists());
     }
 }

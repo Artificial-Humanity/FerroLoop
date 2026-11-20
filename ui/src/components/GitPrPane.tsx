@@ -399,7 +399,7 @@ export const GitPrPane: React.FC<GitPrPaneProps> = ({
             <select
               aria-label="Git view mode"
               data-testid="git-subview-select"
-              className="fd-select"
+              className="fd-select fd-git-subview-select"
               value={subView}
               onChange={(e) => setSubView(e.target.value as GitSubView)}
               style={{ fontSize: "12px", padding: "5px 10px", minWidth: 0, maxWidth: "100%" }}
@@ -411,6 +411,24 @@ export const GitPrPane: React.FC<GitPrPaneProps> = ({
                 Pull Requests &amp; Governance ({effectivePrs.length})
               </option>
             </select>
+            <div className="fd-git-subview-icons" role="group" aria-label="Git view mode">
+              {([
+                { id: "worktrees", label: `Worktrees & Diffs (${effectiveWorktrees.length})`, path: "M6 3v12a3 3 0 0 0 3 3h3 M6 3a2 2 0 1 0 0 4 2 2 0 0 0 0-4 M18 5v3a4 4 0 0 1-4 4H6 M18 3a2 2 0 1 0 0 4 2 2 0 0 0 0-4 M14 18a2 2 0 1 0 0 4 2 2 0 0 0 0-4" },
+                { id: "prs", label: `Pull Requests & Governance (${effectivePrs.length})`, path: "M6 7v10 M6 3a2 2 0 1 0 0 4 2 2 0 0 0 0-4 M6 17a2 2 0 1 0 0 4 2 2 0 0 0 0-4 M18 17v-6a4 4 0 0 0-4-4h-3 M14 4l-3 3 3 3 M18 17a2 2 0 1 0 0 4 2 2 0 0 0 0-4" },
+              ] as const).map((view) => (
+                <button
+                  key={view.id}
+                  type="button"
+                  aria-label={view.label}
+                  aria-pressed={subView === view.id}
+                  className={`fd-btn fd-git-subview-icon${subView === view.id ? " fd-btn-active" : ""}`}
+                  onClick={() => setSubView(view.id)}
+                >
+                  <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d={view.path} /></svg>
+                  <span className="fd-git-subview-tooltip" aria-hidden="true">{view.label}</span>
+                </button>
+              ))}
+            </div>
           </div>
 
           <button

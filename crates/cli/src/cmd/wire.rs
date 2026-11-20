@@ -153,7 +153,11 @@ pub enum WireCmd {
         #[arg(long)]
         json: bool,
     },
-    /// Register an agent in the workspace store and record the caller's live FerroWire route.
+    /// Register an agent and record the caller's live FerroWire route.
+    ///
+    /// Exit 3 means a supplied hydration generation was discarded; registration succeeded,
+    /// but this invocation did not write an acknowledgement. In JSON, hydration_ack is
+    /// "written", "not_written" (including an existing receipt), or "error".
     Register {
         name: String,
         #[arg(long)]
@@ -164,6 +168,8 @@ pub enum WireCmd {
         extra_areas: Option<String>,
         #[arg(long)]
         replace: bool,
+        #[arg(long)]
+        json: bool,
     },
     /// Prune acknowledged or expired transient messages older than `--older-than-days`.
     Prune {
@@ -1780,7 +1786,8 @@ pub fn run(env: &StateEnv<'_>, cmd: WireCmd) -> Result<i32, (i32, String)> {
             role,
             extra_areas,
             replace,
-        } => execute_register(env, name, project, role, extra_areas, replace),
+            json,
+        } => execute_register(env, name, project, role, extra_areas, replace, json),
         WireCmd::Prune {
             older_than_days,
             json,
@@ -2396,6 +2403,7 @@ pub fn run_agent_msg(env: &StateEnv<'_>, cli: AgentMsgCli) -> Result<i32, (i32, 
                 role,
                 extra_areas,
                 replace,
+                json: false,
             },
         ),
         AgentMsgCmd::Unregister { name } => {
@@ -2451,6 +2459,7 @@ fn execute_register(
     role: String,
     extra_areas: Option<String>,
     replace: bool,
+    json: bool,
 ) -> Result<i32, (i32, String)> {
     let caller_generation = std::env::var("AGENT_HYDRATION_GENERATION")
         .ok()
@@ -2460,7 +2469,7 @@ fn execute_register(
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
-    execute_register_with_hydration_env(
+    execute_register_with_hydration_env_output(
         env,
         name,
         project,
@@ -2469,9 +2478,11 @@ fn execute_register(
         replace,
         caller_generation.as_deref(),
         hosted_id.as_deref(),
+        json,
     )
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn execute_register_with_hydration_env(
     env: &StateEnv<'_>,
@@ -2482,6 +2493,31 @@ fn execute_register_with_hydration_env(
     replace: bool,
     caller_generation: Option<&str>,
     hosted_id: Option<&str>,
+) -> Result<i32, (i32, String)> {
+    execute_register_with_hydration_env_output(
+        env,
+        name,
+        project,
+        role,
+        extra_areas,
+        replace,
+        caller_generation,
+        hosted_id,
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_register_with_hydration_env_output(
+    env: &StateEnv<'_>,
+    name: String,
+    project: String,
+    role: String,
+    extra_areas: Option<String>,
+    replace: bool,
+    caller_generation: Option<&str>,
+    hosted_id: Option<&str>,
+    json: bool,
 ) -> Result<i32, (i32, String)> {
     let parsed_role = parse_role_selector(&role).map_err(|e| (1, e.to_string()))?;
     let extras: Vec<String> = extra_areas
@@ -2571,6 +2607,12 @@ fn execute_register_with_hydration_env(
         }
     };
 
+    let hosted_identity_dropped = trimmed_hid.is_some() && verdict.effective_hosted_id.is_none();
+    let hydration_generation_dropped = caller_generation
+        .map(str::trim)
+        .is_some_and(|g| !g.is_empty())
+        && verdict.effective_generation.is_none();
+
     let existing = store.agent_by_name(&by).map_err(|e| (1, e.to_string()))?;
     // Run `fence_hydration_register` and route update AFTER `evaluate_registration_guard`
     // succeeds (and only when `replace || existing.is_none()`), BEFORE writing the agent
@@ -2619,7 +2661,7 @@ fn execute_register_with_hydration_env(
             let ack_pid = captured_route_pid.or_else(|| {
                 fl_wire::identity::find_nearest_vendor_cli_ancestor_pid(std::process::id())
             });
-            if let Err(e) = fl_hub::lifecycle::record_hydration_ack_with_runtime(
+            let hydration_ack = match fl_hub::lifecycle::record_hydration_ack_with_runtime(
                 &store,
                 &rec.name_key,
                 replace,
@@ -2628,19 +2670,66 @@ fn execute_register_with_hydration_env(
                 ack_pid,
                 Some(&fl_hub::lifecycle::HostRuntime),
             ) {
-                eprintln!("fl wire register: warning: failed to record hydration receipt: {e}");
+                Ok(true) => "written",
+                Ok(false) => "not_written",
+                Err(e) => {
+                    eprintln!("fl wire register: warning: failed to record hydration receipt: {e}");
+                    "error"
+                }
+            };
+            if hosted_identity_dropped || hydration_generation_dropped {
+                eprintln!(
+                    "fl wire register: warning: discarded {}{}{}; this invocation did not write a hydration acknowledgement (a prior receipt may exist)",
+                    if hosted_identity_dropped {
+                        "hosted identity"
+                    } else {
+                        ""
+                    },
+                    if hosted_identity_dropped && hydration_generation_dropped {
+                        " and "
+                    } else {
+                        ""
+                    },
+                    if hydration_generation_dropped {
+                        "hydration generation"
+                    } else {
+                        ""
+                    },
+                );
             }
             let all_active = store.list_agents(None, false).unwrap_or_default();
             let mgr = reports_to(&rec, &all_active);
-            println!(
-                "Registered {} ({}) as {} in {} (reports to {})",
-                rec.display_name,
-                rec.id,
-                rec.role.as_wire(),
-                rec.project,
-                mgr
-            );
-            Ok(0)
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "name": rec.display_name,
+                        "id": rec.id,
+                        "role": rec.role.as_wire(),
+                        "project": rec.project,
+                        "reports_to": mgr,
+                        "hosted_identity_dropped": hosted_identity_dropped,
+                        "hydration_generation_dropped": hydration_generation_dropped,
+                        "hydration_ack": hydration_ack,
+                    })
+                );
+            } else {
+                println!(
+                    "Registered {} ({}) as {} in {} (reports to {})",
+                    rec.display_name,
+                    rec.id,
+                    rec.role.as_wire(),
+                    rec.project,
+                    mgr
+                );
+            }
+            Ok(
+                if hydration_generation_dropped && hydration_ack != "written" {
+                    3
+                } else {
+                    0
+                },
+            )
         }
         Err(e @ (StoreError::AgentCollision { .. } | StoreError::LeadTaken { .. })) => {
             Err((2, e.to_string()))
@@ -3305,6 +3394,7 @@ pub(crate) mod tests {
             hosted: true,
             status: fl_hub::lifecycle::STATUS_RUNNING.into(),
             stop_reason: None,
+            launch_prerequisite_detail: None,
             restart_policy: "on-failure".into(),
             restart_count: 0,
             tmux_target: Some("Feira:claude".into()),
@@ -4231,6 +4321,7 @@ pub(crate) mod tests {
                 hosted: true,
                 status: fl_hub::lifecycle::STATUS_RUNNING.into(),
                 stop_reason: None,
+                launch_prerequisite_detail: None,
                 restart_policy: "on-failure".into(),
                 restart_count: 0,
                 tmux_target: Some("Feira:codex".into()),
@@ -4300,6 +4391,45 @@ pub(crate) mod tests {
             assert_eq!(
                 session.hydration_status,
                 fl_hub::lifecycle::HydrationStatus::Unconfirmed
+            );
+        }
+
+        // A foreign inherited hosted identity causes the guard to discard the supplied
+        // generation. The registration itself may succeed, but it must not report full
+        // hydration success or write an acknowledgement for this attempt.
+        assert_eq!(
+            execute_register_with_hydration_env(
+                &env,
+                "Feira".into(),
+                "ferroloop".into(),
+                "assistant".into(),
+                None,
+                true,
+                Some(&g1),
+                Some("claude:someone-else"),
+            )
+            .unwrap(),
+            3
+        );
+        {
+            use fl_core::StateStore;
+            let store = env.open_for_scope(Some(&StateScope::Workspace)).unwrap();
+            let session = fl_hub::lifecycle::find_hosted_session(&store, &["codex:feira"])
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                session.hydration_status,
+                fl_hub::lifecycle::HydrationStatus::Unconfirmed
+            );
+            assert!(
+                store
+                    .get_state_by_key(
+                        &StateScope::Workspace,
+                        fl_core::state::StateConcern::Runtime,
+                        &fl_hub::lifecycle::hydration_ack_slug(&g1),
+                    )
+                    .unwrap()
+                    .is_none()
             );
         }
 
@@ -4415,6 +4545,7 @@ pub(crate) mod tests {
                 hosted: true,
                 status: fl_hub::lifecycle::STATUS_DECOMMISSIONED.into(),
                 stop_reason: None,
+                launch_prerequisite_detail: None,
                 restart_policy: "on-failure".into(),
                 restart_count: 0,
                 tmux_target: Some("Kacey:claude".into()),
@@ -4448,7 +4579,7 @@ pub(crate) mod tests {
                     None,
                 )
                 .unwrap(),
-                0
+                3
             );
             let mut kacey_newer = kacey_decom;
             kacey_newer.status = fl_hub::lifecycle::STATUS_RUNNING.into();
@@ -4470,7 +4601,7 @@ pub(crate) mod tests {
                     Some("claude:feira"),
                 )
                 .unwrap(),
-                0
+                3
             );
             unsafe {
                 std::env::set_var("AGENT_PERSONA", "feira");
@@ -4840,6 +4971,7 @@ pub(crate) mod tests {
                 hosted: true,
                 status: fl_hub::lifecycle::STATUS_RUNNING.into(),
                 stop_reason: None,
+                launch_prerequisite_detail: None,
                 restart_policy: "on-failure".into(),
                 restart_count: 0,
                 tmux_target: Some("Feira:claude".into()),
@@ -5262,6 +5394,7 @@ pub(crate) mod tests {
                 hosted: true,
                 status: fl_hub::lifecycle::STATUS_RUNNING.into(),
                 stop_reason: None,
+                launch_prerequisite_detail: None,
                 restart_policy: "on-failure".into(),
                 restart_count: 0,
                 tmux_target: None,
@@ -5363,6 +5496,7 @@ pub(crate) mod tests {
                 hosted: true,
                 status: fl_hub::lifecycle::STATUS_RUNNING.into(),
                 stop_reason: None,
+                launch_prerequisite_detail: None,
                 restart_policy: "on-failure".into(),
                 restart_count: 1,
                 tmux_target: Some("Feira:claude".into()),
@@ -5700,6 +5834,7 @@ pub(crate) mod tests {
                 hosted: true,
                 status: fl_hub::lifecycle::STATUS_RUNNING.into(),
                 stop_reason: None,
+                launch_prerequisite_detail: None,
                 restart_policy: "on-failure".into(),
                 restart_count: 0,
                 tmux_target: Some(format!("Feira:{vendor}")),
@@ -6039,6 +6174,7 @@ pub(crate) mod tests {
                 hosted: true,
                 status: fl_hub::lifecycle::STATUS_RUNNING.into(),
                 stop_reason: None,
+                launch_prerequisite_detail: None,
                 restart_policy: "on-failure".into(),
                 restart_count: 0,
                 tmux_target: Some("Feira:claude".into()),
@@ -6172,6 +6308,7 @@ pub(crate) mod tests {
                 hosted: true,
                 status: fl_hub::lifecycle::STATUS_RUNNING.into(),
                 stop_reason: None,
+                launch_prerequisite_detail: None,
                 restart_policy: "on-failure".into(),
                 restart_count: 0,
                 tmux_target: None,
@@ -6884,6 +7021,7 @@ pub(crate) mod tests {
             hosted: true,
             status: fl_hub::lifecycle::STATUS_RUNNING.into(),
             stop_reason: None,
+            launch_prerequisite_detail: None,
             restart_policy: "on-failure".into(),
             restart_count: 0,
             tmux_target: Some("Kacey:muse".into()),

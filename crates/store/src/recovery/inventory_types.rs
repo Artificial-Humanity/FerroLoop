@@ -194,6 +194,8 @@ pub struct BindingEdge {
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct StoreMap {
+    #[serde(default)]
+    pub recovery_metadata: Vec<RecoveryMetadata>,
     pub schema_version: u32,
     pub collected_at_unix_ms: u128,
     pub host_identifier: Option<String>,
@@ -207,4 +209,18 @@ pub struct StoreMap {
     pub bindings: Vec<BindingEdge>,
     pub warnings: Vec<String>,
     pub complete: bool,
+}
+
+/// Stat-only sidecar observation; never a store source or an authority claim.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RecoveryMetadata {
+    pub store_path: PathBuf,
+    pub path: PathBuf,
+    pub kind: RecoveryMetadataKind,
+    pub metadata: FileMetadata,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecoveryMetadataKind {
+    RestoreGuard,
 }

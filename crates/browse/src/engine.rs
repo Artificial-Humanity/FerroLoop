@@ -82,8 +82,21 @@ pub struct HeadlessEngineProbe {
 }
 
 fn is_executable_file(p: &Path) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+    let Ok(meta) = std::fs::metadata(p) else {
+        return false;
+    };
+    if !meta.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        meta.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
 }
 
 impl HeadlessEngineProbe {
@@ -390,11 +403,13 @@ pub fn dump_dom(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
     fn script(dir: &Path, name: &str, body: &str) -> PathBuf {
         let p = dir.join(name);
         std::fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
+        #[cfg(unix)]
         std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
         p
     }
@@ -411,6 +426,62 @@ mod tests {
         width: 320,
         height: 568,
     };
+
+    #[test]
+    fn executable_detection_rejects_missing_paths_and_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!is_executable_file(dir.path()));
+        assert!(!is_executable_file(&dir.path().join("missing")));
+    }
+
+    #[test]
+    fn executable_detection_uses_platform_file_permissions() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("engine.exe");
+        std::fs::write(&file, b"fixture, never executed").unwrap();
+        #[cfg(unix)]
+        {
+            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
+            assert!(!is_executable_file(&file));
+            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o111)).unwrap();
+        }
+        assert!(is_executable_file(&file));
+    }
+
+    #[test]
+    fn explicit_engine_override_preserves_file_validation() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("custom-engine.exe");
+        std::fs::write(&file, b"fixture, never executed").unwrap();
+        #[cfg(unix)]
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let mut probe = HeadlessEngineProbe {
+            engine_bin: Some(file.clone().into()),
+            ..Default::default()
+        };
+        let engine = probe.detect().unwrap().unwrap();
+        assert_eq!(engine.path, file);
+        assert!(engine.from_env);
+        for invalid in [dir.path().to_path_buf(), dir.path().join("missing")] {
+            probe.engine_bin = Some(invalid.into());
+            assert!(matches!(
+                probe.detect(),
+                Err(BrowseError::EngineBinInvalid(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn candidate_detection_uses_explicit_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join(ENGINE_CANDIDATES[0]);
+        std::fs::write(&file, b"fixture, never executed").unwrap();
+        #[cfg(unix)]
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let engine = probe(dir.path()).detect().unwrap().unwrap();
+        assert_eq!(engine.path, file);
+        assert!(!engine.from_env);
+    }
 
     #[test]
     fn nothing_installed_is_none() {
@@ -446,6 +517,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn a_non_executable_or_relative_path_entry_is_skipped() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("chromium");
@@ -500,6 +572,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn version_is_the_first_line() {
         let dir = tempfile::tempdir().unwrap();
         let p = script(
@@ -539,6 +612,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn dumps_the_dom_the_engine_prints_and_passes_the_arguments() {
         let dir = tempfile::tempdir().unwrap();
         let p = script(
@@ -563,6 +637,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn the_engine_gets_a_cleared_environment_and_a_scratch_home() {
         let dir = tempfile::tempdir().unwrap();
         // `cargo test` sets CARGO_MANIFEST_DIR in this process; the engine must not see it.
@@ -591,6 +666,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn writes_a_screenshot_through_the_engine() {
         let dir = tempfile::tempdir().unwrap();
         let p = script(
@@ -629,6 +705,7 @@ echo '<p>ok</p>'"#,
     }
 
     #[test]
+    #[cfg(unix)]
     fn a_failing_engine_reports_its_stderr() {
         let dir = tempfile::tempdir().unwrap();
         let p = script(dir.path(), "chromium", "echo 'no display' >&2; exit 7");
@@ -647,6 +724,7 @@ echo '<p>ok</p>'"#,
     }
 
     #[test]
+    #[cfg(unix)]
     fn an_engine_that_prints_nothing_fails() {
         let dir = tempfile::tempdir().unwrap();
         let p = script(dir.path(), "chromium", "exit 0");
@@ -662,6 +740,7 @@ echo '<p>ok</p>'"#,
     }
 
     #[test]
+    #[cfg(unix)]
     fn a_hung_engine_is_killed_at_the_timeout() {
         let dir = tempfile::tempdir().unwrap();
         let p = script(dir.path(), "chromium", "exec sleep 30");
@@ -679,6 +758,7 @@ echo '<p>ok</p>'"#,
     }
 
     /// Whether process `pid` is gone (or only a zombie waiting to be reaped).
+    #[cfg(unix)]
     fn process_gone(pid: i32) -> bool {
         // SAFETY: signal 0 only checks that the process exists.
         if unsafe { libc::kill(pid, 0) } != 0 {
@@ -687,6 +767,7 @@ echo '<p>ok</p>'"#,
         std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|s| s.contains(") Z"))
     }
 
+    #[cfg(unix)]
     fn helper_pid(file: &Path) -> i32 {
         std::fs::read_to_string(file)
             .unwrap()
@@ -695,6 +776,7 @@ echo '<p>ok</p>'"#,
             .unwrap()
     }
 
+    #[cfg(unix)]
     fn assert_helper_dies(file: &Path) {
         let pid = helper_pid(file);
         let until = Instant::now() + Duration::from_secs(5);
@@ -705,6 +787,7 @@ echo '<p>ok</p>'"#,
     }
 
     #[test]
+    #[cfg(unix)]
     fn a_timeout_kills_the_engines_helpers_too() {
         let dir = tempfile::tempdir().unwrap();
         let pidfile = dir.path().join("helper.pid");
@@ -726,6 +809,7 @@ echo '<p>ok</p>'"#,
     }
 
     #[test]
+    #[cfg(unix)]
     fn runaway_output_kills_the_engines_helpers_too() {
         let dir = tempfile::tempdir().unwrap();
         let pidfile = dir.path().join("helper.pid");
@@ -750,6 +834,7 @@ echo '<p>ok</p>'"#,
     }
 
     #[test]
+    #[cfg(unix)]
     fn a_stale_screenshot_does_not_pass_for_a_new_one() {
         let dir = tempfile::tempdir().unwrap();
         let shot = dir.path().join("out.png");
@@ -800,6 +885,7 @@ echo '<p>ok</p>'"#,
     }
 
     #[test]
+    #[cfg(unix)]
     fn runaway_output_is_cut_off() {
         let dir = tempfile::tempdir().unwrap();
         let p = script(dir.path(), "chromium", "exec yes '<p>spam</p>'");

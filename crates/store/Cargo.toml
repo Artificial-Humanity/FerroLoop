@@ -25,6 +25,8 @@ clap = { workspace = true, optional = true }
 # On by default; a library consumer that needs neither can turn it off.
 default = ["cli"]
 cli = ["dep:clap"]
+# Installed only by a test binary before its threads start.
+wire-test-isolation = []
 
 [[bin]]
 name = "ferrostore"

@@ -198,6 +198,175 @@ The exchange, lease, readiness and purge contracts below incorporate Ferris's 20
 - [ ] Implement quarantine purge in purge.rs under the approved root and matching physical-store administrative exclusion/operation ownership. Dry run never writes an audit or withdraws a receipt; report a pending withdrawal as requiring reconciliation. Confirmed execution first finishes a half-withdrawn receipt, then revalidates the operation and refuses any remaining live catalog receipt, active operation, symlink/replacement or unproven dependency/config reference closure. Dry run lists exact owned names, sizes and SHA-256 digests; an unreadable digest is refusal, not a weaker audit. Mutate only with `--confirm <op-id>` matching the selected operation. Before unlinking, durably publish and directory-sync a catalog purge audit containing operation ID, exact names/sizes/digests, time and actor. Record intent separately from per-name removal/completion so a crash never claims an intended removal already happened. Revalidate held identities before each unlink and sync affected parents. Delete only this quarantined operation's verified-owned quarantine/staging/final names; leave shared configs and other operations untouched. Never general retention, glob sweeps, legacy `.redb` or historic-file deletion.
 - [ ] Run all four Task 6 test commands GREEN. Commit `feat(recovery): add offline journaled restore and readiness checks`; fresh task review. Implementation approval does not authorize a live restore, backup, deployment or operational activation.
 
+
+**Task 6 implementation rulings (Ferris, 2026-11-10):**
+
+- Each explicit resume/finalize or rollback action receives a fresh finite reconciliation deadline, capped by the renewed lease expiry. Persist attempt number and deadline; status reports deadline, remaining time and both counters. Original disk, memory and metadata ceilings never increase. Expiry stops at a journal boundary without cleanup, automatic renewal or guard removal.
+- Renewed leases bind the current destination generation while the journal preserves immutable original admission. Full initial-request equality distinguishes an unchanged initial lease; renewal must prove all held names, identities and available digests match the current phase before recording any attempt. An intent permits only the exact before/after layouts of its one pending transition. Installed and selected finalize phases admit only the candidate; rolled-back and explicit `FinalizeOriginalIntent`/`OriginalFinalized` phases admit only the original verified identity and digest. Equal digests never imply equal generation roles. Mixed layouts or phase-mismatched known generations refuse without mutation.
+- Resume and normal finalize share 12 attempts. Rollback and explicit rollback-finalize share a separate reserve of four. Neither counter resets on restart. Once the rollback reserve is exhausted, all further mutation refuses and status requires forensic handling. Rollback-finalize may use that reserve only for the journal-proven original **verified** identity and digest, with the same typed reconciliation evidence; it cannot admit the selected backup or an unreadable forensic original.
+- An originally absent destination can be rolled back by journaled `NOREPLACE` relocation of the installed candidate into owned staging, with both directory syncs. Explicit absence-finalize consumes rollback reserve and requires original-absence proof, destination absence now without following links, retained candidate identity/digest and an operator attestation that no client opened the path while installed. It durably removes the guard without deleting the candidate or creating a store. Failed proof keeps the guard and requires forensic handling.
+- P0 retains all restore candidates, rollback generations and forensic originals. Status lists their operation IDs, journal-bound paths, identities, sizes and available digests, plus retained file-byte totals; unreadable forensic digests remain explicitly unavailable. **Restore-artifact purge is deferred** to a separate typed design and Lead review. Backup-root quarantine purge has no authority over arbitrary destination-parent siblings. Task 7 must include the checklist item “retained restore artifacts reviewed.”
+- Each restore has a stable private `journal.bin.lock` beside the journal, created exclusively with no-follow mode 0600 at admission, then file/directory synced and retained. The journal records its device/inode; restart never creates, replaces or repairs it. Hold bounded exclusive flock across each restore/resume/rollback/finalize action, reread the latest journal under that lock, and verify the recorded lock identity before any attempt choice or mutation. Read-only status/loading may hold a shared lock. This serializes recovery operations only; exclusion of ordinary/legacy clients remains administrative.
+- Strict 2L admission precedes staging/lock allocation. A transient read-only catalog shared lock may gather preflight sizes, but is released before acquiring the operation lock. Private 0700 sibling staging and its charged stable lock may precede guard publication; hold operation EX before reacquiring catalog SH, then fully revalidate the selected bundle across that unlocked gap. Publish and sync the guard before candidate copying or any original/destination/rollback mutation. No operation-lock acquisition/wait occurs while catalog SH is held. Failed admission retains metadata without cleanup; a redacted typed failure preserves the exact boxed cause and only proven held staging/lock identities, with unknown partial metadata explicitly unproven.
+- A narrow negative-only absence-finalize path may durably record a charged rollback attempt and forensic handling for a failed original-absence layout under the unchanged valid initial attestation and held journal/guard/operation proof. It cannot verify/adopt a candidate, rename material or remove the guard. Exhausted reserve or insufficient safe record capacity refuses without mutation. Normal initial-lease actions retain exact phase validation, and renewed impossible layouts always refuse before any attempt mutation.
+- Task 6 capacity reporting: `B` includes the checked lengths of every selected bundle-owned file, including its manifest and validation/profile/report metadata; it remains existing capacity and never enlarges or enters the new-allocation `C + R + V + M <= 2L` allowance. Shared batch configuration retains its checked reference and is accounted once per batch, separately from each bundle-owned `B`. The journal separately fixes the initial read-byte ceiling for existing bundle/configuration checks; restart uses the lesser of that ceiling and current reconciliation limits. The immutable new-allocation ceiling remains enforced independently by publication I/O.
+- The stable private `root/.locks/catalog.lock` is never unlinked or recreated. Publication receipt writes, reconciliation, quarantine, shared config publication and completed `.batch-<UUID>.json` records hold a shared lock. Purge holds an exclusive lock from reference scan through unlink; bounded lock wait refuses on timeout. Lock order is physical store, operation, then catalog, with borrowed lock-aware helpers rather than recursive acquisition. Dry-run inspection never bootstraps or syncs a missing lock. Administrative exclusion still covers legacy binaries and non-FerroLoop actors; this is no P1 ownership claim.
+- Reference closure uses bounded verified other live receipts/manifests and typed completed batch records. Any explicit pointer to the target operation ID or bundle name in `reference_dependencies`, shared-config descriptors or completed batch records refuses; equal member digests across independent bundles are not references. A dry-run digest binds confirmation, and closure is recomputed after half-withdrawal. Changed, incomplete or unproven closure refuses. Shared configs and batch records are never deleted.
+- Validation expectations use recovery metadata **format 2**. Finite vector scores persist as canonical 16-character lowercase hexadecimal IEEE-754 bits, so default JSON parse/reserialize preserves exact member checksums. Recomputed score comparison retains the profile's existing `1e-9` tolerance. Engine, snapshot, validation profile, manifest and verification report versions are unchanged; no global JSON parser feature is enabled. Format 1 expectations, including vector-free format 1, are explicitly unsupported with no migration or reinterpretation. No format 1 bundles were produced outside fixtures. The unchanged `Vec<f32>` probe profile is covered by a default-parser digest round-trip test.
+
+### Task 6 R4 design-record update (2026-11-13, PR #481)
+
+This dated update records the implemented review corrections and current limits;
+it leaves the original task checkboxes and operational gates unchanged.
+**Operational HOLD remains: no deployment, restart, live backup, restore or purge.
+Only isolated local fixture tests are in scope.**
+
+- Generic resume accepts `Prepared`, `ExchangeIntent`, `RelocateIntent`,
+  `Installed`, `RolledBack` and `OriginalAbsenceRestored`, subject to the existing
+  authority, layout and evidence checks. `ReverseIntent` refuses before an attempt
+  and names `rollback_restore`; a rollback already started never resumes forward.
+  Admitted/abandoned and terminal/finalize-intent phases name their typed action.
+- In post-exchange `RelocateIntent`, an original without a verification report
+  cannot support verified rollback. Resume can finish from the independently
+  verified preserved candidate, on the exchanged or installed layout, even when
+  the selected bundle is unavailable. Pre-exchange forward work still requires
+  the selected bundle. Forensic material remains retained and unverified.
+- Completed resume calls (`Installed`, `RolledBack`, `OriginalAbsenceRestored`)
+  and completed rollback calls (`RolledBack`, `OriginalAbsenceRestored`) append no
+  frame and consume no attempt after the existing authority/layout/evidence
+  checks. Work still needed shares the unchanged 12-attempt resume/finalize limit
+  and separate four-attempt rollback reserve; renewal never resets them.
+- Admission reserves terminal capacity **before staging, lock or journal
+  creation**, using maximum-width placeholder identities. It reuses one owned
+  journal, then installs actual identities and rechecks the exact reservation.
+  Refusal names `metadata_byte_limit`, offered bytes and an at-least required
+  amount, with headroom for serialized budget widths; an impossible reservation
+  states the supported maximum. Neither the metadata cap nor strict restore
+  `2L`, disk/read/memory ceilings or cumulative schedule changes: at most
+  `5 + 12 * 4 + 4 * 4 = 69` writer frames within the 96-frame reservation.
+- Fresh terminal acceptance reserves fixed maxima **O128** for the accepting
+  operator and **X256** for accepting-lease exclusion evidence, measured as JSON
+  encoded bytes including quotes and escapes. Both operator occurrences (lease
+  and reconciliation) are reserved. The reconciliation/absence evidence cap is
+  derived from the saved journal's immutable fields and remaining frame room.
+  One-byte-over new inputs refuse for free and state offered size and limit.
+  Existing shape, working-memory and whole-frame checks can refuse first; this
+  changes refusal priority without increasing any budget or acceptance bound.
+  Authenticated already-accepted evidence bypasses fresh-input limits on retry.
+
+The first post-release change to the accepting operator or exclusion-evidence
+allowances (O128 and X256 encoded bytes) must add a persisted reservation-policy
+version. First acceptance from earlier branch journals is unsupported because
+those journals exist only in fixtures on this unmerged operational HOLD;
+historically accepted contexts retain their authenticated retry path. No fallback
+for a tight earlier fixture journal is provided.
+
+Restore pins and purge audit intent/member/completion rows publish through fully
+written, file-synced and hash-checked private temporary files, atomic `NOREPLACE`
+rename and required directory syncs. Existing final names are never overwritten;
+a malformed final pin still fails closed. Typed cleanup/resume handles only the
+owning operation's checked temp under its locks. Four isolated mutations now
+turn the corresponding regressions red: audit temp file sync, post-rename catalog
+sync, unpublished pin hash check and the initial monotonic lease-deadline cap.
+Each exact source restoration passes. The frozen-wall test proves the cap stops
+namespace mutation even when wall time does not advance. The journal-boundary
+expiry regression uses an unfinished forward intent and injected expiry after
+charging, with ample real-time allowance; completed Installed calls are free.
+
+Rollback retains its early `verify_preserved_candidate` check. A corrupt
+preserved candidate refuses with exact journal/frame/attempt and artifact proofs.
+The order-only mutant moving that check after `attempt` remains **green**, as
+Ferris ruled equivalent: `continuation_limits`, rollback's `inspect_layout` and
+`attempt_scoped`'s `inspect_phase_layout` independently hash the candidate before
+charging; journal loading also validates generation/report bindings. No check is
+weakened or private injection added to manufacture a red mutation result.
+
+Read-only status exposes `accepted_reconciliation` and
+`accepted_absence_reconciliation`. Selected/original INTENT retries require
+byte-identical stored reconciliation. Absence finalization has no separate
+INTENT phase; already-terminal cleanup uses persisted evidence and ignores
+caller replacement evidence on both paths. Status does not consume attempts or
+mutate artifacts. The canonical 19,238-byte pin region remains SHA-256
+`7a6196e820b1b09fd77f3caa6f59515d4b0d36d8ab0996210269b28912c59bd0`
+through all R4 code changes.
+
+**Purge limitation:** inspection and confirmed purge require full bundle
+verification **and a matching receipt**. They cannot purge most corrupt or
+incomplete quarantine material, including an image digest mismatch, missing
+report, truncated manifest or missing receipt. A corrupt live catalogued bundle
+or completed-batch member with a quarantined receipt can also block inspection
+and confirmed purge of an unrelated healthy target throughout the approved root.
+Member-name diagnostics cover only some failures: a corrupt image, truncated
+manifest or missing report in a completed-batch member names that member relative
+to the root and retains its typed cause. The blocker remains unnamed when a
+member directory is missing or replaced by a symlink, a member file has mode 0644
+or is replaced by a symlink, a quarantined `receipt.json` contains garbage, or the
+manifest hash differs from the batch record. A corrupt live catalogued bundle
+also remains unnamed. These refusals remain fail-closed; they do not accept
+corrupt material or delete anything. Regression snapshots prove retained
+recovery artifacts and source unchanged with zero unlinks; a confirmed request
+may refresh only existing store-lock timestamp bookkeeping. The root-wide
+blocking and remaining unnamed diagnostics remain under
+[#514](https://github.com/Artificial-Humanity/FerroLoop/issues/514); an as-found
+purge mode remains deferred, with no automatic cleanup or manual deletion
+authorization. The restore floor for stores under about 8 MiB remains
+[#515](https://github.com/Artificial-Humanity/FerroLoop/issues/515), and scheduled
+exhaustive CI remains [#516](https://github.com/Artificial-Humanity/FerroLoop/issues/516).
+
+**Known limits and deferred nits:** zeroing the entire shared 4 KiB block
+containing the previous frame's tail and final frame's header can make the
+journal unloadable; this is outside the tested page old-or-new tear model. An
+orphan pin temp whose staging directory was removed remains harmless but may
+persist until same-operation typed cleanup. Broader stray-entry, forensic-abandon
+and expiry-cause diagnostics, and clarification of the existing op-ID "own temp"
+comment, are deferred; no additional pin exception or repair/unfence path is
+introduced. The oversized parsed-JSON unit fixture now uses the common fixture
+root.
+
+**Fixture verification modes:** the workspace dev profile builds both `sha2` and
+`fl-store` at `opt-level = 3`. Default exchange/reverse and completion/guard-cut
+matrices use deterministic samples retaining event-kind endpoints, semantic
+neighbors and original errno assignments on `journal_fixture`; exhaustive mode
+selects their original complete schedules. The two terminal pairwise matrices
+remain 12 cases each by default, with exact 96-case removal and 288-case sync
+schedules in exhaustive mode. All modes retain their recovery/fencing assertions
+and schedule-coverage tests. The subprocess poll sleeps 5 ms under its existing
+15-second deadline.
+
+From the repository root, use isolated native Linux ext4/XFS fixture storage;
+set `FL_RECOVERY_TEST_DIR` to an isolated directory there when the default
+temporary filesystem is unsupported. Portable commands include:
+
+```sh
+# Default recovery_restore suite (FL_RECOVERY_EXHAUSTIVE unset).
+cargo test --workspace --test recovery_restore -- --test-threads=1
+
+# All four full schedules, using each existing test's exact name as TEST_NAME.
+FL_RECOVERY_EXHAUSTIVE=1 cargo test --workspace --test recovery_restore TEST_NAME -- --exact --test-threads=1
+```
+
+The four test names are
+`restore_exchange_and_reverse_exchange_recover_every_cut`,
+`restore_selected_and_original_finalize_recover_every_completion_and_guard_cut`,
+`restore_terminal_all_generations_are_held_across_removal_and_later_authority_open`
+and
+`restore_terminal_absent_guard_and_pin_recheck_authority_and_layout_after_every_sync`.
+
+R4 item 5 focused local harness times were 36.55/17.10 s for the default
+exchange/finalization matrices and 60.91/33.26 s for exhaustive schedules. Cuts
+were forward 49/71, reverse 12/17 and each finalize role 15/21 (default/full).
+A cached unoptimized test-only rebuild took 2.69 s, the first optimized
+package/test rebuild 52.86 s, and a subsequent integration-test rebuild 13.35 s.
+These are different incremental rebuilds with cached dependencies, **not a cold
+compile comparison or measured cold compile delta**.
+
+Each R4 item has focused green checks and fresh scoped review. Final-head main
+integration, workspace/Windows clippy, full workspace tests, exhaustive schedules
+and whole-branch review remain pending for the coordinator. The required **CI
+job <=30 minutes** and **CI recovery_restore <=10 minutes** remain unverified
+until measured on the exact final head. Earlier R3 local results are historical
+and do not establish either R4 target or operational readiness.
+
 ### Task 7: Package reproducible acceptance evidence and rollout gates
 
 **Files:** Create `docs/operations/ferrostore-recovery.md`, `crates/store/tests/recovery_acceptance.rs`, and `crates/store/examples/recovery_fixture_baseline.rs`; update the architecture inventory only where implemented capability is now true. Evidence lives in private project scratch, with a redacted schema/example in docs.
@@ -217,6 +386,7 @@ Required activation blockers from Task 5 review (must be implemented and reviewe
 - [ ] Add a RED acceptance test that rejects a report missing any authoritative class, native platform proof, unknown-collection coverage, measured quota, dependency/effect reconciliation or a restore time within 30 min. Do not assert wall-clock scheduling in unit tests; fake clocks verify policy and measured runs supply performance evidence.
 - [ ] Run `cargo test -p fl-store --test recovery_acceptance`; retain RED. Implement report aggregation and an inert fixture example that generates cold/warm small/large/concurrent cases, domain transaction boundaries and failure matrices from spec §4. Never use a production path as a benchmark fixture.
 - [ ] Run GREEN and the final trio: `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`. Run native macOS/Windows tests for supported paths; list unsupported paths explicitly. Do not assert Windows safety from Linux cross-compilation.
+- [ ] Future operator guard checklist (documentation requirement only; Task 7 remains unimplemented and operational activation stays on HOLD): inspect the matching restore journal and prefer typed abandonment with that matching journal. A stray guard may be cleared manually only after journal state, retained artifacts, originals and administrative exclusion have been reviewed and the Lead operational gate explicitly permits it; never automatically delete a guard or recommend unconditional removal. Review retained restore artifacts before clearing. Record that running daemons check the guard at bind, not per request, and legacy binaries and already-open/cached handles are not fenced; administrative exclusion is still required.
 - [ ] Write the operator runbook: regenerate map; check all retained classes/dependencies; Jarvis verifies destination hardware/ownership; review budgets/proof; select one-off versus served mode; private backup verification; offline restore/reconciliation; rollback; alert handling. Capture inventory of domain multi-record atomicity and full Scan/Query read sets, with bounded retries and no external-effect reissue.
 - [ ] State separate go/no-go gates: Ferris accepts code/proof; Jarvis provisions and approves operational scheduling; owner approves any off-host transfer, key escrow and later history retirement; a live drill needs an announced approved window. Unserved Council's missed six-hour coverage stays visible until its own daemon is authorized. Off-host status remains pending, not silently satisfied by the second NVMe.
 - [ ] Commit `docs(recovery): document fixture proof and operational gates`; whole-branch independent review, required PR review and current-head CI before merge. Send the plan/evidence to Ferris; no deployment or operational activation follows automatically.
