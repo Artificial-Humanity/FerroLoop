@@ -73,10 +73,10 @@ Structural authority must not hang on a role's spelling. `RoleRecord` gains a `t
 A user-defined role is an ordinary `RoleRecord` with tier `member` unless the owner sets
 another tier. The wire form of every role is its bare slug. `custom:<slug>` is never written.
 
-Removing the prefix is a change of spelling only. It never changes an agent's tier, review
-authority or profile, and a user-defined role keeps its own role record. The bare slug cannot
-always stand for the prefixed one: today `AgentRole::from_wire` keeps `custom:lead`,
-`custom:assistant`, `custom:lab_manager` and `custom:lab-manager` as custom roles, distinct
+Removing the prefix preserves an agent's tier, review authority and profile, and a user-defined
+role keeps its own role record. The approved Council Chair transition is specified in §7.4.
+The bare slug cannot always stand for the prefixed one. Today `AgentRole::from_wire` keeps
+`custom:lead`, `custom:assistant`, `custom:lab_manager` and `custom:lab-manager` as roles distinct
 from the structural built-ins, while `custom:<other built-in>` already reads as that built-in
 (code-verified). Two rules follow:
 
@@ -91,7 +91,7 @@ from the structural built-ins, while `custom:<other built-in>` already reads as 
 
 ### 2.1.1 Review chain
 
-The reviewer of a pull request is the first *available* agent in the chain above its author:
+The review request targets the first available non-author tier in the chain above the author:
 
 | Author tier | Chain |
 |---|---|
@@ -100,20 +100,32 @@ The reviewer of a pull request is the first *available* agent in the chain above
 | `project-manager` | Director → Owner |
 | `director` | Owner |
 
-"Available" keeps today's meaning: an active registry record with a live route that answers a
-review request within 15 minutes. A tier with no agent for the project (most projects have no
-Project Manager) is skipped at once, not waited for. The Project Manager of a project is an
-agent of tier `project-manager` whose registered areas include that project; this uses the
-extra areas a manager already registers and needs no parent link between projects. A
-co-author is never its own reviewer, and the Owner-tier triggers of `pr_policy` (protected
-paths, missing trailers, instruction files) are unchanged and come before the chain.
-System-level changes (the workspace, the lab host, shared services) stay with the Director:
-the chain does not move them to a Project Manager.
+For each tier, first look for an active registry record eligible to review the project that
+belongs to a non-author. For every Project Manager review check, including request selection,
+escalation and approval, the PR's project must be among that manager's registered areas. This
+uses the extra areas a manager already registers and needs no parent link between projects.
+System-level changes (the workspace, the lab host, shared services) stay with the Director.
+The existing Owner authority and the Owner-tier triggers of `pr_policy` (including protected
+paths, missing trailers and instruction files) take precedence over the chain.
 
-`fl_core::pr_policy` gains the `project-manager` tier between `lead` and `director`, and
-`fl github pr create` reports the whole chain with the first available reviewer as the
-target. An approval from any tier at or above the target counts, as an approval from a higher
-tier does today.
+Request routing checks live routes and records why it skipped a tier for this project and
+head. A tier is absent when it has no eligible agent and offline when none of its eligible
+agents has a live route. Send a review request for the exact PR head to the first eligible
+tier with a live route. If that tier has no response within the existing 15-minute window,
+record the exact-head request and elapsed window before moving up. A refusal or changes
+requested is a response and gives no basis to skip the tier.
+
+An eligible non-Owner approval counts on the exact head only if each lower tier in the
+applicable chain has recorded absence, offline status, or the elapsed 15-minute no-response
+window for an exact-head request. Validate those reasons against the current head and
+eligibility. A new head requires reevaluating the chain and making a fresh request wherever
+a window is needed. A co-author's approval never counts. Owner approvals remain subject to
+the existing Owner rules.
+
+Today's `fl_core::pr_policy` evaluator uses active registry records. The implementation plan
+adds the `project-manager` tier between `lead` and `director`, live route and response evidence,
+and enforcement of those records in the approval check. `fl github pr create` reports the
+whole chain and the current request target.
 
 ### 2.2 Two kinds of grant
 
@@ -266,18 +278,18 @@ The three outcomes:
 
 - **deny** → the hook blocks the call and returns the reason and, where one exists, the broker
   command to use instead;
-- **ask** → the gate never allows the call by itself. The call goes to a real prompt channel:
+- **ask** → the gate never allows the call by itself. The call goes to a proven prompt channel:
   the vendor's own prompt, or a FerroDeck channel on a transport where #103 §3 proves one.
-  Where no prompt channel is proven for that vendor, transport and posture (M7), ask is
-  treated as deny (#103 §2: a deny never degrades to ask, and an ask with no prompt is a run);
+  Where no prompt channel is proven for that vendor, transport and posture (M7), deny the
+  call so bypass cannot silently run an unanswered ask (#103 §2);
 - **allow** → the hook pre-answers only where Phase 0 (M1, M2) proves that the vendor honours
   it. Elsewhere the gate does not answer for the vendor: the vendor layer may still prompt or
   refuse, which can only tighten the result.
 
-It is a local policy engine with a bounded timeout: pre-answer by rule, not remote resolution
-(#103 §3). On a timeout or a gate error (the effective policy is missing or unreadable, or
-the call cannot be classified) the result is deny, for every call. This is the #103 rule:
-bounded timeout, deny on timeout.
+It evaluates local policy within a bounded timeout (#103 §3). When the gate reaches its own
+deadline or encounters a policy error (the effective policy is missing or unreadable, or the
+call cannot be classified), it returns deny for every call. Vendor enforcement when the hook
+cannot return a decision is a separate requirement (M8).
 
 **The gate is never the sole control for a restriction.** Every deny and every ask in the
 effective policy, the `defaults` entries included, must have a compiled native restriction
@@ -297,17 +309,16 @@ gate as the only control.
 On top of the native rules the gate adds what they do not give: the reason, the broker hint,
 the journal, and the pre-answer of allowed calls.
 
-Fallback never widens. No path through the gate yields a more permissive result than the
-canonical policy: the gate can refuse a call or leave it to a layer that can only tighten,
-and it cannot turn a deny or an ask into a run. If the hook returns no decision at all (the
-hook process crashes, or the vendor's own hook timeout fires), the native rules decide, so
-the result is never more permissive than the canonical policy. That a vendor applies its
-native rules in that case is vendor behaviour and is unmeasured (M8). Until M8 proves it for a
-vendor, the gate hook is not installed for that vendor, and the compiled rules of §3.2 work
-alone.
+Install the hook only for a vendor, transport and posture where M8 proves the vendor denies
+the call when its watchdog terminates the hook or the hook returns no decision, including
+for a call the native rules would otherwise allow. A native prompt on hook failure does not
+satisfy this requirement. Where denial on hook failure is unproven, leave the hook disabled
+and use the compiled native rules alone if they cover every canonical deny and ask. Refuse
+the plan if that coverage is unavailable. Record the selected mode in the compile receipt.
 
-Every decision is journaled. FerroLoop installs the hook through the same per-session
-settings as §3.2; the hand-registered user-level entries are retired with it.
+FerroLoop journals decisions the gate returns. Evidence of vendor handling when a hook
+returns no decision comes from M8. FerroLoop installs proven hooks through the same
+per-session settings as §3.2 and retires the corresponding hand-registered user-level entries.
 
 ### 3.4 What is not enforcement
 
@@ -336,7 +347,7 @@ runtime-proven rows in `docs/permissions.md`:
 | M5 | Are per-session settings loaded, in what order against user and project settings, and are edits picked up live? |
 | M6 | Can the session itself rewrite the per-session settings or hook file, and does the vendor's protected-path handling stop it? |
 | M7 | Under each posture, is a call that matches a native ask rule held for a prompt that an operator can answer on this transport (the vendor's own prompt, or a channel of #103 §3), or does it run or fail without one? |
-| M8 | When a `PreToolUse` or `PermissionRequest` hook returns no decision (the hook process crashes, or the vendor's own hook timeout fires), does the vendor apply its native rules to the call (a native deny blocks, a native ask prompts), or does the call run? |
+| M8 | For each vendor, transport, posture and hook kind to be installed, does the vendor deny the call when its watchdog terminates the hook or the hook returns no decision? Exercise missing decisions, process crashes and the vendor's own timeout, including calls with native allow, ask and deny. Record whether the call is blocked, prompted or runs. |
 
 §3.1 depends on Phase 0 least: it needs one allow rule (`fl github`) per vendor, and if M1
 fails for a vendor the fallback is that vendor's reviewer judging one stable command instead
@@ -359,15 +370,17 @@ Each phase is its own plan and pull request series under `subagent-dev`.
 ## 6. Draft action matrix (not applied; each profile needs the owner's approval)
 
 Taken from the role files and `WORKFLOW.md`. "Open" cells are not answered by today's rules.
+Review actions follow §2.1.1, including exact-head evidence, portfolio scope, and the existing
+Owner triggers.
 
 | Action | Member | Lead | Project Manager | Director |
 |---|---|---|---|---|
 | Open a pull request | allow | allow | allow | allow |
-| Approve a member's pull request | deny | allow, own team | allow when the Lead is unavailable | allow when Lead and Project Manager are unavailable |
-| Approve a Lead's pull request | deny | deny | allow, portfolio | allow when the Project Manager is unavailable or absent |
+| Approve a member's pull request | deny | allow, own team | allow, portfolio, with recorded Lead unavailability (§2.1.1) | allow with recorded Lead and portfolio Project Manager unavailability (§2.1.1) |
+| Approve a Lead's pull request | deny | deny | allow, portfolio (§2.1.1) | allow with recorded portfolio Project Manager unavailability (§2.1.1) |
 | Approve a Project Manager's pull request | deny | deny | deny | allow |
 | Merge own approved pull request | allow | allow | allow | allow |
-| Merge another agent's pull request | deny | allow when a permission blocks the author | open (O2), for a pull request it approved | same, for a pull request it approved |
+| Merge another agent's pull request | deny | allow when a permission blocks the author | open (O2), portfolio only, for a pull request it approved | allow when a permission blocks the author, for a pull request it approved |
 | Change instruction files or protected paths | pull request, owner approves | pull request, owner approves | pull request, owner approves | pull request, owner approves |
 | File an issue in own project | open (O2) | allow | open (O2) | open (O2) |
 | Clear or reforge another agent's session | deny | open (O2), own team | open (O2) | open (O2) |
@@ -422,8 +435,16 @@ which the migration would then rewrite, or namespace-1 role documents into a sto
 which nothing would rewrite. Until the P1 plan defines a namespace-aware sync, a build at the
 epoch refuses an inbound store-level sync batch that carries a role-bearing document or a
 schema-version put across the marker boundary, in either direction. The plan must say how the
-build establishes the side a batch comes from; a batch whose side is not established is
-refused. This is new work for the P1 plan.
+build establishes the side a batch comes from. Refuse a batch whose side is unestablished.
+Role-catalog StateRevision sync on `fl/state` is a separate path (§7.3), with its own fence.
+
+Authority-bearing role data may take effect only through verified Owner authorization. The
+P1 plan must enforce this before applying role changes through `fl role` and `/api/v1/roles`,
+generic state writes to `workspace/runtime/role-*`, or any sync/import surface that can
+materialize role data. A caller-supplied `by` value, a trusted transport or a namespace
+marker alone provides no such authorization. The plan must preserve provable historical
+Owner decisions and refuse or hold an import it cannot authorize. The same-UID limitation
+in §3.1 applies to these checks.
 
 ### 7.2 The rewrite
 
@@ -439,6 +460,9 @@ One store migration, one transaction. In this order it:
 5. strips `custom:` where §7.4 allows it, and makes `council-chair` a built-in role with tier
    `council-chair`;
 6. raises the store format to the epoch and writes the role-namespace marker.
+
+Live catalog rewrites move the workspace runtime key and payload slug together. Published
+catalog revision history keeps its source representation and follows the §7.3 import fence.
 
 Steps 3 to 6 commit together or not at all. The migration appends no `AgentUpsert` event to the
 registry event log (§7.3). Given the sync rule of §7.1, no committed store holds new names
@@ -471,10 +495,13 @@ input to the decoder; no reader infers it from the text of the value.
     rewrites it in the transaction of §7.2.
   - **History**: posted markers, FerroWire messages and journal entries. It is only read, and
     it is decoded in the namespace it was written in.
-  - **Replayable events**: the registry event log. It is not only read:
-    `RegistryEventKind::AgentUpsert` carries a whole agent record, the role included, and
-    `import_registry_events` writes that record into live state (code-verified). It is
-    translated on import, as described below.
+  - **Replayable events**: the registry event log. `RegistryEventKind::AgentUpsert` carries
+    a whole agent record, the role included, and `import_registry_events` updates live state
+    (code-verified). The import applies source-namespace effects before projecting live names.
+  - **Role catalog revisions**: `StateRevision` entries for `workspace/runtime/role-*`.
+    The `fl/state` branch sync imports and exports them separately from registry events and
+    store-level sync. They can update or delete a live `RoleRecord`, subject to the catalog
+    admission rule below.
   - **Stored definitions**: any other stored type that carries a role value. Stored workflow
     definitions are one: the assignee selector of a step carries a role, and an approval tier
     has the value `lab_manager` (code-verified: `AssigneeRule::Selector` and `ApprovalTier` in
@@ -504,41 +531,70 @@ dismissed review that carries a new marker, so an earlier approval by the same r
 the same head stays in force for it. The supported upgrade order of §7.5 leaves no older build
 that verifies approvals; the rollback contract of §7.5 covers the case where one returns.
 
-**Replayable events are translated on import.** The registry event log reaches live state
-through `import_registry_events`, which the `fl/state` branch sync and the FerroWire peer
+**Registry event replay preserves source-namespace effects.** The registry event log reaches
+live state through `import_registry_events`, which `fl/state` branch sync and FerroWire peer
 frames call (code-verified: `state_sync.rs`, `daemon.rs`). The branch log is append-only, so
 the migration cannot rewrite the events already in it. The rules below are design for the P1
 plan:
 
 - Every registry event that a build at the epoch writes carries the role namespace. An event
   without it is namespace 1.
-- A build at the epoch translates a namespace-1 event to namespace 2 when it imports it. The
-  translation is the fixed table of §7.1 and of this section, the classification of §7.4 and
-  the Owner mappings of §7.4: the same function as the rewrite of §7.2. It never applies the
-  role of such an event verbatim, and never reads it as namespace 2.
-- The migrated role of an agent is therefore a deterministic function of the log: every store
-  derives the same namespace-2 state from the same log. The migration appends no
-  `AgentUpsert` event, so the migration of a lagging store cannot change a role or a status
-  on another store. The log carries agent records, not role records (code-verified: its four
-  event kinds).
+- Interpret a namespace-1 event under the original namespace-1 semantics, including its
+  lifecycle and status effects against the corresponding source-namespace roles. Only a genuine
+  namespace-1 Lead upsert can invoke namespace-1 Lead replacement. The current importer retires
+  another active Lead in the same project on an active Lead upsert
+  (`crates/store/src/ferrostore/traits_state.rs:608–623`), so applying a different tier or a
+  newly structural spelling first would risk retiring a legitimate Lead. A legacy
+  custom collision keeps its authority under its noncolliding name. The Council Chair
+  exception of §7.4 changes its live role representation and has no Lead replacement effect.
+- Project the resulting live names through the same mapping as the rewrite of §7.2. A
+  namespace-2 event uses namespace-2 semantics. The P1 plan must preserve parity of role,
+  tier, authority and status when a fresh store rebuilds, a lagging store imports after the
+  epoch, or a store processes a mixture of both namespaces. For a legacy segment, the
+  reference result is replay under namespace 1 followed by projection. The migration appends
+  no `AgentUpsert` event. The existing log carries agent records only, with the role catalog
+  supplied separately.
 - The Owner mappings travel with the log. An Owner mapping (§7.4) is published as a registry
   event of a new, Owner-authorized kind; this is new work for the P1 plan. A store applies
-  every mapping event that it can see before it translates a role-bearing event, so the
-  result does not depend on the position of a mapping in the log. The plan must say when a
+  every verified mapping event that it can see before it projects a role-bearing event, so
+  the result does not depend on the position of a mapping in the log. The plan must say when a
   mapping event is written and what a store does with two mapping events that disagree for
   one role; the order of import must not decide.
-- An event whose role needs an Owner mapping is refused, not applied, only when no mapping
-  event for that role exists anywhere in the log that the store can see. The P1 plan must
-  make sure that a refused event is not skipped for good: today the FerroWire peer path
-  advances its sync cursor before the import and only warns when the import fails
-  (code-verified: `daemon.rs`).
-- The translation applies to the live record that the import writes. The stored copy of the
-  event keeps its text: the import compares a repeated event with its stored copy today
-  (code-verified), and the log stays append-only.
+- If the visible log lacks a verified Owner mapping or contains a conflict, hold the dependent
+  event until an unambiguous verified mapping is available. The P1 plan must make holds
+  resumable. Today the FerroWire peer path advances its sync cursor before the import and
+  only warns when the import fails (code-verified: `daemon.rs`).
+- Projection applies to the live view only. Event identities, payloads and recorded statuses
+  stay immutable, and legitimate lifecycle effects retain their original meaning. The import
+  compares a repeated event with its stored copy today (code-verified). The log stays append-only.
 - `RegistryEvent` and `AgentRecord` refuse unknown fields today (code-verified), so a build
   older than the epoch cannot decode an event with a new field and cannot apply a namespace-2
   role as namespace 1. The P1 plan must keep that property in the form it gives the
   namespace.
+
+**Role catalog revisions have a separate admission fence.** `fl/state` imports ordered
+`StateRevision` records even with registry-event sync disabled, and exports unpublished
+revisions from the state log (`crates/exec/src/state_sync.rs:879–896,955–967`). Workspace
+runtime entries with `role-` keys are the live role catalog. The reader requires the key suffix
+to match the role payload slug. Role upserts and tombstones use the same workspace runtime
+key (`crates/core/src/agent.rs:671–683,753–764,771–794`). A legacy `role-director` revision
+concerns the Project Manager, including when it is a tombstone.
+
+At the epoch, fail closed on import or export of legacy or unclassified role-catalog revisions
+until the P1 plan implements epoch-aware admission and projection. Hold unverifiable Owner
+authority the same way on import. Either refuse before applying the affected catalog batch or
+durably retain held revisions and their dependencies for resumption. Preserve the original
+revision identities, payloads and lineage. Transfer progress must allow retry after support or
+authority is established. A fresh or lagging store must refuse to use any unresolved catalog
+revision as effective authority.
+
+The P1 plan must specify and validate how the canonical key and payload slug, revision
+lineage, and tombstones translate together into the live catalog while the published revision
+log remains append-only. Classify tombstones by their source namespace and key even when the
+payload lacks a slug. Require explicit namespace and verified Owner authorization before
+admitting authority-bearing revisions after cutover (§7.1). Legacy revisions must never set or
+delete the new Director record, and replay must never resurrect a role removed by a later
+tombstone. The fence applies independently of registry-event and store-level sync admission.
 
 ### 7.4 The `custom:` prefix
 
@@ -548,7 +604,7 @@ The migration classifies every namespace-1 `custom:<slug>` value before it write
 |---|---|
 | `custom:<slug>`, slug not a structural name of §2.1 (`custom:reviewer`) | Becomes `<slug>`. Same role record, same tier (`member` unless the owner set another), same profile. |
 | `custom:<built-in>` that namespace 1 already reads as the built-in (`custom:tester`, `custom:director`) | Handled as that namespace-1 built-in. `custom:director` is Project Director there, so it becomes `project-manager`, never the new `director`. |
-| `custom:council-chair` | Becomes `council-chair`. This is the one mapping to a structural name that Record #193 fixes (§1): the existing Council Chair role becomes the built-in, with the tier §2.1 gives it. That tier is not in the review chain of §2.1.1. |
+| `custom:council-chair` | Becomes the built-in `council-chair` with the tier §2.1 gives it, as approved in Record #193 (§1). That tier falls outside the review chain of §2.1.1. This exception has no Lead replacement effect in replay. |
 | `custom:<slug>`, slug any other structural name (`custom:lead`, `custom:assistant`, `custom:lab_manager`, `custom:lab-manager`, `custom:project-manager`) | **Collision.** Not stripped. |
 
 A user-defined role record whose slug is a structural name of namespace 2 (`project-manager`)
@@ -556,15 +612,15 @@ is a collision in the same way.
 
 On a collision the migration refuses. It reports each colliding role and the agents that hold
 it, writes nothing, and leaves the store below the epoch. It runs again only with an Owner
-mapping for every colliding role, given with Owner authority (§2.3), journaled and published
-as a registry event (§7.3). The mapping is one of:
-
-- **rename**: the custom role gets a non-colliding slug. It stays a user-defined role with its
-  own role record and tier `member` unless the owner sets another;
-- **structural**: an explicit Owner decision that these agents hold the structural role.
-
-The migration never chooses between the two. With a complete mapping it applies the mapping in
+mapping for every colliding role, given with Owner authority (§7.1), journaled and published
+as a registry event (§7.3). The mapping gives the custom role a noncolliding user-defined slug
+and preserves its existing tier, profile and authority. With a complete mapping, apply it in
 the same transaction as the rest of §7.2.
+
+Any later promotion to a structural role requires a separate explicit Owner-authorized action
+after cutover. Evaluate it against current registry state under normal namespace-2 validation.
+Record its effects at that point in history. A promotion cannot be encoded as a migration
+mapping or applied to earlier events.
 
 ### 7.5 Older writers, upgrade order and rollback
 
@@ -596,8 +652,8 @@ the migration must not be released without it.
 With both fences, once the epoch is committed a hub, wire daemon, CLI, store server or hosted
 hook older than the epoch cannot write to the store, by a direct open or as a client. Given
 the sync rule of §7.1, a mixed-version live write fails closed. It is never accepted with an
-old spelling and never translated on the way in. Translation exists only for the events of
-the registry log (§7.3).
+old spelling and never translated on the way in. Replayable registry events and role-catalog
+revisions have their own import rules (§7.3).
 
 Two cases need more than the fences, and the P1 plan must close both:
 
@@ -609,10 +665,9 @@ Two cases need more than the fences, and the P1 plan must close both:
 - A live role-bearing write that reaches a build at the epoch from another process (a hub
   request, a FerroWire message) and not through the store. It must state namespace 2, by a
   field or by a protocol version that implies it. A live write without that statement is
-  refused; it is not decoded as namespace 2. This rule does not apply to a registry event,
-  which is a replayable record and not a live request: an event that states namespace 2 is
-  applied, and an event without a namespace is namespace 1 and is translated on import
-  (§7.3). It is neither refused for the missing statement nor applied verbatim.
+  refused. Replayable registry events use their source-namespace semantics and projection
+  (§7.3). Role-catalog revisions pass the separate §7.3 admission fence before affecting the
+  live catalog.
 
 **Supported upgrade order.**
 
@@ -661,12 +716,25 @@ count. After a rollback, no pull request is merged on a review posted before the
   identity mismatch.
 - The same command from a shell that is not under a hosted session: refused without Owner
   authority.
+- A member opens a PR for head H1 with an active Lead on a live route, a Project Manager for
+  the project, and an active manager outside that portfolio. The Lead receives the H1 request.
+  Neither manager's approval counts before the window elapses. If the Lead requests changes,
+  the timeout cannot authorize escalation. If the Lead stays silent for 15 minutes, the
+  in-portfolio manager becomes the target and their approval can count. The Director's
+  approval still needs evidence that the in-portfolio tier is unavailable. A new head H2
+  needs current-head approval and fresh timeout evidence. Recorded absence or offline status
+  allows immediate escalation to the next eligible tier. Owner-tier triggers continue to route
+  to the Owner first.
 - Spin-up with no `permission_policy`: the hosted record shows the role's profile and its
   compile receipt. With a widening override and no Owner authority: refused, naming the rule.
 - Two agents of different roles in one project directory get different compiled rules, and
   neither run changes a shared settings file.
 - A raw `gh pr merge` in a gated session is denied with a message that names
   `fl github pr merge`.
+- In an M8-proven configuration, terminating an installed hook via the vendor watchdog or
+  returning no decision blocks the call, even with a matching native allow. A configuration
+  that prompts, runs, or has no proof for that failure keeps the hook disabled. Its native
+  restrictions still enforce every canonical deny and ask, or spin-up is refused.
 - Migration fixtures: a store below the epoch holding `lab_manager`, `lab-manager`,
   `director`, `custom:director`, `custom:council-chair` and `custom:reviewer` reads back as
   `director`, `director`, `project-manager`, `project-manager`, `council-chair` and
@@ -678,8 +746,9 @@ count. After a rollback, no pull request is merged on a review posted before the
   `project-manager`.
 - Structural-name collisions: a store holding `custom:lead` and `custom:lab_manager` makes the
   migration stop with the Owner-mapping refusal. The refusal names both roles and the agents
-  that hold them, and the store is unchanged and still below the epoch. With an Owner mapping
-  for both, the run completes and each agent has exactly the mapped role.
+  that hold them, and the store is unchanged and still below the epoch. With verified Owner
+  mappings to noncolliding slugs, the run completes and both agents retain their prior tier,
+  profile and authority. An attempted structural promotion through a mapping is refused.
 - After the migration, `custom:reviewer` on input is read as `reviewer`; `custom:lead`,
   `custom:director` and `custom:lab_manager` on input are refused with the message of §2.1;
   creating a user-defined role named `lead` or `project-manager` is refused.
@@ -690,15 +759,26 @@ count. After a rollback, no pull request is merged on a review posted before the
   epoch states no role-namespace capability and is refused in the handshake, before any
   write. The store is unchanged; no `lab_manager` or `custom:` value is written. A
   role-bearing request without namespace 2 to a hub at the epoch is refused.
-- Event replay: a new store and a lagging store each import the same registry log. It holds
-  pre-epoch `AgentUpsert` events with `lab_manager`, `director`, `custom:reviewer` and
-  `custom:lead`, and after them an Owner mapping event for `custom:lead`. Both stores end with
-  the same roles: `director`, `project-manager`, `reviewer` and the mapped role. The migration
-  of the lagging store appends no `AgentUpsert` event to the log and changes no role on another
-  store. With no mapping event in the log, the `custom:lead` event is refused, and it is
-  applied once the mapping event is there. A pre-epoch `director` event, imported alone by a
-  build at the epoch, gives `project-manager` and never the new Director. The stored copy of
-  every event is unchanged.
+- Event replay: a fresh epoch store and a lagging store upgraded from a prefix of the same
+  registry log converge on roles and statuses. Include pre-epoch `AgentUpsert` events for
+  `lab_manager`, `director`, `custom:council-chair`, `custom:reviewer` and `custom:lead`, a
+  later Owner rename mapping for `custom:lead`, and subsequent namespace-2 events. An agent
+  once held `custom:lead` alongside a legitimate active Lead of the same project, then changed
+  to another non-Lead role. Replay keeps the legitimate Lead active and the historical holder
+  in its latest role, with identical results on fresh, lagging and mixed-namespace import.
+  Include a genuine Lead replacement as a control. With the rename mapping missing, hold the
+  `custom:lead` event and resume when the verified mapping is present. Event IDs, payloads and
+  recorded statuses stay unchanged. The migration appends no `AgentUpsert`.
+- Role-catalog sync: `fl/state` revisions still reach the catalog path with registry sync
+  disabled. Stage a legacy `role-director` write and its descendant tombstone, alongside a
+  namespace-2 `role-director` revision. Before epoch-aware handling is supported, reject or
+  durably hold the legacy revisions without losing retry progress or
+  touching either live role. After verified admission and replay, the new Director is
+  unchanged, the Project Manager remains deleted, and the source lineage and revision IDs
+  are intact. Attempt the same authority change via dedicated role writes, generic state
+  writes and sync without Owner proof. Each path refuses to activate it, even with `by` set
+  to the Owner or an authenticated transport. Repeat with valid Owner authorization and the
+  right namespace as a positive control.
 - Marker decoding: a posted marker without a namespace field and with role `lab_manager`
   verifies as the Director tier, and one with role `director` verifies as the Project Manager
   tier. A marker with `role_ns: 2` and role `director` verifies as the Director tier. Neither
@@ -711,9 +791,10 @@ count. After a rollback, no pull request is merged on a review posted before the
   Director; session clear and reforge by a Lead for its own team, by the Project Manager and
   by the Director; and whether a Project Manager may merge a blocked author's pull request
   that it approved, as a Lead and the Director may.
-- **O3.** The gate timeout duration, and how a timeout or a gate error is reported to the
-  operator, after M2 and M3. The authorization semantics of §3.3 are fixed and not open: the
-  profile's `defaults` map, an ask is never auto-allowed, deny on timeout or error, and no
-  restriction rests on the gate alone.
+- **O3.** Set the gate deadline and operator-facing error reporting after M2, M3 and M8. §3.3
+  fixes the authorization semantics. The gate uses the profile's `defaults`, holds or denies
+  every ask, and denies on its own timeout or policy error. Installing a hook requires M8
+  proof of denial when no decision reaches the vendor. Native restrictions must cover every
+  canonical deny and ask in either mode.
 - **O4.** Whether the interim deny rules for raw `gh` writes (P2) ship before or with the new
   broker commands; before means a short period in which members cannot file issues at all.
