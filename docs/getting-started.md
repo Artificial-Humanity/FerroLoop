@@ -174,7 +174,9 @@ A directory-backed project is made in this order, leaving what is already right 
 4. **Config.** A `[[project]]` block (`name` is the slug, `root`, `store`) is appended to
    `$XDG_CONFIG_HOME/fl/config.toml`, the rest of the file untouched. The block is written last,
    by replacing the file whole, so a failure earlier leaves the project unregistered and a re-run
-   finishes it. `--github owner/repo` adds a `[project.tracker]` with `credential` `app` (the
+   finishes it. If an older run left only a project store at a different historical slug,
+   the command asks for an explicit choice. Use the historical `--slug` to resume that store.
+   `--github owner/repo` adds a `[project.tracker]` with `credential` `app` (the
    default) or `env`; `--credential` needs `--github`. A project that has no tracker gets the one
    asked for; creating never rebinds one that has a tracker (the Hub's
    `PATCH /api/v1/projects/<slug>` does).
@@ -186,9 +188,10 @@ either, so it is already a virtual group. To convert an unlinked leaf to a direc
 project, first give it a directory with `fl agent area set <slug> --path <dir> --purpose <text>
 --by <you>`. The command refuses to repoint an area that has a parent or children.
 
-Validation failures leave the target project, workspace registry and configuration contents
-unchanged. Taking the configuration lock can create the config directory and a persistent
-`<config-file>.projects.lock` file. fl refuses an empty path, a NUL, a path that is a file, a
+Hierarchy validation failures leave the target project, workspace registry and configuration
+contents unchanged. A workspace open during validation still follows the selected backend's
+normal migration rules. Taking the configuration lock can create the config directory and a
+persistent `<config-file>.projects.lock` file. fl refuses an empty path, a NUL, a path that is a file, a
 slug that another project's block already has (at another root), a root that is already
 registered under another slug, a store that holds another project, a root that contains the
 stores' directory, and a slug that is the other kind. Running the same command again changes
