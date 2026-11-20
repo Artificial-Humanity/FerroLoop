@@ -1055,17 +1055,16 @@ fn check_create_store_owner(
     }
 }
 
+fn read_redb_projects(path: &Path) -> Result<Vec<fl_core::model::Project>, InitError> {
+    let error = |e: fl_core::store::StoreError| failed(format!("store {}: {e}", path.display()));
+    // The usual scan can repair an unreadable redb. Only read before proving ownership.
+    let redb = fl_store::RedbStore::open_read_only(path, fl_store::StoreOptions::default().retries)
+        .map_err(error)?;
+    redb.list_projects().map_err(error)
+}
+
 fn check_lone_redb_owner(resolved: &Resolved) -> Result<(), InitError> {
-    let error =
-        |e: fl_core::store::StoreError| failed(format!("store {}: {e}", resolved.store.display()));
-    // The usual scan can repair an unreadable redb. Prove this unbound store's owner
-    // with a strictly read-only open before permitting its ordinary open to migrate it.
-    let redb = fl_store::RedbStore::open_read_only(
-        &resolved.store,
-        fl_store::StoreOptions::default().retries,
-    )
-    .map_err(error)?;
-    let projects = redb.list_projects().map_err(error)?;
+    let projects = read_redb_projects(&resolved.store)?;
     check_create_store_owner(resolved, &projects, true)
 }
 
@@ -1084,24 +1083,39 @@ fn check_resume_store(resolved: &Resolved) -> Result<(), InitError> {
             resolved.store.display()
         )));
     }
-    // Scan opens may initialize a zero-byte file. A flat recovery must find existing data.
-    let physical = fl_store::store_identity(&resolved.store);
-    let metadata = std::fs::metadata(physical).or_else(|e| {
-        if e.kind() == std::io::ErrorKind::NotFound {
-            std::fs::metadata(&resolved.store)
-        } else {
-            Err(e)
-        }
-    });
-    if metadata.is_ok_and(|meta| meta.is_file() && meta.len() == 0) {
+    let error =
+        |e: fl_core::store::StoreError| failed(format!("store {}: {e}", resolved.store.display()));
+    let backend = fl_store::choose_backend(
+        &resolved.store,
+        std::env::var(fl_store::BACKEND_ENV).ok().as_deref(),
+    )
+    .map_err(error)?;
+    let physical = fl_store::physical_path(&resolved.store, backend);
+    // Ferro uses the logical file as redb only when its distinct .fls is absent.
+    let lone_redb = physical != resolved.store
+        && std::fs::symlink_metadata(&physical)
+            .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound);
+    let path = if lone_redb {
+        &resolved.store
+    } else {
+        &physical
+    };
+    // The ordinary Ferro open can initialize a zero-byte file.
+    let metadata =
+        std::fs::metadata(path).map_err(|e| failed(format!("store {}: {e}", path.display())))?;
+    if metadata.is_file() && metadata.len() == 0 {
         return Err(resume_store_refusal(resolved));
     }
-    // A wrong root must not cause a lone redb to be migrated.
-    let store = fl_store::open_store_for_scan(&resolved.store)
-        .map_err(|e| failed(format!("store {}: {e}", resolved.store.display())))?;
-    let projects = store
-        .list_projects()
-        .map_err(|e| failed(format!("store {}: {e}", resolved.store.display())))?;
+    let projects = if backend == fl_store::BackendKind::Redb || lone_redb {
+        // Preserve the ordinary scan's restore fence for the selected physical store.
+        fl_store::recovery::admission::check_restore_admission(&physical)
+            .map_err(|e| failed(format!("store {}: {e}", resolved.store.display())))?;
+        read_redb_projects(path)?
+    } else {
+        // Open the selected .fls by name so this read cannot fall back to redb.
+        let store = fl_store::open_store_for_scan(path).map_err(error)?;
+        store.list_projects().map_err(error)?
+    };
     match projects.as_slice() {
         [project] if same_root(&project.root, &resolved.root) => Ok(()),
         _ => Err(resume_store_refusal(resolved)),
