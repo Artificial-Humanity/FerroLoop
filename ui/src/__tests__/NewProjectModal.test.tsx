@@ -70,6 +70,52 @@ describe("deriveProjectSlug", () => {
 });
 
 describe("NewProjectModal", () => {
+  it("previews a hierarchical slug and only sends parent creation when checked", async () => {
+    const { create } = setup();
+    type("new-project-name", "Café / R&D / Mobile");
+    type("new-project-path", "/work/mobile");
+    expect(screen.getByTestId("new-project-slug")).toHaveValue("cafe-r-d-mobile");
+    const createParent = screen.getByRole("checkbox", { name: "Create missing parent groups" });
+    expect(createParent).not.toBeChecked();
+    fireEvent.click(createParent);
+    await submit();
+    expect(create).toHaveBeenCalledWith({
+      name: "Café / R&D / Mobile",
+      slug: "cafe-r-d-mobile",
+      kind: "project",
+      path: "/work/mobile",
+      create_parent: true,
+    });
+  });
+
+  it("requires an explicit slug if part of a name uses untranslatable letters", async () => {
+    const { create } = setup();
+    type("new-project-name", "Lab / 東京");
+    type("new-project-path", "/work/tokyo");
+    expect(screen.getByTestId("new-project-slug")).toHaveValue("");
+    await submit();
+    expect(screen.getByText(/Enter a slug/)).toBeInTheDocument();
+    expect(create).not.toHaveBeenCalled();
+    type("new-project-slug", "tokyo");
+    await submit();
+    expect(create).toHaveBeenCalledWith({
+      name: "Lab / 東京",
+      slug: "tokyo",
+      kind: "project",
+      path: "/work/tokyo",
+    });
+  });
+
+  it("rejects empty hierarchy segments before asking the hub to create them", async () => {
+    const { create } = setup();
+    type("new-project-name", "Lab // Mobile");
+    type("new-project-slug", "mobile");
+    type("new-project-path", "/work/mobile");
+    await submit();
+    expect(screen.getByText(/non-empty segments/)).toBeInTheDocument();
+    expect(create).not.toHaveBeenCalled();
+  });
+
   it("renders nothing when closed", () => {
     render(
       <NewProjectModal
@@ -289,7 +335,7 @@ describe("NewProjectModal", () => {
       await submit();
       expect(create).not.toHaveBeenCalled();
       expect(screen.getByTestId("new-project-slug")).toHaveAccessibleDescription(
-        "Slug is required.",
+        "Enter a slug using lowercase letters, digits and hyphens.",
       );
     });
 

@@ -31,7 +31,7 @@ import {
   type CurrencyPreference,
 } from "../lib/currency";
 import { TIMEZONE_OPTIONS, setActiveTimeZone } from "../lib/datetime";
-import { PinIcon, togglePinnedProject, usePinnedState } from "./RosterSidebar";
+import { isProjectPinned, PinIcon, togglePinnedProject, usePinnedState } from "./RosterSidebar";
 import { RuntimesQuotasPanel } from "./RuntimesQuotasPanel";
 import {
   ACP_CONFORMANCE_OPERATIONS,
@@ -2691,6 +2691,13 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   const isProjectScoped =
     Boolean(initialProject) || resolvedProjectFilter !== "all";
   const scopedProject = findProject(effectiveProjects, resolvedProjectFilter);
+  const scopedArea = areaRecords.find((area) =>
+    [area.name, area.area_key].some((label) =>
+      label.trim().toLowerCase() === resolvedProjectFilter.trim().toLowerCase(),
+    ),
+  );
+  const projectPinKey = scopedProject?.slug ?? scopedArea?.area_key ?? resolvedProjectFilter;
+  const projectPinned = isProjectPinned(pinnedProjects, projectPinKey, resolvedProjectFilter);
   const scopedProjectName =
     resolvedProjectFilter !== "all"
       ? resolvedProjectFilter
@@ -2817,20 +2824,10 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
             <button
               type="button"
               data-testid="project-pin-toggle-btn"
-              aria-pressed={pinnedProjects.has(
-                resolvedProjectFilter.trim().toLowerCase(),
-              )}
-              title={
-                pinnedProjects.has(resolvedProjectFilter.trim().toLowerCase())
-                  ? "Unpin Project"
-                  : "Pin Project"
-              }
-              aria-label={
-                pinnedProjects.has(resolvedProjectFilter.trim().toLowerCase())
-                  ? "Unpin Project"
-                  : "Pin Project"
-              }
-              className={`fd-btn${pinnedProjects.has(resolvedProjectFilter.trim().toLowerCase()) ? " fd-btn-active" : ""}`}
+              aria-pressed={projectPinned}
+              title={projectPinned ? "Unpin Project" : "Pin Project"}
+              aria-label={projectPinned ? "Unpin Project" : "Pin Project"}
+              className={`fd-btn${projectPinned ? " fd-btn-active" : ""}`}
               style={{
                 padding: "4px 6px",
                 display: "inline-flex",
@@ -2838,12 +2835,10 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 justifyContent: "center",
                 lineHeight: 1,
               }}
-              onClick={() => togglePinnedProject(resolvedProjectFilter)}
+              onClick={() => togglePinnedProject(projectPinKey, resolvedProjectFilter)}
             >
               <PinIcon
-                pinned={pinnedProjects.has(
-                  resolvedProjectFilter.trim().toLowerCase(),
-                )}
+                pinned={projectPinned}
                 circled={true}
                 size={16}
               />

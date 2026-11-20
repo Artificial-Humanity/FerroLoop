@@ -62,6 +62,25 @@ describe("HubApiClient projects", () => {
     expect(new Headers(calls[0].init?.headers).get("Accept")).toBe("application/json");
   });
 
+  it("preserves canonical hierarchy links and sends explicit parent creation", async () => {
+    const root = { ...FULL, parent: null, ancestors: [] };
+    const child = {
+      ...FULL,
+      id: "ferro-mobile",
+      slug: "ferro-mobile",
+      name: "Ferro / Mobile",
+      parent: "ferro",
+      ancestors: ["ferro"],
+    };
+    const { client, calls } = makeClient((_url, init) =>
+      init?.method === "POST" ? json(child, 201) : json({ projects: [root, child] }),
+    );
+    expect(await client.listProjects()).toEqual([root, child]);
+    const request = { kind: "virtual" as const, name: child.name, create_parent: true };
+    expect(await client.createProject(request)).toEqual(child);
+    expect(JSON.parse(String(calls[1].init?.body))).toEqual(request);
+  });
+
   it("listProjects maps a legacy {id} entry to a full summary", async () => {
     const { client } = makeClient(() =>
       json({

@@ -32,14 +32,22 @@ export interface NewProjectModalProps {
 }
 
 const SLUG_PATTERN = /^[a-z0-9][a-z0-9-]*$/;
+const MAX_NAME_CHARS = 80;
+const MAX_NAME_SEGMENTS = 4;
 
 export function deriveProjectSlug(name: string): string {
-  return name
-    .normalize("NFKD")
-    .replace(/[\u0300-\u036f]/g, "")
+  const normalized = name
+    .normalize("NFD")
+    .replace(/([A-Za-z])\p{Mark}+/gu, "$1");
+  if (/[^\x00-\x7f]/.test(normalized.replace(/[^\p{Letter}]/gu, ""))) {
+    return "";
+  }
+  const segments = normalized.split("/").map((segment) => segment
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, "-")
-    .replace(/^-+|-+$/g, "");
+    .replace(/^-+|-+$/g, ""),
+  );
+  return segments.every(Boolean) ? segments.join("-") : "";
 }
 
 function NewProjectForm({
@@ -54,6 +62,7 @@ function NewProjectForm({
   const [name, setName] = useState("");
   const [slug, setSlug] = useState("");
   const [slugManual, setSlugManual] = useState(false);
+  const [createParent, setCreateParent] = useState(false);
   const [path, setPath] = useState("");
   const [purpose, setPurpose] = useState("");
   const [gitInit, setGitInit] = useState(false);
@@ -76,6 +85,8 @@ function NewProjectForm({
 
   const isProject = kind === "project";
   const trimmedName = name.trim();
+  const nameSegments = trimmedName.split("/").map((segment) => segment.trim());
+  const isNested = nameSegments.length > 1;
   const trimmedSlug = slug.trim();
   const trimmedPath = path.trim();
   const trimmedGithub = github.trim();
@@ -88,7 +99,14 @@ function NewProjectForm({
     github?: string;
   } = {};
   if (!trimmedName) errors.name = "Name is required.";
-  if (!trimmedSlug) errors.slug = "Slug is required.";
+  else if (Array.from(trimmedName).length > MAX_NAME_CHARS)
+    errors.name = `Name must be at most ${MAX_NAME_CHARS} characters.`;
+  else if (nameSegments.length > MAX_NAME_SEGMENTS || nameSegments.some((segment) => !segment))
+    errors.name = `Use one to ${MAX_NAME_SEGMENTS} non-empty segments separated by "/".`;
+  if (!trimmedSlug)
+    errors.slug = trimmedName && !deriveProjectSlug(trimmedName)
+      ? "Enter a slug using lowercase letters, digits and hyphens."
+      : "Slug is required.";
   else if (!SLUG_PATTERN.test(trimmedSlug))
     errors.slug =
       "Slug must start with a lowercase letter or digit and use only a-z, 0-9 and '-'.";
@@ -127,6 +145,7 @@ function NewProjectForm({
 
   const changeName = (value: string) => {
     setName(value);
+    if (!value.includes("/")) setCreateParent(false);
     // An emptied slug counts as "not chosen yet": editing the name refills it.
     if (!slugManual || slug === "") {
       setSlugManual(false);
@@ -167,6 +186,7 @@ function NewProjectForm({
       slug: trimmedSlug,
       kind,
     };
+    if (isNested && createParent) req.create_parent = true;
     if (trimmedPurpose) req.purpose = trimmedPurpose;
     if (isProject) {
       req.path = trimmedPath;
@@ -324,9 +344,12 @@ function NewProjectForm({
               value={name}
               disabled={busy}
               aria-invalid={shown.name ? true : undefined}
-              aria-describedby={describedBy("name", Boolean(shown.name))}
+              aria-describedby={shown.name ? `${uid}-name-err` : `${uid}-name-help`}
               onChange={(e) => changeName(e.target.value)}
             />
+            <p id={`${uid}-name-help`} style={HELP_STYLE}>
+              Use slashes to nest a project, for example Lab / Research / Mobile.
+            </p>
             {fieldError("name", shown.name)}
           </div>
 
@@ -352,6 +375,18 @@ function NewProjectForm({
             />
             {fieldError("slug", shown.slug)}
           </div>
+
+          {isNested && (
+            <label style={{ display: "flex", gap: "8px", alignItems: "center", fontSize: "12px" }}>
+              <input
+                type="checkbox"
+                checked={createParent}
+                disabled={busy}
+                onChange={(e) => setCreateParent(e.target.checked)}
+              />
+              Create missing parent groups
+            </label>
+          )}
 
           {isProject && (
             <div style={FIELD_STYLE}>

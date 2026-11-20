@@ -23,6 +23,7 @@ import {
   type AgentLivenessItem,
   type AgentRecord,
   type DiscoveredSessionSummary,
+  type ProjectSummary,
 } from "../types/api";
 
 describe("RosterSidebar", () => {
@@ -85,6 +86,166 @@ describe("RosterSidebar", () => {
       verdict: { status: "exited", outcome: "completed" },
     },
   ];
+
+  const nestedProject = (slug: string, name: string, parent?: string | null) => ({
+    id: slug,
+    slug,
+    name,
+    parent,
+    kind: "virtual" as const,
+    path: null,
+    has_git: false,
+    purpose: null,
+    tracker: null,
+    store_path: null,
+    active_agent_count: 0,
+  });
+
+  const nestedAgent = (name: string, project: string, extra: string[] = []): AgentRecord => ({
+    id: `urn:fl:agent:${name}`,
+    name_key: name,
+    display_name: name,
+    project,
+    role: "agent",
+    status: "active",
+    extra_areas: extra,
+  });
+
+  function nestedRoster(projects: ProjectSummary[], agents: AgentRecord[], showEmptyProjects = false) {
+    return (
+      <RosterSidebar
+        agents={agents}
+        routes={[]}
+        liveness={[]}
+        projects={projects}
+        unreadByAgent={{ first: 2, second: 3, third: 1 }}
+        unreadSeverityByAgent={{ second: "question", third: "important" }}
+        selectedAgentName={null}
+        onSelectAgent={vi.fn()}
+        showEmptyProjects={showEmptyProjects}
+      />
+    );
+  }
+
+  const lab = nestedProject("lab", "Lab", null);
+  const alpha = nestedProject("lab-alpha", "Lab / Alpha", "lab");
+  const beta = nestedProject("lab-beta", "Lab / Beta", "lab");
+  const mobile = nestedProject("lab-alpha-mobile", "Lab / Alpha / Mobile", "lab-alpha");
+  const elsewhere = nestedProject("elsewhere", "Elsewhere", null);
+
+  it("renders direct agents before linked children and persists independent collapse states", () => {
+    const roster = nestedRoster(
+      [lab, alpha, mobile],
+      [nestedAgent("first", "lab"), nestedAgent("second", "lab-alpha-mobile")],
+    );
+    const { unmount } = render(roster);
+    const labGroup = screen.getByTestId("project-group-lab");
+    const first = within(labGroup).getByTestId("agent-row-first");
+    const toggle = (label: string) => screen.getByRole("button", { name: label });
+    const alphaToggle = toggle("Lab / Alpha");
+    expect(alphaToggle).toHaveTextContent("Alpha");
+    expect(alphaToggle).not.toHaveTextContent("Lab / Alpha");
+    expect(alphaToggle).toHaveAttribute("title", "Lab / Alpha");
+    expect(first.compareDocumentPosition(alphaToggle) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(labGroup).toContainElement(alphaToggle);
+    expect(toggle("Lab / Alpha / Mobile")).toHaveTextContent("Mobile");
+
+    fireEvent.click(alphaToggle);
+    expect(toggle("Lab")).toHaveAttribute("aria-expanded", "true");
+    expect(screen.queryByTestId("agent-row-second")).not.toBeInTheDocument();
+    fireEvent.click(toggle("Lab"));
+    expect(screen.queryByTestId("agent-row-first")).not.toBeInTheDocument();
+    unmount();
+    render(roster);
+    expect(toggle("Lab")).toHaveAttribute("aria-expanded", "false");
+    fireEvent.click(toggle("Lab"));
+    expect(toggle("Lab / Alpha")).toHaveAttribute("aria-expanded", "false");
+    fireEvent.click(toggle("Lab / Alpha"));
+    expect(screen.getByTestId("agent-row-second")).toBeInTheDocument();
+  });
+
+  it("rolls unread counts and highest severity up only for hidden groups and counts each persona once", () => {
+    render(nestedRoster(
+      [lab, alpha, beta, mobile],
+      [
+        nestedAgent("first", "lab", ["lab-alpha"]),
+        nestedAgent("second", "lab-alpha-mobile", ["lab-beta"]),
+        nestedAgent("third", "lab-beta"),
+      ],
+    ));
+    const badge = (name: string) => screen.getByTestId(`project-unread-badge-${name}`);
+    expect(badge("lab")).toHaveTextContent(/^2$/);
+    fireEvent.click(screen.getByRole("button", { name: "Lab / Alpha" }));
+    expect(badge("lab / alpha")).toHaveTextContent(/^5\?$/);
+    expect(badge("lab")).toHaveTextContent(/^2$/);
+    fireEvent.click(screen.getByRole("button", { name: "Lab" }));
+    expect(badge("lab")).toHaveTextContent(/^6!$/);
+    expect(badge("lab")).toHaveAttribute("data-severity", "important");
+  });
+
+  it("sorts pinned projects within siblings and moves a pinned parent with its subtree", () => {
+    render(nestedRoster([elsewhere, lab, alpha, beta, mobile], [], true));
+    const rows = () => screen.getAllByTestId(/^project-header-row-/).map(row =>
+      within(row).getAllByRole("button")[0]?.getAttribute("aria-label"),
+    );
+    act(() => { togglePinnedProject("lab-beta"); });
+    expect(rows()).toEqual(["Elsewhere", "Lab", "Lab / Beta", "Lab / Alpha", "Lab / Alpha / Mobile"]);
+    act(() => { togglePinnedProject("Lab"); });
+    expect(rows()).toEqual(["Lab", "Lab / Beta", "Lab / Alpha", "Lab / Alpha / Mobile", "Elsewhere"]);
+  });
+
+  it("keeps an empty ancestor for a matching descendant and tolerates old and malformed links", () => {
+    const legacy = nestedProject("old-lab", "Lab / Old");
+    const stale = nestedProject("missing-area", "Elsewhere / Missing", "departed");
+    const cyclic = nestedProject("circle", "Circle", "ring");
+    const ring = nestedProject("ring", "Ring", "circle");
+    render(nestedRoster(
+      [elsewhere, lab, alpha, legacy, stale, cyclic, ring],
+      [nestedAgent("matching-agent", "lab-alpha")],
+      true,
+    ));
+    expect(screen.getByTestId("project-group-lab")).toContainElement(
+      screen.getByTestId("project-group-lab / alpha"),
+    );
+    for (const label of ["Lab / Old", "Elsewhere / Missing", "Circle", "Ring"]) {
+      const toggle = screen.getByRole("button", { name: label });
+      expect(toggle).toHaveTextContent(label);
+      expect(screen.getByTestId("project-group-lab")).not.toContainElement(toggle);
+    }
+    const search = screen.getByPlaceholderText("Search agents, projects, adapters...");
+    fireEvent.change(search, { target: { value: "matching-agent" } });
+    expect(screen.getByRole("button", { name: "Lab" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Elsewhere" })).not.toBeInTheDocument();
+    fireEvent.change(search, { target: { value: "Lab / Alpha" } });
+    expect(screen.getByTestId("agent-row-matching-agent")).toBeInTheDocument();
+  });
+
+  it("uses roster-only parent links and honors saved flat preferences while the project list loads", () => {
+    window.localStorage.setItem(COLLAPSED_PROJECTS_STORAGE_KEY, JSON.stringify(["the lab"]));
+    window.localStorage.setItem(PINNED_PROJECTS_STORAGE_KEY, JSON.stringify(["the lab"]));
+    render(
+      <RosterSidebar
+        agents={[nestedAgent("first", "lab-alpha")]}
+        areas={[
+          { area_key: "lab", name: "The Lab", purpose: "", path: null, parent: null },
+          { area_key: "lab-alpha", name: "The Lab / Alpha", purpose: "", path: null, parent: "lab" },
+        ]}
+        routes={[]}
+        liveness={[]}
+        unreadByAgent={{ first: 2 }}
+        selectedAgentName={null}
+        onSelectAgent={vi.fn()}
+      />,
+    );
+
+    const toggle = screen.getByRole("button", { name: "The Lab" });
+    expect(toggle).toHaveAttribute("aria-expanded", "false");
+    expect(screen.getByTestId("project-group-the lab")).toHaveAttribute("data-pinned", "true");
+    expect(screen.getByTestId("project-unread-badge-the lab")).toHaveTextContent("2");
+    expect(screen.queryByRole("button", { name: "The Lab / Alpha" })).toBeNull();
+    fireEvent.click(toggle);
+    expect(screen.getByRole("button", { name: "The Lab / Alpha" })).toHaveTextContent("Alpha");
+  });
 
   it("embedded mode renders roster content only, in flow, without drawer chrome", () => {
     const onClose = vi.fn();
