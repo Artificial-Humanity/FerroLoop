@@ -888,7 +888,7 @@ fn resolve_project(
 
     let store = match here.and_then(|e| e.store.as_deref()) {
         Some(s) => PathBuf::from(s),
-        None if req.resume_flat => historical_store_path(paths, &slug),
+        None if req.resume_flat || create_only => historical_store_path(paths, &slug),
         None => paths.store_dir.join(format!("{slug}.fls")),
     };
     if fl_store::store_identity(&store) == fl_store::store_identity(&paths.workspace_store) {
@@ -992,14 +992,14 @@ fn ensure_git(root: &Path, by: &str) -> Result<GitOutcome, InitError> {
 fn seed_project_store(
     store: &AnyStore,
     r: &Resolved,
-    resume_flat: bool,
+    require_owner: bool,
 ) -> Result<(String, Vec<String>), InitError> {
     let st = |e: fl_core::store::StoreError| failed(format!("store: {e}"));
     let root = r.root.to_string_lossy();
     let held = store.list_projects().map_err(st)?;
     let id = match held.as_slice() {
         [p] if same_root(&p.root, &r.root) => p.id.clone(),
-        _ if resume_flat => return Err(resume_store_refusal(r)),
+        _ if require_owner => return Err(resume_store_refusal(r)),
         [] => store.add_project(&root).map_err(st)?,
         _ => return Err(store_owner_conflict(r, &held)),
     };
@@ -1040,6 +1040,33 @@ fn historical_store_path(paths: &InitPaths, slug: &str) -> PathBuf {
     } else {
         ferro
     }
+}
+
+fn check_create_store_owner(
+    resolved: &Resolved,
+    projects: &[fl_core::model::Project],
+    require_owner: bool,
+) -> Result<(), InitError> {
+    match projects {
+        [] if !require_owner => Ok(()),
+        [project] if same_root(&project.root, &resolved.root) => Ok(()),
+        [] => Err(resume_store_refusal(resolved)),
+        _ => Err(store_owner_conflict(resolved, projects)),
+    }
+}
+
+fn check_lone_redb_owner(resolved: &Resolved) -> Result<(), InitError> {
+    let error =
+        |e: fl_core::store::StoreError| failed(format!("store {}: {e}", resolved.store.display()));
+    // The usual scan can repair an unreadable redb. Prove this unbound store's owner
+    // with a strictly read-only open before permitting its ordinary open to migrate it.
+    let redb = fl_store::RedbStore::open_read_only(
+        &resolved.store,
+        fl_store::StoreOptions::default().retries,
+    )
+    .map_err(error)?;
+    let projects = redb.list_projects().map_err(error)?;
+    check_create_store_owner(resolved, &projects, true)
 }
 
 fn resume_store_refusal(resolved: &Resolved) -> InitError {
@@ -1403,8 +1430,13 @@ where
             )));
         }
     }
+    let lone_redb = create_only
+        && resolved.registers
+        && resolved.store.extension().is_some_and(|ext| ext == "redb");
     if req.resume_flat {
         check_resume_store(&resolved)?;
+    } else if lone_redb {
+        check_lone_redb_owner(&resolved)?;
     }
     let (workspace_store, registry) = workspace.open()?;
     let before = registry.get(&resolved.slug);
@@ -1506,14 +1538,11 @@ where
         let held = project_store
             .list_projects()
             .map_err(|e| failed(format!("store: {e}")))?;
-        if !held.is_empty()
-            && !matches!(held.as_slice(), [project] if same_root(&project.root, &resolved.root))
-        {
-            return Err(store_owner_conflict(&resolved, &held));
-        }
+        check_create_store_owner(&resolved, &held, lone_redb)?;
         git = prepare_root()?;
     }
-    let (project, areas) = seed_project_store(&project_store, &resolved, req.resume_flat)?;
+    let (project, areas) =
+        seed_project_store(&project_store, &resolved, req.resume_flat || lone_redb)?;
     let area = AreaRecord {
         area_key: resolved.slug.clone(),
         name: placement.name,

@@ -2921,6 +2921,69 @@ fn directory_create_only_validates_a_store_only_slug_before_setup() {
 }
 
 #[test]
+fn directory_create_only_preserves_lone_redb_ownership_before_setup() {
+    let _env = no_backend_env();
+    let hub = Hub::new();
+    let original = hub.work("original");
+    fs::create_dir(&original).unwrap();
+    let redb = hub.base.join("home/.local/share/fl/taken.redb");
+    let fls = redb.with_extension("fls");
+    let store_dir = redb.parent().unwrap();
+    fs::create_dir_all(store_dir).unwrap();
+    let store = fl_store::open_redb(&redb).unwrap();
+    let project = store.add_project(original.to_str().unwrap()).unwrap();
+    drop(store);
+    let before = fs::read(&redb).unwrap();
+    let metadata = fs::metadata(&redb).unwrap();
+    let files = file_names(store_dir);
+
+    for slug in [None, Some("taken")] {
+        let root = hub.work("unrelated");
+        let mut body = json!({
+            "name": "Taken", "path": root, "create_only": true, "git_init": true,
+        });
+        if let Some(slug) = slug {
+            body["slug"] = json!(slug);
+        }
+        let refused = hub.post(OWNER, &body);
+        assert_eq!(refused.status, 409, "{}", text_of(&refused));
+        assert!(
+            error_of(&refused).contains("original"),
+            "{}",
+            text_of(&refused)
+        );
+        assert!(!root.exists());
+        assert!(!hub.config().exists());
+        assert!(hub.workspace().get_area("taken").unwrap().is_none());
+        assert_eq!(
+            file_names(store_dir),
+            files,
+            "refusal created store artifacts"
+        );
+        assert_eq!(fs::read(&redb).unwrap(), before);
+        let after = fs::metadata(&redb).unwrap();
+        assert_eq!(after.modified().unwrap(), metadata.modified().unwrap());
+        assert_eq!(
+            after.permissions().readonly(),
+            metadata.permissions().readonly()
+        );
+    }
+
+    let resumed = hub.post(
+        OWNER,
+        &json!({ "name": "Taken", "path": original, "create_only": true }),
+    );
+    assert_eq!(resumed.status, 201, "{}", text_of(&resumed));
+    assert_eq!(body_of(&resumed)["slug"], "taken");
+    assert_eq!(body_of(&resumed)["store_path"], json!(fls));
+    assert!(original.join(".fl/mcp.toml").is_file());
+    let held = fl_store::open_store(&fls).unwrap().list_projects().unwrap();
+    assert_eq!(held.len(), 1);
+    assert_eq!(held[0].id, project);
+    assert_eq!(held[0].root, original.to_str().unwrap());
+}
+
+#[test]
 fn a_slug_cannot_be_both_kinds_over_http() {
     let hub = Hub::new();
     assert_eq!(
