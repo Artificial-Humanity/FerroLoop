@@ -181,14 +181,18 @@ pub const FORMAT_WITH_WORKFLOW: u64 = 8;
 /// ⚠ The format of a store whose registry event log holds an `area_delete` event. The first
 /// area deletion (or the first import of such an event) raises the store to 9 in the same
 /// transaction, so an older fl refuses the store with `FormatVersion` instead of failing to
-/// decode the event in its state sync and registry cursor. A store that never deletes an area
-/// stays where it was. This build opens 2 to 9.
+/// decode the event in its state sync and registry cursor.
 pub const FORMAT_WITH_AREA_DELETE: u64 = 9;
+
+/// ⚠ The first area upsert carrying a parent, written locally or imported, raises the store
+/// to 10 in the same transaction. Older builds refuse the store before decoding a row or
+/// registry event with the new field.
+pub const FORMAT_WITH_AREA_PARENT: u64 = 10;
 
 /// Every schema version this build opens, oldest first. Both `RedbStore` and
 /// `FerroStore` use this one ladder, so `format_version()` means the same on
 /// both; a new schema step adds a constant here and an upgrade for both.
-pub(crate) const FORMAT_LADDER: [u64; 8] = [
+pub(crate) const FORMAT_LADDER: [u64; 9] = [
     FORMAT_VERSION,
     FORMAT_WITH_IMPORTS,
     FORMAT_WITH_LEDGER_ROOT,
@@ -197,6 +201,7 @@ pub(crate) const FORMAT_LADDER: [u64; 8] = [
     FORMAT_WITH_WIRE,
     FORMAT_WITH_WORKFLOW,
     FORMAT_WITH_AREA_DELETE,
+    FORMAT_WITH_AREA_PARENT,
 ];
 
 /// `FormatVersion` unless `found` is on [`FORMAT_LADDER`].
@@ -206,7 +211,7 @@ pub(crate) fn check_format(found: Option<u64>) -> Result<(), StoreError> {
         _ => Err(StoreError::FormatVersion {
             found,
             oldest: FORMAT_VERSION,
-            newest: FORMAT_WITH_AREA_DELETE,
+            newest: FORMAT_WITH_AREA_PARENT,
         }),
     }
 }
@@ -2326,7 +2331,7 @@ mod tests {
                 StoreError::FormatVersion {
                     found: Some(1),
                     oldest: 2,
-                    newest: FORMAT_WITH_AREA_DELETE
+                    newest: FORMAT_WITH_AREA_PARENT
                 }
             ),
             "{err:?}"
@@ -3140,7 +3145,7 @@ mod tests {
             let tx = db.begin_write().unwrap();
             tx.open_table(META)
                 .unwrap()
-                .insert(FORMAT_KEY, FORMAT_WITH_AREA_DELETE + 1)
+                .insert(FORMAT_KEY, FORMAT_WITH_AREA_PARENT + 1)
                 .unwrap();
             tx.commit().unwrap();
         }
@@ -3683,10 +3688,111 @@ mod tests {
             area_key: key.into(),
             name: key.into(),
             path: None,
+            parent: None,
             purpose: "p".into(),
             updated_at: fl_core::At::from_unix_millis(1),
             by: "tester".into(),
         }
+    }
+
+    fn area_parent_persists_in_registry<S: fl_core::store::AgentRegistry>(
+        open: impl Fn(&std::path::Path) -> S,
+        format_version: impl Fn(&S) -> Result<Option<u64>, StoreError>,
+        flat_format: u64,
+    ) {
+        use fl_core::agent::{AreaRecord, RegistryEvent, RegistryEventKind};
+
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = dir.path().join("source");
+        let target_path = dir.path().join("target");
+        let with_parent = |key, parent| {
+            let mut raw = serde_json::to_value(area(key)).unwrap();
+            raw["parent"] = serde_json::json!(parent);
+            serde_json::from_value::<AreaRecord>(raw).unwrap()
+        };
+        let child = with_parent("child", "GROUP");
+        let invalid = with_parent("other", "other");
+        let parent_of = |area| serde_json::to_value(area).unwrap()["parent"].clone();
+
+        let events: Vec<RegistryEvent> = {
+            let source = open(&source_path);
+            assert!(source.upsert_area(area("group")).is_ok());
+            assert_eq!(format_version(&source).unwrap(), Some(flat_format));
+            assert!(matches!(
+                source.upsert_area(invalid.clone()),
+                Err(StoreError::InvalidState(_))
+            ));
+            assert_eq!(format_version(&source).unwrap(), Some(flat_format));
+            assert_eq!(parent_of(source.upsert_area(child).unwrap()), "group");
+            source
+                .registry_events_after(0)
+                .unwrap()
+                .into_iter()
+                .map(|(_, event)| event)
+                .collect()
+        };
+        assert_eq!(events.len(), 2);
+        let source = open(&source_path);
+        assert_eq!(format_version(&source).unwrap(), Some(10));
+        let child = source.get_area("child").unwrap().unwrap();
+        assert_eq!(parent_of(child.clone()), "group");
+        let persisted = source.registry_events_after(0).unwrap();
+        assert_eq!(persisted[1].1, events[1]);
+        assert_eq!(persisted[1].1.kind, RegistryEventKind::AreaUpsert(child));
+
+        let target = open(&target_path);
+        target.import_registry_events(&events[..1]).unwrap();
+        assert_eq!(format_version(&target).unwrap(), Some(flat_format));
+        let invalid = RegistryEvent {
+            event_id: seq_iri(1234),
+            at: events[1].at.clone(),
+            by: events[1].by.clone(),
+            kind: RegistryEventKind::AreaUpsert(invalid),
+        };
+        assert!(matches!(
+            target.import_registry_events(&[events[1].clone(), invalid]),
+            Err(StoreError::InvalidState(_))
+        ));
+        assert_eq!(format_version(&target).unwrap(), Some(flat_format));
+        assert_eq!(target.get_area("child").unwrap(), None);
+        assert_eq!(target.registry_events_after(0).unwrap().len(), 1);
+        target.import_registry_events(&events[1..]).unwrap();
+        drop(target);
+
+        let target = open(&target_path);
+        assert_eq!(format_version(&target).unwrap(), Some(10));
+        assert_eq!(
+            parent_of(target.get_area("child").unwrap().unwrap()),
+            "group"
+        );
+        target.import_registry_events(&events).unwrap();
+        assert_eq!(
+            target
+                .registry_events_after(0)
+                .unwrap()
+                .into_iter()
+                .map(|(_, event)| event)
+                .collect::<Vec<_>>(),
+            events
+        );
+    }
+
+    #[test]
+    fn area_parent_is_persisted_and_versioned_in_redb() {
+        area_parent_persists_in_registry(
+            |path| RedbStore::open(path).unwrap(),
+            RedbStore::format_version,
+            FORMAT_WITH_STATE,
+        );
+    }
+
+    #[test]
+    fn area_parent_is_persisted_and_versioned_in_ferrostore() {
+        area_parent_persists_in_registry(
+            |path| crate::ferrostore::FerroStore::open(path).unwrap(),
+            crate::ferrostore::FerroStore::format_version,
+            FORMAT_WITH_WORKFLOW,
+        );
     }
 
     // An older fl cannot decode an `area_delete` registry event, so the first deletion raises
@@ -3694,7 +3800,7 @@ mod tests {
     #[test]
     fn the_first_area_delete_raises_the_store_to_format_9_and_nothing_before_it_does() {
         use fl_core::store::AgentRegistry;
-        const { assert!(FORMAT_WITH_AREA_DELETE > FORMAT_WITH_WORKFLOW) };
+        const { assert!(FORMAT_WITH_AREA_DELETE == 9) };
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("area.redb");
         let at = |n| fl_core::At::from_unix_millis(n);
@@ -3722,10 +3828,6 @@ mod tests {
         // This build still opens it; one whose ladder ends at 8 refuses it.
         let reopened = RedbStore::open(&path).unwrap();
         assert!(reopened.get_area("gone").unwrap().is_none());
-        assert!(
-            !FORMAT_LADDER[..FORMAT_LADDER.len() - 1].contains(&FORMAT_WITH_AREA_DELETE),
-            "the formats an older fl knows do not include the raised one"
-        );
     }
 
     #[test]

@@ -1,5 +1,5 @@
-import { AreaBadge, CoverageChips } from "./AreaCoverage";
-import React, { useEffect, useRef, useState } from "react";
+import { AreaBadge, areaReferenceIndex, CoverageChips } from "./AreaCoverage";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import { HubApiClient, HubApiError } from "../api/client";
 import { roleLabel, roleOptions, selectedRoleOptions, useRoles } from "../hooks/useRoles";
 import type { AreaRecord, HubAuthority, ProjectSummary, SessionQuotaUsage } from "../types/api";
@@ -528,6 +528,7 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
   authority = null,
 }) => {
   const { pinnedAgents } = usePinnedState();
+  const areaReferences = useMemo(() => areaReferenceIndex(projects, areas), [projects, areas]);
   const [activeTab, setActiveTab] = useState<AgentSettingsTabId>(initialTab);
   const [agentWorktreePolicy, setAgentWorktreePolicy] =
     useState<WorktreePolicyMode>("create");
@@ -1336,8 +1337,8 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
                   <div style={{ fontSize: "10px", color: "var(--text-muted)", textTransform: "uppercase" }}>
                     Project
                   </div>
-                  <div style={{ fontWeight: 600 }}><AreaBadge slug={agentProject} areas={areas} projects={projects} /></div>
-                  <CoverageChips agent={{ id: "", name_key: "", display_name: "", project: agentProject, role: "", status: "", extra_areas: agentExtraAreas }} areas={areas} projects={projects} />
+                  <div style={{ fontWeight: 600 }}><AreaBadge slug={agentProject} references={areaReferences} /></div>
+                  <CoverageChips agent={{ id: "", name_key: "", display_name: "", project: agentProject, role: "", status: "", extra_areas: agentExtraAreas }} references={areaReferences} />
                 </div>
               )}
               {agentRole && (

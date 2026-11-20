@@ -30,6 +30,7 @@ thiserror.workspace = true
 tokio = { workspace = true, features = ["net", "io-util", "sync", "rt", "rt-multi-thread", "macros", "process", "time"] }
 toml.workspace = true
 toml_edit.workspace = true
+unicode-normalization = "0.1.26"
 ureq.workspace = true
 uuid.workspace = true
 walkdir.workspace = true

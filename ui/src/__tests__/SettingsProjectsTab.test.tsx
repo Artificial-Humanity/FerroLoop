@@ -237,7 +237,7 @@ describe("Settings Projects tab", () => {
       "true",
     );
     expect(screen.getByTestId("settings-tab-select")).toHaveValue("agents");
-    expect(screen.getByTestId("settings-project-filter-select")).toHaveValue(
+    expect(screen.getByTestId("settings-project-filter-select")).toHaveDisplayValue(
       "Sonora",
     );
   });
@@ -249,9 +249,170 @@ describe("Settings Projects tab", () => {
     fireEvent.click(
       screen.getByTestId("settings-project-view-agents-research-group"),
     );
-    expect(screen.getByTestId("settings-project-filter-select")).toHaveValue(
+    expect(screen.getByTestId("settings-project-filter-select")).toHaveDisplayValue(
       "Research Group",
     );
+  });
+
+  describe("project scope when a label matches another project's slug", () => {
+    const reporting = {
+      ...PLAIN,
+      id: "reporting",
+      slug: "reporting",
+      name: "Analysis",
+      default_artifacts_dir: "/art/reporting",
+      effective_artifacts_dir: "/art/reporting",
+    };
+    const modeling = {
+      ...GROUP,
+      id: "analysis",
+      slug: "analysis",
+      name: "Model Runs",
+      parent: "reporting",
+    };
+    const projects = [reporting, modeling];
+    const agents = [
+      { name: "reporter", project: "reporting", extra_areas: ["analysis"] },
+      { name: "modeler", project: "analysis", extra_areas: ["reporting"] },
+      { name: "legacy", project: "Model Runs" },
+    ].map(({ name, ...data }) => ({
+      ...data,
+      id: `urn:fl:agent:${name}`,
+      name_key: name,
+      display_name: name,
+      role: name === "legacy" ? "assistant" : "lead",
+      status: "active" as const,
+    }));
+
+    async function confirmTeardown(
+      onBulkSessionAction: ReturnType<typeof vi.fn>,
+      expectedKeys: string[],
+    ) {
+      fireEvent.click(screen.getByTestId("bulk-action-teardown-btn"));
+      await act(async () => {
+        fireEvent.click(screen.getByTestId("bulk-confirm-btn"));
+      });
+      expect(onBulkSessionAction).toHaveBeenCalledExactlyOnceWith("teardown", expectedKeys);
+    }
+
+    const bulkAction = () => vi.fn().mockResolvedValue({
+      action: "teardown",
+      targeted_sessions: 1,
+      succeeded_sessions: 1,
+      failed_sessions: 0,
+      results: [],
+    });
+
+    it("uses the display entry for header, lead, artifacts and actual teardown targets", async () => {
+      const { client } = makeClient(projects);
+      const onBulkSessionAction = bulkAction();
+      await renderModal(client, {
+        projects,
+        agents,
+        onBulkSessionAction,
+        initialProject: "Analysis",
+        initialProjectSubTab: "agents",
+      });
+
+      expect(screen.getByTestId("settings-modal-title")).toHaveTextContent("Project Settings — Analysis");
+      expect(screen.getByTestId("settings-project-summary-lead")).toHaveTextContent("Lead: reporter");
+      expect(screen.getByTestId("settings-project-artifacts-dir-value")).toHaveTextContent("/art/reporting");
+      expect(within(screen.getByTestId("settings-agent-row-modeler")).getByTitle("Virtual area"))
+        .toHaveTextContent("Model Runs · virtual");
+      expect(screen.getByTestId("agent-select-checkbox-reporter")).toBeEnabled();
+      expect(screen.getByTestId("agent-select-checkbox-modeler")).toBeDisabled();
+      expect(screen.queryByTestId("settings-agent-row-legacy")).toBeNull();
+      await confirmTeardown(onBulkSessionAction, ["reporter"]);
+    });
+
+    it("uses the exact slug from View Agents and keeps legacy members of that project", async () => {
+      const { client } = makeClient(projects);
+      const onBulkSessionAction = bulkAction();
+      await renderModal(client, { agents, onBulkSessionAction });
+      await openProjectsTab();
+      fireEvent.click(screen.getByTestId("settings-project-view-agents-analysis"));
+
+      expect(screen.getByTestId("settings-project-summary-name")).toHaveTextContent("Model Runs");
+      expect(screen.getByTestId("settings-project-summary-lead")).toHaveTextContent("Lead: modeler");
+      expect(screen.getByTestId("agent-select-checkbox-reporter")).toBeDisabled();
+      expect(screen.getByTestId("agent-select-checkbox-modeler")).toBeEnabled();
+      expect(screen.getByTestId("agent-select-checkbox-legacy")).toBeEnabled();
+      await confirmTeardown(onBulkSessionAction, ["modeler", "legacy"]);
+    });
+  });
+
+  it("sends only exact primary bulk targets when a legacy agent label matches two projects", async () => {
+    const projects = [
+      { ...PLAIN, slug: "first", id: "first", name: "Shared Research" },
+      { ...GROUP, slug: "second", id: "second", name: "Shared Research" },
+    ];
+    const agents = [
+      { name: "first-agent", project: "FIRST", extra_areas: ["Shared Research"] },
+      { name: "second-agent", project: "second", extra_areas: ["first"] },
+      { name: "legacy", project: " shared RESEARCH " },
+    ].map(({ name, ...data }) => ({
+      ...data,
+      id: `urn:fl:agent:${name}`,
+      name_key: name,
+      display_name: name,
+      role: "assistant",
+      status: "active" as const,
+    }));
+    const { client } = makeClient(projects);
+    const onBulkSessionAction = vi.fn().mockResolvedValue({
+      action: "teardown",
+      targeted_sessions: 1,
+      succeeded_sessions: 1,
+      failed_sessions: 0,
+      results: [],
+    });
+    await renderModal(client, { agents, onBulkSessionAction });
+
+    const filter = screen.getByTestId("settings-project-filter-select");
+    expect(screen.getByTestId("settings-agent-row-legacy")).toBeVisible();
+    for (const slug of ["first", "second"]) {
+      fireEvent.change(filter, { target: { value: slug } });
+      expect(filter).toHaveDisplayValue(`Shared Research (${slug})`);
+      if (slug === "first") {
+        expect(screen.getByTestId("agent-select-checkbox-second-agent")).toBeDisabled();
+      } else {
+        expect(screen.queryByTestId("settings-agent-row-first-agent")).toBeNull();
+      }
+      fireEvent.click(screen.getByTestId("bulk-action-teardown-btn"));
+      await act(async () => fireEvent.click(screen.getByTestId("bulk-confirm-btn")));
+      expect(onBulkSessionAction).toHaveBeenLastCalledWith("teardown", [`${slug}-agent`]);
+      expect(screen.queryByTestId("settings-agent-row-legacy")).toBeNull();
+    }
+    expect(onBulkSessionAction).toHaveBeenCalledTimes(2);
+  });
+
+  it("requires a project choice when old Settings was opened by an ambiguous label", async () => {
+    const projects = [
+      { ...PLAIN, slug: "shared", id: "shared", name: "Third Project" },
+      { ...PLAIN, slug: "first", id: "first", name: "Shared" },
+      { ...GROUP, slug: "second", id: "second", name: "Shared" },
+    ];
+    const { client } = makeClient(projects);
+    await renderModal(client, {
+      projects,
+      initialProject: "Shared",
+      initialProjectSubTab: "agents",
+      agents: [{
+        id: "urn:fl:agent:third",
+        name_key: "third",
+        display_name: "Third",
+        project: "shared",
+        status: "active",
+        role: "lead",
+      }],
+    });
+
+    const filter = screen.getByTestId("settings-project-filter-select");
+    expect(filter).toHaveDisplayValue("Select a Project");
+    expect(screen.getByTestId("bulk-action-teardown-btn")).toBeDisabled();
+    expect(screen.queryByTestId("project-pin-toggle-btn")).toBeNull();
+    fireEvent.change(filter, { target: { value: "shared" } });
+    expect(screen.getByTestId("agent-select-checkbox-third")).toBeEnabled();
   });
 
   it("shows the artifacts directory row in the card and not on the Agents tab", async () => {
@@ -259,7 +420,7 @@ describe("Settings Projects tab", () => {
     await renderModal(client);
     fireEvent.click(screen.getByTestId("settings-tab-agents"));
     fireEvent.change(screen.getByTestId("settings-project-filter-select"), {
-      target: { value: "FerroLoop" },
+      target: { value: "ferroloop" },
     });
     expect(
       within(screen.getByTestId("settings-panel-agents")).queryByTestId(
@@ -514,7 +675,7 @@ describe("Settings Projects tab", () => {
       }
 
       const expectFiltered = () => {
-        expect(screen.getByTestId("settings-project-filter-select")).toHaveValue(
+        expect(screen.getByTestId("settings-project-filter-select")).toHaveDisplayValue(
           "Fresh Start",
         );
         expect(screen.getByTestId("settings-agent-row-nova")).toBeInTheDocument();
@@ -577,9 +738,9 @@ describe("Settings Projects tab", () => {
           ?.body,
       ).toEqual({
         name: "Council",
-        slug: "council",
         kind: "virtual",
         purpose: "Cross-project scope",
+        create_only: true,
       });
     });
 
@@ -604,13 +765,16 @@ describe("Settings Projects tab", () => {
       );
     });
 
-    it("rejects a slug already on the list without calling the hub", async () => {
+    it("rejects a manually chosen slug already on the list without calling the hub", async () => {
       const { client, calls } = makeClient();
       await renderModal(client);
       await openProjectsTab();
       fireEvent.click(screen.getByTestId("settings-projects-create-btn"));
       fireEvent.change(screen.getByTestId("new-project-name"), {
-        target: { value: "Sonora" },
+        target: { value: "A different name" },
+      });
+      fireEvent.change(screen.getByTestId("new-project-slug"), {
+        target: { value: "sonora" },
       });
       fireEvent.change(screen.getByTestId("new-project-path"), {
         target: { value: "/work/s" },
@@ -625,6 +789,34 @@ describe("Settings Projects tab", () => {
         "aria-invalid",
         "true",
       );
+    });
+
+    it("keeps an unrelated virtual-group collision from a stale list open for correction", async () => {
+      const onProjectsChanged = vi.fn();
+      const collision = "A project or group with the slug `taken` already exists. Choose another slug";
+      const { client, calls } = makeClient([PLAIN], (url, method) =>
+        url.endsWith("/api/v1/projects") && method === "POST"
+          ? json({ error: collision }, 409)
+          : null,
+      );
+      await renderModal(client, { onProjectsChanged });
+      await openProjectsTab();
+      fireEvent.click(screen.getByTestId("settings-projects-create-btn"));
+      fireEvent.click(screen.getByTestId("new-project-kind-virtual"));
+      fireEvent.change(screen.getByTestId("new-project-name"), {
+        target: { value: "Taken" },
+      });
+      await act(async () => {
+        fireEvent.click(screen.getByTestId("new-project-submit"));
+      });
+      expect(calls.find((call) => call.method === "POST")?.body).toEqual({
+        name: "Taken", kind: "virtual", create_only: true,
+      });
+      expect(screen.getByTestId("new-project-modal")).toBeInTheDocument();
+      expect(screen.getByTestId("new-project-error")).toHaveTextContent(collision);
+      expect(screen.getByTestId("new-project-name")).toHaveValue("Taken");
+      expect(screen.queryByTestId("settings-project-card-taken")).toBeNull();
+      expect(onProjectsChanged).not.toHaveBeenCalled();
     });
 
     it("Escape closes only the New Project modal, not Settings", async () => {
@@ -1086,7 +1278,7 @@ describe("Settings Projects tab", () => {
       await renderModal(client);
       await openProjectsTab();
       fireEvent.click(screen.getByTestId("settings-project-view-agents-sonora"));
-      expect(screen.getByTestId("settings-project-filter-select")).toHaveValue("Sonora");
+      expect(screen.getByTestId("settings-project-filter-select")).toHaveDisplayValue("Sonora");
       await openProjectsTab();
       fireEvent.click(screen.getByTestId("settings-project-delete-sonora"));
       await act(async () => {
@@ -1110,7 +1302,7 @@ describe("Settings Projects tab", () => {
         fireEvent.click(screen.getByTestId("delete-project-submit"));
       });
       fireEvent.click(screen.getByTestId("settings-tab-agents"));
-      expect(screen.getByTestId("settings-project-filter-select")).toHaveValue(
+      expect(screen.getByTestId("settings-project-filter-select")).toHaveDisplayValue(
         "Research Group",
       );
     });

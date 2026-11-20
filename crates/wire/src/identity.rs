@@ -5970,6 +5970,7 @@ mod tests {
                     area_key: area.into(),
                     name: area.into(),
                     path: project,
+                    parent: None,
                     purpose: "p".into(),
                     updated_at: At::from_unix_millis(10),
                     by: "owner".into(),

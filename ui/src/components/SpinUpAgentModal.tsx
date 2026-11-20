@@ -40,10 +40,12 @@ export const SPIN_UP_VENDORS = [
   { value: "muse", label: "Muse Code" },
 ] as const;
 
+type SpinUpProjectPreference = string | Pick<ProjectSummary, "slug">;
+
 export interface SpinUpAgentModalProps {
   isOpen: boolean;
   onClose: () => void;
-  initialProject?: string | null;
+  initialProject?: SpinUpProjectPreference | null;
   /** The shared project list for the Project dropdown. Defaults to the built-in list. */
   projects?: readonly ProjectSummary[];
   nodes?: EnrolledNode[];
@@ -66,12 +68,16 @@ export function resolveSpinUpNodeId(
 }
 
 export function resolveSpinUpProject(
-  rawProject?: string | null,
+  rawProject?: SpinUpProjectPreference | null,
   projects: readonly ProjectSummary[] = [],
 ): string {
   const options = spinUpProjectOptions(projects);
   if (options.length === 0) {
     return "";
+  }
+  if (rawProject && typeof rawProject !== "string") {
+    const slug = rawProject.slug.trim().toLowerCase();
+    return options.find((option) => option.value === slug)?.value ?? "";
   }
   const trimmed = (rawProject ?? "").trim().toLowerCase();
   if (!trimmed || trimmed === "all") {

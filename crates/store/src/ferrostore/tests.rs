@@ -2014,6 +2014,28 @@ fn auto_uses_the_listening_socket_and_otherwise_the_file() {
     assert_eq!(opened.get_doc("docs", "remote").unwrap().unwrap()["n"], 2);
 }
 
+#[test]
+fn existing_project_catalog_uses_the_listening_server() {
+    use fl_core::store::Catalog;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("store.fls");
+    let incomplete = [0u8; 64];
+    std::fs::write(&path, incomplete).unwrap();
+    let owner = FerroStore::in_memory();
+    let id = owner.add_project("/served/project").unwrap();
+    let server = FerroStoreServer::bind_unix(default_socket_path_for_store(&path), owner).unwrap();
+
+    let projects = FerroStore::list_existing_projects(&path).unwrap();
+    assert_eq!(projects.len(), 1);
+    assert_eq!(projects[0].id, id);
+    assert_eq!(projects[0].root, "/served/project");
+    drop(server);
+
+    assert!(FerroStore::list_existing_projects(&path).is_err());
+    assert_eq!(std::fs::read(&path).unwrap(), incomplete);
+}
+
 /// A socket path that cannot fit `sun_path` can have no server: `auto` opens the file.
 #[test]
 fn auto_opens_the_file_when_the_socket_path_is_too_long_for_a_unix_socket() {

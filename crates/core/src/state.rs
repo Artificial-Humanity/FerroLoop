@@ -19,6 +19,8 @@ pub enum StateError {
         "invalid slug `{0}`: must be 1..=64 bytes of ASCII lowercase letters, digits, `-`, or `_`, starting with an ASCII letter (`^[a-z][a-z0-9_-]{{0,63}}$`)"
     )]
     InvalidSlug(String),
+    #[error("area `{0}` cannot be its own parent")]
+    SelfParentArea(String),
     #[error(
         "invalid state scope `{0}`: expected `workspace`, `group:<slug>`, `project:<slug>`, `agent:<name>`, or `workflow:<slug>`"
     )]

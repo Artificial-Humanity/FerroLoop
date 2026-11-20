@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
-import { AreaBadge, areaInfo, CoverageChips, coversArea, extraAreaKeys } from "./AreaCoverage";
+import { AreaBadge, areaReferenceIndex, CoverageChips, extraAreaKeys, projectReferenceKey as projectKey } from "./AreaCoverage";
 import {
   HubApiClient,
   HubApiError,
@@ -31,7 +31,7 @@ import {
   type CurrencyPreference,
 } from "../lib/currency";
 import { TIMEZONE_OPTIONS, setActiveTimeZone } from "../lib/datetime";
-import { PinIcon, togglePinnedProject, usePinnedState } from "./RosterSidebar";
+import { isProjectPreferenceSet, PinIcon, togglePinnedProject, usePinnedState } from "./RosterSidebar";
 import { RuntimesQuotasPanel } from "./RuntimesQuotasPanel";
 import {
   ACP_CONFORMANCE_OPERATIONS,
@@ -626,9 +626,7 @@ import {
 } from "../types/api";
 import { roleLabel, roleOptions, selectedRoleOptions, useRoles } from "../hooks/useRoles";
 import {
-  findProject,
   projectChoices,
-  projectLabel,
   projectLabels,
 } from "../hooks/useProjects";
 
@@ -664,6 +662,7 @@ export type ProductsSubTabId = "catalog" | "installer";
 export interface SettingsOriginMemento {
   initialProject: string | null;
   projectFilter: string;
+  projectFilterSlug?: string;
   activeTab: SettingsTabId;
   projectSubTab: ProjectSettingsSubTabId;
   agentsSubTab: AgentsSubTabId;
@@ -677,6 +676,7 @@ export interface SettingsModalProps {
   initialTab?: SettingsTabId;
   initialProject?: string | null;
   initialProjectFilter?: string | null;
+  initialProjectFilterSlug?: string | null;
   initialProjectSubTab?: ProjectSettingsSubTabId;
   initialAgentsSubTab?: AgentsSubTabId;
   agents?: AgentRecord[];
@@ -687,7 +687,7 @@ export interface SettingsModalProps {
   activeCockpitTab?: CockpitTab;
   onSelectCockpitTab?: (tab: CockpitTab) => void;
   onOpenNodesModal?: () => void;
-  onOpenSpinUpModal?: (initialProject?: string | null) => void;
+  onOpenSpinUpModal?: (projectSlug?: string) => void;
   onOpenPairingModal?: () => void;
   onOpenAgentSettings?: (
     nameKey: string,
@@ -757,8 +757,6 @@ export const ATTACHMENT_RETENTION_OPTIONS = [
   { value: 0, label: "Never (0)" },
 ] as const;
 
-const DEFAULT_PROJECT_OPTIONS: readonly string[] = [WORKSPACE_PROJECT];
-
 /** The option strings a project list gives the filter and the project dropdowns. */
 function projectOptionLabels(projects: readonly ProjectSummary[]): string[] {
   const out = projectLabels(projects);
@@ -784,22 +782,30 @@ function artifactsDirInfoFromProject(
   return Object.keys(info).length > 0 ? info : undefined;
 }
 
-export function resolveProjectFilterValue(
-  rawProject: string | null | undefined,
-  options: readonly string[] = DEFAULT_PROJECT_OPTIONS,
-  projects?: readonly ProjectSummary[],
-): string {
-  const trimmed = (rawProject ?? "").trim();
-  if (!trimmed || trimmed.toLowerCase() === "all") {
-    return "all";
-  }
-  const lower = trimmed.toLowerCase();
-  const matched = options.find((opt) => opt.toLowerCase() === lower);
-  if (matched) return matched;
-  // A slug stands for its project's display name.
-  const bySlug = projects ? findProject(projects, trimmed) : undefined;
-  return bySlug ? projectLabel(bySlug) : trimmed;
+type SettingsProjectSelection =
+  | { slug: string; label?: string }
+  | { slug?: undefined; label: string };
+
+interface SettingsProjectScope {
+  slug: string;
+  label: string;
+  project?: ProjectSummary;
+  virtual?: boolean;
 }
+
+function initialSettingsProject(
+  slug: string | null | undefined,
+  label: string | null | undefined,
+): SettingsProjectSelection | null {
+  if (slug?.trim()) return { slug: projectKey(slug), label: label?.trim() || undefined };
+  if (label?.trim() && projectKey(label) !== "all") {
+    return { label: label.trim() };
+  }
+  return null;
+}
+
+// Keep the fleet option distinct even when the registry contains a project named "all".
+const projectFilterOptionValue = (slug: string) => slug === "all" ? "project:all" : slug;
 
 export const CREATE_CUSTOM_ROLE_VALUE = "__create_custom__";
 
@@ -1291,6 +1297,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   initialTab = "agents",
   initialProject = null,
   initialProjectFilter,
+  initialProjectFilterSlug,
   initialProjectSubTab,
   initialAgentsSubTab,
   agents: propAgents,
@@ -1382,13 +1389,8 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     () => projectOptionLabels(sharedProjects),
     [sharedProjects],
   );
-  const [selectedProjectFilter, setSelectedProjectFilter] = useState<string>(
-    () =>
-      resolveProjectFilterValue(
-        initialProjectFilter ?? initialProject,
-        baseProjectOptions,
-        sharedProjects,
-      ),
+  const [projectSelection, setProjectSelection] = useState<SettingsProjectSelection | null>(
+    () => initialSettingsProject(initialProjectFilterSlug, initialProjectFilter ?? initialProject),
   );
   const [selectedAgentKeys, setSelectedAgentKeys] = useState<Set<string>>(
     () => new Set(),
@@ -1488,8 +1490,9 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     isOpen,
     projectList,
     setProjectList,
-    selectedProjectFilter,
-    setSelectedProjectFilter,
+    onProjectDeleted: (slug) => {
+      if (projectScope?.slug === projectKey(slug)) selectProject(null);
+    },
     onProjectsChanged,
   });
   const mergeProjectArtifactsDirs = (project: ProjectSummary) => {
@@ -1651,18 +1654,14 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   };
 
   useEffect(() => {
-    setSelectedProjectFilter(
-      resolveProjectFilterValue(
-        initialProjectFilter ?? initialProject,
-        baseProjectOptions,
-        sharedProjects,
-      ),
+    setProjectSelection(
+      initialSettingsProject(initialProjectFilterSlug, initialProjectFilter ?? initialProject),
     );
     if (initialProject) {
       setActiveTab("agents");
       setProjectSubTab(initialProjectSubTab ?? "overview");
     }
-  }, [initialProject, initialProjectFilter, initialProjectSubTab]);
+  }, [initialProject, initialProjectFilter, initialProjectFilterSlug, initialProjectSubTab]);
 
   useEffect(() => {
     setArmedAction(null);
@@ -1684,12 +1683,8 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     setRecastReplaceLeadArmed({});
     setRecastModalAgentKey(null);
     setSelectedAgentKeys(new Set());
-    setSelectedProjectFilter(
-      resolveProjectFilterValue(
-        initialProjectFilter ?? initialProject,
-        baseProjectOptions,
-        sharedProjects,
-      ),
+    setProjectSelection(
+      initialSettingsProject(initialProjectFilterSlug, initialProjectFilter ?? initialProject),
     );
     setActiveTab(initialProject ? "agents" : initialTab);
     setProjectSubTab(initialProjectSubTab ?? "overview");
@@ -1904,113 +1899,93 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   }, [propAgents, loadedAgents]);
 
   const areaRecords = propAreas ?? loadedAreas;
-
-  const projectOptions = useMemo<string[]>(() => {
-    const out: string[] = projectOptionLabels(effectiveProjects);
-    const addProjectOption = (raw?: string | null) => {
-      const trimmed = (raw ?? "").trim();
-      if (!trimmed || trimmed.toLowerCase() === "all") return;
-      // An agent's project is a slug; list it under the project's display name.
-      const known = findProject(effectiveProjects, trimmed);
-      const label = known ? projectLabel(known) : areaInfo(trimmed, areaRecords, effectiveProjects).label;
-      const lower = label.toLowerCase();
-      if (!out.some((opt) => opt.toLowerCase() === lower)) {
-        out.push(label);
-      }
-    };
-    for (const ag of effectiveAgents) {
-      addProjectOption(ag.project || "Workspace");
-      extraAreaKeys(ag).forEach(addProjectOption);
-    }
-    addProjectOption(initialProject);
-    addProjectOption(selectedProjectFilter);
-    return out;
-  }, [
-    effectiveProjects,
-    effectiveAgents,
-    areaRecords,
-    initialProject,
-    selectedProjectFilter,
-  ]);
-
-  const resolvedProjectFilter = useMemo<string>(
-    () =>
-      resolveProjectFilterValue(
-        selectedProjectFilter,
-        projectOptions,
-        effectiveProjects,
-      ),
-    [selectedProjectFilter, projectOptions, effectiveProjects],
+  const projectIdentities = useMemo(
+    () => areaReferenceIndex(effectiveProjects, areaRecords),
+    [effectiveProjects, areaRecords],
   );
 
-  // A project that leaves the shared list (deleted here or elsewhere) must not stay the
-  // active filter; a renamed one stays, under its new label. The filter holds a label, so
-  // the slug of the filtered project is remembered from the list that still had it.
-  const filterSlugRef = useRef<string | null>(null);
-  const previousProjectsRef = useRef<readonly ProjectSummary[]>(effectiveProjects);
+  const projectScope = useMemo<SettingsProjectScope | null>(() => {
+    if (!projectSelection) return null;
+    const key = projectKey(projectSelection.slug ?? projectSelection.label ?? "");
+    // A label-only Settings entry explicitly carries a display label. Free-form
+    // agent references use the separate slug-first resolver.
+    const selected = projectSelection.slug === undefined
+      ? projectIdentities.resolveLabel(key)
+      : projectIdentities.bySlug.get(key);
+    if (selected) return selected;
+    if (projectIdentities.isAmbiguousLabel(key)) return null;
+    return projectIdentities.bySlug.get(key) ?? { slug: key, label: projectSelection.label ?? key };
+  }, [projectSelection, projectIdentities]);
+
+  const isProjectScoped = Boolean(initialProject || projectSelection);
+  const scopedProjectName = projectScope?.label ?? initialProject ?? projectSelection?.label ?? null;
+
+  // A registry refresh can rename or remove the project. Keep the resolved slug
+  // after the first match so its former label cannot select a different project.
+  const previousProjectsRef = useRef(effectiveProjects);
   useEffect(() => {
     const previous = previousProjectsRef.current;
     previousProjectsRef.current = effectiveProjects;
-    const active = selectedProjectFilter.trim();
-    if (!active || active.toLowerCase() === "all") {
-      filterSlugRef.current = null;
-      return;
+    if (!projectScope) return;
+    if (
+      !projectScope.project &&
+      previous.some(project => projectKey(project.slug) === projectScope.slug)
+    ) {
+      selectProject(null);
+    } else if (projectSelection?.slug === undefined && projectIdentities.bySlug.has(projectScope.slug)) {
+      setProjectSelection({ slug: projectScope.slug, label: projectScope.label });
     }
-    const inCurrent = findProject(effectiveProjects, active);
-    if (previous === effectiveProjects) {
-      if (inCurrent) filterSlugRef.current = inCurrent.slug;
-      return;
-    }
-    const known = findProject(previous, active);
-    const slug = known?.slug ?? filterSlugRef.current;
-    if (inCurrent) {
-      filterSlugRef.current = inCurrent.slug;
-      return;
-    }
-    if (!slug) return;
-    const renamed = effectiveProjects.find(
-      (p) => p.slug.trim().toLowerCase() === slug.trim().toLowerCase(),
-    );
-    if (renamed) {
-      filterSlugRef.current = renamed.slug;
-      setSelectedProjectFilter(projectLabel(renamed));
-    } else {
-      filterSlugRef.current = null;
-      setSelectedProjectFilter("all");
-    }
-  }, [effectiveProjects, selectedProjectFilter]);
+  }, [effectiveProjects, projectIdentities, projectScope, projectSelection]);
 
-  const projectScopedAgents = useMemo<AgentRecord[]>(() => {
-    if (!resolvedProjectFilter || resolvedProjectFilter === "all") {
-      return effectiveAgents;
-    }
-    // Agents carry the project slug; the filter holds the display name.
-    const known = findProject(effectiveProjects, resolvedProjectFilter);
-    const targets = new Set<string>([resolvedProjectFilter.toLowerCase()]);
-    const matchedArea = areaRecords.find((a) => a.name.trim().toLowerCase() === resolvedProjectFilter.trim().toLowerCase() || a.area_key.trim().toLowerCase() === resolvedProjectFilter.trim().toLowerCase());
-    if (matchedArea) targets.add(matchedArea.area_key.trim().toLowerCase());
-    if (known) {
-      targets.add(known.slug.trim().toLowerCase());
-      targets.add(projectLabel(known).toLowerCase());
-    }
-    return effectiveAgents.filter((ag) =>
-      targets.has((ag.project || "Workspace").toLowerCase()),
-    );
-  }, [effectiveAgents, resolvedProjectFilter, effectiveProjects, areaRecords]);
+  function selectProject(slug: string | null, label?: string) {
+    setProjectSelection(slug ? { slug, label } : null);
+    setSelectedAgentKeys(new Set());
+    setArmedAction(null);
+    setProjectArtifactsDirStatus(null);
+  }
 
-  const filteredAgents = useMemo<AgentRecord[]>(() => {
-    if (!resolvedProjectFilter || resolvedProjectFilter === "all") return effectiveAgents;
-    const known = findProject(effectiveProjects, resolvedProjectFilter);
-    const area = areaRecords.find((a) => a.name.trim().toLowerCase() === resolvedProjectFilter.trim().toLowerCase() || a.area_key.trim().toLowerCase() === resolvedProjectFilter.trim().toLowerCase());
-    const target = known?.slug ?? area?.area_key ?? resolvedProjectFilter;
-    return effectiveAgents.filter((agent) => coversArea(agent, target) || projectScopedAgents.includes(agent));
-  }, [effectiveAgents, resolvedProjectFilter, effectiveProjects, areaRecords, projectScopedAgents]);
+  const projectForAgentReference = useMemo(() => (raw: string): SettingsProjectScope | undefined => {
+    const known = projectIdentities.resolve(raw);
+    if (known) return known;
+    if (projectIdentities.isAmbiguousLabel(raw)) return undefined;
+    return { slug: projectKey(raw), label: raw.trim() };
+  }, [projectIdentities]);
+
+  const projectOptions = useMemo(() => {
+    const options = new Map<string, SettingsProjectScope>();
+    const add = (scope: SettingsProjectScope | undefined) => {
+      if (scope?.slug && !options.has(scope.slug)) options.set(scope.slug, scope);
+    };
+    for (const project of effectiveProjects) {
+      add(projectForAgentReference(project.slug));
+    }
+    add(projectForAgentReference(WORKSPACE_PROJECT));
+    for (const agent of effectiveAgents) {
+      add(projectForAgentReference(agent.project || WORKSPACE_PROJECT));
+      extraAreaKeys(agent).forEach(area => add(projectForAgentReference(area)));
+    }
+    if (projectScope) add(projectScope);
+    return Array.from(options.values());
+  }, [effectiveProjects, effectiveAgents, projectForAgentReference, projectScope]);
+
+  const projectScopedAgents = useMemo(() => {
+    if (!projectScope) return isProjectScoped ? [] : effectiveAgents;
+    return effectiveAgents.filter(agent =>
+      projectForAgentReference(agent.project || WORKSPACE_PROJECT)?.slug === projectScope.slug,
+    );
+  }, [effectiveAgents, isProjectScoped, projectForAgentReference, projectScope]);
+
+  const filteredAgents = useMemo(() => {
+    if (!projectScope) return projectScopedAgents;
+    return effectiveAgents.filter(agent =>
+      projectScopedAgents.includes(agent) || extraAreaKeys(agent).some(area =>
+        projectForAgentReference(area)?.slug === projectScope.slug,
+      ),
+    );
+  }, [effectiveAgents, projectForAgentReference, projectScope, projectScopedAgents]);
 
   // Coverage-only rows stay visible, but bulk operations belong to primary projects.
-  const selectableAgents = useMemo(
-    () => filteredAgents.filter(agent => projectScopedAgents.includes(agent)),
-    [filteredAgents, projectScopedAgents],
-  );
+  const selectableAgents = projectScopedAgents;
 
   const allFilteredSelected = useMemo(() => {
     if (selectableAgents.length === 0) return false;
@@ -2020,12 +1995,12 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   }, [selectableAgents, selectedAgentKeys]);
 
   const projectSummaryLead = useMemo(() => {
-    if (!resolvedProjectFilter || resolvedProjectFilter === "all") return null;
+    if (!projectScope) return null;
     const lead = projectScopedAgents.find(
       (ag) => ag.role === "lead" || ag.role === "lab_manager",
     );
     return lead ? lead.display_name : "Unassigned";
-  }, [projectScopedAgents, resolvedProjectFilter]);
+  }, [projectScopedAgents, projectScope]);
 
   const authorityText = useMemo(() => {
     if (!authority) return "Unauthenticated";
@@ -2688,14 +2663,6 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     }
   };
 
-  const isProjectScoped =
-    Boolean(initialProject) || resolvedProjectFilter !== "all";
-  const scopedProject = findProject(effectiveProjects, resolvedProjectFilter);
-  const scopedProjectName =
-    resolvedProjectFilter !== "all"
-      ? resolvedProjectFilter
-      : initialProject || null;
-
   const bulkSelectedKeys = Array.from(selectedAgentKeys).filter(key =>
     !isProjectScoped || projectScopedAgents.some(agent => agent.name_key.toLowerCase() === key),
   );
@@ -2749,8 +2716,14 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     status: projectArtifactsDirStatus,
   };
 
+  const legacyPreferenceLabel = projectScope && !projectIdentities.isAmbiguousLabel(projectScope.label)
+    ? projectScope.label
+    : null;
+  const projectPinned = projectScope
+    ? isProjectPreferenceSet(pinnedProjects, projectScope.slug, legacyPreferenceLabel)
+    : false;
   const projectSummaryCardNode =
-    resolvedProjectFilter !== "all" ? (
+    projectScope ? (
       <div
         data-testid="settings-project-summary-card"
         className="fd-card"
@@ -2784,7 +2757,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
               data-testid="settings-project-summary-name"
               style={{ fontSize: "13px" }}
             >
-              {resolvedProjectFilter}
+              {projectScope.label}
             </strong>
             <span
               className="fd-badge fd-mono"
@@ -2795,10 +2768,10 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
             <span
               className="fd-badge fd-mono"
               data-testid="session-cwd-badge"
-              title={`~/Projects/Artificial-Humanity/${resolvedProjectFilter}`}
+              title={`~/Projects/Artificial-Humanity/${projectScope.label}`}
               style={{ color: "var(--text-muted)" }}
             >
-              ~/Projects/Artificial-Humanity/{resolvedProjectFilter}
+              ~/Projects/Artificial-Humanity/{projectScope.label}
             </span>
             <span className="fd-badge fd-mono">
               {filteredAgents.length}{" "}
@@ -2817,20 +2790,10 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
             <button
               type="button"
               data-testid="project-pin-toggle-btn"
-              aria-pressed={pinnedProjects.has(
-                resolvedProjectFilter.trim().toLowerCase(),
-              )}
-              title={
-                pinnedProjects.has(resolvedProjectFilter.trim().toLowerCase())
-                  ? "Unpin Project"
-                  : "Pin Project"
-              }
-              aria-label={
-                pinnedProjects.has(resolvedProjectFilter.trim().toLowerCase())
-                  ? "Unpin Project"
-                  : "Pin Project"
-              }
-              className={`fd-btn${pinnedProjects.has(resolvedProjectFilter.trim().toLowerCase()) ? " fd-btn-active" : ""}`}
+              aria-pressed={projectPinned}
+              title={projectPinned ? "Unpin Project" : "Pin Project"}
+              aria-label={projectPinned ? "Unpin Project" : "Pin Project"}
+              className={`fd-btn${projectPinned ? " fd-btn-active" : ""}`}
               style={{
                 padding: "4px 6px",
                 display: "inline-flex",
@@ -2838,12 +2801,10 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 justifyContent: "center",
                 lineHeight: 1,
               }}
-              onClick={() => togglePinnedProject(resolvedProjectFilter)}
+              onClick={() => togglePinnedProject(projectScope.slug, legacyPreferenceLabel)}
             >
               <PinIcon
-                pinned={pinnedProjects.has(
-                  resolvedProjectFilter.trim().toLowerCase(),
-                )}
+                pinned={projectPinned}
                 circled={true}
                 size={16}
               />
@@ -2888,10 +2849,10 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
         </div>
 
         {/* Project-scoped Settings has no Projects tab, so the row stays here (Issue #207) */}
-        {initialProject && scopedProject?.kind !== "virtual" && (
+        {initialProject && !projectScope.virtual && (
           <ProjectArtifactsDirRow
-            slug={scopedProject?.slug ?? resolvedProjectFilter}
-            displayName={resolvedProjectFilter}
+            slug={projectScope.slug}
+            displayName={projectScope.label}
             artifactsDir={projectArtifactsDirProps}
           />
         )}
@@ -2944,7 +2905,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
             style={{ margin: 0, fontSize: "16px", fontWeight: 700, flex: 1, minWidth: 0 }}
           >
             {initialProject
-              ? `Project Settings — ${initialProject}`
+              ? `Project Settings — ${scopedProjectName}`
               : "Settings & Fleet Operations"}
           </h2>
           <button
@@ -3637,9 +3598,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 data-testid="settings-spin-up-btn"
                 className="fd-btn fd-btn-primary"
                 onClick={() => {
-                  onOpenSpinUpModal?.(
-                    resolvedProjectFilter !== "all" ? resolvedProjectFilter : undefined,
-                  );
+                  onOpenSpinUpModal?.(projectScope?.slug);
                   onClose();
                 }}
               >
@@ -3675,18 +3634,22 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                   data-testid="settings-project-filter-select"
                   className="fd-select fd-mono"
                   style={{ fontSize: "11.5px", padding: "3px 8px" }}
-                  value={resolvedProjectFilter}
+                  value={projectScope ? projectFilterOptionValue(projectScope.slug) : "all"}
                   onChange={(e) => {
-                    setSelectedProjectFilter(e.target.value);
-                    setSelectedAgentKeys(new Set());
-                    setArmedAction(null);
-                    setProjectArtifactsDirStatus(null);
+                    const option = projectOptions.find(
+                      (project) => projectFilterOptionValue(project.slug) === e.target.value,
+                    );
+                    selectProject(option?.slug ?? null, option?.label);
                   }}
                 >
-                  <option value="all">All Projects ({effectiveAgents.length})</option>
-                  {projectOptions.map((proj) => (
-                    <option key={proj} value={proj}>
-                      {proj}
+                  {initialProject || (isProjectScoped && !projectScope) ? (
+                    !projectScope && <option value="all">Select a Project</option>
+                  ) : (
+                    <option value="all">All Projects ({effectiveAgents.length})</option>
+                  )}
+                  {projectOptions.map(({ slug, label }) => (
+                    <option key={slug} value={projectFilterOptionValue(slug)}>
+                      {projectIdentities.isAmbiguousLabel(label) ? `${label} (${slug})` : label}
                     </option>
                   ))}
                 </select>
@@ -3801,8 +3764,8 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                         <strong style={{ fontSize: "12.5px" }}>
                           {ag.display_name}
                         </strong>
-                        <AreaBadge slug={ag.project || "Workspace"} areas={areaRecords} projects={effectiveProjects} />
-                        <CoverageChips agent={ag} areas={areaRecords} projects={effectiveProjects} />
+                        <AreaBadge slug={ag.project || "Workspace"} references={projectIdentities} />
+                        <CoverageChips agent={ag} references={projectIdentities} />
                         <span
                           className="fd-badge fd-mono"
                           style={{ fontSize: "10.5px" }}
@@ -3924,8 +3887,9 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                           }}
                           onClick={() => {
                             const originMemento: SettingsOriginMemento = {
-                              initialProject: initialProject ?? null,
-                              projectFilter: resolvedProjectFilter,
+                              initialProject: initialProject ? scopedProjectName : null,
+                              projectFilter: projectScope?.label ?? "all",
+                              projectFilterSlug: projectScope?.slug,
                               activeTab,
                               projectSubTab,
                               agentsSubTab,
@@ -5018,8 +4982,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
               error={sharedProjectList ? (projectsError ?? null) : projectListError}
               projectManagement={projectManagement}
               onViewAgents={(slug) => {
-                setSelectedProjectFilter(slug);
-                setProjectArtifactsDirStatus(null);
+                selectProject(projectKey(slug));
                 setActiveTab("agents");
               }}
               artifactsDir={projectArtifactsDirProps}

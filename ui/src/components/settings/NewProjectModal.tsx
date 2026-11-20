@@ -31,15 +31,28 @@ export interface NewProjectModalProps {
   onCreated: (project: ProjectSummary) => void;
 }
 
-const SLUG_PATTERN = /^[a-z0-9][a-z0-9-]*$/;
+const SLUG_PATTERN = /^[a-z][a-z0-9_-]{0,63}$/;
+const SLUG_HELP =
+  "Enter a slug that starts with a lowercase letter and uses at most 64 lowercase letters, digits, hyphens, or underscores.";
+const MAX_NAME_CHARS = 80;
+const MAX_NAME_SEGMENTS = 4;
 
 export function deriveProjectSlug(name: string): string {
-  return name
-    .normalize("NFKD")
-    .replace(/[\u0300-\u036f]/g, "")
+  const normalized = name
+    .normalize("NFD")
+    .replace(/([A-Za-z])\p{Mark}+/gu, "$1");
+  if (/[^\x00-\x7f]/.test(normalized.replace(/[^\p{Alphabetic}]/gu, ""))) {
+    return "";
+  }
+  const parts = normalized.split("/");
+  // Like the Hub, retain underscores in flat names and use kebab-case in paths.
+  const separators = parts.length === 1 ? /[^a-z0-9_]+/g : /[^a-z0-9]+/g;
+  const segments = parts.map((segment) => segment
     .toLowerCase()
-    .replace(/[^a-z0-9]+/g, "-")
-    .replace(/^-+|-+$/g, "");
+    .replace(separators, "-")
+    .replace(/^-+|-+$/g, ""),
+  );
+  return segments.every(Boolean) ? segments.join("-") : "";
 }
 
 function NewProjectForm({
@@ -54,6 +67,7 @@ function NewProjectForm({
   const [name, setName] = useState("");
   const [slug, setSlug] = useState("");
   const [slugManual, setSlugManual] = useState(false);
+  const [createParent, setCreateParent] = useState(false);
   const [path, setPath] = useState("");
   const [purpose, setPurpose] = useState("");
   const [gitInit, setGitInit] = useState(false);
@@ -76,10 +90,14 @@ function NewProjectForm({
 
   const isProject = kind === "project";
   const trimmedName = name.trim();
+  const nameSegments = trimmedName.split("/").map((segment) => segment.trim());
+  const isNested = nameSegments.length > 1;
   const trimmedSlug = slug.trim();
   const trimmedPath = path.trim();
   const trimmedGithub = github.trim();
   const trimmedPurpose = purpose.trim();
+  const slugTaken = existingSlugs.includes(trimmedSlug);
+  const suggestedSlugTaken = !slugManual && slugTaken;
 
   const errors: {
     name?: string;
@@ -88,11 +106,14 @@ function NewProjectForm({
     github?: string;
   } = {};
   if (!trimmedName) errors.name = "Name is required.";
-  if (!trimmedSlug) errors.slug = "Slug is required.";
-  else if (!SLUG_PATTERN.test(trimmedSlug))
-    errors.slug =
-      "Slug must start with a lowercase letter or digit and use only a-z, 0-9 and '-'.";
-  else if (existingSlugs.includes(trimmedSlug))
+  else if (Array.from(trimmedName).length > MAX_NAME_CHARS)
+    errors.name = `Name must be at most ${MAX_NAME_CHARS} characters.`;
+  else if (nameSegments.length > MAX_NAME_SEGMENTS || nameSegments.some((segment) => !segment))
+    errors.name = `Use one to ${MAX_NAME_SEGMENTS} non-empty segments separated by "/".`;
+  if (!trimmedSlug)
+    errors.slug = trimmedName && !deriveProjectSlug(trimmedName) ? SLUG_HELP : "Slug is required.";
+  else if (!SLUG_PATTERN.test(trimmedSlug)) errors.slug = SLUG_HELP;
+  else if (slugManual && slugTaken)
     errors.slug = `A project or group with the slug "${trimmedSlug}" already exists.`;
   if (isProject) {
     errors.path = validateProjectPath(trimmedPath);
@@ -127,6 +148,7 @@ function NewProjectForm({
 
   const changeName = (value: string) => {
     setName(value);
+    if (!value.includes("/")) setCreateParent(false);
     // An emptied slug counts as "not chosen yet": editing the name refills it.
     if (!slugManual || slug === "") {
       setSlugManual(false);
@@ -164,9 +186,12 @@ function NewProjectForm({
     // the hub keeps its own default.
     const req: CreateProjectRequest = {
       name: trimmedName,
-      slug: trimmedSlug,
       kind,
+      create_only: true,
     };
+    // Let the hub resolve an untouched preview, including historical project slugs.
+    if (slugManual) req.slug = trimmedSlug;
+    if (isNested && createParent) req.create_parent = true;
     if (trimmedPurpose) req.purpose = trimmedPurpose;
     if (isProject) {
       req.path = trimmedPath;
@@ -324,9 +349,12 @@ function NewProjectForm({
               value={name}
               disabled={busy}
               aria-invalid={shown.name ? true : undefined}
-              aria-describedby={describedBy("name", Boolean(shown.name))}
+              aria-describedby={shown.name ? `${uid}-name-err` : `${uid}-name-help`}
               onChange={(e) => changeName(e.target.value)}
             />
+            <p id={`${uid}-name-help`} style={HELP_STYLE}>
+              Use slashes to nest a project, for example Lab / Research / Mobile.
+            </p>
             {fieldError("name", shown.name)}
           </div>
 
@@ -342,7 +370,11 @@ function NewProjectForm({
               value={slug}
               disabled={busy}
               aria-invalid={shown.slug ? true : undefined}
-              aria-describedby={describedBy("slug", Boolean(shown.slug))}
+              aria-describedby={describedBy(
+                "slug",
+                Boolean(shown.slug),
+                suggestedSlugTaken ? `${uid}-slug-advisory` : undefined,
+              )}
               onBlur={refillEmptySlug}
               onChange={(e) => {
                 // Any edit is manual; an empty value stays empty while typing.
@@ -350,8 +382,25 @@ function NewProjectForm({
                 setSlug(e.target.value);
               }}
             />
+            {suggestedSlugTaken && (
+              <p id={`${uid}-slug-advisory`} style={HELP_STYLE}>
+                The suggested slug is in use. The Hub will check if it can use an existing project or group.
+              </p>
+            )}
             {fieldError("slug", shown.slug)}
           </div>
+
+          {isNested && (
+            <label style={{ display: "flex", gap: "8px", alignItems: "center", fontSize: "12px" }}>
+              <input
+                type="checkbox"
+                checked={createParent}
+                disabled={busy}
+                onChange={(e) => setCreateParent(e.target.checked)}
+              />
+              Create missing parent groups
+            </label>
+          )}
 
           {isProject && (
             <div style={FIELD_STYLE}>

@@ -13,15 +13,13 @@ export function useProjectModals({
   isOpen,
   projectList,
   setProjectList,
-  selectedProjectFilter,
-  setSelectedProjectFilter,
+  onProjectDeleted,
   onProjectsChanged,
 }: {
   isOpen: boolean;
   projectList: ProjectSummary[];
   setProjectList: Dispatch<SetStateAction<ProjectSummary[]>>;
-  selectedProjectFilter: string;
-  setSelectedProjectFilter: (value: string) => void;
+  onProjectDeleted: (slug: string) => void;
   onProjectsChanged?: () => void;
 }): {
   editTarget: ProjectSummary | null;
@@ -97,15 +95,7 @@ export function useProjectModals({
         ?.closest('[data-testid="settings-projects-tab"]')
         ?.querySelector<HTMLElement>(CREATE_BUTTON);
       if (fallback) deleteOpenerRef.current = fallback;
-      // The Agents filter may hold the slug or the display name.
-      const filter = selectedProjectFilter.trim().toLowerCase();
-      if (
-        filter !== "all" &&
-        (filter === slug.toLowerCase() ||
-          (gone && filter === gone.name.trim().toLowerCase()))
-      ) {
-        setSelectedProjectFilter("all");
-      }
+      onProjectDeleted(slug);
       setDeleteStatus(describeProjectDeletion(gone?.name ?? slug, response));
       setDeleteWarning(Boolean(response.error));
       onProjectsChanged?.();

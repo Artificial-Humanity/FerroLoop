@@ -3,7 +3,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { HubApiClient } from "../api/client";
 import { SettingsModal } from "../components/SettingsModal";
 import { AgentSettingsModal } from "../components/AgentSettingsModal";
-import { areaInfo } from "../components/AreaCoverage";
+import { areaReferenceIndex } from "../components/AreaCoverage";
 import { RosterSidebar } from "../components/RosterSidebar";
 import type { AgentRecord, AreaRecord, ProjectSummary } from "../types/api";
 
@@ -28,13 +28,13 @@ describe("agent coverage", () => {
   });
   it("finds agents by a covered area name", () => {
     render(<RosterSidebar agents={[director]} areas={areas} projects={projects} routes={[]} liveness={[]} unreadByAgent={{}} selectedAgentName={null} onSelectAgent={vi.fn()} embedded />);
-    fireEvent.change(screen.getByPlaceholderText("Search agents, projects, adapters..."), { target: { value: "Kaggle" } });
+    fireEvent.change(screen.getByPlaceholderText("Search agents, projects, adapters..."), { target: { value: "kaggle" } });
     expect(screen.getAllByText("Dana").length).toBeGreaterThan(0);
   });
   it("filters the agent list by extra coverage while keeping default bulk scope primary", () => {
     const client = new HubApiClient({ baseUrl: "http://hub.test", fetchImpl: vi.fn(async () => new Response("{}", { headers: { "Content-Type": "application/json" } })) as typeof fetch });
     render(<SettingsModal isOpen onClose={vi.fn()} agents={[director]} areas={areas} projects={projects} projectsFromHub apiClient={client} />);
-    fireEvent.change(screen.getByTestId("settings-project-filter-select"), { target: { value: "Kaggle" } });
+    fireEvent.change(screen.getByTestId("settings-project-filter-select"), { target: { value: "kaggle" } });
     const row = screen.getByTestId("settings-agent-row-dana");
     expect(row).toHaveTextContent("Dana");
     expect(row).toHaveTextContent("Beta");
@@ -53,7 +53,7 @@ describe("coverage review regressions", () => {
   it.each(["individual", "all"])("keeps %s selection within primary-project bulk scope", async (selection) => {
     const onBulkSessionAction = vi.fn().mockResolvedValue({ action: "clear", total: 1, succeeded: 1, results: [] });
     render(<SettingsModal isOpen onClose={vi.fn()} agents={[director, betaAgent]} areas={areas} projects={projects} projectsFromHub apiClient={client()} onBulkSessionAction={onBulkSessionAction} />);
-    fireEvent.change(screen.getByTestId("settings-project-filter-select"), { target: { value: "Beta" } });
+    fireEvent.change(screen.getByTestId("settings-project-filter-select"), { target: { value: "beta" } });
     expect(screen.getByTestId("settings-agent-row-dana")).toBeInTheDocument();
     expect(screen.getByTestId("agent-select-checkbox-dana")).toBeDisabled();
     fireEvent.click(screen.getByTestId(selection === "all" ? "settings-agents-select-all-btn" : "agent-select-checkbox-bea"));
@@ -67,7 +67,7 @@ describe("coverage review regressions", () => {
     const clear = vi.spyOn(apiClient, "clearSession").mockResolvedValue({ ok: true, session_id: "bea", mode: "clear" });
     const decommission = vi.spyOn(apiClient, "decommissionSession").mockResolvedValue({ session_id: "bea", mode: "teardown", status: "completed", handshake_dispatched: true, unregistered: true, runtime_stopped: true });
     render(<SettingsModal isOpen onClose={vi.fn()} agents={[director, betaAgent]} areas={areas} projects={projects} projectsFromHub apiClient={apiClient} />);
-    fireEvent.change(screen.getByTestId("settings-project-filter-select"), { target: { value: "Beta" } });
+    fireEvent.change(screen.getByTestId("settings-project-filter-select"), { target: { value: "beta" } });
     fireEvent.click(screen.getByTestId("settings-agents-select-all-btn"));
     fireEvent.click(screen.getByTestId(action === "clear" ? "bulk-clear-btn" : "bulk-action-teardown-btn"));
     fireEvent.click(screen.getByTestId("bulk-confirm-btn"));
@@ -81,7 +81,7 @@ describe("coverage review regressions", () => {
     const props = { isOpen: true, onClose: vi.fn(), areas, projects, projectsFromHub: true, apiClient, onBulkSessionAction };
     const otherBeta = { ...betaAgent, id: "c", name_key: "bob", display_name: "Bob" };
     const { rerender } = render(<SettingsModal {...props} agents={[director, betaAgent, otherBeta]} />);
-    fireEvent.change(screen.getByTestId("settings-project-filter-select"), { target: { value: "Beta" } });
+    fireEvent.change(screen.getByTestId("settings-project-filter-select"), { target: { value: "beta" } });
     fireEvent.click(screen.getByTestId("agent-select-checkbox-bea"));
     fireEvent.click(screen.getByTestId("bulk-clear-btn"));
     rerender(<SettingsModal {...props} agents={[director, { ...betaAgent, project: "alpha", extra_areas: ["beta"] }, otherBeta]} />);
@@ -90,7 +90,7 @@ describe("coverage review regressions", () => {
   });
   it("prefers a real project registry entry over a pathless area in chips and headers", () => {
     const pathless = areas.map(a => ({ ...a, path: null }));
-    expect(areaInfo("alpha", pathless, projects).virtual).toBe(false);
+    expect(areaReferenceIndex(projects, pathless).resolve("alpha")?.virtual).toBe(false);
     render(<RosterSidebar agents={[director]} areas={pathless} projects={projects} routes={[]} liveness={[]} unreadByAgent={{}} selectedAgentName={null} onSelectAgent={vi.fn()} embedded />);
     expect(screen.getByTestId("project-group-toggle-alpha")).not.toHaveTextContent("virtual");
     expect(within(screen.getByTestId("project-group-alpha")).queryByText("Beta · virtual")).not.toBeInTheDocument();

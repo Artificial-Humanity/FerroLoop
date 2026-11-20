@@ -608,10 +608,10 @@ fn list_shows_both_kinds_with_the_tracker_and_the_active_agents() {
         .success()
         .stdout(
             contains(format!(
-                "project\tlisted\t{}\tacme/listed\t1\n",
+                "project\tlisted\t{}\tacme/listed\t1\tListed\n",
                 root.display()
             ))
-            .and(contains("virtual\tcouncil\t-\t-\t2\n")),
+            .and(contains("virtual\tcouncil\t-\t-\t2\tCouncil\n")),
         );
 }
 
@@ -971,4 +971,491 @@ fn a_config_whose_projects_are_not_tables_stops_every_project_command_and_names_
     }
     assert_eq!(env.config(), "project = [1, 2]\n");
     assert!(!env.dir("beta").exists());
+}
+
+#[test]
+fn nested_projects_keep_flat_slugs_and_explicit_names() {
+    let env = Env::new();
+    let root = env.dir("pokemon");
+    env.fl(env.work.path())
+        .args(["project", "create", "--name", "Kaggle/Pokémon", "--path"])
+        .arg(&root)
+        .assert()
+        .failure()
+        .stderr(contains("Kaggle").and(contains("--create-parent")));
+    assert!(!root.exists());
+    let parent = env.run_json("create", &["--virtual", "--name", "Kaggle"]);
+    assert_eq!(parent["slug"], "kaggle");
+    let args = [
+        "--name",
+        " Kaggle / Pokémon ",
+        "--path",
+        root.to_str().unwrap(),
+    ];
+    for _ in 0..2 {
+        let child = env.run_json("create", &args);
+        assert_eq!(child["name"], "Kaggle/Pokémon");
+        assert_eq!(child["slug"], "kaggle-pokemon");
+        assert_eq!(child["parent"], "kaggle");
+        assert_eq!(child["ancestors"], serde_json::json!(["kaggle"]));
+    }
+    env.fl(env.work.path())
+        .args(["project", "list"])
+        .assert()
+        .success()
+        .stdout(contains("Kaggle/Pokémon"));
+}
+
+#[test]
+fn resume_flat_uses_the_existing_project_store_without_creating_ancestors() {
+    for (name, slug, extension) in [
+        ("Kaggle/Pokémon", "kaggle-pok-mon", "fls"),
+        ("Archive//Old", "archive-old", "redb"),
+    ] {
+        let env = Env::new();
+        let root = env.dir("historical");
+        std::fs::create_dir(&root).unwrap();
+        let ws = env.home.path().join("data/fl/fl.fls");
+        let store = ws.with_file_name(format!("{slug}.{extension}"));
+        let mut seed = env.fl(env.work.path());
+        if extension == "redb" {
+            seed.env("FL_STORE_BACKEND", "redb");
+        }
+        seed.arg("--db")
+            .arg(&store)
+            .args(["project", "add"])
+            .arg(&root)
+            .assert()
+            .success();
+        let args = [
+            "--resume-flat",
+            "--name",
+            name,
+            "--slug",
+            slug,
+            "--path",
+            root.to_str().unwrap(),
+        ];
+        for expected_registered in [true, false] {
+            let resumed = env.run_json("create", &args);
+            assert_eq!(resumed["slug"], slug);
+            assert_eq!(resumed["name"], name);
+            assert_eq!(resumed["parent"], Value::Null);
+            assert_eq!(resumed["ancestors"], serde_json::json!([]));
+            assert_eq!(resumed["registered"], expected_registered);
+        }
+        assert_eq!(env.slugs(), [slug]);
+        assert!(root.join(".fl/mcp.toml").is_file());
+        assert_ne!(
+            fl_store::FerroStore::open(&ws)
+                .unwrap()
+                .format_version()
+                .unwrap(),
+            Some(10)
+        );
+    }
+}
+
+#[test]
+fn resume_flat_refuses_missing_empty_and_wrong_root_stores_before_project_changes() {
+    for fixture in [
+        "missing",
+        "zero-byte",
+        "empty",
+        "wrong-root",
+        "wrong-root-redb",
+    ] {
+        let env = Env::new();
+        let root = env.dir("requested");
+        let ferro = env.home.path().join("data/fl/historical.fls");
+        let store = if fixture == "wrong-root-redb" {
+            ferro.with_extension("redb")
+        } else {
+            ferro.clone()
+        };
+        match fixture {
+            "zero-byte" => {
+                std::fs::create_dir_all(store.parent().unwrap()).unwrap();
+                std::fs::File::create(&store).unwrap();
+            }
+            "empty" => drop(fl_store::open_store(&store).unwrap()),
+            "wrong-root" | "wrong-root-redb" => {
+                let other = env.dir("other");
+                std::fs::create_dir(&other).unwrap();
+                let mut seed = env.fl(env.work.path());
+                if fixture == "wrong-root-redb" {
+                    seed.env("FL_STORE_BACKEND", "redb");
+                }
+                seed.arg("--db")
+                    .arg(&store)
+                    .args(["project", "add"])
+                    .arg(&other)
+                    .assert()
+                    .success();
+            }
+            _ => {}
+        }
+        let before = std::fs::read(&store).ok();
+        env.fl(env.work.path())
+            .args([
+                "project",
+                "create",
+                "--resume-flat",
+                "--name",
+                "Archive/Old",
+                "--slug",
+                "historical",
+                "--git-init",
+                "--path",
+            ])
+            .arg(&root)
+            .assert()
+            .failure()
+            .stderr(contains(if fixture == "missing" {
+                "existing project store"
+            } else {
+                "does not hold exactly the project at"
+            }));
+        assert!(!root.exists());
+        assert!(!env.config_path().exists());
+        assert!(!env.home.path().join("data/fl/fl.fls").exists());
+        assert_eq!(std::fs::read(&store).ok(), before);
+        if fixture == "wrong-root-redb" {
+            assert!(!ferro.exists());
+        }
+    }
+}
+
+#[test]
+fn resume_flat_leaves_a_partially_initialized_ferro_store_untouched() {
+    use std::time::{Duration, SystemTime};
+
+    let env = Env::new();
+    let root = env.dir("requested");
+    let store = env.home.path().join("data/fl/historical.fls");
+    let dir = store.parent().unwrap();
+    std::fs::create_dir_all(dir).unwrap();
+    let partial_header = [0u8; 64];
+    std::fs::write(&store, partial_header).unwrap();
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&store)
+        .unwrap()
+        .set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000))
+        .unwrap();
+    let modified = std::fs::metadata(&store).unwrap().modified().unwrap();
+
+    env.fl(env.work.path())
+        .args([
+            "project",
+            "create",
+            "--resume-flat",
+            "--name",
+            "Archive/Old",
+            "--slug",
+            "historical",
+            "--git-init",
+            "--path",
+        ])
+        .arg(&root)
+        .assert()
+        .failure();
+    assert_eq!(
+        std::fs::metadata(&store).unwrap().len(),
+        partial_header.len() as u64,
+        "flat recovery initialized the incomplete store"
+    );
+    assert_eq!(std::fs::read(&store).unwrap(), partial_header);
+    assert_eq!(
+        std::fs::metadata(&store).unwrap().modified().unwrap(),
+        modified
+    );
+    let files: Vec<_> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    assert_eq!(files, [store]);
+    assert!(!root.exists());
+    assert!(!env.config_path().exists());
+}
+
+#[test]
+fn resume_flat_refuses_a_wrong_root_with_forced_redb() {
+    assert_resume_redb_refusal(true, false);
+}
+
+#[test]
+fn resume_flat_does_not_repair_a_lone_redb_before_checking_its_owner() {
+    assert_resume_redb_refusal(false, true);
+}
+
+#[test]
+fn resume_flat_does_not_repair_a_forced_redb_before_checking_its_owner() {
+    assert_resume_redb_refusal(true, true);
+}
+
+#[test]
+fn resume_flat_honors_the_restore_fence_for_a_lone_redb() {
+    use fl_core::store::Catalog;
+
+    let env = Env::new();
+    let root = env.dir("requested");
+    let store = env.home.path().join("data/fl/historical.redb");
+    std::fs::create_dir_all(store.parent().unwrap()).unwrap();
+    let redb = fl_store::RedbStore::open(&store).unwrap();
+    redb.add_project(root.to_str().unwrap()).unwrap();
+    drop(redb);
+    // The default backend's restore fence lives beside the destination .fls.
+    std::fs::write(store.with_extension("fls.restore-guard"), "fenced").unwrap();
+    env.fl(env.work.path())
+        .args([
+            "project",
+            "create",
+            "--resume-flat",
+            "--name",
+            "Archive/Old",
+            "--slug",
+            "historical",
+            "--git-init",
+            "--path",
+        ])
+        .arg(&root)
+        .assert()
+        .failure()
+        .stderr(contains("restore admission fenced"));
+    assert!(!root.exists());
+    assert!(!env.config_path().exists());
+    assert!(!store.with_file_name("fl.fls").exists());
+    assert!(!store.with_extension("fls").exists());
+}
+
+fn assert_resume_redb_refusal(force_redb: bool, needs_repair: bool) {
+    use fl_core::store::Catalog;
+    use std::time::{Duration, SystemTime};
+
+    let env = Env::new();
+    let root = env.dir("requested");
+    let other = env.dir("other");
+    std::fs::create_dir(&other).unwrap();
+    let store = env.home.path().join("data/fl/historical.redb");
+    env.fl(env.work.path())
+        .env("FL_STORE_BACKEND", "redb")
+        .arg("--db")
+        .arg(&store)
+        .args(["project", "add"])
+        .arg(&other)
+        .assert()
+        .success();
+    if needs_repair {
+        // Redb's header puts the recovery-required bit in the byte after its 9-byte magic.
+        let mut dirty = std::fs::read(&store).unwrap();
+        assert!(dirty.starts_with(b"redb\x1a\x0a\xa9\x0d\x0a"));
+        assert_eq!(dirty[9] & 2, 0);
+        dirty[9] |= 2;
+        std::fs::write(&store, dirty).unwrap();
+        assert!(
+            fl_store::RedbStore::open_read_only(&store, 0)
+                .err()
+                .expect("dirty fixture must reject a read-only open")
+                .to_string()
+                .contains("repair")
+        );
+        // A disposable copy proves the ordinary writable open can repair these exact bytes.
+        let copy = env.dir("repair-witness.redb");
+        std::fs::copy(&store, &copy).unwrap();
+        let repaired = fl_store::RedbStore::open_with_retries(&copy, 0).unwrap();
+        let projects = repaired.list_projects().unwrap();
+        assert_eq!(projects.len(), 1);
+        assert_eq!(Path::new(&projects[0].root), other);
+    }
+    // Avoid relying on the filesystem's timestamp resolution to observe a write.
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&store)
+        .unwrap()
+        .set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000))
+        .unwrap();
+    let store_files = || {
+        let mut paths: Vec<_> = std::fs::read_dir(store.parent().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        paths.sort();
+        paths
+    };
+    let before_paths = store_files();
+    let before_files: Vec<_> = before_paths
+        .iter()
+        .map(|path| {
+            (
+                std::fs::metadata(path).unwrap(),
+                std::fs::read(path).unwrap(),
+            )
+        })
+        .collect();
+
+    let mut resume = env.fl(env.work.path());
+    if force_redb {
+        resume.env("FL_STORE_BACKEND", "redb");
+    }
+    let result = resume
+        .args([
+            "project",
+            "create",
+            "--resume-flat",
+            "--name",
+            "Archive/Old",
+            "--slug",
+            "historical",
+            "--git-init",
+            "--path",
+        ])
+        .arg(&root)
+        .assert()
+        .failure();
+    assert!(!root.exists(), "checkout, Git and catalog must stay absent");
+    assert!(!env.config_path().exists());
+    assert_eq!(
+        store_files(),
+        before_paths,
+        "store files or sidecars changed"
+    );
+    for (path, (before, bytes)) in before_paths.iter().zip(before_files) {
+        let after = std::fs::metadata(path).unwrap();
+        assert!(
+            std::fs::read(path).unwrap() == bytes,
+            "store bytes changed at {}. {result}",
+            path.display()
+        );
+        assert_eq!(after.modified().unwrap(), before.modified().unwrap());
+        assert_eq!(after.permissions(), before.permissions());
+    }
+    result.stderr(contains(if needs_repair {
+        "repair"
+    } else {
+        "does not hold exactly the project at"
+    }));
+}
+
+#[test]
+fn resume_flat_does_not_flatten_an_existing_linked_project() {
+    let env = Env::new();
+    let root = env.dir("linked");
+    env.run_json(
+        "create",
+        &[
+            "Top/Child",
+            "--path",
+            root.to_str().unwrap(),
+            "--create-parent",
+        ],
+    );
+    env.fl(env.work.path())
+        .args([
+            "project",
+            "create",
+            "--resume-flat",
+            "--name",
+            "Top/Child",
+            "--slug",
+            "top-child",
+            "--path",
+        ])
+        .arg(&root)
+        .assert()
+        .failure()
+        .stderr(contains("linked project"));
+    assert_eq!(
+        env.projects()
+            .iter()
+            .find(|p| p["slug"] == "top-child")
+            .unwrap()["parent"],
+        "top"
+    );
+}
+
+#[test]
+fn nested_area_set_updates_purpose_without_repointing_the_area() {
+    let env = Env::new();
+    let root = env.dir("child");
+    env.run_json(
+        "create",
+        &[
+            "Portfolio/Child",
+            "--path",
+            root.to_str().unwrap(),
+            "--create-parent",
+        ],
+    );
+    env.fl(env.work.path())
+        .args([
+            "agent",
+            "area",
+            "set",
+            "portfolio-child",
+            "--purpose",
+            "updated",
+            "--by",
+            "tester",
+        ])
+        .assert()
+        .success();
+    let listed = env.run_json("list", &[]);
+    let child = listed
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["slug"] == "portfolio-child")
+        .unwrap();
+    assert_eq!(child["name"], "Portfolio/Child");
+    assert_eq!(child["parent"], "portfolio");
+    assert_eq!(child["purpose"], "updated");
+    env.fl(env.work.path())
+        .args([
+            "agent",
+            "area",
+            "set",
+            "portfolio-child",
+            "--path",
+            "/elsewhere",
+            "--purpose",
+            "bad",
+            "--by",
+            "tester",
+        ])
+        .assert()
+        .failure();
+}
+
+#[test]
+fn nested_cli_honors_the_config_lock() {
+    let env = Env::new();
+    let config_dir = env.config_path();
+    let config_dir = config_dir.parent().unwrap();
+    std::fs::create_dir_all(config_dir).unwrap();
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let held = options
+        .open(config_dir.join("config.toml.projects.lock"))
+        .unwrap();
+    held.try_lock().unwrap();
+    let root = env.dir("busy");
+    env.fl(env.work.path())
+        .args(["project", "init"])
+        .arg(&root)
+        .assert()
+        .failure()
+        .stderr(contains("busy"));
+    assert!(!root.exists());
+    drop(held);
+    env.fl(env.work.path())
+        .args(["project", "init"])
+        .arg(&root)
+        .assert()
+        .success();
 }

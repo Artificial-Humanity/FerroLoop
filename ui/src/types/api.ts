@@ -271,6 +271,10 @@ export interface ProjectSummary {
   tracker: ProjectTracker | null;
   store_path: string | null;
   active_agent_count: number;
+  /** Older hubs omit hierarchy metadata. */
+  parent?: string | null;
+  /** Canonical ancestor slugs in root-to-parent order. */
+  ancestors?: string[];
   /** The three artifact fields are explicit `null` for a virtual group, which has no directory. */
   artifacts_dir?: string | null;
   default_artifacts_dir?: string | null;
@@ -285,6 +289,10 @@ export interface ProjectSummary {
 export interface CreateProjectRequest {
   name: string;
   slug?: string;
+  /** Explicitly allow missing ancestors to be created as virtual groups. */
+  create_parent?: boolean;
+  /** Allow exact retries and reject unrelated collisions for projects and virtual groups. */
+  create_only?: boolean;
   kind: ProjectKind;
   path?: string | null;
   purpose?: string;
@@ -521,6 +529,8 @@ export interface RecastAgentResponse {
 export interface AreaRecord {
   area_key: string;
   name: string;
+  parent?: string | null;
+  ancestors?: string[];
   path?: string | null;
   purpose: string;
   updated_at?: string;

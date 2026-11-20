@@ -1,6 +1,7 @@
 import { useRef, useState } from "react";
 import { act, fireEvent, render, screen } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
+import { HubApiClient } from "../api/client";
 import {
   NewProjectModal,
   deriveProjectSlug,
@@ -56,8 +57,10 @@ function fillProject() {
 }
 
 describe("deriveProjectSlug", () => {
-  it("lowercases, collapses non-alphanumerics and trims dashes", () => {
-    expect(deriveProjectSlug("  My Cool_Project!! ")).toBe("my-cool-project");
+  it("retains flat underscores and uses dashes within hierarchy segments", () => {
+    expect(deriveProjectSlug("My_Project")).toBe("my_project");
+    expect(deriveProjectSlug("  My Cool_Project!! ")).toBe("my-cool_project");
+    expect(deriveProjectSlug("Lab/My_Project")).toBe("lab-my-project");
     expect(deriveProjectSlug("--A  b--")).toBe("a-b");
     expect(deriveProjectSlug("***")).toBe("");
   });
@@ -70,6 +73,95 @@ describe("deriveProjectSlug", () => {
 });
 
 describe("NewProjectModal", () => {
+  it.each(["project", "virtual"] as const)(
+    "leaves the Hub to resolve the historical slug when both the old and suggested %s slugs are taken",
+    async (kind) => {
+      const name = "Kaggle/Pokémon";
+      const path = "/work/pokemon";
+      const legacySlug = "kaggle-pok-mon";
+      const legacyProject = {
+        ...CREATED,
+        id: legacySlug,
+        slug: legacySlug,
+        name,
+        kind,
+        path: kind === "project" ? path : null,
+      };
+      const fetchImpl = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) =>
+        Response.json(legacyProject),
+      );
+      const client = new HubApiClient({ baseUrl: "http://hub.test", fetchImpl });
+      const { onCreated } = setup((request) => client.createProject(request), [legacySlug, "kaggle-pokemon"]);
+      type("new-project-name", name);
+      if (kind === "virtual") {
+        fireEvent.click(screen.getByTestId("new-project-kind-virtual"));
+      } else {
+        type("new-project-path", path);
+      }
+      fireEvent.click(screen.getByRole("checkbox", { name: "Create missing parent groups" }));
+      expect(screen.getByTestId("new-project-slug")).toHaveValue("kaggle-pokemon");
+      await submit();
+
+      expect(fetchImpl).toHaveBeenCalledTimes(1);
+      const [url, init] = fetchImpl.mock.calls[0];
+      expect(url).toBe("http://hub.test/api/v1/projects");
+      expect(init?.method).toBe("POST");
+      expect(JSON.parse(String(init?.body))).toEqual(
+        kind === "project"
+          ? { name, kind, path, create_parent: true, create_only: true }
+          : { name, kind, create_parent: true, create_only: true },
+      );
+      expect(onCreated).toHaveBeenCalledWith(legacyProject);
+    },
+  );
+
+  it("previews a hierarchical slug and only sends parent creation when checked", async () => {
+    const { create } = setup();
+    type("new-project-name", "Café / R&D / Mobile");
+    type("new-project-path", "/work/mobile");
+    expect(screen.getByTestId("new-project-slug")).toHaveValue("cafe-r-d-mobile");
+    const createParent = screen.getByRole("checkbox", { name: "Create missing parent groups" });
+    expect(createParent).not.toBeChecked();
+    fireEvent.click(createParent);
+    await submit();
+    expect(create).toHaveBeenCalledWith({
+      name: "Café / R&D / Mobile",
+      kind: "project",
+      create_only: true,
+      path: "/work/mobile",
+      create_parent: true,
+    });
+  });
+
+  it("requires an explicit slug if part of a name uses untranslatable letters", async () => {
+    const { create } = setup();
+    type("new-project-name", "Lab / 東京");
+    type("new-project-path", "/work/tokyo");
+    expect(screen.getByTestId("new-project-slug")).toHaveValue("");
+    await submit();
+    expect(screen.getByText(/Enter a slug/)).toBeInTheDocument();
+    expect(create).not.toHaveBeenCalled();
+    type("new-project-slug", "lab_tokyo");
+    await submit();
+    expect(create).toHaveBeenCalledWith({
+      name: "Lab / 東京",
+      slug: "lab_tokyo",
+      kind: "project",
+      create_only: true,
+      path: "/work/tokyo",
+    });
+  });
+
+  it("rejects empty hierarchy segments before asking the hub to create them", async () => {
+    const { create } = setup();
+    type("new-project-name", "Lab // Mobile");
+    type("new-project-slug", "mobile");
+    type("new-project-path", "/work/mobile");
+    await submit();
+    expect(screen.getByText(/non-empty segments/)).toBeInTheDocument();
+    expect(create).not.toHaveBeenCalled();
+  });
+
   it("renders nothing when closed", () => {
     render(
       <NewProjectModal
@@ -147,8 +239,8 @@ describe("NewProjectModal", () => {
     expect(create).toHaveBeenCalledTimes(1);
     expect(create.mock.calls[0][0]).toStrictEqual({
       name: "Alpha Project",
-      slug: "alpha-project",
       kind: "project",
+      create_only: true,
       purpose: "Does alpha things",
       path: "/work/alpha",
       git_init: true,
@@ -159,14 +251,14 @@ describe("NewProjectModal", () => {
     expect(onClose).toHaveBeenCalledTimes(1);
   });
 
-  it("sends only name, slug, kind and path for a minimal Directory Project", async () => {
+  it("sends a create-only request for a minimal Directory Project", async () => {
     const { create } = setup();
     fillProject();
     await submit();
     expect(create.mock.calls[0][0]).toStrictEqual({
       name: "Alpha",
-      slug: "alpha",
       kind: "project",
+      create_only: true,
       path: "/work/alpha",
     });
   });
@@ -206,8 +298,9 @@ describe("NewProjectModal", () => {
     expect(screen.getByTestId("new-project-slug")).toHaveValue("b");
   });
 
-  it("re-derives an empty slug on blur", () => {
-    setup();
+  it("uses the hub default after an emptied slug is refilled on blur", async () => {
+    const { create } = setup();
+    type("new-project-path", "/work/alpha");
     type("new-project-name", "My App");
     type("new-project-slug", "custom");
     type("new-project-slug", "");
@@ -216,6 +309,17 @@ describe("NewProjectModal", () => {
     // Derivation is live again.
     type("new-project-name", "Third One");
     expect(screen.getByTestId("new-project-slug")).toHaveValue("third-one");
+    await submit();
+    expect(create.mock.calls[0][0]).not.toHaveProperty("slug");
+  });
+
+  it("sends the edited slug even when it matches the original preview", async () => {
+    const { create } = setup();
+    fillProject();
+    type("new-project-slug", "custom");
+    type("new-project-slug", "alpha");
+    await submit();
+    expect(create.mock.calls[0][0]).toHaveProperty("slug", "alpha");
   });
 
   it("does not touch a non-empty slug on blur", () => {
@@ -254,8 +358,8 @@ describe("NewProjectModal", () => {
     await submit();
     expect(create.mock.calls[0][0]).toStrictEqual({
       name: "Alpha",
-      slug: "alpha",
       kind: "virtual",
+      create_only: true,
       purpose: "Council scope",
     });
   });
@@ -289,7 +393,7 @@ describe("NewProjectModal", () => {
       await submit();
       expect(create).not.toHaveBeenCalled();
       expect(screen.getByTestId("new-project-slug")).toHaveAccessibleDescription(
-        "Slug is required.",
+        /starts with a lowercase letter.*64.*underscores/,
       );
     });
 
@@ -305,9 +409,19 @@ describe("NewProjectModal", () => {
       );
     });
 
-    it("rejects a duplicate slug client-side", async () => {
+    it.each(["2alpha", "a".repeat(65)])("rejects a slug outside the hub's grammar (%s)", async (slug) => {
       const { create } = setup();
-      type("new-project-name", "Taken");
+      fillProject();
+      type("new-project-slug", slug);
+      await submit();
+      expect(create).not.toHaveBeenCalled();
+      expect(screen.getByTestId("new-project-slug")).toHaveAttribute("aria-invalid", "true");
+    });
+
+    it("rejects an explicitly chosen duplicate slug client-side", async () => {
+      const { create } = setup();
+      type("new-project-name", "A different name");
+      type("new-project-slug", "taken");
       type("new-project-path", "/work/taken");
       await submit();
       expect(create).not.toHaveBeenCalled();

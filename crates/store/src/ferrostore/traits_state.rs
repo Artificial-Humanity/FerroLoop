@@ -8,7 +8,7 @@ use super::doc::{
     NEXT_STATE_REV, STATE_CONFLICTS, STATE_ENTRIES, STATE_KEYS, STATE_REVISION_IDS,
     STATE_REVISIONS, STATE_SYNC_CURSORS,
 };
-use crate::{FORMAT_WITH_AREA_DELETE, FORMAT_WITH_STATE, decode, mint};
+use crate::{FORMAT_WITH_AREA_DELETE, FORMAT_WITH_AREA_PARENT, FORMAT_WITH_STATE, decode, mint};
 use fl_core::agent::{
     AgentRecord, AgentRole, AgentStatus, AreaRecord, RegisterAgentArgs, RegistryEvent,
     RegistryEventKind, validate_agent_identity,
@@ -292,7 +292,12 @@ impl AgentRegistry for FerroStore {
             .normalized()
             .map_err(|err| StoreError::InvalidState(err.to_string()))?;
         self.with_write(|txn| {
-            doc::raise_format(txn, FORMAT_WITH_STATE)?;
+            let format = if normalized.parent.is_some() {
+                FORMAT_WITH_AREA_PARENT
+            } else {
+                FORMAT_WITH_STATE
+            };
+            doc::raise_format(txn, format)?;
             let ev = RegistryEvent {
                 event_id: mint()?,
                 at: normalized.updated_at.clone(),
@@ -371,6 +376,7 @@ impl AgentRegistry for FerroStore {
                     area_key: area_key.clone(),
                     name: area_key.clone(),
                     path: None,
+                    parent: None,
                     purpose: format!("Registered area {area_key}"),
                     updated_at: args.at.clone(),
                     by: args.by.clone(),
@@ -587,6 +593,9 @@ impl AgentRegistry for FerroStore {
                         let norm = area
                             .normalized()
                             .map_err(|err| StoreError::InvalidState(err.to_string()))?;
+                        if norm.parent.is_some() {
+                            doc::raise_format(txn, FORMAT_WITH_AREA_PARENT)?;
+                        }
                         doc::put_json(txn, AREAS, &norm.area_key, &norm)?;
                     }
                     RegistryEventKind::AgentUpsert(rec) => {

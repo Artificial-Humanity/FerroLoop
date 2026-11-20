@@ -19,6 +19,9 @@ pub struct AreaRecord {
     pub area_key: String,
     pub name: String,
     pub path: Option<String>,
+    /// Workspace area slug for the display hierarchy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<String>,
     pub purpose: String,
     pub updated_at: At,
     pub by: String,
@@ -45,6 +48,7 @@ impl AreaRecord {
             area_key,
             name: name.trim().to_string(),
             path,
+            parent: None,
             purpose,
             updated_at,
             by: by.trim().to_string(),
@@ -58,6 +62,14 @@ impl AreaRecord {
             self.area_key.trim()
         };
         let area_key = validate_slug(raw_key)?;
+        let parent = self
+            .parent
+            .as_deref()
+            .map(|parent| validate_slug(parent.trim()))
+            .transpose()?;
+        if parent.as_deref() == Some(area_key.as_str()) {
+            return Err(StateError::SelfParentArea(area_key));
+        }
         let name = if self.name.trim().is_empty() {
             area_key.clone()
         } else {
@@ -68,6 +80,7 @@ impl AreaRecord {
             area_key,
             name,
             path: self.path.clone(),
+            parent,
             purpose,
             updated_at: self.updated_at.clone(),
             by: self.by.trim().to_string(),
@@ -314,6 +327,7 @@ crate::wire::wire_tags!(RegistryEventKind as registry_event_kind_wire {
         area_key: "ferroloop".into(),
         name: "FerroLoop".into(),
         path: Some("FerroLoop/".into()),
+        parent: None,
         purpose: "Agent orchestration".into(),
         updated_at: At::from_unix_millis(1),
         by: "owner".into(),
@@ -798,6 +812,48 @@ pub fn delete_role(store: &impl StateStore, slug: &str) -> Result<(), RoleError>
 mod tests {
     use super::*;
     use crate::ids::seq_iri;
+
+    const LEGACY_AREA: &str = concat!(
+        r#"{"area_key":"child","name":"Parent/Child","path":null,"purpose":"Example","#,
+        r#""updated_at":"1970-01-01T00:00:00.001Z","by":"owner"}"#,
+    );
+
+    #[test]
+    fn area_parent_legacy_row_and_event_encoding_stay_the_same() {
+        let area: AreaRecord = serde_json::from_str(LEGACY_AREA).unwrap();
+        assert_eq!(area.parent, None);
+        assert_eq!(serde_json::to_string(&area).unwrap(), LEGACY_AREA);
+        let encoded_event = format!(r#"{{"area_upsert":{LEGACY_AREA}}}"#);
+        let event: RegistryEventKind = serde_json::from_str(&encoded_event).unwrap();
+        assert_eq!(event, RegistryEventKind::AreaUpsert(area));
+        assert_eq!(serde_json::to_string(&event).unwrap(), encoded_event);
+    }
+
+    fn area_with_parent(parent: &str) -> AreaRecord {
+        let mut area: serde_json::Value = serde_json::from_str(LEGACY_AREA).unwrap();
+        area["parent"] = serde_json::json!(parent);
+        serde_json::from_value(area).unwrap()
+    }
+
+    #[test]
+    fn area_parent_normalizes_to_the_existing_slug_form() {
+        let area = area_with_parent(" PARENT_1 ").normalized().unwrap();
+        assert_eq!(serde_json::to_value(area).unwrap()["parent"], "parent_1");
+    }
+
+    #[test]
+    fn area_parent_rejects_invalid_slugs_and_self_links() {
+        for parent in ["", "two/parts", "9parent", "💾"] {
+            assert!(matches!(
+                area_with_parent(parent).normalized(),
+                Err(StateError::InvalidSlug(_))
+            ));
+        }
+        assert_eq!(
+            area_with_parent(" CHILD ").normalized(),
+            Err(StateError::SelfParentArea("child".into()))
+        );
+    }
 
     #[test]
     fn director_role_is_canonical_and_catalogued() {

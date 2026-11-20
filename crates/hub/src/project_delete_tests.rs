@@ -74,6 +74,8 @@ impl Fx {
         let req = InitRequest {
             path: root.to_path_buf(),
             slug: None,
+            create_parent: false,
+            resume_flat: false,
             display_name: None,
             github: None,
             credential: None,
@@ -99,6 +101,7 @@ impl Fx {
         let req = crate::project_init::VirtualRequest {
             slug: None,
             display_name: name.into(),
+            create_parent: false,
             purpose: None,
             by: "tester".into(),
         };
@@ -639,6 +642,7 @@ fn it_refuses_when_the_registered_path_no_longer_matches() {
             area_key: "alpha".into(),
             name: "alpha".into(),
             path: Some(moved.display().to_string()),
+            parent: None,
             purpose: "p".into(),
             updated_at: At::from_unix_millis(9),
             by: "tester".into(),
@@ -1218,6 +1222,8 @@ fn summary(slug: &str, store: &Path) -> ProjectSummary {
     ProjectSummary {
         slug: slug.into(),
         name: slug.into(),
+        parent: None,
+        ancestors: vec![],
         kind: crate::project_init::ProjectKind::Project,
         path: None,
         has_git: false,
@@ -1631,7 +1637,7 @@ fn decommission_delete_conflicts_before_effects_and_refuses_new_unfenced_persona
     .unwrap();
     assert_eq!(fx.snapshot(&[]), before);
     {
-        let _config = crate::project_init::CONFIG_LOCK.lock().unwrap();
+        let _config = crate::project_config_lock::acquire(&fx.paths.config_path, true).unwrap();
         let error = fx
             .call(
                 "alpha",

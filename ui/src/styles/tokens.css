@@ -1224,6 +1224,22 @@ button.fd-badge:hover:not(:disabled) {
 }
 
 /* RosterSidebar inside the phone shell: in flow, full width, no drawer chrome. */
+.fd-roster-project-children {
+  margin-inline-start: 12px;
+  min-width: 0;
+}
+
+.fd-roster-project-group .fd-roster-agent-identity .fd-badge {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+@media (max-width: 767px) {
+  .fd-roster-project-children {
+    margin-inline-start: 6px;
+  }
+}
+
 .fd-sidebar.fd-sidebar-embedded {
   position: static;
   width: 100%;

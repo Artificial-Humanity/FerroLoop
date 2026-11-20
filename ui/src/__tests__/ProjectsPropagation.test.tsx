@@ -3,7 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import App from "../App";
 import { HubApiClient } from "../api/client";
 import type { HubWsClient } from "../api/ws";
-import type { ProjectSummary } from "../types/api";
+import type { AgentRecord, AreaRecord, ProjectSummary } from "../types/api";
 
 function summary(
   slug: string,
@@ -39,7 +39,20 @@ type ProjectsMode = "ok" | "error" | "missing" | "legacy";
 
 /** A fake hub: the project list lives in `state.projects` and POST/DELETE change it. */
 function makeHub(initial: ProjectSummary[], mode: ProjectsMode = "ok") {
-  const state = { projects: [...initial], mode };
+  const state = {
+    projects: [...initial],
+    mode,
+    areas: [] as AreaRecord[],
+    projectsGate: undefined as Promise<void> | undefined,
+    agents: [{
+      id: "ferris",
+      name_key: "ferris",
+      display_name: "Ferris",
+      project: "ferroloop",
+      role: "lead",
+      status: "active",
+    }] as AgentRecord[],
+  };
   const calls: { url: string; method: string; body: unknown }[] = [];
   const fetchImpl = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = String(input);
@@ -51,19 +64,19 @@ function makeHub(initial: ProjectSummary[], mode: ProjectsMode = "ok") {
     }
     if (url.endsWith("/api/v1/agents")) {
       return json({
-        agents: [
-          { name_key: "ferris", display_name: "Ferris", project: "ferroloop", role: "lead" },
-        ],
+        agents: state.agents,
+        areas: state.areas,
         routes: [],
       });
     }
     if (url.endsWith("/api/v1/projects")) {
       if (method === "POST") {
-        const created = summary(body.slug, body.name, body.kind);
+        const created = summary(body.slug ?? body.name.toLowerCase(), body.name, body.kind);
         state.projects.push(created);
         return json(created, 201);
       }
       if (method === "GET") {
+        await state.projectsGate;
         if (state.mode === "error") return json({ error: "boom" }, 500);
         if (state.mode === "missing") return json({ error: "not found" }, 404);
         if (state.mode === "legacy") {
@@ -134,10 +147,11 @@ async function renderApp(client: HubApiClient, width = 1280, height = 800) {
   return view;
 }
 
-const filterOptions = () =>
+const filterProjectLabels = () =>
   within(screen.getByTestId("settings-project-filter-select"))
-    .getAllByRole("option")
-    .map((o) => (o as HTMLOptionElement).value);
+    .getAllByRole<HTMLOptionElement>("option")
+    .filter((option) => option.value !== "all")
+    .map((option) => option.label);
 
 const spinUpOptions = () =>
   within(screen.getByTestId("spin-up-project-select"))
@@ -204,7 +218,7 @@ describe("one project list for the switcher, the roster and Spin-Up", () => {
     expect(screen.getByTestId("project-group-sonora")).toBeInTheDocument();
 
     await openSettings();
-    expect(filterOptions()).toEqual(["all", "FerroLoop", "Sonora", "Council", "Workspace"]);
+    expect(filterProjectLabels()).toEqual(["FerroLoop", "Sonora", "Council", "Workspace"]);
     expect(screen.getByRole("option", { name: "Council" })).toBeInTheDocument();
     await closeSettings();
 
@@ -251,7 +265,7 @@ describe("one project list for the switcher, the roster and Spin-Up", () => {
     expect(screen.queryByTestId("project-group-council")).toBeNull();
 
     await openSettings();
-    expect(filterOptions()).not.toContain("Council");
+    expect(filterProjectLabels()).not.toContain("Council");
     await openProjectsTab();
     await createCouncilThroughSettings();
 
@@ -262,7 +276,7 @@ describe("one project list for the switcher, the roster and Spin-Up", () => {
     ).toBeGreaterThanOrEqual(2);
 
     fireEvent.click(screen.getByTestId("settings-tab-agents"));
-    await waitFor(() => expect(filterOptions()).toContain("Council"));
+    await waitFor(() => expect(filterProjectLabels()).toContain("Council"));
     await closeSettings();
 
     await openSpinUp();
@@ -277,7 +291,7 @@ describe("one project list for the switcher, the roster and Spin-Up", () => {
 
     // Make Council the active filter, then come back and delete it.
     fireEvent.click(screen.getByTestId("settings-project-view-agents-council"));
-    expect(screen.getByTestId("settings-project-filter-select")).toHaveValue("Council");
+    expect(screen.getByTestId("settings-project-filter-select")).toHaveDisplayValue("Council");
     fireEvent.click(screen.getByTestId("settings-tab-projects"));
     fireEvent.click(screen.getByTestId("settings-project-delete-council"));
     await act(async () => {
@@ -286,12 +300,93 @@ describe("one project list for the switcher, the roster and Spin-Up", () => {
 
     await waitFor(() => expect(screen.queryByTestId("project-group-council")).toBeNull());
     fireEvent.click(screen.getByTestId("settings-tab-agents"));
-    await waitFor(() => expect(filterOptions()).not.toContain("Council"));
+    await waitFor(() => expect(filterProjectLabels()).not.toContain("Council"));
     expect(screen.getByTestId("settings-project-filter-select")).toHaveValue("all");
     await closeSettings();
 
     await openSpinUp();
     expect(spinUpOptions()).toEqual(["", "ferroloop", "sonora"]);
+  });
+
+  it("keeps a linked project's exact identity through the roster and Settings memento", async () => {
+    const reporting = summary("reporting", "Analysis");
+    const modeling = { ...summary("analysis", "Model Runs", "virtual"), parent: "reporting" };
+    const { client, state } = makeHub([reporting, modeling]);
+    state.agents = ["reporting", "analysis"].map((project) => ({
+      id: project,
+      name_key: project + "-lead",
+      display_name: project + " lead",
+      project,
+      role: "lead",
+      status: "active",
+    }));
+
+    await renderApp(client);
+    const gear = await screen.findByTestId("project-settings-btn-model runs");
+    fireEvent.click(gear);
+    expect(screen.getByTestId("settings-modal-title")).toHaveTextContent("Project Settings — Model Runs");
+    expect(screen.getByTestId("settings-project-filter-select")).toHaveValue("analysis");
+    fireEvent.click(screen.getByTestId("project-tab-agents"));
+    expect(screen.queryByTestId("settings-agent-row-reporting-lead")).toBeNull();
+    fireEvent.click(screen.getByTestId("settings-agent-cog-btn-analysis-lead"));
+
+    const back = await screen.findByTestId("agent-settings-back-to-origin-btn");
+    expect(back).toHaveTextContent("← Back to Project Settings (Model Runs)");
+    fireEvent.click(back);
+    expect(screen.getByTestId("settings-project-filter-select")).toHaveValue("analysis");
+    expect(screen.getByTestId("settings-agent-row-analysis-lead")).toBeVisible();
+    expect(screen.queryByTestId("settings-agent-row-reporting-lead")).toBeNull();
+  });
+
+  it.each([false, true])(
+    "uses the roster project slug when opening New Agent before the project list catches up (manual selection %s)",
+    async (selectManually) => {
+      const reporting = summary("reporting", "Analysis");
+      const modeling = { ...summary("analysis", "Model Runs", "virtual"), parent: "reporting" };
+      const { client, state, calls } = makeHub([reporting]);
+      state.areas = [{
+        area_key: "analysis",
+        name: "Model Runs",
+        parent: "reporting",
+        path: null,
+        purpose: "Modeling work",
+      }];
+      await renderApp(client);
+      await screen.findByTestId("project-settings-btn-analysis");
+      let releaseProjects!: () => void;
+      state.projectsGate = new Promise<void>((resolve) => { releaseProjects = resolve; });
+      fireEvent.click(await screen.findByTestId("project-settings-btn-model runs"));
+      fireEvent.click(screen.getByTestId("project-tab-agents"));
+      fireEvent.click(screen.getByTestId("settings-spin-up-btn"));
+
+      const select = await screen.findByTestId("spin-up-project-select");
+      expect(within(select).getByRole("option", { name: "Analysis" })).toHaveValue("reporting");
+      expect(select).toHaveValue("");
+      fireEvent.change(screen.getByTestId("spin-up-persona-input"), { target: { value: "modeler" } });
+      fireEvent.click(screen.getByTestId("spin-up-submit-btn"));
+      expect(await screen.findByRole("alert")).toHaveTextContent(/select a project/i);
+      expect(calls.some(({ url }) => url.endsWith("/api/v1/sessions/spin-up"))).toBe(false);
+      if (selectManually) {
+        fireEvent.change(select, { target: { value: "reporting" } });
+      }
+
+      state.projects.push(modeling);
+      await act(async () => { releaseProjects(); });
+      expect(await within(select).findByRole("option", { name: "Model Runs" })).toHaveValue("analysis");
+      expect(select).toHaveValue(selectManually ? "reporting" : "analysis");
+    },
+  );
+
+  it("preselects the directory project whose slug is all when New Agent opens from its Settings", async () => {
+    const { client } = makeHub([summary("all", "All Work"), FERRO]);
+    await renderApp(client);
+    fireEvent.click(await screen.findByTestId("project-settings-btn-all work"));
+    fireEvent.click(screen.getByTestId("project-tab-agents"));
+    fireEvent.click(screen.getByTestId("settings-spin-up-btn"));
+
+    const select = await screen.findByTestId("spin-up-project-select");
+    expect(within(select).getByRole("option", { name: "All Work" })).toHaveValue("all");
+    expect(select).toHaveValue("all");
   });
 
   it("follows a project renamed on the hub in the Agents filter", async () => {
@@ -300,11 +395,11 @@ describe("one project list for the switcher, the roster and Spin-Up", () => {
     await renderApp(client);
     await openSettings();
 
-    // Pick the project by its label, the way a user does.
+    // Select the project that displays The Council.
     fireEvent.change(screen.getByTestId("settings-project-filter-select"), {
-      target: { value: "The Council" },
+      target: { value: "council" },
     });
-    expect(screen.getByTestId("settings-project-filter-select")).toHaveValue("The Council");
+    expect(screen.getByTestId("settings-project-filter-select")).toHaveDisplayValue("The Council");
 
     // Someone else renames it on the hub; the next refresh in this session picks it up.
     state.projects = state.projects.map((p) =>
@@ -323,9 +418,9 @@ describe("one project list for the switcher, the roster and Spin-Up", () => {
     );
 
     fireEvent.click(screen.getByTestId("settings-tab-agents"));
-    await waitFor(() => expect(filterOptions()).toContain("Round Table"));
-    expect(filterOptions()).not.toContain("The Council");
-    expect(screen.getByTestId("settings-project-filter-select")).toHaveValue("Round Table");
+    await waitFor(() => expect(filterProjectLabels()).toContain("Round Table"));
+    expect(filterProjectLabels()).not.toContain("The Council");
+    expect(screen.getByTestId("settings-project-filter-select")).toHaveDisplayValue("Round Table");
   });
 
   it("resets the Agents filter when the project it points at is deleted elsewhere", async () => {
@@ -334,7 +429,7 @@ describe("one project list for the switcher, the roster and Spin-Up", () => {
     await renderApp(client);
     await openSettings();
     fireEvent.change(screen.getByTestId("settings-project-filter-select"), {
-      target: { value: "The Council" },
+      target: { value: "council" },
     });
     state.projects = state.projects.filter((p) => p.slug !== "council");
     await openProjectsTab();
@@ -346,7 +441,7 @@ describe("one project list for the switcher, the roster and Spin-Up", () => {
     });
     await waitFor(() => expect(screen.getByTestId("project-group-zeta")).toBeInTheDocument());
     fireEvent.click(screen.getByTestId("settings-tab-agents"));
-    await waitFor(() => expect(filterOptions()).not.toContain("The Council"));
+    await waitFor(() => expect(filterProjectLabels()).not.toContain("The Council"));
     expect(screen.getByTestId("settings-project-filter-select")).toHaveValue("all");
   });
 
@@ -384,7 +479,7 @@ describe("one project list for the switcher, the roster and Spin-Up", () => {
     expect(screen.queryByTestId("project-group-council")).toBeNull();
 
     await openSettings();
-    expect(filterOptions()).toEqual(["all", "Workspace", "ferroloop"]);
+    expect(filterProjectLabels()).toEqual(["Workspace", "ferroloop"]);
     await closeSettings();
 
     await openSpinUp();
@@ -400,10 +495,10 @@ describe("one project list for the switcher, the roster and Spin-Up", () => {
     expect(screen.getByTestId("project-group-council")).toBeInTheDocument();
 
     await openSettings();
-    expect(filterOptions()).toContain("Council");
+    expect(filterProjectLabels()).toContain("Council");
     // On the phone, Spin-Up opens from Settings -> Agents -> New Agent.
     fireEvent.change(screen.getByTestId("settings-project-filter-select"), {
-      target: { value: "Council" },
+      target: { value: "council" },
     });
     fireEvent.click(screen.getByTestId("settings-spin-up-btn"));
     await screen.findByTestId("spin-up-project-select");
@@ -425,7 +520,7 @@ describe("one project list for the switcher, the roster and Spin-Up", () => {
     expect(screen.queryByTestId("project-group-lucida")).toBeNull();
 
     await openSettings();
-    expect(filterOptions()).toEqual(["all", "Workspace", "ferroloop"]);
+    expect(filterProjectLabels()).toEqual(["Workspace", "ferroloop"]);
     await openProjectsTab();
     expect(screen.getByTestId("settings-projects-unsupported")).toHaveTextContent(
       "This hub does not support project management. Update the hub to create, edit or delete projects.",

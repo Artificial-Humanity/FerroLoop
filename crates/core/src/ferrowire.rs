@@ -852,6 +852,7 @@ mod tests {
             area_key: key.into(),
             name: key.into(),
             path: None,
+            parent: None,
             purpose: "p".into(),
             updated_at: At::from_unix_millis(1),
             by: "owner".into(),
@@ -861,6 +862,7 @@ mod tests {
     fn real_area(key: &str) -> AreaRecord {
         AreaRecord {
             path: Some(format!("/work/{key}")),
+            parent: None,
             ..virtual_area(key)
         }
     }

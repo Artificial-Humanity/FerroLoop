@@ -6,9 +6,12 @@ import type { HubWsClient } from "../api/ws";
 import { ContextHeader, RightPanelHeader } from "../components/ContextHeader";
 import { AgentSettingsModal } from "../components/AgentSettingsModal";
 import { PairingModal } from "../components/PairingModal";
+import { SettingsModal } from "../components/SettingsModal";
 import {
+  COLLAPSED_PROJECT_OVERRIDES_KEY,
   COLLAPSED_PROJECTS_STORAGE_KEY,
   PINNED_AGENTS_STORAGE_KEY,
+  PINNED_PROJECT_OVERRIDES_KEY,
   PINNED_PROJECTS_STORAGE_KEY,
   RosterSidebar,
   classifyTextUnreadSeverity,
@@ -23,11 +26,14 @@ import {
   type AgentLivenessItem,
   type AgentRecord,
   type DiscoveredSessionSummary,
+  type ProjectSummary,
 } from "../types/api";
 
 describe("RosterSidebar", () => {
   beforeEach(() => {
+    window.localStorage.removeItem(COLLAPSED_PROJECT_OVERRIDES_KEY);
     window.localStorage.removeItem(COLLAPSED_PROJECTS_STORAGE_KEY);
+    window.localStorage.removeItem(PINNED_PROJECT_OVERRIDES_KEY);
     window.localStorage.removeItem(PINNED_PROJECTS_STORAGE_KEY);
     window.localStorage.removeItem(PINNED_AGENTS_STORAGE_KEY);
   });
@@ -85,6 +91,273 @@ describe("RosterSidebar", () => {
       verdict: { status: "exited", outcome: "completed" },
     },
   ];
+
+  const nestedProject = (slug: string, name: string, parent?: string | null) => ({
+    id: slug,
+    slug,
+    name,
+    parent,
+    kind: "virtual" as const,
+    path: null,
+    has_git: false,
+    purpose: null,
+    tracker: null,
+    store_path: null,
+    active_agent_count: 0,
+  });
+
+  const nestedAgent = (name: string, project: string, extra: string[] = []): AgentRecord => ({
+    id: `urn:fl:agent:${name}`,
+    name_key: name,
+    display_name: name,
+    project,
+    role: "agent",
+    status: "active",
+    extra_areas: extra,
+  });
+
+  function nestedRoster(projects: ProjectSummary[], agents: AgentRecord[], showEmptyProjects = false) {
+    return (
+      <RosterSidebar
+        agents={agents}
+        routes={[]}
+        liveness={[]}
+        projects={projects}
+        unreadByAgent={{ first: 2, second: 3, third: 1 }}
+        unreadSeverityByAgent={{ second: "question", third: "important" }}
+        selectedAgentName={null}
+        onSelectAgent={vi.fn()}
+        showEmptyProjects={showEmptyProjects}
+      />
+    );
+  }
+
+  const lab = nestedProject("lab", "Lab", null);
+  const alpha = nestedProject("lab-alpha", "Lab / Alpha", "lab");
+  const beta = nestedProject("lab-beta", "Lab / Beta", "lab");
+  const mobile = nestedProject("lab-alpha-mobile", "Lab / Alpha / Mobile", "lab-alpha");
+  const elsewhere = nestedProject("elsewhere", "Elsewhere", null);
+
+  it("renders direct agents before linked children and persists independent collapse states", () => {
+    const roster = nestedRoster(
+      [lab, alpha, mobile],
+      [nestedAgent("first", "lab"), nestedAgent("second", "lab-alpha-mobile")],
+    );
+    const { unmount } = render(roster);
+    const labGroup = screen.getByTestId("project-group-lab");
+    const first = within(labGroup).getByTestId("agent-row-first");
+    const toggle = (label: string) => screen.getByRole("button", { name: label });
+    const alphaToggle = toggle("Lab / Alpha");
+    expect(alphaToggle).toHaveTextContent("Alpha");
+    expect(alphaToggle).not.toHaveTextContent("Lab / Alpha");
+    expect(alphaToggle).toHaveAttribute("title", "Lab / Alpha");
+    expect(first.compareDocumentPosition(alphaToggle) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(labGroup).toContainElement(alphaToggle);
+    expect(toggle("Lab / Alpha / Mobile")).toHaveTextContent("Mobile");
+
+    fireEvent.click(alphaToggle);
+    expect(toggle("Lab")).toHaveAttribute("aria-expanded", "true");
+    expect(screen.queryByTestId("agent-row-second")).not.toBeInTheDocument();
+    fireEvent.click(toggle("Lab"));
+    expect(screen.queryByTestId("agent-row-first")).not.toBeInTheDocument();
+    unmount();
+    render(roster);
+    expect(toggle("Lab")).toHaveAttribute("aria-expanded", "false");
+    fireEvent.click(toggle("Lab"));
+    expect(toggle("Lab / Alpha")).toHaveAttribute("aria-expanded", "false");
+    fireEvent.click(toggle("Lab / Alpha"));
+    expect(screen.getByTestId("agent-row-second")).toBeInTheDocument();
+  });
+
+  it("rolls unread counts and highest severity up only for hidden groups and counts each persona once", () => {
+    render(nestedRoster(
+      [lab, alpha, beta, mobile],
+      [
+        nestedAgent("first", "lab", ["lab-alpha"]),
+        nestedAgent("second", "lab-alpha-mobile", ["lab-beta"]),
+        nestedAgent("third", "lab-beta"),
+      ],
+    ));
+    const badge = (name: string) => screen.getByTestId(`project-unread-badge-${name}`);
+    expect(badge("lab")).toHaveTextContent(/^2$/);
+    fireEvent.click(screen.getByRole("button", { name: "Lab / Alpha" }));
+    expect(badge("lab / alpha")).toHaveTextContent(/^5\?$/);
+    expect(badge("lab")).toHaveTextContent(/^2$/);
+    fireEvent.click(screen.getByRole("button", { name: "Lab" }));
+    expect(badge("lab")).toHaveTextContent(/^6!$/);
+    expect(badge("lab")).toHaveAttribute("data-severity", "important");
+  });
+
+  it("leaves agents with ambiguous legacy project labels visible outside the exact projects", () => {
+    window.localStorage.setItem(PINNED_PROJECTS_STORAGE_KEY, JSON.stringify(["shared research"]));
+    window.localStorage.setItem(PINNED_PROJECT_OVERRIDES_KEY, JSON.stringify({ first: true }));
+    render(nestedRoster(
+      [nestedProject("first", "Shared Research"), nestedProject("second", "Shared Research")],
+      [
+        nestedAgent("primary-first", "FIRST", ["Shared Research"]),
+        nestedAgent("primary-second", "second"),
+        nestedAgent("legacy", "Shared Research"),
+      ],
+    ));
+
+    const sections = screen.getAllByTestId("project-group-shared research");
+    const first = sections.find(section => within(section).queryByTestId("agent-row-primary-first"))!;
+    const second = sections.find(section => within(section).queryByTestId("agent-row-primary-second"))!;
+    const legacy = screen.getByTestId("agent-row-legacy");
+    expect(legacy).toBeVisible();
+    expect(first).not.toContainElement(legacy);
+    expect(second).not.toContainElement(legacy);
+    expect(within(second).queryByTestId("agent-row-primary-first")).toBeNull();
+    expect(first).toHaveAttribute("data-pinned", "true");
+    expect(second).toHaveAttribute("data-pinned", "false");
+    const unassigned = screen.getByTestId("project-group-shared research (unassigned)");
+    expect(unassigned).toContainElement(legacy);
+    expect(unassigned).toHaveAttribute("data-pinned", "false");
+    expect(within(unassigned).queryByRole("button", { name: /project settings/i })).toBeNull();
+  });
+
+  it("keeps collapse preferences independent when a project slug matches another display name", () => {
+    const roster = nestedRoster(
+      [nestedProject("reporting", "Analysis"), nestedProject("analysis", "Model Runs")],
+      [],
+      true,
+    );
+    const { unmount } = render(roster);
+    const analysis = () => screen.getByRole("button", { name: "Analysis" });
+    const modelRuns = () => screen.getByRole("button", { name: "Model Runs" });
+
+    fireEvent.click(modelRuns());
+    expect(modelRuns()).toHaveAttribute("aria-expanded", "false");
+    expect(analysis()).toHaveAttribute("aria-expanded", "true");
+    fireEvent.click(analysis());
+    expect(analysis()).toHaveAttribute("aria-expanded", "false");
+
+    unmount();
+    render(roster);
+    expect(analysis()).toHaveAttribute("aria-expanded", "false");
+    expect(modelRuns()).toHaveAttribute("aria-expanded", "false");
+    fireEvent.click(analysis());
+    expect(analysis()).toHaveAttribute("aria-expanded", "true");
+    expect(modelRuns()).toHaveAttribute("aria-expanded", "false");
+  });
+
+  it("lets Settings override a legacy pin independently of a colliding project slug", async () => {
+    const projects = [
+      nestedProject("reporting", "Analysis"),
+      nestedProject("analysis", "Model Runs"),
+    ];
+    window.localStorage.setItem(PINNED_PROJECTS_STORAGE_KEY, JSON.stringify(["analysis"]));
+    const roster = nestedRoster(projects, [], true);
+    const apiClient = new HubApiClient({
+      fetchImpl: async () => new Response(null, { status: 503 }),
+    });
+    const settings = (name: string) => (
+      <SettingsModal
+        key={name}
+        isOpen
+        initialProject={name}
+        projects={projects}
+        apiClient={apiClient}
+        onClose={vi.fn()}
+      />
+    );
+    const pin = () => screen.getByTestId("project-pin-toggle-btn");
+    const group = (name: string) => screen.getByTestId(`project-group-${name}`);
+    const { rerender, unmount } = render(<>{roster}{settings("Model Runs")}</>);
+    await act(async () => {});
+    expect(group("analysis")).toHaveAttribute("data-pinned", "true");
+    expect(pin()).toHaveAttribute("aria-pressed", "false");
+    fireEvent.click(pin());
+    expect(group("model runs")).toHaveAttribute("data-pinned", "true");
+
+    await act(async () => { rerender(<>{roster}{settings("Analysis")}</>); });
+    expect(pin()).toHaveAttribute("aria-pressed", "true");
+    fireEvent.click(pin());
+    expect(group("analysis")).toHaveAttribute("data-pinned", "false");
+    expect(group("model runs")).toHaveAttribute("data-pinned", "true");
+
+    unmount();
+    render(<>{roster}{settings("Analysis")}</>);
+    await act(async () => {});
+    expect(pin()).toHaveAttribute("aria-pressed", "false");
+    expect(group("analysis")).toHaveAttribute("data-pinned", "false");
+    expect(group("model runs")).toHaveAttribute("data-pinned", "true");
+  });
+
+  it("exposes the full name and virtual status of a nested project to assistive technology", () => {
+    render(nestedRoster([lab, alpha], [], true));
+    expect(screen.getByRole("button", { name: "Lab / Alpha" })).toHaveAccessibleDescription(
+      /virtual/i,
+    );
+  });
+
+  it("sorts pinned projects within siblings and moves a pinned parent with its subtree", () => {
+    render(nestedRoster([elsewhere, lab, alpha, beta, mobile], [], true));
+    const rows = () => screen.getAllByTestId(/^project-header-row-/).map(row =>
+      within(row).getAllByRole("button")[0]?.getAttribute("aria-label"),
+    );
+    act(() => { togglePinnedProject("lab-beta"); });
+    expect(rows()).toEqual(["Elsewhere", "Lab", "Lab / Beta", "Lab / Alpha", "Lab / Alpha / Mobile"]);
+    act(() => { togglePinnedProject("Lab"); });
+    expect(rows()).toEqual(["Lab", "Lab / Beta", "Lab / Alpha", "Lab / Alpha / Mobile", "Elsewhere"]);
+  });
+
+  it("keeps an empty ancestor for a matching descendant and tolerates old and malformed links", () => {
+    const legacy = nestedProject("old-lab", "Lab / Old");
+    const stale = nestedProject("missing-area", "Elsewhere / Missing", "departed");
+    const cyclic = nestedProject("circle", "Circle", "ring");
+    const ring = nestedProject("ring", "Ring", "circle");
+    render(nestedRoster(
+      [elsewhere, lab, alpha, legacy, stale, cyclic, ring],
+      [nestedAgent("matching-agent", "lab-alpha")],
+      true,
+    ));
+    expect(screen.getByTestId("project-group-lab")).toContainElement(
+      screen.getByTestId("project-group-lab / alpha"),
+    );
+    for (const label of ["Lab / Old", "Elsewhere / Missing", "Circle", "Ring"]) {
+      const toggle = screen.getByRole("button", { name: label });
+      expect(toggle).toHaveTextContent(label);
+      expect(screen.getByTestId("project-group-lab")).not.toContainElement(toggle);
+    }
+    const search = screen.getByPlaceholderText("Search agents, projects, adapters...");
+    fireEvent.change(search, { target: { value: "matching-agent" } });
+    expect(screen.getByRole("button", { name: "Lab" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Elsewhere" })).not.toBeInTheDocument();
+    fireEvent.change(search, { target: { value: "Lab / Alpha" } });
+    expect(screen.getByTestId("agent-row-matching-agent")).toBeInTheDocument();
+  });
+
+  it("uses roster-only parent links and honors saved flat preferences while the project list loads", () => {
+    window.localStorage.setItem(COLLAPSED_PROJECTS_STORAGE_KEY, JSON.stringify(["the lab"]));
+    window.localStorage.setItem(PINNED_PROJECTS_STORAGE_KEY, JSON.stringify(["the lab"]));
+    const roster = (
+      <RosterSidebar
+        agents={[nestedAgent("first", "lab-alpha")]}
+        areas={[
+          { area_key: "lab", name: "The Lab", purpose: "", path: null, parent: null },
+          { area_key: "lab-alpha", name: "The Lab / Alpha", purpose: "", path: null, parent: "lab" },
+        ]}
+        routes={[]}
+        liveness={[]}
+        unreadByAgent={{ first: 2 }}
+        selectedAgentName={null}
+        onSelectAgent={vi.fn()}
+      />
+    );
+    const { unmount } = render(roster);
+
+    const toggle = screen.getByRole("button", { name: "The Lab" });
+    expect(toggle).toHaveAttribute("aria-expanded", "false");
+    expect(screen.getByTestId("project-group-the lab")).toHaveAttribute("data-pinned", "true");
+    expect(screen.getByTestId("project-unread-badge-the lab")).toHaveTextContent("2");
+    expect(screen.queryByRole("button", { name: "The Lab / Alpha" })).toBeNull();
+    fireEvent.click(toggle);
+    expect(screen.getByRole("button", { name: "The Lab / Alpha" })).toHaveTextContent("Alpha");
+    unmount();
+    render(roster);
+    expect(screen.getByRole("button", { name: "The Lab" })).toHaveAttribute("aria-expanded", "true");
+  });
 
   it("embedded mode renders roster content only, in flow, without drawer chrome", () => {
     const onClose = vi.fn();
@@ -317,7 +590,7 @@ describe("RosterSidebar", () => {
     // Clicking project settings cog calls onOpenProjectSettings without collapsing group
     const ferroCogBtn = screen.getByTestId("project-settings-btn-ferroloop");
     fireEvent.click(ferroCogBtn);
-    expect(onOpenProjectSettings).toHaveBeenCalledWith("FerroLoop");
+    expect(onOpenProjectSettings).toHaveBeenCalledWith("FerroLoop", "ferroloop");
     expect(screen.getByTestId("agent-row-ferris")).toBeInTheDocument();
 
     // Clicking project group toggle collapses FerroLoop agents while keeping unread badge visible
@@ -327,12 +600,6 @@ describe("RosterSidebar", () => {
     expect(ferroToggle).toHaveAttribute("aria-expanded", "false");
     expect(screen.queryByTestId("agent-row-ferris")).toBeNull();
     expect(screen.getByTestId("project-unread-badge-ferroloop")).toHaveTextContent("6");
-
-    // Persisted in localStorage
-    expect(
-      JSON.parse(window.localStorage.getItem(COLLAPSED_PROJECTS_STORAGE_KEY) ?? "[]"),
-    ).toContain("ferroloop");
-    window.localStorage.removeItem(COLLAPSED_PROJECTS_STORAGE_KEY);
   });
 
   it("renders roster-global-controls (Settings, ?, icon-only theme toggle) and sorts pinned projects and pinned agents alphabetically to top", () => {

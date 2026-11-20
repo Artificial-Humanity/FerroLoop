@@ -2416,6 +2416,7 @@ on = "pass"
                 area_key: key.into(),
                 name: key.into(),
                 path: path.map(str::to_string),
+                parent: None,
                 purpose: "p".into(),
                 updated_at: At::from_unix_millis(1),
                 by: "t".into(),

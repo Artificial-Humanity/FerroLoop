@@ -21,7 +21,7 @@ use crate::project_delete::{
 };
 use crate::project_init::{
     Credential, InitError, InitPaths, InitRequest, ProjectKind, VirtualRequest, canonical_root,
-    create_virtual, init_project, user_config_path,
+    create_virtual_with_policy, init_project_with_policy, user_config_path,
 };
 use crate::project_list::{ProjectSummary, UpdateRequest, list_projects, update_project};
 use crate::{HubState, ProjectOpenError, artifact_dirs, records};
@@ -166,6 +166,11 @@ struct CreateProjectBody {
     name: Option<String>,
     slug: Option<String>,
     kind: Option<String>,
+    #[serde(default)]
+    create_parent: bool,
+    /// Request an idempotent create instead of updating an existing project or group.
+    #[serde(default)]
+    create_only: bool,
     path: Option<String>,
     purpose: Option<String>,
     git_init: Option<bool>,
@@ -227,10 +232,11 @@ pub(crate) fn handle_post_projects(
             let request = VirtualRequest {
                 slug,
                 display_name,
+                create_parent: body.create_parent,
                 purpose,
                 by,
             };
-            create_virtual(&request, &paths, open_workspace(state))
+            create_virtual_with_policy(&request, &paths, body.create_only, open_workspace(state))
         }
         ProjectKind::Project => {
             let credential = match body.credential.as_deref().map(str::parse::<Credential>) {
@@ -248,15 +254,21 @@ pub(crate) fn handle_post_projects(
                 path,
                 slug,
                 display_name: name,
+                create_parent: body.create_parent,
+                resume_flat: false,
                 github: present(body.github),
                 credential,
                 purpose,
                 git_init: body.git_init.unwrap_or(false),
                 by,
             };
-            init_project(&request, &paths, open_workspace(state), |r| {
-                open_project(state, &r.store)
-            })
+            init_project_with_policy(
+                &request,
+                &paths,
+                body.create_only,
+                open_workspace(state),
+                |r| open_project(state, &r.store),
+            )
         }
     };
     let outcome = match outcome {

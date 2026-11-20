@@ -1982,24 +1982,61 @@ impl FerroStore {
     /// A failed handshake is an error that names the socket. `open` errors are still returned.
     pub fn auto(path: impl AsRef<Path>) -> Result<Self, StoreError> {
         let path = path.as_ref();
-        crate::recovery::admission::check_restore_admission(path)
-            .map_err(|e| backend(e.to_string()))?;
+        match Self::try_auto_remote(path)? {
+            Some(store) => Ok(store),
+            None => Self::open(path),
+        }
+    }
+
+    /// Read the catalog through the local server, or decode one published snapshot
+    /// from an existing file opened read-only. An uninitialized file is an error.
+    pub fn list_existing_projects(path: &Path) -> Result<Vec<fl_core::model::Project>, StoreError> {
+        use fl_core::store::Catalog;
+
+        if let Some(remote) = Self::try_auto_remote(path)? {
+            return remote.list_projects();
+        }
+        let resolved = RealFs.resolve(path)?;
+        RealFs.check_restore_admission(&resolved)?;
+        let file = RealFs
+            .open_ro(&resolved)
+            .map_err(|err| backend(format!("open {}: {err}", resolved.display())))?;
+        let read = Descriptor::new(file, &resolved)?;
+        let (_, sb) = latest_superblock(&*read.file).map_err(|err| name_store(err, path))?;
+        let cache = load_full(&*read.file, read.id, sb).map_err(|err| name_store(err, path))?;
+        if let Some(found) =
+            doc::schema_version_in(|collection, id| cache.state.docs.get(collection, id).cloned())?
+        {
+            crate::check_format(Some(found))?;
+        }
+        let current = RealFs
+            .stat_id(path)
+            .map_err(|err| backend(format!("stat {}: {err}", path.display())))?;
+        if current != read.id {
+            return Err(backend(format!(
+                "{} changed while reading its catalog",
+                path.display()
+            )));
+        }
+        doc::scan_json(&Txn::new(cache.state), doc::PROJECTS)
+    }
+
+    fn try_auto_remote(path: &Path) -> Result<Option<Self>, StoreError> {
+        RealFs.check_restore_admission(path)?;
         let sock = default_socket_path_for_store(path);
         if !socket_path_fits(&sock) {
-            return Self::open(path);
+            return Ok(None);
         }
         match crate::guarded_unix_connect(&sock) {
             Ok(stream) => {
                 let remote = server::client_from_unix(stream, &auth::ClientCred::None)
                     .map_err(|err| naming_socket(&sock, err))?;
-                Ok(Self::assemble(
+                Ok(Some(Self::assemble(
                     Inner::Remote(remote),
                     sock.display().to_string(),
-                ))
+                )))
             }
-            // Nothing listening, or the socket file is missing. Other connect
-            // errors stay errors. `open` errors are not swallowed.
-            Err(err) if refused_connect(&err) => Self::open(path),
+            Err(err) if refused_connect(&err) => Ok(None),
             Err(err) => Err(backend(format!("connect {}: {err}", sock.display()))),
         }
     }
@@ -2137,7 +2174,7 @@ impl FerroStore {
     /// The schema version the store records, `None` for a store with no
     /// version document (a FerroStore written before schema versioning), the
     /// same meaning as [`crate::RedbStore::format_version`]. The value is on
-    /// the shared ladder `FORMAT_VERSION` … `FORMAT_WITH_AREA_DELETE`.
+    /// the shared ladder `FORMAT_VERSION` … `FORMAT_WITH_AREA_PARENT`.
     pub fn format_version(&self) -> Result<Option<u64>, StoreError> {
         self.with_read(doc::schema_version)
     }
@@ -5027,10 +5064,9 @@ fn allocate_extent(file: &dyn ContainerIo, sb: &Superblock, len: u64) -> Result<
 }
 
 /// The documents a new store starts with: its schema version, [`crate::FORMAT_WITH_WORKFLOW`].
-/// That is the format every write but the first area deletion needs; deleting an area raises
-/// it to [`crate::FORMAT_WITH_AREA_DELETE`], so an older fl keeps opening a store that never
-/// deleted one. They sit in the snapshot at sequence 0, so a new store still
-/// has `last_seq` 0 and no WAL frame.
+/// An area deletion or a write of an area with a parent raises the schema on first use,
+/// so an older fl can still open a store that uses neither feature. The schema is in the
+/// snapshot at sequence 0, so a new store has `last_seq` 0 and no WAL frame.
 fn new_store_docs() -> Docs {
     let mut docs = Docs::default();
     docs.insert(

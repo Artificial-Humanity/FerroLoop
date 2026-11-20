@@ -31,6 +31,60 @@ fn lifecycle_fence_contends_across_open_descriptions_and_normalizes_persona() {
     drop(other);
 }
 
+#[test]
+fn lifecycle_fixture_homes_do_not_share_the_discovered_host_fence() {
+    const CHILD: &str = "FL_TEST_LIFECYCLE_FOREIGN_HOST";
+    if let Some(socket) = std::env::var_os(CHILD).map(PathBuf::from) {
+        let _fixture = fl_host_proto::register_hub_test_host_fixture(&socket).unwrap();
+        let discovered = HostEndpoint::discover().unwrap();
+        assert_eq!(discovered, HostEndpoint::unix(&socket).unwrap());
+
+        let first = TempDir::new().unwrap();
+        let second = TempDir::new().unwrap();
+        let first_env = LifecycleEnv::new(Some(first.path()));
+        let second_env = LifecycleEnv::new(Some(second.path()));
+        let _first = lock::LifecycleFence::acquire(&first_env, "ada", "spin-up").unwrap();
+        let _second = lock::LifecycleFence::acquire(&second_env, "ada", "teardown")
+            .expect("distinct fixture homes must not share Ada's fence");
+        assert_eq!(
+            lock::LifecycleFence::acquire(&first_env, "ada", "restart")
+                .unwrap_err()
+                .status(),
+            409
+        );
+
+        let _discovered =
+            lock::LifecycleFence::acquire_endpoint(discovered, None, "ada", "host-fixture")
+                .unwrap();
+        assert_eq!(
+            lock::LifecycleFence::acquire(&LifecycleEnv::new(None), "ada", "restart")
+                .unwrap_err()
+                .status(),
+            409
+        );
+        return;
+    }
+
+    let root = TempDir::new().unwrap();
+    let socket = root.path().canonicalize().unwrap().join("host.sock");
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "lifecycle::fence_tests::lifecycle_fixture_homes_do_not_share_the_discovered_host_fence",
+        ])
+        .env(CHILD, &socket)
+        .env("FL_HOST_SOCK", &socket)
+        .env_remove("FL_WIRE_TMUX_BIN")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "lifecycle fixture child failed: {}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn lifecycle_fence_canonical_socket_aliases_share_the_same_lock() {

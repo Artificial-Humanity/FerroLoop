@@ -515,7 +515,7 @@ describe("TimeZone option & timestamp formatting across FerroDeck+", () => {
 
     // Project filter renders scoped Project Summary Card with Pin Project button
     fireEvent.change(screen.getByTestId("settings-project-filter-select"), {
-      target: { value: "FerroLoop" },
+      target: { value: "ferroloop" },
     });
     expect(screen.getByTestId("settings-project-summary-card")).toBeInTheDocument();
     expect(screen.getByTestId("settings-project-summary-name")).toHaveTextContent("FerroLoop");
@@ -570,9 +570,7 @@ describe("TimeZone option & timestamp formatting across FerroDeck+", () => {
     expect(screen.getByTestId("settings-tab-agents")).toHaveAccessibleName("Agents");
     expect(screen.getByTestId("settings-agents-heading")).toHaveTextContent("2 Agents");
     // Case-insensitive initialProject="ferroloop" selects "FerroLoop" in dropdown
-    expect(
-      (screen.getByTestId("settings-project-filter-select") as HTMLSelectElement).value,
-    ).toBe("FerroLoop");
+    expect(screen.getByTestId("settings-project-filter-select")).toHaveDisplayValue("FerroLoop");
     // Top button says "+ New Agent" and redundant project spin-up button is removed
     expect(screen.getByTestId("settings-spin-up-btn")).toHaveTextContent("+ New Agent");
     expect(screen.queryByTestId("settings-project-spin-up-btn")).toBeNull();

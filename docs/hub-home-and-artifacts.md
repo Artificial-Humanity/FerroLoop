@@ -78,22 +78,31 @@ area with no path that names a set of agents.
 
 ```json
 { "projects": [
+  { "id": "council", "slug": "council", "name": "Council", "kind": "virtual",
+    "parent": null, "ancestors": [],
+    "path": null, "has_git": false, "purpose": "the strategists", "tracker": null,
+    "store_path": null, "active_agent_count": 3,
+    "artifacts_dir": null, "default_artifacts_dir": null, "effective_artifacts_dir": null },
+  { "id": "council-research", "slug": "council-research", "name": "Council/Research",
+    "kind": "virtual", "parent": "council", "ancestors": ["council"],
+    "path": null, "has_git": false, "purpose": "research", "tracker": null,
+    "store_path": null, "active_agent_count": 2,
+    "artifacts_dir": null, "default_artifacts_dir": null, "effective_artifacts_dir": null },
   { "id": "ferroloop", "slug": "ferroloop", "name": "FerroLoop", "kind": "project",
+    "parent": null, "ancestors": [],
     "path": "/srv/code/ferroloop", "has_git": true, "purpose": "the platform",
     "tracker": { "kind": "github", "repo": "acme/ferroloop", "credential": "app" },
     "store_path": "/home/me/.local/share/fl/ferroloop.fls", "active_agent_count": 5,
-    "artifacts_dir": null, "default_artifacts_dir": "...", "effective_artifacts_dir": "..." },
-  { "id": "council", "slug": "council", "name": "Council", "kind": "virtual",
-    "path": null, "has_git": false, "purpose": "the strategists", "tracker": null,
-    "store_path": null, "active_agent_count": 3,
-    "artifacts_dir": null, "default_artifacts_dir": null, "effective_artifacts_dir": null }
+    "artifacts_dir": null, "default_artifacts_dir": "...", "effective_artifacts_dir": "..." }
 ] }
 ```
 
-Every field is always present; an absent value is `null`. `slug` (also `id`) never changes; `name`
-is the display name. `path` and `store_path` are `null` for a group. `has_git` is true when the
-root holds a `.git`, a repository with no commit included; it is read, never made. `tracker` is
-`null` or `{ "kind": "github", "repo": "owner/repo", "credential": "app" | "env" }`.
+Every field is always present. `slug` (also `id`) never changes. `name` is the full display
+name. `parent` is the verified immediate parent's slug, and `ancestors` lists verified slugs
+from the root to that parent. Top-level projects and projects with an incomplete or invalid
+ancestor chain return `parent: null` and `ancestors: []`. `path` and `store_path` are `null` for a
+group. `has_git` is true when the root holds a `.git`, including a repository with no commit.
+`tracker` is `null` or `{ "kind": "github", "repo": "owner/repo", "credential": "app" | "env" }`.
 `active_agent_count` counts active agents whose project or extra areas equal the slug or the
 area's name, ignoring case. `artifacts_dir`, `default_artifacts_dir` and `effective_artifacts_dir`
 are the project's artifacts directories (below); a group has none, so they are `null`. The list is
@@ -108,22 +117,36 @@ already made or `PATCH` set it.
 
 ```json
 { "name": "My Project", "slug": "my-project", "kind": "project", "path": "/srv/code/app",
-  "purpose": "the app", "git_init": false, "github": "acme/app", "credential": "app" }
+  "purpose": "the app", "git_init": false, "github": "acme/app", "credential": "app",
+  "create_parent": false }
 ```
 
-`kind` is `"project"` (the default) or `"virtual"`; `"virtual": true` is the same as
-`"kind": "virtual"`. Unknown fields are refused. `slug` is optional (empty counts as absent):
-without it the slug is the config's for that path, else the kebab-case of `name`, else the
-directory's lowercase name. For a project, `path` is required, `git_init` defaults to `false` (Git
-is not touched unless it is `true`: `git init`, and an empty initial commit when there is no
-`HEAD`), `credential` defaults to `app` and needs `github`. `path` must be absolute, with no `..`
+`kind` is `"project"` (the default) or `"virtual"`. `"virtual": true` is the same as
+`"kind": "virtual"`. Unknown fields are refused. If `slug` is omitted or blank, the Hub uses the
+configured slug for the path if available, then derives one from `name`, then falls back to the
+directory when no name is supplied. Names with `/` can have up to four nonempty segments. Each
+prefix names an ancestor. `create_parent` is an optional boolean and defaults to `false`. With
+`true`, the Hub creates missing ancestors as virtual groups when it can derive an available slug
+for each. Create an ancestor with an explicit slug first if needed. The Hub returns `400` for a
+missing ancestor when `create_parent` is `false` or for an underivable ancestor slug. An ambiguous
+ancestor name, incompatible ancestor chain, or occupied ancestor slug returns `409`. Reusing a
+legacy project's slug preserves its existing placement, even if its stored name contains `/`.
+
+For a project, `path` is required and `git_init` defaults to `false`. Setting `git_init` to
+`true` runs `git init` and makes an empty initial commit when there is no `HEAD`. `credential`
+defaults to `app` and needs `github`. `path` must be absolute, with no `..`
 and no NUL byte; the Hub also refuses one in a system directory, under a secret's directory
 (`.ssh`, `.aws` and the like), or that is, or contains, the Hub's home. For a virtual group,
-`name` is required and `path`, `git_init`, `github` and `credential` are ignored. The author
-recorded is the caller's name. The config is the Hub's `$XDG_CONFIG_HOME/fl/config.toml` (default
-`$HOME/.config/fl/config.toml`), a project's store is `$HOME/.local/share/fl/<slug>.fls`, and the
-workspace area goes into the Hub store. A group writes that area and nothing else. It broadcasts
-`project.created` on the `projects` channel.
+the request needs `name` or `slug`, and `path`, `git_init`, `github` and `credential` are ignored.
+FerroDeck sends `create_only: true` for both projects and virtual groups. The Hub resolves the
+slug before checking for an existing area. A matching name and, for a project, the same root can
+be retried without changing the existing area or tracker. A registered project's Git setup is
+also left alone. The retry can finish a partial registration. An unrelated identity at the
+resolved slug returns `409`. Omit `create_only` to retain the usual create or update behavior.
+The author recorded is the caller's name. The config is the Hub's `$XDG_CONFIG_HOME/fl/config.toml`
+(default `$HOME/.config/fl/config.toml`), a project's store is `$HOME/.local/share/fl/<slug>.fls`,
+and the workspace area goes into the Hub store. A group writes its area and any requested missing
+ancestors. A successful request broadcasts `project.created` on the `projects` channel.
 
 `PATCH /api/v1/projects/:slug` changes any of these, all optional:
 
@@ -132,7 +155,9 @@ workspace area goes into the Hub store. A group writes that area and nothing els
   "github": "acme/app", "credential": "env" }
 ```
 
-`name` is the display name; the slug cannot change, and a `slug` field is refused. `purpose` is
+`name` is the display name. The slug stays fixed, and unknown fields such as `slug` or `parent`
+return `400`. Changing the name of a linked child or a project with registered children returns
+`409`. The existing name can be sent again alongside other updates. `purpose` is
 the purpose; an empty or blank one resets it to the default (`Project <slug>`, or
 `Virtual group <slug>` for a group), the same as leaving it out on `POST`. `path` moves a directory-backed project to an existing directory, checked as `POST`
 checks a path and refused when another project has it; the project keeps its store, gates and
@@ -141,14 +166,15 @@ replaces the tracker (`""` clears it) and `credential` applies to it (the curren
 `github` is absent, which needs one). A group has no tracker. The config block and the area change
 together: the stores are written first, then the config in one atomic replacement, and a failure
 puts the stores back. Asking for what is already so changes nothing. A project with a store but no
-config block can be renamed but not moved or given a tracker. It broadcasts `project.updated`.
+config block can be renamed subject to the hierarchy rules above. Moving it or changing its
+tracker requires a config block. A successful request broadcasts `project.updated`.
 
 | Status | Cause |
 | --- | --- |
 | `400` | the body is not valid, nothing is asked for, or the slug, name, path, repository or credential cannot be used, or the path is somewhere the Hub refuses |
 | `403` | the caller is not the Owner |
 | `404` | (`PATCH`, `DELETE`) no project has that slug (`DELETE`: or no `reassign_to` project) |
-| `409` | the slug is registered at another root, the root under another slug, the slug is the other kind (a project's slug for a group, or the reverse), the path is another project's, the tracker is a different one (`POST`), or the store holds another project |
+| `409` | the slug is registered at another root, the root under another slug, the slug is the other kind, the path is another project's, the tracker is a different one (`POST`), the store holds another project, a hierarchy rule conflicts, or another mutation holds the project configuration lock |
 | `500` | git, a store or the config file failed, or the config file is not valid TOML (the message names the file) |
 
 `DELETE /api/v1/projects/:slug` deletes a project or a virtual group, with the flow of
@@ -164,6 +190,9 @@ The order is fixed: validate everything, then reassign or decommission the activ
 unregister (the `[[project]]` block, written atomically, and the area), then delete the store
 files, then the directory.
 
+* **Children.** Deleting a project or virtual group with a registered child returns `409`
+  before agents are reassigned or decommissioned, the project is unregistered, or files are
+  removed. The error names one child. A leaf follows the usual deletion rules.
 * **Agents.** Active agents are those whose project or extra areas equal the slug or the area's
   name, ignoring case. With some, and neither `reassign_to` nor `decommission_agents: true`, the
   answer is `409` and nothing changes:
@@ -207,9 +236,8 @@ A `200` answers, and broadcasts `project.deleted` on the `projects` channel:
 A failure to delete the store files or the directory happens after the unregistration, which is
 not undone: the answer is still `200`, the flag stays `false`, and an `error` field says why.
 
-The lock that serializes edits of `config.toml` is held inside one process. A `fl` command and
-the Hub that write the file at the same moment are not serialized, and one block can be lost; run
-one writer at a time.
+Hub and CLI project mutations that share the same `config.toml` use a local cross-process lock.
+A competing mutation can return `409` with `project configuration is busy; retry`.
 
 A virtual group has no store and no records: `GET /api/v1/records?project=<slug>` and the
 per-project artifacts-directory routes below answer `404` for it.

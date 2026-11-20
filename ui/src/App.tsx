@@ -103,6 +103,7 @@ import {
   type PrMergeRequest,
   type PromptRequest,
   type PrReviewRequest,
+  type ProjectSummary,
   type PullRequestItem,
   type RemodelSessionResponse,
   type SessionContextUsage,
@@ -721,7 +722,7 @@ export const App: React.FC<AppProps> = ({
   const { roles: rosterRoles } = useRoles(Boolean(authority) && !settingsModalOpen, apiClient);
   const [settingsInitialProject, setSettingsInitialProject] = useState<string | null>(null);
   const [settingsInitialProjectFilter, setSettingsInitialProjectFilter] =
-    useState<string | null>(null);
+    useState<{ label?: string; slug?: string } | null>(null);
   const [settingsInitialTab, setSettingsInitialTab] =
     useState<SettingsTabId | undefined>(undefined);
   const [settingsInitialProjectSubTab, setSettingsInitialProjectSubTab] =
@@ -733,7 +734,7 @@ export const App: React.FC<AppProps> = ({
   const [helpDrawerOpen, setHelpDrawerOpen] = useState<boolean>(false);
   const [helpTopic, setHelpTopic] = useState<HelpTopicId>("chat");
   const [spinUpModalOpen, setSpinUpModalOpen] = useState<boolean>(false);
-  const [spinUpInitialProject, setSpinUpInitialProject] = useState<string | null>(null);
+  const [spinUpInitialProject, setSpinUpInitialProject] = useState<Pick<ProjectSummary, "slug"> | null>(null);
   const [agentSettingsOpen, setAgentSettingsOpen] = useState<boolean>(false);
   const [nodes, setNodes] = useState<EnrolledNode[]>([]);
   const [wsConnected, setWsConnected] = useState<boolean>(false);
@@ -3528,7 +3529,10 @@ export const App: React.FC<AppProps> = ({
     setAgentSettingsOpen(false);
     setSettingsOriginMemento(null);
     setSettingsInitialProject(memento.initialProject);
-    setSettingsInitialProjectFilter(memento.projectFilter);
+    setSettingsInitialProjectFilter({
+      label: memento.projectFilter,
+      slug: memento.projectFilterSlug,
+    });
     setSettingsInitialTab(memento.activeTab);
     setSettingsInitialProjectSubTab(memento.projectSubTab);
     setSettingsInitialAgentsSubTab(memento.agentsSubTab);
@@ -3816,10 +3820,10 @@ export const App: React.FC<AppProps> = ({
         setSettingsOriginMemento(null);
         handleOpenAgentSettingsFor(nameKey);
       }}
-      onOpenProjectSettings={(project) => {
+      onOpenProjectSettings={(project, slug) => {
         setSettingsOriginMemento(null);
         setSettingsInitialProject(project);
-        setSettingsInitialProjectFilter(null);
+        setSettingsInitialProjectFilter({ slug });
         setSettingsInitialTab(undefined);
         setSettingsInitialProjectSubTab(undefined);
         setSettingsInitialAgentsSubTab(undefined);
@@ -4092,7 +4096,8 @@ export const App: React.FC<AppProps> = ({
           setSettingsInitialAgentsSubTab(undefined);
         }}
         initialProject={settingsInitialProject}
-        initialProjectFilter={settingsInitialProjectFilter}
+        initialProjectFilter={settingsInitialProjectFilter?.label}
+        initialProjectFilterSlug={settingsInitialProjectFilter?.slug}
         initialTab={settingsInitialTab}
         initialProjectSubTab={settingsInitialProjectSubTab}
         initialAgentsSubTab={settingsInitialAgentsSubTab}
@@ -4104,8 +4109,8 @@ export const App: React.FC<AppProps> = ({
         activeCockpitTab={activeTab}
         onSelectCockpitTab={handleSelectTab}
         onOpenNodesModal={() => setNodesModalOpen(true)}
-        onOpenSpinUpModal={(proj) => {
-          setSpinUpInitialProject(proj ?? null);
+        onOpenSpinUpModal={(slug) => {
+          setSpinUpInitialProject(slug ? { slug } : null);
           setSpinUpModalOpen(true);
         }}
         onOpenPairingModal={() => setPairingOpen(true)}
