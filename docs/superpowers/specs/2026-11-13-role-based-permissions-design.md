@@ -36,8 +36,8 @@ What exists today (code-verified):
 
 1. **Approved.** The role is the default source of an agent's permission policy at spin-up.
    The owner may override it for one agent.
-2. **Approved.** GitHub writes go only through the `fl github` broker. Raw `gh` writes are
-   denied for agents; reads stay allowed.
+2. **Approved.** GitHub writes go only through the `fl github` broker, including branch
+   publication (§3.1.1). Raw GitHub writes are denied for gated agents. Reads stay allowed.
 3. **Approved.** Protection against mistakes is sufficient for now. Per-agent isolation is a
    separate roadmap record (Record #192) with its own design.
 4. **Approved.** The Lead drafts one permission profile per role; no profile is applied before
@@ -155,10 +155,11 @@ places. It also holds the `defaults` map described after the example.
     "shell_exec": "ask", "network_web": "ask", "mcp_tool_call": "ask"
   },
   "actions": [
-    {"action": "github.issue.create",  "scope": "own-project"},
-    {"action": "github.pr.review",     "scope": "own-team"},
-    {"action": "github.pr.merge",      "scope": "own-approved"},
-    {"action": "session.reforge",      "scope": "own-team", "effect": "ask-owner"}
+    {"action": "github.issue.create",   "scope": "own-project"},
+    {"action": "github.branch.publish", "scope": "own-project"},
+    {"action": "github.pr.review",      "scope": "own-team"},
+    {"action": "github.pr.merge",       "scope": "own-approved"},
+    {"action": "session.reforge",       "scope": "own-team", "effect": "ask-owner"}
   ]
 }
 ```
@@ -196,7 +197,8 @@ policy and its compile receipt are stored on the hosted record and shown in Ferr
 
 `fl github` becomes the only way an agent writes to GitHub. It already brokers review and
 merge. It gains `issue create|comment|edit|close`, labels, assignees and review requests,
-`pr create|edit|merge`, each mapped to one action name. For each call the broker:
+`branch publish` and `pr create|edit|merge`, each mapped to one action name. For each call the
+broker:
 
 1. resolves the caller (below),
 2. loads the caller's effective action grants,
@@ -224,6 +226,35 @@ The same broker pattern later carries session lifecycle actions (`session.clear`
 authorize them. That is in scope for the action enum now and for implementation after the
 GitHub actions.
 
+#### 3.1.1 Branch publication
+
+Phase P2 gives authors a brokered publication step before `fl github pr create`. The proposed
+`fl github branch publish` command invokes the `github.branch.publish` action. The broker
+resolves the repository from the caller's authorized project binding and verifies the exact
+source commit in the project's worktree. It resolves one fully qualified branch ref in the
+feature branch namespace assigned to that author for the repository. Caller-supplied
+remotes, refspecs and transport options are outside this interface.
+
+The broker reads the current destination from GitHub and permits first creation or a
+fast-forward. Its authenticated transport sends one explicit ref update conditioned on the
+observed destination SHA or absence. A stale expectation produces a conflict and requires a
+fresh check. The broker refuses default or protected refs, forced updates, deletions,
+ambiguous or multiple destinations, and refs outside the caller's authorized namespace.
+Unknown repository, ownership or protection facts cause refusal. The journal records the
+caller, repository, ref, exact source head, expected destination and outcome.
+
+`fl github pr create` checks the branch on GitHub against the exact head from the authorized
+publication. It confirms the returned PR head before routing review and reports a mismatch as
+a conflict. GitHub enforces protected branch rules without a broker bypass. The PR still
+requires approval and passing checks. Feature branches carrying protected-path changes require
+Owner approval through the PR workflow.
+
+P2 must supply and verify this path, including active feature branches, before an
+Owner-reviewed workflow change replaces the current publish step for gated sessions. The
+raw Git publication deny takes effect at that verified cutover. Until then, the current
+`WORKFLOW.md` publish step governs. This cutover is separate from the interim raw `gh` rule
+in O4.
+
 ### 3.2 Compiled vendor rules, per session
 
 The hub accepts `permission_policy` at spin-up (unknown fields refused), defaults it from the
@@ -237,10 +268,11 @@ targets:
   `-c key=value` overrides or a per-session profile (flags present in help; unmeasured). Muse,
   Grok, Antigravity: per #103 §1; where no per-session target exists the capability is
   launch-fixed and compiled to the stricter form, with the downgrade in the receipt.
-- **Raw `gh` writes are denied by rule.** The role profiles carry `shell_exec` deny rules for
+- **Raw GitHub writes are denied by rule.** The role profiles carry `shell_exec` deny rules for
   the `gh` write subcommands and for `gh api` with a write method, and an allow rule for
   `fl github`. The hand-written user-level allow rules are removed once the broker covers
-  those commands.
+  those commands. At the §3.1.1 cutover, gated sessions also deny direct Git publication to
+  GitHub. Read-only operations such as fetch and `ls-remote` remain available.
 
 ### 3.3 The tool gate
 
@@ -363,7 +395,7 @@ of every `gh` form.
 |---|---|---|
 | P0 | Measurements M1–M8 on five vendors | — |
 | P1 | Role model: `tier`, bare slugs, the Record #193 rename and migration (§7); action enum; role profiles in the store; `fl role` and `/api/v1/roles` read and write them | Owner-approved profiles (§6) |
-| P2 | Broker: hosted-caller identity, the new `fl github` commands, action checks, journal; raw `gh` write deny rules through the existing hand-written settings as an interim | P1 |
+| P2 | Broker: hosted-caller identity, `fl github` writes including branch publication, action checks and journal; verified publish workflow and raw Git cutover (§3.1.1); interim raw `gh` write rules (O4) | P1 |
 | P3 | Compiler wiring: `permission_policy` in spin-up, per-session writers, receipts on the hosted record and in FerroDeck (closes Record #160, completes Record #103 §4) | P0, P1 |
 | P4 | Tool gate: `PreToolUse` handling, hook install, decision journal, drift check against the applied plan | P0, P3 |
 | P5 | Lifecycle actions through the broker (`session.reforge` and the rest) | P2 |
@@ -379,6 +411,7 @@ Owner triggers.
 
 | Action | Member | Lead | Project Manager | Director |
 |---|---|---|---|---|
+| Publish own feature branch | allow, own project (§3.1.1) | allow, own project (§3.1.1) | allow, own project (§3.1.1) | allow, own project (§3.1.1) |
 | Open a pull request | allow | allow | allow | allow |
 | Approve a member's pull request | deny | allow, own team | allow, portfolio, with recorded Lead unavailability (§2.1.1) | allow with recorded Lead and portfolio Project Manager unavailability (§2.1.1) |
 | Approve a Lead's pull request | deny | deny | allow, portfolio (§2.1.1) | allow with recorded portfolio Project Manager unavailability (§2.1.1) |
@@ -725,6 +758,20 @@ count. After a rollback, no pull request is merged on a review posted before the
   identity mismatch.
 - The same command from a shell that is not under a hosted session: refused without Owner
   authority.
+- An author with a project-scoped grant publishes a new authorized feature ref at H1, then
+  fast-forwards it to H2. Both writes update only that ref and record their old and new
+  heads. Brokered PR creation verifies H2 with GitHub and routes review for H2. A missing or
+  mismatched published head prevents review routing.
+- Publication to the default branch, another protected ref, another author's branch or a
+  different repository is refused. Repeat with alternate, ambiguous and multiple refspecs,
+  a forced update, a deletion and a non-fast-forward. If the destination changes after it
+  was read, the conditional update fails without overwriting the concurrent change. An
+  ordinary feature branch with protected-path changes can be published and the PR still
+  requires Owner review.
+- Before cutover the current workflow still publishes feature branches. After the broker and
+  workflow are verified, raw Git publication from a gated session is denied even for an
+  authorized feature branch. The broker can still publish that branch and read-only Git
+  commands still work.
 - A member opens a PR for head H1 with an active Lead on a live route, a Project Manager for
   the project, and an active manager outside that portfolio. The Lead receives the H1 request.
   Neither manager's approval counts before the window elapses. If the Lead requests changes,
