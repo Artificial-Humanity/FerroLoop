@@ -182,23 +182,27 @@ A directory-backed project is made in this order, leaving what is already right 
 A virtual group records its area, with no path, in the workspace store. No directory, no
 store file, no config block and no Git; `--virtual` refuses `--path`, `--git-init`, `--github`
 and `--credential`. An area made earlier with `fl agent register --create-area` has no path
-either, so it is a virtual group already; to make a directory-backed project of that slug, first
-give the area its directory with `fl agent area set <slug> --path <dir> --purpose <text> --by
-<you>`.
+either, so it is already a virtual group. To convert an unlinked leaf to a directory-backed
+project, first give it a directory with `fl agent area set <slug> --path <dir> --purpose <text>
+--by <you>`. The command refuses to repoint an area that has a parent or children.
 
-Nothing is changed until the request is checked. fl refuses an empty path, a NUL, a path that is
-a file, a slug that another project's block already has (at another root), a root that is already
+Validation failures leave the target project, workspace registry and configuration contents
+unchanged. Taking the configuration lock can create the config directory and a persistent
+`<config-file>.projects.lock` file. fl refuses an empty path, a NUL, a path that is a file, a
+slug that another project's block already has (at another root), a root that is already
 registered under another slug, a store that holds another project, a root that contains the
 stores' directory, and a slug that is the other kind. Running the same command again changes
-nothing. `--json` prints the project as the Hub lists it (`slug`, `name`, `parent`,
+nothing. With `--json`, creation prints the `ProjectSummary` fields (`slug`, `name`, `parent`,
 `ancestors`, `kind`, `path`, `has_git`, `purpose`, `tracker`, `store_path`,
-`active_agent_count`) plus `registered`, `git`
-(`null` unless `--git-init` ran), `mcp_catalog_created`, `areas` and `config`.
+`active_agent_count`) plus `registered`, `git` (`null` unless `--git-init` ran),
+`mcp_catalog_created`, `areas` and `config`.
 
 `fl project list` shows every directory-backed project in the config and every virtual group,
 one per line with kind, slug, path (`-` for a group), tracker repository (`-` for none), the
 number of active agents whose project or extra areas name it, and the full display name.
-With `--json` it prints the list that `GET /api/v1/projects` serves. The Hub can also create
+With `--json` it prints a bare array of `ProjectSummary` objects. `GET /api/v1/projects`
+wraps the array in a `projects` field and adds `id` (the slug), `artifacts_dir`,
+`default_artifacts_dir` and `effective_artifacts_dir` to each entry. The Hub can also create
 projects with `POST`, update them with `PATCH`, and delete them with `DELETE`.
 [Hub projects API](hub-home-and-artifacts.md)
 
@@ -233,7 +237,9 @@ In FerroDeck, choose **Create Project / Group** in the Projects settings. Enable
 its children. Each row remembers its own collapse state. Collapsing a parent hides its
 subtree and rolls unread and attention badges into the parent row. The parent link organizes
 the display. Project configuration, agent membership, and access are resolved for each
-project. Renaming and moving linked projects are tracked separately. [Project hierarchy #310](https://github.com/Artificial-Humanity/FerroLoop/issues/310)
+project. Renaming a linked project and changing a project's parent are tracked separately.
+A directory-backed project's filesystem path remains editable in Projects settings.
+[Project hierarchy #310](https://github.com/Artificial-Humanity/FerroLoop/issues/310)
 
 Upgrade store readers, writers, and registry replicas before creating or importing the first
 linked project. At that point, affected stores move to schema 10. [Store schema and upgrade](ferrostore-spec.md#schema-version)
