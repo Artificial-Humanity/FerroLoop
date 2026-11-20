@@ -790,6 +790,37 @@ pub(crate) fn check_store_dir_overlap(root: &Path, paths: &InitPaths) -> Result<
 
 /// Checks `req` against the config and the places in `paths`. Changes nothing.
 pub fn resolve(req: &InitRequest, paths: &InitPaths) -> Result<Resolved, InitError> {
+    resolve_project(req, paths, |_, _, _| Ok(false))
+}
+
+/// An old flat name can bypass hierarchy parsing or derivation only when it still names
+/// the same stored area. Pass a configured or explicit slug to keep it authoritative.
+fn display_identity(
+    raw: &str,
+    slug: Option<String>,
+    matches_legacy: impl FnOnce(&str, &str) -> Result<bool, InitError>,
+) -> Result<(String, String), InitError> {
+    let raw = checked_display_name(raw)?;
+    let current = display_path(&raw).and_then(|name| {
+        let slug = slug
+            .clone()
+            .map_or_else(|| slug_from_project_name(&name), Ok)?;
+        Ok((slug, name))
+    });
+    if let Ok(legacy_slug) = slug.map_or_else(|| slug_from_display(&raw), Ok)
+        && !current.as_ref().is_ok_and(|(slug, _)| *slug == legacy_slug)
+        && matches_legacy(&legacy_slug, &raw)?
+    {
+        return Ok((legacy_slug, raw));
+    }
+    current
+}
+
+fn resolve_project(
+    req: &InitRequest,
+    paths: &InitPaths,
+    matches_legacy: impl FnOnce(&str, &str, &Path) -> Result<bool, InitError>,
+) -> Result<Resolved, InitError> {
     let root = canonical_root(&req.path)?;
     if req.by.trim().is_empty() {
         return Err(invalid("`by` is empty"));
@@ -797,7 +828,6 @@ pub fn resolve(req: &InitRequest, paths: &InitPaths) -> Result<Resolved, InitErr
     if let Some(p) = &req.purpose {
         checked_purpose(p)?;
     }
-    let display_name = req.display_name.as_deref().map(display_path).transpose()?;
     let github = req.github.as_deref().map(checked_github).transpose()?;
     if github.is_none() && req.credential.is_some() {
         return Err(invalid(
@@ -808,11 +838,19 @@ pub fn resolve(req: &InitRequest, paths: &InitPaths) -> Result<Resolved, InitErr
     let doc = read_config(&paths.config_path)?;
     let entries = config_entries(&doc, &paths.config_path)?;
     let here = entries.iter().find(|e| same_root(&e.root, &root));
-    let slug = match (&req.slug, here, &display_name) {
-        (Some(s), _, _) => checked_slug(s)?,
-        (None, Some(e), _) => checked_slug(&e.slug().unwrap_or_default())?,
-        (None, None, Some(n)) => slug_from_project_name(n)?,
-        (None, None, None) => derive_slug(&root)?,
+    let known_slug = match (&req.slug, here) {
+        (Some(s), _) => Some(checked_slug(s)?),
+        (None, Some(e)) => Some(checked_slug(&e.slug().unwrap_or_default())?),
+        (None, None) => None,
+    };
+    let (slug, display_name) = match &req.display_name {
+        Some(raw) => {
+            let (slug, name) = display_identity(raw, known_slug, |slug, name| {
+                matches_legacy(slug, name, &root)
+            })?;
+            (slug, Some(name))
+        }
+        None => (known_slug.map_or_else(|| derive_slug(&root), Ok)?, None),
     };
     if let Some(e) = here
         && e.slug().as_deref() != Some(slug.as_str())
@@ -982,32 +1020,20 @@ fn virtual_slug_taken_by_group(slug: &str) -> InitError {
     ))
 }
 
-/// A directory-backed project onto a virtual group's slug is refused.
-fn check_not_a_virtual_group(ws: &AnyStore, r: &Resolved) -> Result<(), InitError> {
+/// A new config binding cannot take a virtual group's slug or repoint a different project.
+/// A project that the config already registers keeps its area.
+fn check_area_for_project(area: Option<&AreaRecord>, r: &Resolved) -> Result<(), InitError> {
     if !r.registers {
         return Ok(());
     }
-    let area = ws
-        .get_area(&r.slug)
-        .map_err(|e| failed(format!("workspace store: {e}")))?;
-    match area {
-        Some(a) if a.is_virtual() => Err(virtual_slug_taken_by_group(&r.slug)),
-        _ => Ok(()),
+    if area.is_some_and(AreaRecord::is_virtual) {
+        return Err(virtual_slug_taken_by_group(&r.slug));
     }
-}
-
-/// A new directory-backed project onto an area that records another directory is refused: the
-/// area would be re-pointed away from the project it names. A project the config already
-/// registers keeps the area it has (its flows move it deliberately).
-fn check_area_not_repointed(ws: &AnyStore, r: &Resolved) -> Result<(), InitError> {
-    if !r.registers {
-        return Ok(());
-    }
-    let area = ws
-        .get_area(&r.slug)
-        .map_err(|e| failed(format!("workspace store: {e}")))?;
-    match area.and_then(|a| a.path).filter(|p| !p.trim().is_empty()) {
-        Some(path) if !same_root(&path, &r.root) => Err(conflict(format!(
+    match area
+        .and_then(|area| area.path.as_deref())
+        .filter(|path| !path.trim().is_empty())
+    {
+        Some(path) if !same_root(path, &r.root) => Err(conflict(format!(
             "`{}` is already an area for the directory {path}, not {}. Choose another slug \
              with --slug or --name, or register the project at {path}",
             r.slug,
@@ -1028,6 +1054,51 @@ fn registry_areas(ws: &AnyStore) -> Result<BTreeMap<String, AreaRecord>, InitErr
 
 fn workspace_error(error: fl_core::store::StoreError) -> InitError {
     failed(format!("workspace store: {error}"))
+}
+
+/// Keep the same workspace guard and registry snapshot from the legacy lookup through
+/// placement. A legacy lookup must never create a workspace.
+struct InitWorkspace<W, F> {
+    opened: Option<(W, BTreeMap<String, AreaRecord>)>,
+    opener: Option<F>,
+}
+
+impl<W: Deref<Target = AnyStore>, F: FnOnce() -> Result<W, InitError>> InitWorkspace<W, F> {
+    fn new(opener: F) -> Self {
+        Self {
+            opened: None,
+            opener: Some(opener),
+        }
+    }
+
+    fn legacy_area(
+        &mut self,
+        path: &Path,
+        slug: &str,
+        name: &str,
+    ) -> Result<Option<&AreaRecord>, InitError> {
+        if !fl_store::store_exists(path) {
+            return Ok(None);
+        }
+        let opened = self.read_registry()?;
+        let (_, areas) = self.opened.insert(opened);
+        Ok(areas
+            .get(slug)
+            .filter(|area| area.parent.is_none() && area.name == name))
+    }
+
+    fn read_registry(&mut self) -> Result<(W, BTreeMap<String, AreaRecord>), InitError> {
+        let store = self.opener.take().expect("workspace opened once")()?;
+        let areas = registry_areas(&store)?;
+        Ok((store, areas))
+    }
+
+    fn open(mut self) -> Result<(W, BTreeMap<String, AreaRecord>), InitError> {
+        match self.opened.take() {
+            Some(workspace) => Ok(workspace),
+            None => self.read_registry(),
+        }
+    }
 }
 
 /// A linked child or a parent with children can repeat its displayed name. A raw child
@@ -1209,13 +1280,16 @@ where
     W: Deref<Target = AnyStore>,
 {
     let _one_at_a_time = lock_project_configuration(&paths.config_path)?;
-    let resolved = resolve(req, paths)?;
-    let workspace_store = open_workspace()?;
-    check_not_a_virtual_group(&workspace_store, &resolved)?;
-    check_area_not_repointed(&workspace_store, &resolved)?;
-
-    let registry = registry_areas(&workspace_store)?;
+    let mut workspace = InitWorkspace::new(open_workspace);
+    let resolved = resolve_project(req, paths, |slug, name, root| {
+        let area = workspace.legacy_area(&paths.workspace_store, slug, name)?;
+        Ok(area
+            .and_then(|area| area.path.as_deref())
+            .is_some_and(|path| !path.trim().is_empty() && same_root(path, root)))
+    })?;
+    let (workspace_store, registry) = workspace.open()?;
     let before = registry.get(&resolved.slug);
+    check_area_for_project(before, &resolved)?;
     let name = resolved
         .display_name
         .clone()
@@ -1307,38 +1381,17 @@ where
     if req.by.trim().is_empty() {
         return Err(invalid("`by` is empty"));
     }
-    let display = display_path(&req.display_name)?;
     let purpose = req.purpose.as_deref().map(checked_purpose).transpose()?;
     let doc = read_config(&paths.config_path)?;
     let entries = config_entries(&doc, &paths.config_path)?;
-    let derived = req
-        .slug
-        .as_deref()
-        .map_or_else(|| slug_from_project_name(&display), checked_slug);
-    let legacy_slug = req
-        .slug
-        .is_none()
-        .then(|| slug_from_display(&req.display_name).ok())
-        .flatten()
-        .filter(|slug| derived.as_ref().ok() != Some(slug));
-    // The old ASCII-only derivation can have produced a different slug for this exact
-    // virtual area. A repeated command still names the original area in that case.
-    let derived = if legacy_slug.is_none() {
-        let slug = derived?;
-        check_virtual_slug(&slug, paths, &entries)?;
-        Ok(slug)
-    } else {
-        derived
-    };
-    let ws = open_workspace()?;
-    let registry = registry_areas(&ws)?;
-    let existing_legacy = legacy_slug.filter(|slug| {
-        registry.get(slug).is_some_and(|area| {
-            area.parent.is_none() && area.is_virtual() && matches_display_path(&area.name, &display)
-        })
-    });
-    let slug = existing_legacy.map_or(derived, Ok)?;
+    let known_slug = req.slug.as_deref().map(checked_slug).transpose()?;
+    let mut workspace = InitWorkspace::new(open_workspace);
+    let (slug, display) = display_identity(&req.display_name, known_slug, |slug, name| {
+        let area = workspace.legacy_area(&paths.workspace_store, slug, name)?;
+        Ok(area.is_some_and(AreaRecord::is_virtual))
+    })?;
     check_virtual_slug(&slug, paths, &entries)?;
+    let (ws, registry) = workspace.open()?;
     let held = ws.list_projects().map_err(workspace_error)?;
     check_held_project(&slug, &held)?;
     let before = registry.get(&slug);

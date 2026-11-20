@@ -3555,6 +3555,125 @@ fn nested_readers_keep_legacy_and_malformed_areas_visible_as_roots() {
 }
 
 #[test]
+fn legacy_project_retry_preserves_bound_flat_names_outside_the_hierarchy_grammar() {
+    let sb = Sandbox::new();
+    for (slug, name) in [("old-empty", "Legacy//Child"), ("old-deep", "A/B/C/D/E")] {
+        let root = sb.dir(slug);
+        let mut request = sb.request(&root);
+        request.git_init = false;
+        let original = sb.init(&request).unwrap();
+        let ws = sb.workspace();
+        let mut area = ws.get_area(slug).unwrap().unwrap();
+        area.name = name.into();
+        ws.upsert_area(area.clone()).unwrap();
+        drop(ws);
+
+        let config = sb.config();
+        request.display_name = Some(format!(" {name} "));
+        request.create_parent = true;
+        let repeated = sb.init(&request).unwrap();
+        assert!(!repeated.registered);
+        assert_eq!(repeated.slug, slug);
+        assert_eq!(repeated.project, original.project);
+        assert_eq!(repeated.store, original.store);
+        assert_eq!(sb.workspace().get_area(slug).unwrap(), Some(area));
+        assert_eq!(sb.config(), config);
+        request.display_name = Some("Different//Child".into());
+        assert!(invalid(sb.init(&request)).contains("nonempty parts"));
+        assert_eq!(sb.config(), config);
+    }
+    assert_eq!(sb.workspace().list_areas().unwrap().len(), 2);
+}
+
+#[test]
+fn legacy_project_retry_preserves_an_unbound_old_slug_and_its_existing_store() {
+    let sb = Sandbox::new();
+    let root = sb.dir("not-the-slug");
+    let mut request = sb.request(&root);
+    request.slug = Some("kaggle-pok-mon".into());
+    request.git_init = false;
+    let original = sb.init(&request).unwrap();
+    fs::remove_file(&sb.paths.config_path).unwrap();
+    let ws = sb.workspace();
+    let mut area = ws.get_area("kaggle-pok-mon").unwrap().unwrap();
+    area.name = "Kaggle/Pokémon".into();
+    ws.upsert_area(area.clone()).unwrap();
+    drop(ws);
+
+    request.display_name = Some(area.name.clone());
+    request.slug = None;
+    request.create_parent = true;
+    let repeated = sb.init(&request).unwrap();
+    assert!(repeated.registered);
+    assert_eq!(repeated.slug, "kaggle-pok-mon");
+    assert_eq!(repeated.project, original.project);
+    assert_eq!(repeated.store, original.store);
+    assert_eq!(sb.workspace().list_areas().unwrap(), [area]);
+    assert!(!sb.paths.store_dir.join("kaggle-pokemon.fls").exists());
+    let blocks = sb.blocks();
+    assert_eq!(blocks.len(), 1);
+    assert_eq!(blocks[0]["name"].as_str(), Some("kaggle-pok-mon"));
+
+    // The old spelling cannot redirect a legitimate creation at another root.
+    request.path = sb.dir("other-root");
+    let separate = sb.init(&request).unwrap();
+    assert_eq!(separate.slug, "kaggle-pokemon");
+    assert_ne!(separate.project, original.project);
+}
+
+#[test]
+fn legacy_project_retry_preserves_flat_virtual_groups_by_explicit_or_old_derived_slug() {
+    let sb = Sandbox::new();
+    let ws = sb.workspace();
+    for (slug, name) in [("explicit", "Old//Group"), ("a-b-c-d-e", "A/B/C/D/E")] {
+        ws.upsert_area(fl_core::agent::AreaRecord {
+            area_key: slug.into(),
+            name: name.into(),
+            path: None,
+            parent: None,
+            purpose: "existing".into(),
+            updated_at: fl_exec::stamp::now(),
+            by: "tester".into(),
+        })
+        .unwrap();
+    }
+    drop(ws);
+
+    let mut explicit = sb.vrequest(" Old//Group ");
+    explicit.slug = Some("explicit".into());
+    explicit.create_parent = true;
+    let repeated = sb.virtual_group(&explicit).unwrap();
+    assert_eq!(repeated.slug, "explicit");
+    assert!(!repeated.registered);
+    let mut derived = sb.vrequest("A/B/C/D/E");
+    derived.create_parent = true;
+    let repeated = sb.virtual_group(&derived).unwrap();
+    assert_eq!(repeated.slug, "a-b-c-d-e");
+    assert!(!repeated.registered);
+
+    assert!(invalid(sb.virtual_group(&sb.vrequest("New//Group"))).contains("nonempty parts"));
+    let mut different_slug = explicit.clone();
+    different_slug.slug = Some("different".into());
+    assert!(invalid(sb.virtual_group(&different_slug)).contains("nonempty parts"));
+    let areas = sb.workspace().list_areas().unwrap();
+    assert_eq!(areas.len(), 2);
+    assert!(areas.iter().all(|area| area.parent.is_none()));
+}
+
+#[test]
+fn legacy_project_retry_does_not_create_a_workspace_during_invalid_name_preflight() {
+    let sb = Sandbox::new();
+    let mut project = sb.request(&sb.dir("no-project"));
+    project.display_name = Some("New//Project".into());
+    assert!(invalid(sb.init(&project)).contains("nonempty parts"));
+    assert!(invalid(sb.virtual_group(&sb.vrequest("New//Group"))).contains("nonempty parts"));
+    assert!(!sb.paths.workspace_store.exists());
+    assert!(!sb.paths.store_dir.exists());
+    assert!(!project.path.exists());
+    assert!(!sb.paths.config_path.exists());
+}
+
+#[test]
 fn nested_hub_honors_the_config_lock_but_list_does_not_create_it() {
     let hub = Hub::new();
     let config = hub.config();
