@@ -6,9 +6,12 @@ import type { HubWsClient } from "../api/ws";
 import { ContextHeader, RightPanelHeader } from "../components/ContextHeader";
 import { AgentSettingsModal } from "../components/AgentSettingsModal";
 import { PairingModal } from "../components/PairingModal";
+import { SettingsModal } from "../components/SettingsModal";
 import {
+  COLLAPSED_PROJECT_OVERRIDES_KEY,
   COLLAPSED_PROJECTS_STORAGE_KEY,
   PINNED_AGENTS_STORAGE_KEY,
+  PINNED_PROJECT_OVERRIDES_KEY,
   PINNED_PROJECTS_STORAGE_KEY,
   RosterSidebar,
   classifyTextUnreadSeverity,
@@ -28,7 +31,9 @@ import {
 
 describe("RosterSidebar", () => {
   beforeEach(() => {
+    window.localStorage.removeItem(COLLAPSED_PROJECT_OVERRIDES_KEY);
     window.localStorage.removeItem(COLLAPSED_PROJECTS_STORAGE_KEY);
+    window.localStorage.removeItem(PINNED_PROJECT_OVERRIDES_KEY);
     window.localStorage.removeItem(PINNED_PROJECTS_STORAGE_KEY);
     window.localStorage.removeItem(PINNED_AGENTS_STORAGE_KEY);
   });
@@ -183,6 +188,81 @@ describe("RosterSidebar", () => {
     expect(badge("lab")).toHaveAttribute("data-severity", "important");
   });
 
+  it("keeps collapse preferences independent when a project slug matches another display name", () => {
+    const roster = nestedRoster(
+      [nestedProject("reporting", "Analysis"), nestedProject("analysis", "Model Runs")],
+      [],
+      true,
+    );
+    const { unmount } = render(roster);
+    const analysis = () => screen.getByRole("button", { name: "Analysis" });
+    const modelRuns = () => screen.getByRole("button", { name: "Model Runs" });
+
+    fireEvent.click(modelRuns());
+    expect(modelRuns()).toHaveAttribute("aria-expanded", "false");
+    expect(analysis()).toHaveAttribute("aria-expanded", "true");
+    fireEvent.click(analysis());
+    expect(analysis()).toHaveAttribute("aria-expanded", "false");
+
+    unmount();
+    render(roster);
+    expect(analysis()).toHaveAttribute("aria-expanded", "false");
+    expect(modelRuns()).toHaveAttribute("aria-expanded", "false");
+    fireEvent.click(analysis());
+    expect(analysis()).toHaveAttribute("aria-expanded", "true");
+    expect(modelRuns()).toHaveAttribute("aria-expanded", "false");
+  });
+
+  it("lets Settings override a legacy pin independently of a colliding project slug", async () => {
+    const projects = [
+      nestedProject("reporting", "Analysis"),
+      nestedProject("analysis", "Model Runs"),
+    ];
+    window.localStorage.setItem(PINNED_PROJECTS_STORAGE_KEY, JSON.stringify(["analysis"]));
+    const roster = nestedRoster(projects, [], true);
+    const apiClient = new HubApiClient({
+      fetchImpl: async () => new Response(null, { status: 503 }),
+    });
+    const settings = (name: string) => (
+      <SettingsModal
+        key={name}
+        isOpen
+        initialProject={name}
+        projects={projects}
+        apiClient={apiClient}
+        onClose={vi.fn()}
+      />
+    );
+    const pin = () => screen.getByTestId("project-pin-toggle-btn");
+    const group = (name: string) => screen.getByTestId(`project-group-${name}`);
+    const { rerender, unmount } = render(<>{roster}{settings("Model Runs")}</>);
+    await act(async () => {});
+    expect(group("analysis")).toHaveAttribute("data-pinned", "true");
+    expect(pin()).toHaveAttribute("aria-pressed", "false");
+    fireEvent.click(pin());
+    expect(group("model runs")).toHaveAttribute("data-pinned", "true");
+
+    await act(async () => { rerender(<>{roster}{settings("Analysis")}</>); });
+    expect(pin()).toHaveAttribute("aria-pressed", "true");
+    fireEvent.click(pin());
+    expect(group("analysis")).toHaveAttribute("data-pinned", "false");
+    expect(group("model runs")).toHaveAttribute("data-pinned", "true");
+
+    unmount();
+    render(<>{roster}{settings("Analysis")}</>);
+    await act(async () => {});
+    expect(pin()).toHaveAttribute("aria-pressed", "false");
+    expect(group("analysis")).toHaveAttribute("data-pinned", "false");
+    expect(group("model runs")).toHaveAttribute("data-pinned", "true");
+  });
+
+  it("exposes the full name and virtual status of a nested project to assistive technology", () => {
+    render(nestedRoster([lab, alpha], [], true));
+    expect(screen.getByRole("button", { name: "Lab / Alpha" })).toHaveAccessibleDescription(
+      /virtual/i,
+    );
+  });
+
   it("sorts pinned projects within siblings and moves a pinned parent with its subtree", () => {
     render(nestedRoster([elsewhere, lab, alpha, beta, mobile], [], true));
     const rows = () => screen.getAllByTestId(/^project-header-row-/).map(row =>
@@ -223,7 +303,7 @@ describe("RosterSidebar", () => {
   it("uses roster-only parent links and honors saved flat preferences while the project list loads", () => {
     window.localStorage.setItem(COLLAPSED_PROJECTS_STORAGE_KEY, JSON.stringify(["the lab"]));
     window.localStorage.setItem(PINNED_PROJECTS_STORAGE_KEY, JSON.stringify(["the lab"]));
-    render(
+    const roster = (
       <RosterSidebar
         agents={[nestedAgent("first", "lab-alpha")]}
         areas={[
@@ -235,8 +315,9 @@ describe("RosterSidebar", () => {
         unreadByAgent={{ first: 2 }}
         selectedAgentName={null}
         onSelectAgent={vi.fn()}
-      />,
+      />
     );
+    const { unmount } = render(roster);
 
     const toggle = screen.getByRole("button", { name: "The Lab" });
     expect(toggle).toHaveAttribute("aria-expanded", "false");
@@ -245,6 +326,9 @@ describe("RosterSidebar", () => {
     expect(screen.queryByRole("button", { name: "The Lab / Alpha" })).toBeNull();
     fireEvent.click(toggle);
     expect(screen.getByRole("button", { name: "The Lab / Alpha" })).toHaveTextContent("Alpha");
+    unmount();
+    render(roster);
+    expect(screen.getByRole("button", { name: "The Lab" })).toHaveAttribute("aria-expanded", "true");
   });
 
   it("embedded mode renders roster content only, in flow, without drawer chrome", () => {
@@ -488,12 +572,6 @@ describe("RosterSidebar", () => {
     expect(ferroToggle).toHaveAttribute("aria-expanded", "false");
     expect(screen.queryByTestId("agent-row-ferris")).toBeNull();
     expect(screen.getByTestId("project-unread-badge-ferroloop")).toHaveTextContent("6");
-
-    // Persisted in localStorage
-    expect(
-      JSON.parse(window.localStorage.getItem(COLLAPSED_PROJECTS_STORAGE_KEY) ?? "[]"),
-    ).toContain("ferroloop");
-    window.localStorage.removeItem(COLLAPSED_PROJECTS_STORAGE_KEY);
   });
 
   it("renders roster-global-controls (Settings, ?, icon-only theme toggle) and sorts pinned projects and pinned agents alphabetically to top", () => {

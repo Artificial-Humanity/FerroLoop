@@ -31,7 +31,9 @@ export interface NewProjectModalProps {
   onCreated: (project: ProjectSummary) => void;
 }
 
-const SLUG_PATTERN = /^[a-z0-9][a-z0-9-]*$/;
+const SLUG_PATTERN = /^[a-z][a-z0-9_-]{0,63}$/;
+const SLUG_HELP =
+  "Enter a slug that starts with a lowercase letter and uses at most 64 lowercase letters, digits, hyphens, or underscores.";
 const MAX_NAME_CHARS = 80;
 const MAX_NAME_SEGMENTS = 4;
 
@@ -104,12 +106,8 @@ function NewProjectForm({
   else if (nameSegments.length > MAX_NAME_SEGMENTS || nameSegments.some((segment) => !segment))
     errors.name = `Use one to ${MAX_NAME_SEGMENTS} non-empty segments separated by "/".`;
   if (!trimmedSlug)
-    errors.slug = trimmedName && !deriveProjectSlug(trimmedName)
-      ? "Enter a slug using lowercase letters, digits and hyphens."
-      : "Slug is required.";
-  else if (!SLUG_PATTERN.test(trimmedSlug))
-    errors.slug =
-      "Slug must start with a lowercase letter or digit and use only a-z, 0-9 and '-'.";
+    errors.slug = trimmedName && !deriveProjectSlug(trimmedName) ? SLUG_HELP : "Slug is required.";
+  else if (!SLUG_PATTERN.test(trimmedSlug)) errors.slug = SLUG_HELP;
   else if (existingSlugs.includes(trimmedSlug))
     errors.slug = `A project or group with the slug "${trimmedSlug}" already exists.`;
   if (isProject) {

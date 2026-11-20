@@ -96,11 +96,11 @@ describe("NewProjectModal", () => {
     await submit();
     expect(screen.getByText(/Enter a slug/)).toBeInTheDocument();
     expect(create).not.toHaveBeenCalled();
-    type("new-project-slug", "tokyo");
+    type("new-project-slug", "lab_tokyo");
     await submit();
     expect(create).toHaveBeenCalledWith({
       name: "Lab / 東京",
-      slug: "tokyo",
+      slug: "lab_tokyo",
       kind: "project",
       path: "/work/tokyo",
     });
@@ -335,7 +335,7 @@ describe("NewProjectModal", () => {
       await submit();
       expect(create).not.toHaveBeenCalled();
       expect(screen.getByTestId("new-project-slug")).toHaveAccessibleDescription(
-        "Enter a slug using lowercase letters, digits and hyphens.",
+        /starts with a lowercase letter.*64.*underscores/,
       );
     });
 
@@ -349,6 +349,15 @@ describe("NewProjectModal", () => {
         "aria-invalid",
         "true",
       );
+    });
+
+    it.each(["2alpha", "a".repeat(65)])("rejects a slug outside the hub's grammar (%s)", async (slug) => {
+      const { create } = setup();
+      fillProject();
+      type("new-project-slug", slug);
+      await submit();
+      expect(create).not.toHaveBeenCalled();
+      expect(screen.getByTestId("new-project-slug")).toHaveAttribute("aria-invalid", "true");
     });
 
     it("rejects a duplicate slug client-side", async () => {

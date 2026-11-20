@@ -31,7 +31,7 @@ import {
   type CurrencyPreference,
 } from "../lib/currency";
 import { TIMEZONE_OPTIONS, setActiveTimeZone } from "../lib/datetime";
-import { isProjectPinned, PinIcon, togglePinnedProject, usePinnedState } from "./RosterSidebar";
+import { isProjectPreferenceSet, PinIcon, togglePinnedProject, usePinnedState } from "./RosterSidebar";
 import { RuntimesQuotasPanel } from "./RuntimesQuotasPanel";
 import {
   ACP_CONFORMANCE_OPERATIONS,
@@ -2690,14 +2690,19 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
 
   const isProjectScoped =
     Boolean(initialProject) || resolvedProjectFilter !== "all";
-  const scopedProject = findProject(effectiveProjects, resolvedProjectFilter);
-  const scopedArea = areaRecords.find((area) =>
-    [area.name, area.area_key].some((label) =>
-      label.trim().toLowerCase() === resolvedProjectFilter.trim().toLowerCase(),
-    ),
+  // The picker holds display labels. A different project's slug can match that label.
+  const scopedLabel = resolvedProjectFilter.trim().toLowerCase();
+  const namedArea = areaRecords.find((area) => area.name.trim().toLowerCase() === scopedLabel);
+  const scopedSlug = namedArea?.area_key.trim().toLowerCase() ?? scopedLabel;
+  const scopedProject = effectiveProjects.find(
+    (project) => projectLabel(project).toLowerCase() === scopedLabel,
+  ) ?? effectiveProjects.find((project) => project.slug.trim().toLowerCase() === scopedSlug);
+  const scopedArea = namedArea ?? areaRecords.find(
+    (area) => area.area_key.trim().toLowerCase() === scopedSlug,
   );
   const projectPinKey = scopedProject?.slug ?? scopedArea?.area_key ?? resolvedProjectFilter;
-  const projectPinned = isProjectPinned(pinnedProjects, projectPinKey, resolvedProjectFilter);
+  const pinLabel = scopedProject ? projectLabel(scopedProject) : scopedArea?.name || resolvedProjectFilter;
+  const projectPinned = isProjectPreferenceSet(pinnedProjects, projectPinKey, pinLabel);
   const scopedProjectName =
     resolvedProjectFilter !== "all"
       ? resolvedProjectFilter
@@ -2835,7 +2840,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 justifyContent: "center",
                 lineHeight: 1,
               }}
-              onClick={() => togglePinnedProject(projectPinKey, resolvedProjectFilter)}
+              onClick={() => togglePinnedProject(projectPinKey, pinLabel)}
             >
               <PinIcon
                 pinned={projectPinned}

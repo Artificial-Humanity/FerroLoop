@@ -30,6 +30,8 @@ import {
 export const COLLAPSED_PROJECTS_STORAGE_KEY = "fd_collapsed_projects";
 export const PINNED_PROJECTS_STORAGE_KEY = "fd_pinned_projects";
 export const PINNED_AGENTS_STORAGE_KEY = "fd_pinned_agents";
+export const COLLAPSED_PROJECT_OVERRIDES_KEY = "fd_collapsed_project_overrides";
+export const PINNED_PROJECT_OVERRIDES_KEY = "fd_pinned_project_overrides";
 
 export type UnreadSeverity = "normal" | "question" | "important";
 
@@ -178,48 +180,68 @@ function readStorageStringSet(storageKey: string): Set<string> {
   return new Set();
 }
 
-function writeStorageStringSet(storageKey: string, values: Set<string>): void {
+function writeStorageValue(storageKey: string, value: unknown): void {
   try {
     if (typeof window !== "undefined" && window.localStorage) {
-      window.localStorage.setItem(storageKey, JSON.stringify(Array.from(values)));
+      window.localStorage.setItem(storageKey, JSON.stringify(value));
     }
   } catch {
     // Ignore storage errors
   }
-  for (const listener of pinListeners) {
-    listener();
-  }
 }
 
-export function readPinnedProjects(): Set<string> {
-  return readStorageStringSet(PINNED_PROJECTS_STORAGE_KEY);
+function notifyPinListeners(): void {
+  for (const listener of pinListeners) listener();
+}
+
+interface ProjectPreferences {
+  legacyLabels: ReadonlySet<string>;
+  overrides: ReadonlyMap<string, boolean>;
+}
+
+function readProjectPreferences(legacyKey: string, overridesKey: string): ProjectPreferences {
+  const overrides = new Map<string, boolean>();
+  try {
+    const raw = window.localStorage.getItem(overridesKey);
+    const parsed: unknown = raw ? JSON.parse(raw) : null;
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      for (const [slug, value] of Object.entries(parsed)) {
+        if (typeof value === "boolean") overrides.set(slug, value);
+      }
+    }
+  } catch {
+    // Ignore storage errors.
+  }
+  return { legacyLabels: readStorageStringSet(legacyKey), overrides };
+}
+
+function readPinnedProjects(): ProjectPreferences {
+  return readProjectPreferences(PINNED_PROJECTS_STORAGE_KEY, PINNED_PROJECT_OVERRIDES_KEY);
 }
 
 export function readPinnedAgents(): Set<string> {
   return readStorageStringSet(PINNED_AGENTS_STORAGE_KEY);
 }
 
-export function isProjectPinned(
-  pinnedProjects: ReadonlySet<string>,
+export function isProjectPreferenceSet(
+  preferences: ProjectPreferences,
   project: string,
   label = project,
 ): boolean {
-  return pinnedProjects.has(project.trim().toLowerCase()) ||
-    pinnedProjects.has(label.trim().toLowerCase());
+  // Older preferences were keyed by display name. An explicit false also overrides them.
+  return preferences.overrides.get(project.trim().toLowerCase()) ??
+    preferences.legacyLabels.has(label.trim().toLowerCase());
 }
 
 export function togglePinnedProject(project: string, label = project): boolean {
   const key = project.trim().toLowerCase();
   if (!key) return false;
-  const next = readPinnedProjects();
-  const pinned = !isProjectPinned(next, project, label);
-  if (pinned) {
-    next.add(key);
-  } else {
-    next.delete(key);
-    next.delete(label.trim().toLowerCase());
-  }
-  writeStorageStringSet(PINNED_PROJECTS_STORAGE_KEY, next);
+  const preferences = readPinnedProjects();
+  const pinned = !isProjectPreferenceSet(preferences, key, label);
+  const overrides = new Map(preferences.overrides);
+  overrides.set(key, pinned);
+  writeStorageValue(PINNED_PROJECT_OVERRIDES_KEY, Object.fromEntries(overrides));
+  notifyPinListeners();
   return pinned;
 }
 
@@ -233,7 +255,8 @@ export function togglePinnedAgent(agentKey: string): boolean {
   } else {
     next.delete(key);
   }
-  writeStorageStringSet(PINNED_AGENTS_STORAGE_KEY, next);
+  writeStorageValue(PINNED_AGENTS_STORAGE_KEY, Array.from(next));
+  notifyPinListeners();
   return pinned;
 }
 
@@ -308,7 +331,7 @@ export const ProjectSettingsIcon: React.FC<{ size?: number }> = ({
 );
 
 export function usePinnedState(): {
-  pinnedProjects: Set<string>;
+  pinnedProjects: ProjectPreferences;
   pinnedAgents: Set<string>;
 } {
   const [, setTick] = useState(0);
@@ -738,43 +761,17 @@ export const RosterSidebar: React.FC<RosterSidebarProps> = ({
     LEFT_PANEL_TABS.find((t) => t.id === effectiveLeftTab)?.label ?? "Agent Roster";
   const [searchQuery, setSearchQuery] = useState("");
   const { pinnedProjects, pinnedAgents } = usePinnedState();
-  const [collapsedProjects, setCollapsedProjects] = useState<Set<string>>(() => {
-    try {
-      if (typeof window !== "undefined" && window.localStorage) {
-        const raw = window.localStorage.getItem(COLLAPSED_PROJECTS_STORAGE_KEY);
-        if (raw) {
-          const parsed = JSON.parse(raw);
-          if (Array.isArray(parsed)) {
-            return new Set(parsed.map((p) => String(p).toLowerCase()));
-          }
-        }
-      }
-    } catch {
-      // Ignore storage errors
-    }
-    return new Set();
-  });
+  const virtualBadgePrefix = React.useId();
+  const [collapsedProjects, setCollapsedProjects] = useState(() =>
+    readProjectPreferences(COLLAPSED_PROJECTS_STORAGE_KEY, COLLAPSED_PROJECT_OVERRIDES_KEY),
+  );
 
   const toggleProjectGroup = (key: string, label: string) => {
     setCollapsedProjects((prev) => {
-      const next = new Set(prev);
-      if (next.has(key) || next.has(label)) {
-        next.delete(key);
-        next.delete(label);
-      } else {
-        next.add(key);
-      }
-      try {
-        if (typeof window !== "undefined" && window.localStorage) {
-          window.localStorage.setItem(
-            COLLAPSED_PROJECTS_STORAGE_KEY,
-            JSON.stringify(Array.from(next)),
-          );
-        }
-      } catch {
-        // Ignore storage errors
-      }
-      return next;
+      const overrides = new Map(prev.overrides);
+      overrides.set(key, !isProjectPreferenceSet(prev, key, label));
+      writeStorageValue(COLLAPSED_PROJECT_OVERRIDES_KEY, Object.fromEntries(overrides));
+      return { ...prev, overrides };
     });
   };
 
@@ -1032,8 +1029,8 @@ export const RosterSidebar: React.FC<RosterSidebarProps> = ({
     }
 
     const byProjectOrder = (a: ProjectGroup, b: ProjectGroup) => {
-      const aPinned = isProjectPinned(pinnedProjects, a.key, a.label);
-      const bPinned = isProjectPinned(pinnedProjects, b.key, b.label);
+      const aPinned = isProjectPreferenceSet(pinnedProjects, a.key, a.label);
+      const bPinned = isProjectPreferenceSet(pinnedProjects, b.key, b.label);
       if (aPinned !== bPinned) return aPinned ? -1 : 1;
       const aIdx = listOrder.get(a.key) ?? Infinity;
       const bIdx = listOrder.get(b.key) ?? Infinity;
@@ -1297,8 +1294,9 @@ export const RosterSidebar: React.FC<RosterSidebarProps> = ({
           groupedByProject.map(function renderProject(group): React.ReactNode {
             const { key, label: project, agents: items, children, linked, virtual } = group;
             const projectLower = project.trim().toLowerCase();
-            const isGroupCollapsed = collapsedProjects.has(key) || collapsedProjects.has(projectLower);
-            const isGroupPinned = isProjectPinned(pinnedProjects, key, project);
+            const isGroupCollapsed = isProjectPreferenceSet(collapsedProjects, key, project);
+            const isGroupPinned = isProjectPreferenceSet(pinnedProjects, key, project);
+            const virtualBadgeId = virtual ? `${virtualBadgePrefix}-${encodeURIComponent(key)}` : undefined;
             const { count: projectUnread, severity: projectSeverity } =
               summarizeProjectUnread(group, isGroupCollapsed);
             const displayName = linked ? project.split("/").at(-1)?.trim() || project : project;
@@ -1332,6 +1330,7 @@ export const RosterSidebar: React.FC<RosterSidebarProps> = ({
                     data-testid={`project-group-toggle-${projectLower}`}
                     aria-expanded={!isGroupCollapsed}
                     aria-label={project}
+                    aria-describedby={virtualBadgeId}
                     title={project}
                     onClick={() => toggleProjectGroup(key, projectLower)}
                     style={{
@@ -1377,7 +1376,11 @@ export const RosterSidebar: React.FC<RosterSidebarProps> = ({
                     >
                       {displayName}
                     </span>
-                    {virtual && <span className="fd-badge" style={{ borderStyle: "dashed" }}>virtual</span>}
+                    {virtual && (
+                      <span id={virtualBadgeId} className="fd-badge" style={{ borderStyle: "dashed" }}>
+                        virtual
+                      </span>
+                    )}
                   </button>
 
                   <div style={{ display: "flex", alignItems: "center", gap: "4px", flexShrink: 0 }}>
