@@ -562,7 +562,7 @@ describe("RosterSidebar", () => {
     // Clicking project settings cog calls onOpenProjectSettings without collapsing group
     const ferroCogBtn = screen.getByTestId("project-settings-btn-ferroloop");
     fireEvent.click(ferroCogBtn);
-    expect(onOpenProjectSettings).toHaveBeenCalledWith("FerroLoop");
+    expect(onOpenProjectSettings).toHaveBeenCalledWith("FerroLoop", "ferroloop");
     expect(screen.getByTestId("agent-row-ferris")).toBeInTheDocument();
 
     // Clicking project group toggle collapses FerroLoop agents while keeping unread badge visible

@@ -426,7 +426,7 @@ export interface RosterSidebarProps {
   selectedAgentName: string | null;
   onSelectAgent: (nameKey: string) => void;
   onOpenAgentSettings?: (nameKey: string) => void;
-  onOpenProjectSettings?: (project: string) => void;
+  onOpenProjectSettings?: (project: string, slug: string) => void;
   onOpenSettingsModal?: () => void;
   onOpenHelpModal?: () => void;
   themeMode?: "dark" | "light" | "system";
@@ -1403,7 +1403,7 @@ export const RosterSidebar: React.FC<RosterSidebarProps> = ({
                       aria-label={`Project settings for ${project}`}
                       onClick={(e) => {
                         e.stopPropagation();
-                        onOpenProjectSettings?.(project);
+                        onOpenProjectSettings?.(project, key);
                       }}
                       style={{
                         border: "none",

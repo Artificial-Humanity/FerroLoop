@@ -721,7 +721,7 @@ export const App: React.FC<AppProps> = ({
   const { roles: rosterRoles } = useRoles(Boolean(authority) && !settingsModalOpen, apiClient);
   const [settingsInitialProject, setSettingsInitialProject] = useState<string | null>(null);
   const [settingsInitialProjectFilter, setSettingsInitialProjectFilter] =
-    useState<string | null>(null);
+    useState<{ label?: string; slug?: string } | null>(null);
   const [settingsInitialTab, setSettingsInitialTab] =
     useState<SettingsTabId | undefined>(undefined);
   const [settingsInitialProjectSubTab, setSettingsInitialProjectSubTab] =
@@ -3528,7 +3528,10 @@ export const App: React.FC<AppProps> = ({
     setAgentSettingsOpen(false);
     setSettingsOriginMemento(null);
     setSettingsInitialProject(memento.initialProject);
-    setSettingsInitialProjectFilter(memento.projectFilter);
+    setSettingsInitialProjectFilter({
+      label: memento.projectFilter,
+      slug: memento.projectFilterSlug,
+    });
     setSettingsInitialTab(memento.activeTab);
     setSettingsInitialProjectSubTab(memento.projectSubTab);
     setSettingsInitialAgentsSubTab(memento.agentsSubTab);
@@ -3816,10 +3819,10 @@ export const App: React.FC<AppProps> = ({
         setSettingsOriginMemento(null);
         handleOpenAgentSettingsFor(nameKey);
       }}
-      onOpenProjectSettings={(project) => {
+      onOpenProjectSettings={(project, slug) => {
         setSettingsOriginMemento(null);
         setSettingsInitialProject(project);
-        setSettingsInitialProjectFilter(null);
+        setSettingsInitialProjectFilter({ slug });
         setSettingsInitialTab(undefined);
         setSettingsInitialProjectSubTab(undefined);
         setSettingsInitialAgentsSubTab(undefined);
@@ -4092,7 +4095,8 @@ export const App: React.FC<AppProps> = ({
           setSettingsInitialAgentsSubTab(undefined);
         }}
         initialProject={settingsInitialProject}
-        initialProjectFilter={settingsInitialProjectFilter}
+        initialProjectFilter={settingsInitialProjectFilter?.label}
+        initialProjectFilterSlug={settingsInitialProjectFilter?.slug}
         initialTab={settingsInitialTab}
         initialProjectSubTab={settingsInitialProjectSubTab}
         initialAgentsSubTab={settingsInitialAgentsSubTab}

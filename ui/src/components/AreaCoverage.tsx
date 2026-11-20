@@ -10,12 +10,18 @@ export function areaInfo(
   areas: readonly AreaRecord[],
   projects: readonly ProjectSummary[],
 ) {
-  const area = areas.find(a => key(a.area_key) === key(slug) || key(a.name) === key(slug));
-  const project = projects.find(p =>
-    key(p.slug) === key(area?.area_key ?? slug) || key(projectLabel(p)) === key(slug),
-  );
+  const normalized = key(slug);
+  const exactProject = projects.find(project => key(project.slug) === normalized);
+  const exactArea = areas.find(area => key(area.area_key) === normalized);
+  // A known area key cannot refer to a different project's display name.
+  const project = exactProject ?? (exactArea ? undefined : projects.find(
+    project => key(projectLabel(project)) === normalized,
+  ));
+  const area = exactArea ?? (project ? undefined : areas.find(
+    area => key(area.name) === normalized,
+  ));
   return {
-    label: area?.name || (project ? projectLabel(project) : slug),
+    label: project ? projectLabel(project) : area?.name || slug,
     // The project registry also knows configured projects whose area has no path.
     virtual: project ? project.kind === "virtual" : area?.path === null,
   };
@@ -29,11 +35,6 @@ export function extraAreaKeys(agent: AgentRecord): string[] {
     seen.add(normalized);
     return true;
   });
-}
-
-export function coversArea(agent: AgentRecord, target: string): boolean {
-  const normalized = key(target);
-  return key(agent.project) === normalized || extraAreaKeys(agent).some(area => key(area) === normalized);
 }
 
 export function AreaBadge({ slug, areas, projects, primary = false }: {
