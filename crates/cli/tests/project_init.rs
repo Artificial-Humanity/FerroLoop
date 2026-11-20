@@ -608,10 +608,10 @@ fn list_shows_both_kinds_with_the_tracker_and_the_active_agents() {
         .success()
         .stdout(
             contains(format!(
-                "project\tlisted\t{}\tacme/listed\t1\n",
+                "project\tlisted\t{}\tacme/listed\t1\tListed\n",
                 root.display()
             ))
-            .and(contains("virtual\tcouncil\t-\t-\t2\n")),
+            .and(contains("virtual\tcouncil\t-\t-\t2\tCouncil\n")),
         );
 }
 
@@ -971,4 +971,123 @@ fn a_config_whose_projects_are_not_tables_stops_every_project_command_and_names_
     }
     assert_eq!(env.config(), "project = [1, 2]\n");
     assert!(!env.dir("beta").exists());
+}
+
+#[test]
+fn nested_projects_keep_flat_slugs_and_explicit_names() {
+    let env = Env::new();
+    let root = env.dir("pokemon");
+    env.fl(env.work.path())
+        .args(["project", "create", "--name", "Kaggle/Pokémon", "--path"])
+        .arg(&root)
+        .assert()
+        .failure()
+        .stderr(contains("Kaggle").and(contains("--create-parent")));
+    assert!(!root.exists());
+    let parent = env.run_json("create", &["--virtual", "--name", "Kaggle"]);
+    assert_eq!(parent["slug"], "kaggle");
+    let args = [
+        "--name",
+        " Kaggle / Pokémon ",
+        "--path",
+        root.to_str().unwrap(),
+    ];
+    for _ in 0..2 {
+        let child = env.run_json("create", &args);
+        assert_eq!(child["name"], "Kaggle/Pokémon");
+        assert_eq!(child["slug"], "kaggle-pokemon");
+        assert_eq!(child["parent"], "kaggle");
+        assert_eq!(child["ancestors"], serde_json::json!(["kaggle"]));
+    }
+    env.fl(env.work.path())
+        .args(["project", "list"])
+        .assert()
+        .success()
+        .stdout(contains("Kaggle/Pokémon"));
+}
+
+#[test]
+fn nested_area_set_updates_purpose_without_repointing_the_area() {
+    let env = Env::new();
+    let root = env.dir("child");
+    env.run_json(
+        "create",
+        &[
+            "Portfolio/Child",
+            "--path",
+            root.to_str().unwrap(),
+            "--create-parent",
+        ],
+    );
+    env.fl(env.work.path())
+        .args([
+            "agent",
+            "area",
+            "set",
+            "portfolio-child",
+            "--purpose",
+            "updated",
+            "--by",
+            "tester",
+        ])
+        .assert()
+        .success();
+    let listed = env.run_json("list", &[]);
+    let child = listed
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["slug"] == "portfolio-child")
+        .unwrap();
+    assert_eq!(child["name"], "Portfolio/Child");
+    assert_eq!(child["parent"], "portfolio");
+    assert_eq!(child["purpose"], "updated");
+    env.fl(env.work.path())
+        .args([
+            "agent",
+            "area",
+            "set",
+            "portfolio-child",
+            "--path",
+            "/elsewhere",
+            "--purpose",
+            "bad",
+            "--by",
+            "tester",
+        ])
+        .assert()
+        .failure();
+}
+
+#[test]
+fn nested_cli_honors_the_config_lock() {
+    let env = Env::new();
+    let config_dir = env.config_path();
+    let config_dir = config_dir.parent().unwrap();
+    std::fs::create_dir_all(config_dir).unwrap();
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let held = options
+        .open(config_dir.join("config.toml.projects.lock"))
+        .unwrap();
+    held.try_lock().unwrap();
+    let root = env.dir("busy");
+    env.fl(env.work.path())
+        .args(["project", "init"])
+        .arg(&root)
+        .assert()
+        .failure()
+        .stderr(contains("busy"));
+    assert!(!root.exists());
+    drop(held);
+    env.fl(env.work.path())
+        .args(["project", "init"])
+        .arg(&root)
+        .assert()
+        .success();
 }

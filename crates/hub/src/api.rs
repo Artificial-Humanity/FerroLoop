@@ -1512,7 +1512,7 @@ fn handle_get_agents(state: &HubState, req: &HttpRequest) -> HttpResponse {
         200,
         json!({
             "agents": agents,
-            "areas": areas,
+            "areas": crate::project_hierarchy::roster_areas(areas),
             "routes": routes,
         }),
     )

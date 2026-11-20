@@ -1062,6 +1062,14 @@ fn run(cli: Cli) -> Result<i32> {
                 }
                 None => cfg.workspace_state_store(&default_store),
             };
+            let _project_config = match &cmd {
+                cmd::agent::AgentCmd::Area {
+                    cmd: cmd::agent::AreaCmd::Set { .. },
+                } => config::path()
+                    .map(|path| fl_hub::project_init::lock_project_configuration(&path))
+                    .transpose()?,
+                _ => None,
+            };
             if let Some(dir) = store_path.parent()
                 && !dir.as_os_str().is_empty()
             {

@@ -63,6 +63,7 @@ impl Sandbox {
             path: path.to_path_buf(),
             slug: None,
             display_name: None,
+            create_parent: false,
             github: None,
             credential: None,
             purpose: None,
@@ -100,6 +101,7 @@ impl Sandbox {
         VirtualRequest {
             slug: None,
             display_name: name.into(),
+            create_parent: false,
             purpose: None,
             by: "tester".into(),
         }
@@ -802,11 +804,12 @@ fn a_symlinked_config_is_written_through_and_stays_a_link() {
 fn no_temporary_file_is_left_beside_the_config() {
     let sb = Sandbox::new();
     sb.init(&sb.request(&sb.dir("tidy"))).unwrap();
-    let names: Vec<String> = fs::read_dir(sb.paths.config_path.parent().unwrap())
+    let mut names: Vec<String> = fs::read_dir(sb.paths.config_path.parent().unwrap())
         .unwrap()
         .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
         .collect();
-    assert_eq!(names, ["config.toml"]);
+    names.sort();
+    assert_eq!(names, ["config.toml", "config.toml.projects.lock"]);
 }
 
 #[test]
@@ -1099,10 +1102,14 @@ fn a_virtual_group_writes_its_area_and_nothing_else() {
     assert_eq!(area.purpose, "the strategists");
     assert_eq!(area.by, "tester");
 
-    // Nothing else exists: no config, no per-project store, no directory but the one the
-    // workspace store lives in.
+    // The coordination sidecar does not register a project or create a config file.
     assert!(!sb.paths.config_path.exists(), "no config file");
-    assert!(!sb.paths.config_path.parent().unwrap().exists());
+    assert!(
+        sb.paths
+            .config_path
+            .with_extension("toml.projects.lock")
+            .is_file()
+    );
     let made: Vec<String> = fs::read_dir(&sb.paths.store_dir)
         .unwrap()
         .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
@@ -1863,6 +1870,8 @@ fn a_project_summary_serializes_with_exactly_these_fields() {
     let project = ProjectSummary {
         slug: "ferroloop".into(),
         name: "FerroLoop".into(),
+        parent: None,
+        ancestors: vec![],
         kind: ProjectKind::Project,
         path: Some("/abs/root".into()),
         has_git: true,
@@ -1877,7 +1886,7 @@ fn a_project_summary_serializes_with_exactly_these_fields() {
     assert_eq!(
         serde_json::to_value(&project).unwrap(),
         json!({
-            "slug": "ferroloop", "name": "FerroLoop", "kind": "project", "path": "/abs/root",
+            "slug": "ferroloop", "name": "FerroLoop", "parent": null, "ancestors": [], "kind": "project", "path": "/abs/root",
             "has_git": true, "purpose": "p",
             "tracker": { "kind": "github", "repo": "owner/repo", "credential": "app" },
             "store_path": "/abs/ferroloop.fls", "active_agent_count": 5
@@ -1886,6 +1895,8 @@ fn a_project_summary_serializes_with_exactly_these_fields() {
     let group = ProjectSummary {
         slug: "council".into(),
         name: "Council".into(),
+        parent: None,
+        ancestors: vec![],
         kind: ProjectKind::Virtual,
         path: None,
         has_git: false,
@@ -1898,17 +1909,17 @@ fn a_project_summary_serializes_with_exactly_these_fields() {
     assert_eq!(
         value,
         json!({
-            "slug": "council", "name": "Council", "kind": "virtual", "path": null,
+            "slug": "council", "name": "Council", "parent": null, "ancestors": [], "kind": "virtual", "path": null,
             "has_git": false, "purpose": "p", "tracker": null, "store_path": null,
             "active_agent_count": 3
         })
     );
     // Null, not absent.
     let object = value.as_object().unwrap();
-    for key in ["path", "tracker", "store_path"] {
+    for key in ["parent", "path", "tracker", "store_path"] {
         assert!(object.contains_key(key), "{key} is present as null");
     }
-    assert_eq!(object.len(), 9);
+    assert_eq!(object.len(), 11);
 }
 
 // --- PATCH, as a flow -------------------------------------------------------------------------
@@ -1951,6 +1962,20 @@ fn an_update_changes_the_name_and_purpose_and_never_the_slug() {
         stamp
     );
     assert_eq!(sb.config(), config);
+}
+
+#[test]
+fn a_legacy_flat_name_with_a_slash_can_still_be_edited() {
+    let sb = Sandbox::new();
+    sb.virtual_group(&sb.vrequest("Council")).unwrap();
+    let mut req = change();
+    req.name = Some("The / Council".into());
+    let old = sb.update("council", &req).unwrap();
+    assert_eq!(old.name, "The / Council");
+    req.name = Some("The/Council".into());
+    let edited = sb.update("council", &req).unwrap();
+    assert_eq!(edited.name, "The/Council");
+    assert_eq!(edited.parent, None);
 }
 
 #[test]
@@ -2411,7 +2436,8 @@ fn get_lists_both_kinds_in_the_canonical_shape_with_the_artifact_fields() {
         body_of(&resp),
         json!({ "projects": [
             {
-                "id": "council", "slug": "council", "name": "Council", "kind": "virtual",
+                "id": "council", "slug": "council", "name": "Council", "parent": null, "ancestors": [], "kind": "virtual",
+                "parent": null, "ancestors": [],
                 "path": null, "has_git": false, "purpose": "p2", "tracker": null,
                 "store_path": null, "active_agent_count": 0,
                 "artifacts_dir": null, "default_artifacts_dir": null,
@@ -2419,6 +2445,7 @@ fn get_lists_both_kinds_in_the_canonical_shape_with_the_artifact_fields() {
             },
             {
                 "id": "ferroloop", "slug": "ferroloop", "name": "ferroloop", "kind": "project",
+                "parent": null, "ancestors": [],
                 "path": null, "has_git": false, "purpose": "", "tracker": null,
                 "store_path": null, "active_agent_count": 0,
                 "artifacts_dir": null,
@@ -2427,6 +2454,7 @@ fn get_lists_both_kinds_in_the_canonical_shape_with_the_artifact_fields() {
             },
             {
                 "id": "shape", "slug": "shape", "name": "Shape", "kind": "project",
+                "parent": null, "ancestors": [],
                 "path": root.display().to_string(), "has_git": false, "purpose": "p1",
                 "tracker": { "kind": "github", "repo": "acme/shape", "credential": "app" },
                 "store_path": hub.base.join("home/.local/share/fl/shape.fls").display().to_string(),
@@ -2487,7 +2515,7 @@ fn the_owner_creates_a_project_and_gets_its_summary() {
     assert_eq!(
         body_of(&resp),
         json!({
-            "id": "hubby", "slug": "hubby", "name": "Hubby", "kind": "project",
+            "id": "hubby", "slug": "hubby", "name": "Hubby", "parent": null, "ancestors": [], "kind": "project",
             "path": root.display().to_string(), "has_git": true, "purpose": "from the hub",
             "tracker": { "kind": "github", "repo": "acme/hubby", "credential": "env" },
             "store_path": hub.base.join("home/.local/share/fl/hubby.fls").display().to_string(),
@@ -2622,7 +2650,7 @@ fn a_virtual_group_is_made_by_kind_or_by_the_earlier_flag_and_writes_only_its_ar
     assert_eq!(
         body_of(&resp),
         json!({
-            "id": "council", "slug": "council", "name": "Council", "kind": "virtual",
+            "id": "council", "slug": "council", "name": "Council", "parent": null, "ancestors": [], "kind": "virtual",
             "path": null, "has_git": false, "purpose": "the seats", "tracker": null,
             "store_path": null, "active_agent_count": 0,
             "artifacts_dir": null, "default_artifacts_dir": null,
@@ -3355,4 +3383,201 @@ fn delete_refuses_an_unknown_field_and_a_bad_slug() {
     assert_eq!(resp.status, 400, "{}", text_of(&resp));
     assert_eq!(hub.delete(OWNER, "Not%20A%20Slug", None).status, 400);
     assert_ne!(hub.entry("p"), Value::Null);
+}
+
+#[test]
+fn nested_project_routes_agree_and_protect_parent_links() {
+    let hub = Hub::new();
+    let root = hub.work("real-project");
+    let directory = hub.post(OWNER, &json!({"name": "Kaggle", "path": root}));
+    assert_eq!(directory.status, 201, "{}", error_of(&directory));
+
+    let request = json!({
+        "name": "Kaggle / Pokémon / Audit / 結果",
+        "slug": "audit-results",
+        "kind": "virtual",
+        "create_parent": true
+    });
+    assert_eq!(hub.post(PEER, &request).status, 403);
+    assert!(
+        hub.workspace()
+            .get_area("kaggle-pokemon")
+            .unwrap()
+            .is_none()
+    );
+    let resp = hub.post(OWNER, &request);
+    assert_eq!(resp.status, 201, "{}", error_of(&resp));
+    assert_eq!(body_of(&resp)["name"], "Kaggle/Pokémon/Audit/結果");
+    assert_eq!(body_of(&resp)["parent"], "kaggle-pokemon-audit");
+    let expected = json!(["kaggle", "kaggle-pokemon", "kaggle-pokemon-audit"]);
+    assert_eq!(hub.entry("audit-results")["ancestors"], expected);
+    let roster = body_of(&hub.get("/api/v1/agents"));
+    let areas = roster["areas"].as_array().unwrap();
+    let child = areas
+        .iter()
+        .find(|a| a["area_key"] == "audit-results")
+        .unwrap();
+    assert_eq!(child["ancestors"], expected);
+    assert_eq!(child["parent"], "kaggle-pokemon-audit");
+    assert_eq!(hub.post(OWNER, &request).status, 200);
+    assert_eq!(
+        hub.patch(OWNER, "audit-results", &json!({"name": "Detached"}))
+            .status,
+        409
+    );
+    assert_eq!(
+        hub.patch(OWNER, "kaggle", &json!({"name": "Renamed"}))
+            .status,
+        409
+    );
+    let updated = hub.patch(OWNER, "audit-results", &json!({"purpose": "new purpose"}));
+    assert_eq!(updated.status, 200, "{}", error_of(&updated));
+    assert_eq!(body_of(&updated)["ancestors"], expected);
+    assert_eq!(
+        hub.delete(
+            OWNER,
+            "kaggle",
+            Some(&json!({"delete_dir": true, "delete_store": true}))
+        )
+        .status,
+        409
+    );
+    assert!(root.is_dir());
+    assert!(hub.data_file("kaggle.fls").is_file());
+    assert_eq!(hub.entry("audit-results")["ancestors"], expected);
+}
+
+#[test]
+fn nested_project_creation_preflights_names_and_slug_collisions() {
+    let hub = Hub::new();
+    let root = hub.work("must-not-exist");
+    for display in ["/Child", "Parent//Child", "A/B/C/D/E", "München/結果"] {
+        let rejected = hub.post(
+            OWNER,
+            &json!({
+                "name": display, "path": root, "create_parent": true
+            }),
+        );
+        assert_eq!(rejected.status, 400, "{display}: {}", error_of(&rejected));
+        assert!(!root.exists());
+    }
+
+    assert_eq!(
+        hub.post(
+            OWNER,
+            &json!({"kind": "virtual", "name": "Taken", "slug": "lab-a"})
+        )
+        .status,
+        201
+    );
+    let conflict = hub.post(
+        OWNER,
+        &json!({
+            "name": "Lab/A/Child", "path": root, "create_parent": true
+        }),
+    );
+    assert_eq!(conflict.status, 409, "{}", error_of(&conflict));
+    assert!(!root.exists());
+    assert!(hub.workspace().get_area("lab").unwrap().is_none());
+
+    for slug in ["one", "two"] {
+        assert_eq!(
+            hub.post(
+                OWNER,
+                &json!({
+                    "kind": "virtual", "name": "Ambiguous", "slug": slug
+                })
+            )
+            .status,
+            201
+        );
+    }
+    let ambiguous = hub.post(
+        OWNER,
+        &json!({
+            "name": "Ambiguous/Child", "path": root, "create_parent": true
+        }),
+    );
+    assert_eq!(ambiguous.status, 409, "{}", error_of(&ambiguous));
+    assert!(!root.exists());
+    assert!(
+        hub.workspace()
+            .get_area("ambiguous-child")
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn nested_readers_keep_legacy_and_malformed_areas_visible_as_roots() {
+    let hub = Hub::new();
+    let ws = hub.workspace();
+    for (key, name, parent) in [
+        ("old", "Legacy/History", None),
+        ("orphan", "Scope/Orphan", Some("missing")),
+        ("cycle-one", "Scope", Some("cycle-two")),
+        ("cycle-two", "Scope/Child", Some("cycle-one")),
+    ] {
+        ws.upsert_area(fl_core::agent::AreaRecord {
+            area_key: key.into(),
+            name: name.into(),
+            path: None,
+            parent: parent.map(str::to_string),
+            purpose: "existing".into(),
+            updated_at: fl_exec::stamp::now(),
+            by: "tester".into(),
+        })
+        .unwrap();
+    }
+    drop(ws);
+    let same = hub.post(
+        OWNER,
+        &json!({
+            "kind": "virtual", "name": "Legacy/History", "slug": "old"
+        }),
+    );
+    assert_eq!(same.status, 200, "{}", error_of(&same));
+    let roster = body_of(&hub.get("/api/v1/agents"));
+    for key in ["old", "orphan", "cycle-one", "cycle-two"] {
+        let entry = hub.entry(key);
+        assert_eq!(entry["slug"], key);
+        assert!(entry["parent"].is_null());
+        assert_eq!(entry["ancestors"], json!([]));
+        let row = roster["areas"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|area| area["area_key"] == key)
+            .unwrap();
+        assert!(row["parent"].is_null());
+        assert_eq!(row["ancestors"], json!([]));
+    }
+}
+
+#[test]
+fn nested_hub_honors_the_config_lock_but_list_does_not_create_it() {
+    let hub = Hub::new();
+    let config = hub.config();
+    let dir = config.parent().unwrap();
+    let lock = dir.join("config.toml.projects.lock");
+    assert_eq!(hub.get("/api/v1/projects").status, 200);
+    assert!(!lock.exists());
+    fs::create_dir_all(dir).unwrap();
+    let mut options = fs::OpenOptions::new();
+    options.read(true).write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let held = options.open(lock).unwrap();
+    held.try_lock().unwrap();
+    let root = hub.work("busy");
+    let request = json!({"name": "Kaggle/Pokémon", "path": root, "create_parent": true});
+    let rejected = hub.post(OWNER, &request);
+    assert_eq!(rejected.status, 409, "{}", error_of(&rejected));
+    assert!(error_of(&rejected).contains("busy"));
+    assert!(!root.exists());
+    drop(held);
+    assert_eq!(hub.post(OWNER, &request).status, 201);
 }

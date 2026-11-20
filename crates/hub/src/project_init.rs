@@ -26,12 +26,17 @@
 //! Nothing here reads `$HOME`, `$XDG_*` or any other environment variable: every path is an
 //! argument, so a test never reaches a real config or data directory.
 
+use std::collections::BTreeMap;
 use std::io::Write as _;
 use std::ops::Deref;
 use std::path::{Component, Path, PathBuf};
 use std::str::FromStr;
+#[cfg(test)]
 use std::sync::Mutex;
 
+use crate::project_config_lock;
+pub use crate::project_config_lock::ProjectConfigGuard;
+use crate::project_hierarchy::{display_path, matches_display_path, slug_from_project_name};
 use crate::project_list::{StoreHint, is_project_slug};
 use fl_core::agent::AreaRecord;
 use fl_core::routing::{Routes, RoutingMap, Tier};
@@ -62,9 +67,10 @@ pub const MAX_NAME_CHARS: usize = 80;
 /// Slugs a virtual group may not take: `@all` is everyone, and `fl` is the Hub's own store.
 const RESERVED_GROUP_SLUGS: [&str; 2] = ["all", "fl"];
 
-/// One change to the config or the registry at a time in this process: the config file is
-/// read, edited and replaced whole, so two at once would lose one edit.
-pub(crate) static CONFIG_LOCK: Mutex<()> = Mutex::new(());
+/// Take the project configuration guard before opening a store for a local area edit.
+pub fn lock_project_configuration(path: &Path) -> Result<ProjectConfigGuard, InitError> {
+    project_config_lock::acquire(path, true)
+}
 
 // Independent fixtures still contend on the process-wide production config lock. Keep their
 // lifetimes separate so a deliberate nonblocking delete tests its own contention scenario.
@@ -201,6 +207,8 @@ pub struct InitRequest {
     /// The name shown for the project (the area's name). Without it: the area's present name,
     /// else the slug.
     pub display_name: Option<String>,
+    /// Create missing ancestor groups.
+    pub create_parent: bool,
     /// `owner/repo`: bind the project's tracker to this GitHub repository.
     pub github: Option<String>,
     /// The tracker's credential source; `app` when `github` is given and this is not.
@@ -221,6 +229,8 @@ pub struct VirtualRequest {
     pub slug: Option<String>,
     /// The name shown for the group.
     pub display_name: String,
+    /// Create missing ancestor groups.
+    pub create_parent: bool,
     /// What the group is for; an existing group keeps its purpose when this is `None`.
     pub purpose: Option<String>,
     /// Who is creating.
@@ -245,6 +255,7 @@ pub struct Resolved {
     pub slug: String,
     /// The canonical root.
     pub root: PathBuf,
+    display_name: Option<String>,
     /// The project's store, as the config names it (an existing entry keeps its store).
     pub store: PathBuf,
     /// The tracker the project has, or will have, if any.
@@ -786,9 +797,7 @@ pub fn resolve(req: &InitRequest, paths: &InitPaths) -> Result<Resolved, InitErr
     if let Some(p) = &req.purpose {
         checked_purpose(p)?;
     }
-    if let Some(n) = &req.display_name {
-        checked_display_name(n)?;
-    }
+    let display_name = req.display_name.as_deref().map(display_path).transpose()?;
     let github = req.github.as_deref().map(checked_github).transpose()?;
     if github.is_none() && req.credential.is_some() {
         return Err(invalid(
@@ -799,10 +808,10 @@ pub fn resolve(req: &InitRequest, paths: &InitPaths) -> Result<Resolved, InitErr
     let doc = read_config(&paths.config_path)?;
     let entries = config_entries(&doc, &paths.config_path)?;
     let here = entries.iter().find(|e| same_root(&e.root, &root));
-    let slug = match (&req.slug, here, &req.display_name) {
+    let slug = match (&req.slug, here, &display_name) {
         (Some(s), _, _) => checked_slug(s)?,
         (None, Some(e), _) => checked_slug(&e.slug().unwrap_or_default())?,
-        (None, None, Some(n)) => slug_from_display(n)?,
+        (None, None, Some(n)) => slug_from_project_name(n)?,
         (None, None, None) => derive_slug(&root)?,
     };
     if let Some(e) = here
@@ -880,6 +889,7 @@ pub fn resolve(req: &InitRequest, paths: &InitPaths) -> Result<Resolved, InitErr
     Ok(Resolved {
         slug,
         root,
+        display_name,
         store,
         tracker,
         registers: here.is_none(),
@@ -1007,44 +1017,163 @@ fn check_area_not_repointed(ws: &AnyStore, r: &Resolved) -> Result<(), InitError
     }
 }
 
-/// Upserts the project's area in the workspace store (name, root as path, purpose). What the
-/// request does not name stays as the area has it. An area that is already right is left alone.
-/// Returns the area as it is.
-fn upsert_project_area(
-    ws: &AnyStore,
-    r: &Resolved,
-    req: &InitRequest,
-) -> Result<AreaRecord, InitError> {
-    let st = |e: fl_core::store::StoreError| failed(format!("workspace store: {e}"));
-    let existing = ws.get_area(&r.slug).map_err(st)?;
-    let name = match (&req.display_name, &existing) {
-        (Some(n), _) => checked_display_name(n)?,
-        (None, Some(a)) => a.name.clone(),
-        (None, None) => r.slug.clone(),
-    };
-    let purpose = match (&req.purpose, &existing) {
-        (Some(p), _) => checked_purpose(p)?,
-        (None, Some(a)) => a.purpose.clone(),
-        (None, None) => default_purpose(ProjectKind::Project, &r.slug),
-    };
-    let path = Some(r.root.to_string_lossy().into_owned());
-    if let Some(a) = &existing
-        && a.name == name
-        && a.purpose == purpose
-        && a.path == path
-    {
-        return Ok(a.clone());
+fn registry_areas(ws: &AnyStore) -> Result<BTreeMap<String, AreaRecord>, InitError> {
+    Ok(ws
+        .list_areas()
+        .map_err(workspace_error)?
+        .into_iter()
+        .map(|area| (area.area_key.clone(), area))
+        .collect())
+}
+
+fn workspace_error(error: fl_core::store::StoreError) -> InitError {
+    failed(format!("workspace store: {error}"))
+}
+
+/// A linked child or a parent with children can repeat its displayed name. A raw child
+/// edge still counts while registry sync has left its projected chain incomplete.
+pub(crate) fn project_name_changes(
+    area: &AreaRecord,
+    name: &str,
+    areas: impl IntoIterator<Item = impl std::borrow::Borrow<AreaRecord>>,
+) -> Result<bool, InitError> {
+    if name == area.name {
+        return Ok(false);
     }
-    ws.upsert_area(AreaRecord {
-        area_key: r.slug.clone(),
+    if area.parent.is_some()
+        || areas
+            .into_iter()
+            .any(|child| child.borrow().parent.as_deref() == Some(area.area_key.as_str()))
+    {
+        if display_path(name).is_ok_and(|name| matches_display_path(&area.name, &name)) {
+            return Ok(false);
+        }
+        return Err(conflict(format!(
+            "cannot rename linked project `{}`",
+            area.area_key
+        )));
+    }
+    Ok(true)
+}
+
+struct Placement {
+    name: String,
+    parent: Option<String>,
+    missing: Vec<AreaRecord>,
+}
+
+fn plan_placement(
+    slug: &str,
+    name: String,
+    create_parent: bool,
+    by: &str,
+    areas: &BTreeMap<String, AreaRecord>,
+    check_available_parent: impl Fn(&str) -> Result<(), InitError>,
+) -> Result<Placement, InitError> {
+    let mut parent: Option<String> = None;
+    let mut missing = Vec::new();
+    if let Some(area) = areas.get(slug) {
+        project_name_changes(area, &name, areas.values())?;
+        let name = if matches_display_path(&area.name, &name) {
+            area.name.clone()
+        } else if name.contains('/') {
+            return Err(conflict(format!(
+                "`{slug}` already exists as a top-level project. Choose another slug for `{name}`"
+            )));
+        } else {
+            name
+        };
+        // The suffix of an old top-level area's display name has no topology.
+        return Ok(Placement {
+            name,
+            parent: area.parent.clone(),
+            missing,
+        });
+    }
+
+    for (split, _) in name.match_indices('/') {
+        let prefix = &name[..split];
+        let mut matches = areas
+            .values()
+            .filter(|area| matches_display_path(&area.name, prefix));
+        let key = if let Some(area) = matches.next() {
+            if matches.next().is_some() {
+                return Err(conflict(format!("project parent `{prefix}` is ambiguous")));
+            }
+            if area.parent != parent {
+                return Err(conflict(format!(
+                    "project parent `{prefix}` has an incompatible parent chain"
+                )));
+            }
+            area.area_key.clone()
+        } else {
+            if !create_parent {
+                return Err(invalid(format!(
+                    "project parent `{prefix}` does not exist. Create it first or pass --create-parent"
+                )));
+            }
+            let key = slug_from_project_name(prefix).map_err(|_| {
+                invalid(format!(
+                    "cannot derive a slug for parent `{prefix}`. Create it first with --slug"
+                ))
+            })?;
+            if key == slug
+                || areas.contains_key(&key)
+                || missing.iter().any(|area: &AreaRecord| area.area_key == key)
+            {
+                return Err(conflict(format!(
+                    "the slug `{key}` for project parent `{prefix}` is already in use"
+                )));
+            }
+            check_available_parent(&key)?;
+            missing.push(AreaRecord {
+                area_key: key.clone(),
+                name: prefix.to_string(),
+                path: None,
+                parent,
+                purpose: default_purpose(ProjectKind::Virtual, &key),
+                updated_at: fl_exec::stamp::now(),
+                by: by.trim().to_string(),
+            });
+            key
+        };
+        parent = Some(key);
+    }
+    Ok(Placement {
         name,
-        path,
-        parent: None,
-        purpose,
-        updated_at: fl_exec::stamp::now(),
-        by: req.by.trim().to_string(),
+        parent,
+        missing,
     })
-    .map_err(st)
+}
+
+fn check_held_project(slug: &str, held: &[fl_core::model::Project]) -> Result<(), InitError> {
+    let hints: [StoreHint; 1] = [(crate::records::DEFAULT_PROJECT.to_string(), None)];
+    if is_project_slug(slug, &[], &hints, held) {
+        return Err(conflict(format!(
+            "`{slug}` is already a project, so it cannot also be a virtual group. Choose another slug"
+        )));
+    }
+    Ok(())
+}
+
+fn publish_area(
+    ws: &AnyStore,
+    area: AreaRecord,
+    missing: Vec<AreaRecord>,
+    existing: Option<&AreaRecord>,
+) -> Result<AreaRecord, InitError> {
+    if let Some(before) = existing
+        && before.name == area.name
+        && before.purpose == area.purpose
+        && before.path == area.path
+        && before.parent == area.parent
+    {
+        return Ok(before.clone());
+    }
+    for ancestor in missing {
+        ws.upsert_area(ancestor).map_err(workspace_error)?;
+    }
+    ws.upsert_area(area).map_err(workspace_error)
 }
 
 /// Writes the starter `.fl/mcp.toml` when the project has none. Whatever is there is left alone.
@@ -1079,11 +1208,39 @@ where
     P: Deref<Target = AnyStore>,
     W: Deref<Target = AnyStore>,
 {
-    let _one_at_a_time = CONFIG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _one_at_a_time = lock_project_configuration(&paths.config_path)?;
     let resolved = resolve(req, paths)?;
     let workspace_store = open_workspace()?;
     check_not_a_virtual_group(&workspace_store, &resolved)?;
     check_area_not_repointed(&workspace_store, &resolved)?;
+
+    let registry = registry_areas(&workspace_store)?;
+    let before = registry.get(&resolved.slug);
+    let name = resolved
+        .display_name
+        .clone()
+        .unwrap_or_else(|| before.map_or_else(|| resolved.slug.clone(), |area| area.name.clone()));
+    let placement = plan_placement(
+        &resolved.slug,
+        name,
+        req.create_parent,
+        &req.by,
+        &registry,
+        |parent| {
+            let doc = read_config(&paths.config_path)?;
+            let entries = config_entries(&doc, &paths.config_path)?;
+            check_virtual_slug(parent, paths, &entries)?;
+            check_held_project(
+                parent,
+                &workspace_store.list_projects().map_err(workspace_error)?,
+            )
+        },
+    )?;
+    let purpose = match (&req.purpose, before) {
+        (Some(purpose), _) => checked_purpose(purpose)?,
+        (None, Some(area)) => area.purpose.clone(),
+        (None, None) => default_purpose(ProjectKind::Project, &resolved.slug),
+    };
 
     std::fs::create_dir_all(&resolved.root)
         .map_err(|e| failed(format!("could not create {}: {e}", resolved.root.display())))?;
@@ -1103,7 +1260,16 @@ where
     }
     let project_store = open_project(&resolved)?;
     let (project, areas) = seed_project_store(&project_store, &resolved)?;
-    let area = upsert_project_area(&workspace_store, &resolved, req)?;
+    let area = AreaRecord {
+        area_key: resolved.slug.clone(),
+        name: placement.name,
+        path: Some(resolved.root.to_string_lossy().into_owned()),
+        parent: placement.parent,
+        purpose,
+        updated_at: fl_exec::stamp::now(),
+        by: req.by.trim().to_string(),
+    };
+    let area = publish_area(&workspace_store, area, placement.missing, before)?;
     drop(project_store);
     drop(workspace_store);
 
@@ -1126,9 +1292,9 @@ where
     })
 }
 
-/// Creates the virtual group `req` names: an area with no path in the workspace store, and
-/// nothing else. No directory, no store file, no config block and no git. A group that exists
-/// is kept; the request's name and purpose, when given, replace the group's.
+/// Creates the virtual group `req` names as an area with no path in the workspace store.
+/// Virtual groups have no project directory, store file, config block or Git repository.
+/// Repeats can update the group's purpose and, for a flat group, its display name.
 pub fn create_virtual<W>(
     req: &VirtualRequest,
     paths: &InitPaths,
@@ -1137,91 +1303,117 @@ pub fn create_virtual<W>(
 where
     W: Deref<Target = AnyStore>,
 {
-    let _one_at_a_time = CONFIG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _one_at_a_time = lock_project_configuration(&paths.config_path)?;
     if req.by.trim().is_empty() {
         return Err(invalid("`by` is empty"));
     }
-    let display = checked_display_name(&req.display_name)?;
-    let slug = match &req.slug {
-        Some(s) => checked_slug(s)?,
-        None => slug_from_display(&display)?,
+    let display = display_path(&req.display_name)?;
+    let purpose = req.purpose.as_deref().map(checked_purpose).transpose()?;
+    let doc = read_config(&paths.config_path)?;
+    let entries = config_entries(&doc, &paths.config_path)?;
+    let derived = req
+        .slug
+        .as_deref()
+        .map_or_else(|| slug_from_project_name(&display), checked_slug);
+    let legacy_slug = req
+        .slug
+        .is_none()
+        .then(|| slug_from_display(&req.display_name).ok())
+        .flatten()
+        .filter(|slug| derived.as_ref().ok() != Some(slug));
+    // The old ASCII-only derivation can have produced a different slug for this exact
+    // virtual area. A repeated command still names the original area in that case.
+    let derived = if legacy_slug.is_none() {
+        let slug = derived?;
+        check_virtual_slug(&slug, paths, &entries)?;
+        Ok(slug)
+    } else {
+        derived
     };
-    if RESERVED_GROUP_SLUGS.contains(&slug.as_str()) {
-        return Err(invalid(format!(
-            "`{slug}` cannot be a virtual group: `@all` is everyone and `fl` is the Hub's own \
-             store. Choose another slug"
+    let ws = open_workspace()?;
+    let registry = registry_areas(&ws)?;
+    let existing_legacy = legacy_slug.filter(|slug| {
+        registry.get(slug).is_some_and(|area| {
+            area.parent.is_none() && area.is_virtual() && matches_display_path(&area.name, &display)
+        })
+    });
+    let slug = existing_legacy.map_or(derived, Ok)?;
+    check_virtual_slug(&slug, paths, &entries)?;
+    let held = ws.list_projects().map_err(workspace_error)?;
+    check_held_project(&slug, &held)?;
+    let before = registry.get(&slug);
+    if let Some(path) = before.and_then(|area| area.path.as_deref()) {
+        return Err(conflict(format!(
+            "`{slug}` is already an area for the project at {path}, so it cannot also be a virtual group. Choose another slug"
         )));
     }
-    let purpose = req.purpose.as_deref().map(checked_purpose).transpose()?;
+    let placement = plan_placement(
+        &slug,
+        display,
+        req.create_parent,
+        &req.by,
+        &registry,
+        |parent| {
+            check_virtual_slug(parent, paths, &entries)?;
+            check_held_project(parent, &held)
+        },
+    )?;
+    let area = AreaRecord {
+        purpose: purpose.unwrap_or_else(|| {
+            before.map_or_else(
+                || default_purpose(ProjectKind::Virtual, &slug),
+                |area| area.purpose.clone(),
+            )
+        }),
+        area_key: slug,
+        name: placement.name,
+        path: None,
+        parent: placement.parent,
+        updated_at: fl_exec::stamp::now(),
+        by: req.by.trim().to_string(),
+    };
+    let saved = publish_area(&ws, area, placement.missing, before)?;
+    Ok(virtual_outcome(saved, before.is_none()))
+}
 
-    // A slug names one kind. A directory-backed project holds it in the config or as a store.
-    let doc = read_config(&paths.config_path)?;
-    if let Some(e) = config_entries(&doc, &paths.config_path)?
+fn check_virtual_slug(
+    slug: &str,
+    paths: &InitPaths,
+    entries: &[ConfigEntry],
+) -> Result<(), InitError> {
+    if RESERVED_GROUP_SLUGS.contains(&slug) {
+        return Err(invalid(format!(
+            "`{slug}` cannot be a virtual group: `@all` is everyone and `fl` is the Hub's own store. Choose another slug"
+        )));
+    }
+    if let Some(entry) = entries
         .iter()
-        .find(|e| e.slug().as_deref() == Some(slug.as_str()))
+        .find(|entry| entry.slug().as_deref() == Some(slug))
     {
         return Err(conflict(format!(
-            "`{slug}` is already a directory-backed project at {}, so it cannot also be a \
-             virtual group. Choose another slug",
-            e.root
+            "`{slug}` is already a directory-backed project at {}, so it cannot also be a virtual group. Choose another slug",
+            entry.root
         )));
     }
     for ext in ["fls", "redb"] {
         let store = paths.store_dir.join(format!("{slug}.{ext}"));
-        if std::fs::symlink_metadata(&store).is_ok() {
-            return Err(conflict(format!(
-                "`{slug}` is already a project: its store {} exists. Choose another slug",
-                store.display()
-            )));
+        match std::fs::symlink_metadata(&store) {
+            Ok(_) => {
+                return Err(conflict(format!(
+                    "`{slug}` is already a project: its store {} exists. Choose another slug",
+                    store.display()
+                )));
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(failed(format!(
+                    "could not check {}: {err}",
+                    store.display()
+                )));
+            }
         }
     }
-
-    let st = |e: fl_core::store::StoreError| failed(format!("workspace store: {e}"));
-    let ws = open_workspace()?;
-    // A slug the project list shows as a project (the default project, one the workspace store
-    // holds a row for) is not a group, whatever its area says.
-    let entries = config_entries(&doc, &paths.config_path)?;
-    let hints: [StoreHint; 1] = [(crate::records::DEFAULT_PROJECT.to_string(), None)];
-    if is_project_slug(&slug, &entries, &hints, &ws.list_projects().map_err(st)?) {
-        return Err(conflict(format!(
-            "`{slug}` is already a project, so it cannot also be a virtual group. Choose \
-             another slug"
-        )));
-    }
-    let existing = ws.get_area(&slug).map_err(st)?;
-    if let Some(a) = &existing
-        && let Some(path) = &a.path
-    {
-        return Err(conflict(format!(
-            "`{slug}` is already an area for the project at {path}, so it cannot also be a \
-             virtual group. Choose another slug"
-        )));
-    }
-    let name = display;
-    let purpose = match (&purpose, &existing) {
-        (Some(p), _) => p.clone(),
-        (None, Some(a)) => a.purpose.clone(),
-        (None, None) => default_purpose(ProjectKind::Virtual, &slug),
-    };
-    if let Some(a) = &existing
-        && a.name == name
-        && a.purpose == purpose
-    {
-        return Ok(virtual_outcome(a.clone(), false));
-    }
-    let registered = existing.is_none();
-    let saved = ws
-        .upsert_area(AreaRecord {
-            area_key: slug,
-            name,
-            path: None,
-            parent: None,
-            purpose,
-            updated_at: fl_exec::stamp::now(),
-            by: req.by.trim().to_string(),
-        })
-        .map_err(st)?;
-    Ok(virtual_outcome(saved, registered))
+    Ok(())
 }
 
 fn virtual_outcome(area: AreaRecord, registered: bool) -> InitOutcome {

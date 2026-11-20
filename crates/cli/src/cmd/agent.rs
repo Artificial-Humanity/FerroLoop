@@ -653,8 +653,27 @@ pub fn run<S: AgentRegistry + Handles + StateStore + Catalog + fl_core::MessageS
                 by,
                 json,
             } => {
-                let rec = AreaRecord::new(&name, path, &purpose, now_at(), &by)
+                let mut rec = AreaRecord::new(&name, path, &purpose, now_at(), &by)
                     .map_err(|e| (1, e.to_string()))?;
+                let st = |e: fl_core::store::StoreError| (1, e.to_string());
+                if let Some(before) = store.get_area(&rec.area_key).map_err(st)?
+                    && (before.parent.is_some()
+                        || store
+                            .list_areas()
+                            .map_err(st)?
+                            .iter()
+                            .any(|area| area.parent.as_deref() == Some(rec.area_key.as_str())))
+                {
+                    if rec.path.is_some() && rec.path != before.path {
+                        return Err((
+                            1,
+                            format!("cannot repoint linked project `{}`", rec.area_key),
+                        ));
+                    }
+                    rec.name = before.name;
+                    rec.path = before.path;
+                    rec.parent = before.parent;
+                }
                 let saved = store.upsert_area(rec).map_err(|e| (1, e.to_string()))?;
                 if json {
                     println!("{}", serde_json::to_string_pretty(&saved).unwrap());

@@ -27,11 +27,12 @@ use fl_store::AnyStore;
 use serde::Serialize;
 use toml_edit::{DocumentMut, Item, Table, value};
 
+use crate::project_hierarchy::ancestors;
 use crate::project_init::{
-    CONFIG_LOCK, ConfigEntry, Credential, InitError, InitPaths, ProjectKind, Tracker,
-    canonical_root, check_store_dir_overlap, checked_display_name, checked_github, checked_purpose,
-    config_entries, conflict, default_purpose, failed, has_git, invalid, read_config, same_root,
-    slug_from_display, write_atomic,
+    ConfigEntry, Credential, InitError, InitPaths, ProjectKind, Tracker, canonical_root,
+    check_store_dir_overlap, checked_display_name, checked_github, checked_purpose, config_entries,
+    conflict, default_purpose, failed, has_git, invalid, lock_project_configuration,
+    project_name_changes, read_config, same_root, slug_from_display, write_atomic,
 };
 
 /// One project as the list shows it. It serializes with every field present; an absent value
@@ -42,6 +43,10 @@ pub struct ProjectSummary {
     pub slug: String,
     /// The name shown for the project (its area's name).
     pub name: String,
+    /// The verified immediate parent (null for a top-level project).
+    pub parent: Option<String>,
+    /// Verified ancestor slugs in root-to-parent order.
+    pub ancestors: Vec<String>,
     pub kind: ProjectKind,
     /// The project root; `null` for a virtual group.
     pub path: Option<String>,
@@ -186,7 +191,10 @@ pub fn list_projects<R: AgentRegistry + ?Sized>(
     };
     let make = |slug: &str, kind, path: Option<&str>, tracker, store: Option<String>| {
         let area = areas.get(slug);
+        let ancestors = area.and_then(|a| ancestors(&areas, a)).unwrap_or_default();
         ProjectSummary {
+            parent: ancestors.last().cloned(),
+            ancestors,
             slug: slug.to_string(),
             name: area.map_or_else(|| slug.to_string(), |a| a.name.clone()),
             kind,
@@ -410,7 +418,7 @@ where
     P: Deref<Target = AnyStore>,
     W: Deref<Target = AnyStore>,
 {
-    let _one_at_a_time = CONFIG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _one_at_a_time = lock_project_configuration(&paths.config_path)?;
     if req.is_empty() {
         return Err(invalid(
             "nothing to change: pass `name`, `purpose`, `path`, `github` or `credential`",
@@ -454,7 +462,10 @@ where
         updated_at: fl_exec::stamp::now(),
         by: req.by.trim().to_string(),
     });
-    if let Some(n) = &name {
+    if let Some(n) = &name
+        && *n != area.name
+        && project_name_changes(&area, n, ws.list_areas().map_err(st)?)?
+    {
         area.name = n.clone();
     }
     if let Some(p) = &purpose {

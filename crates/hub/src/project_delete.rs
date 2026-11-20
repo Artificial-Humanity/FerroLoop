@@ -30,10 +30,10 @@ use serde::{Deserialize, Serialize};
 use toml_edit::DocumentMut;
 
 use crate::lifecycle::{self, LifecycleEnv, SessionTarget};
+use crate::project_config_lock;
 use crate::project_init::{
-    CONFIG_LOCK, ConfigEntry, InitError, InitPaths, ProjectKind, checked_slug, config_entries,
-    conflict, default_purpose, failed, invalid, read_config, remove_blocks, same_root,
-    write_atomic,
+    ConfigEntry, InitError, InitPaths, ProjectKind, checked_slug, config_entries, conflict,
+    default_purpose, failed, invalid, read_config, remove_blocks, same_root, write_atomic,
 };
 use crate::project_list::{ProjectSummary, StoreHint, agent_in_project, held_slug, list_projects};
 
@@ -683,7 +683,7 @@ where
     W: Deref<Target = AnyStore>,
 {
     if !req.decommission_agents && req.reassign_to.is_none() {
-        let _one_at_a_time = CONFIG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _one_at_a_time = project_config_lock::acquire(&ctx.paths.config_path, true)?;
         return delete_project_fenced(slug, req, by, ctx, env_home, open_workspace, clear_queue);
     }
     // Candidate reads only: drop the workspace guard before any lifecycle file/local fence.
@@ -699,16 +699,11 @@ where
             .collect::<Vec<_>>()
     };
     lifecycle::with_lifecycle_fences(ctx.lifecycle, &personas, "project-delete", |env| {
-        // Configuration is part of this explicit transaction: take its local mutex
-        // after every file fence, without queueing behind another transaction.
-        let _config = match CONFIG_LOCK.try_lock() {
+        // Take the configuration guard after every persona fence without queueing
+        // behind another project mutation.
+        let _config = match project_config_lock::acquire(&ctx.paths.config_path, false) {
             Ok(guard) => guard,
-            Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
-            Err(std::sync::TryLockError::WouldBlock) => {
-                return Err(lifecycle::LifecycleError::Conflict(
-                    "project configuration is busy; retry".into(),
-                ));
-            }
+            Err(err) => return Ok(Err(err.into())),
         };
         let ctx = DeleteContext {
             lifecycle: env,
@@ -760,6 +755,18 @@ where
     let Some(current) = listed.iter().find(|p| p.slug == slug) else {
         return Err(InitError::NotFound(format!("no project `{slug}`")).into());
     };
+    if let Some(child) = ws
+        .list_areas()
+        .map_err(st)?
+        .into_iter()
+        .find(|child| child.parent.as_deref() == Some(slug.as_str()))
+    {
+        return Err(conflict(format!(
+            "cannot delete project `{slug}`: it has child `{}`",
+            child.area_key
+        ))
+        .into());
+    }
     if current.kind == ProjectKind::Virtual && (req.delete_store || req.delete_dir) {
         return Err(invalid(
             "a virtual group has no store and no directory: `delete_store` and `delete_dir` \

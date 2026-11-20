@@ -16,7 +16,7 @@ pub enum Cmd {
     /// Register a project directory. The directory need not be a Git repository.
     Add { path: String },
     /// List directory-backed projects and virtual groups: kind, slug, path, tracker and the
-    /// number of active agents.
+    /// number of active agents and display name.
     List {
         /// Print the projects as JSON.
         #[arg(long)]
@@ -77,18 +77,20 @@ pub struct CreateArgs {
     /// With `--path` or `--virtual`: the project's name, as shown (`"My Project"`); its slug is
     /// the name in lowercase kebab-case unless `--slug` says. Without either: the project root
     /// (the `init <path>` form), made if it does not exist.
-    target: String,
+    target: Option<String>,
     /// The project root, an existing or new directory. It need not be a Git repository.
     #[arg(long, conflicts_with = "virtual_group")]
     path: Option<String>,
     /// Make a virtual group: an area with no path. No directory, store, config block or git.
     #[arg(long = "virtual", conflicts_with_all = ["path", "git_init", "github", "credential"])]
     virtual_group: bool,
-    /// The project's name, as shown, in the `init <path>` form. Its slug is the name in
-    /// lowercase kebab-case: lowercase letters, digits, `-` and `_`, starting with a letter.
-    /// Without it, the root's lowercase directory name.
-    #[arg(long, conflicts_with_all = ["path", "virtual_group"])]
+    /// The name shown for the project or group. Use '/' to separate nested project names.
+    /// Without it, use the positional name or the root's lowercase directory name.
+    #[arg(long)]
     name: Option<String>,
+    /// Create any missing ancestors as virtual groups.
+    #[arg(long)]
+    create_parent: bool,
     /// The project's slug, when it is not the kebab-case of its name.
     #[arg(long)]
     slug: Option<String>,
@@ -252,24 +254,25 @@ pub fn create(
 ) -> Result<i32> {
     let paths = places(cfg, cwd, explicit_db, default_store)?;
     let by = args.by.clone().unwrap_or_else(|| "fl".to_string());
-    let outcome = if args.virtual_group {
-        let request = VirtualRequest {
-            slug: args.slug.clone(),
-            display_name: args.target.clone(),
-            purpose: args.purpose.clone(),
-            by,
+    let (path, display_name) = if args.virtual_group || args.path.is_some() {
+        let name = match (args.target, args.name) {
+            (Some(name), None) | (None, Some(name)) => name,
+            (Some(_), Some(_)) => bail!("pass the project name once, positionally or with --name"),
+            (None, None) => bail!("pass a project name positionally or with --name"),
         };
-        project_init::create_virtual(&request, &paths, || open_workspace(&paths.workspace_store))
+        (args.path, Some(name))
     } else {
-        // With `--path` the argument is the name; without, it is the root (the `init` form).
-        let (path, display_name) = match &args.path {
-            Some(path) => (path.clone(), Some(args.target.clone())),
-            None => (args.target.clone(), args.name.clone()),
-        };
+        let path = args
+            .target
+            .context("pass a project directory or use --path")?;
+        (Some(path), args.name)
+    };
+    let outcome = if let Some(path) = path {
         let request = InitRequest {
             path: absolute(cwd, &path)?,
             slug: args.slug.clone(),
             display_name,
+            create_parent: args.create_parent,
             github: args.github.clone(),
             credential: args.credential,
             purpose: args.purpose.clone(),
@@ -286,6 +289,15 @@ pub fn create(
                     .map_err(|e| open_err("store", &r.store, &e))
             },
         )
+    } else {
+        let request = VirtualRequest {
+            slug: args.slug,
+            display_name: display_name.expect("virtual creation needs a name"),
+            create_parent: args.create_parent,
+            purpose: args.purpose,
+            by,
+        };
+        project_init::create_virtual(&request, &paths, || open_workspace(&paths.workspace_store))
     }
     .map_err(|e| anyhow::anyhow!("{e}"))?;
     if let Some(git) = &outcome.git {
@@ -400,12 +412,13 @@ pub fn list(
     } else {
         for p in projects {
             println!(
-                "{}\t{}\t{}\t{}\t{}",
+                "{}\t{}\t{}\t{}\t{}\t{}",
                 p.kind.as_str(),
                 p.slug,
                 p.path.as_deref().unwrap_or("-"),
                 p.tracker.as_ref().map_or("-", |t| t.github.as_str()),
-                p.active_agent_count
+                p.active_agent_count,
+                p.name
             );
         }
     }

@@ -166,6 +166,8 @@ struct CreateProjectBody {
     name: Option<String>,
     slug: Option<String>,
     kind: Option<String>,
+    #[serde(default)]
+    create_parent: bool,
     path: Option<String>,
     purpose: Option<String>,
     git_init: Option<bool>,
@@ -227,6 +229,7 @@ pub(crate) fn handle_post_projects(
             let request = VirtualRequest {
                 slug,
                 display_name,
+                create_parent: body.create_parent,
                 purpose,
                 by,
             };
@@ -248,6 +251,7 @@ pub(crate) fn handle_post_projects(
                 path,
                 slug,
                 display_name: name,
+                create_parent: body.create_parent,
                 github: present(body.github),
                 credential,
                 purpose,
