@@ -86,7 +86,7 @@ pub(super) fn refuse_reserved(collection: &str, what: &str) -> Result<(), StoreE
     Ok(())
 }
 /// `(SCHEMA_COLLECTION, SCHEMA_KEY)` holds the schema version: the same ladder
-/// as `RedbStore` (`FORMAT_VERSION` … `FORMAT_WITH_AREA_DELETE`).
+/// as `RedbStore` (`FORMAT_VERSION` … `FORMAT_WITH_AREA_PARENT`).
 pub(super) const SCHEMA_KEY: &str = "schema_version";
 /// redb's key for the schema version in `meta`. A FerroStore written before
 /// `__meta` existed may hold it in the `meta` collection.

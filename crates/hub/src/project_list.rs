@@ -445,6 +445,7 @@ where
         area_key: slug.to_string(),
         name: current.name.clone(),
         path: current.path.clone(),
+        parent: None,
         purpose: if current.purpose.is_empty() {
             default_purpose(current.kind, slug)
         } else {

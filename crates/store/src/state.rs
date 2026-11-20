@@ -19,8 +19,9 @@ use fl_core::store::{AgentRegistry, StateStore, StoreError};
 use redb::{ReadableTable, TableDefinition};
 
 use crate::{
-    ALIASES, FORMAT_WITH_AREA_DELETE, FORMAT_WITH_STATE, HANDLE_OF, HANDLES, IDS, META, RedbStore,
-    additive, backend, decode, index_new, locate_in, mint, raise_format,
+    ALIASES, FORMAT_WITH_AREA_DELETE, FORMAT_WITH_AREA_PARENT, FORMAT_WITH_STATE, HANDLE_OF,
+    HANDLES, IDS, META, RedbStore, additive, backend, decode, index_new, locate_in, mint,
+    raise_format,
 };
 
 pub(crate) const STATE_ENTRIES: TableDefinition<&str, &str> = TableDefinition::new("state_entries");
@@ -576,7 +577,12 @@ impl AgentRegistry for RedbStore {
             .normalized()
             .map_err(|e| StoreError::InvalidState(e.to_string()))?;
         let tx = self.db.begin_write().map_err(backend)?;
-        raise_format(&tx, FORMAT_WITH_STATE)?;
+        let format = if normalized.parent.is_some() {
+            FORMAT_WITH_AREA_PARENT
+        } else {
+            FORMAT_WITH_STATE
+        };
+        raise_format(&tx, format)?;
         let ev = RegistryEvent {
             event_id: mint()?,
             at: normalized.updated_at.clone(),
@@ -676,6 +682,7 @@ impl AgentRegistry for RedbStore {
                             area_key: area_key.clone(),
                             name: area_key.clone(),
                             path: None,
+                            parent: None,
                             purpose: format!("Registered area {area_key}"),
                             updated_at: args.at.clone(),
                             by: args.by.clone(),
@@ -972,6 +979,9 @@ impl AgentRegistry for RedbStore {
                     let norm = area
                         .normalized()
                         .map_err(|e| StoreError::InvalidState(e.to_string()))?;
+                    if norm.parent.is_some() {
+                        raise_format(&tx, FORMAT_WITH_AREA_PARENT)?;
+                    }
                     let json = serde_json::to_string(&norm).map_err(backend)?;
                     tx.open_table(AREAS)
                         .map_err(backend)?

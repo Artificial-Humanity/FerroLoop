@@ -639,6 +639,7 @@ fn it_refuses_when_the_registered_path_no_longer_matches() {
             area_key: "alpha".into(),
             name: "alpha".into(),
             path: Some(moved.display().to_string()),
+            parent: None,
             purpose: "p".into(),
             updated_at: At::from_unix_millis(9),
             by: "tester".into(),

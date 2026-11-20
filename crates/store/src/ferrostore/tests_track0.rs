@@ -3,7 +3,10 @@
 
 use super::layout::{self, FORMAT_V1, FORMAT_V2, SLOT_LEN, SlotRead, Superblock};
 use super::{FerroStore, FerroStoreServer, latest_superblock};
-use crate::{FORMAT_VERSION, FORMAT_WITH_AREA_DELETE, FORMAT_WITH_ROUTING, FORMAT_WITH_WORKFLOW};
+use crate::{
+    FORMAT_VERSION, FORMAT_WITH_AREA_DELETE, FORMAT_WITH_AREA_PARENT, FORMAT_WITH_ROUTING,
+    FORMAT_WITH_WORKFLOW,
+};
 use fl_core::StoreError;
 use serde_json::json;
 use std::fs::{File, OpenOptions};
@@ -376,6 +379,7 @@ fn area(key: &str) -> fl_core::agent::AreaRecord {
         area_key: key.into(),
         name: key.into(),
         path: None,
+        parent: None,
         purpose: "p".into(),
         updated_at: fl_core::At::from_unix_millis(1),
         by: "tester".into(),
@@ -453,7 +457,7 @@ fn a_schema_newer_than_this_build_is_refused() {
             .put_doc_unchecked(
                 "__meta",
                 "schema_version",
-                &json!(FORMAT_WITH_AREA_DELETE + 1),
+                &json!(FORMAT_WITH_AREA_PARENT + 1),
                 false,
             )
             .unwrap();
@@ -465,8 +469,8 @@ fn a_schema_newer_than_this_build_is_refused() {
     assert!(
         matches!(
             err,
-            StoreError::FormatVersion { found: Some(v), oldest: FORMAT_VERSION, newest: FORMAT_WITH_AREA_DELETE }
-                if v == FORMAT_WITH_AREA_DELETE + 1
+            StoreError::FormatVersion { found: Some(v), oldest: FORMAT_VERSION, newest: FORMAT_WITH_AREA_PARENT }
+                if v == FORMAT_WITH_AREA_PARENT + 1
         ),
         "{err:?}"
     );
@@ -661,7 +665,7 @@ fn ensure_superblock_says_when_it_initialized_the_file() {
 mod reserved {
     use super::super::{DocState, FerroStore, Inner, Op, SyncAdapter, SyncBatch, SyncMode, SyncOp};
     use crate::{
-        FORMAT_VERSION, FORMAT_WITH_AREA_DELETE, FORMAT_WITH_ROUTING, FORMAT_WITH_STATE,
+        FORMAT_VERSION, FORMAT_WITH_AREA_PARENT, FORMAT_WITH_ROUTING, FORMAT_WITH_STATE,
         FORMAT_WITH_WORKFLOW,
     };
     use fl_core::StoreError;
@@ -929,7 +933,7 @@ mod reserved {
     #[test]
     fn an_inbound_schema_newer_than_this_build_is_refused() {
         let (store, recorder) = attached(FerroStore::in_memory(), SyncMode::WriteBehind);
-        let newer = FORMAT_WITH_AREA_DELETE + 1;
+        let newer = FORMAT_WITH_AREA_PARENT + 1;
         pulled(
             &recorder,
             vec![
@@ -944,7 +948,7 @@ mod reserved {
             assert!(
                 matches!(
                     err,
-                    StoreError::FormatVersion { found: Some(v), oldest: FORMAT_VERSION, newest: FORMAT_WITH_AREA_DELETE }
+                    StoreError::FormatVersion { found: Some(v), oldest: FORMAT_VERSION, newest: FORMAT_WITH_AREA_PARENT }
                         if v == newer
                 ),
                 "{err:?}"

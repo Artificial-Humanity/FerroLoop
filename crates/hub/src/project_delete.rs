@@ -887,6 +887,7 @@ where
                 area_key: t.slug.clone(),
                 name: t.name.clone(),
                 path: t.path.clone(),
+                parent: None,
                 purpose: if t.purpose.is_empty() {
                     default_purpose(ProjectKind::Project, &t.slug)
                 } else {

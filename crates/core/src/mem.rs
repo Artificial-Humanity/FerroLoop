@@ -1284,6 +1284,7 @@ impl AgentRegistry for MemStore {
                         area_key: area_key.clone(),
                         name: area_key.clone(),
                         path: None,
+                        parent: None,
                         purpose: format!("Registered area {area_key}"),
                         updated_at: args.at.clone(),
                         by: args.by.clone(),
