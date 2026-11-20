@@ -3622,6 +3622,53 @@ fn legacy_project_retry_preserves_an_unbound_old_slug_and_its_existing_store() {
 }
 
 #[test]
+fn legacy_project_retry_requires_an_explicit_slug_when_only_the_old_store_exists() {
+    let sb = Sandbox::new();
+    sb.virtual_group(&sb.vrequest("Kaggle")).unwrap();
+    let root = sb.dir("existing-work");
+    fs::create_dir_all(&root).unwrap();
+    let old_slug = "kaggle-pok-mon";
+    let old_path = sb.paths.store_dir.join("kaggle-pok-mon.fls");
+    let new_path = sb.paths.store_dir.join("kaggle-pokemon.fls");
+    // The old init wrote the project row but stopped before publishing its area or config.
+    let old_store = Sandbox::open_project(&old_path).unwrap();
+    let original = old_store.add_project(root.to_str().unwrap()).unwrap();
+    drop(old_store);
+    let old_bytes = fs::read(&old_path).unwrap();
+    let registry = sb.workspace().list_areas().unwrap();
+    assert!(!sb.paths.config_path.exists());
+    assert_eq!(registry.len(), 1);
+
+    let mut request = sb.request(&root);
+    request.display_name = Some("Kaggle/Pokémon".into());
+    let refusal = conflict(sb.init(&request));
+    assert!(refusal.contains("--slug kaggle-pok-mon"), "{refusal}");
+    assert!(refusal.contains("--slug kaggle-pokemon"), "{refusal}");
+    assert!(!root.join(".git").exists());
+    assert!(!root.join(".fl").exists());
+    assert!(!new_path.exists());
+    assert!(!sb.paths.config_path.exists());
+    assert_eq!(sb.workspace().list_areas().unwrap(), registry);
+    assert_eq!(fs::read(&old_path).unwrap(), old_bytes);
+
+    request.slug = Some(old_slug.into());
+    request.git_init = false;
+    let mut wrong_root = request.clone();
+    wrong_root.path = sb.dir("wrong-work");
+    assert!(conflict(sb.init(&wrong_root)).contains("already holds"));
+    assert_eq!(sb.workspace().list_areas().unwrap(), registry);
+    assert!(!sb.paths.config_path.exists());
+    assert!(!new_path.exists());
+
+    let resumed = sb.init(&request).unwrap();
+    assert_eq!(resumed.slug, old_slug);
+    assert_eq!(resumed.project.as_deref(), Some(original.iri().as_str()));
+    assert_eq!(resumed.store.as_deref(), old_path.to_str());
+    assert_eq!(sb.blocks().len(), 1);
+    assert!(!new_path.exists());
+}
+
+#[test]
 fn legacy_project_retry_preserves_flat_virtual_groups_by_explicit_or_old_derived_slug() {
     let sb = Sandbox::new();
     let ws = sb.workspace();

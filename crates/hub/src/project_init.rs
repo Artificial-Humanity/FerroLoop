@@ -1087,6 +1087,10 @@ impl<W: Deref<Target = AnyStore>, F: FnOnce() -> Result<W, InitError>> InitWorks
             .filter(|area| area.parent.is_none() && area.name == name))
     }
 
+    fn cached_area(&self, slug: &str) -> Option<&AreaRecord> {
+        self.opened.as_ref()?.1.get(slug)
+    }
+
     fn read_registry(&mut self) -> Result<(W, BTreeMap<String, AreaRecord>), InitError> {
         let store = self.opener.take().expect("workspace opened once")()?;
         let areas = registry_areas(&store)?;
@@ -1287,6 +1291,29 @@ where
             .and_then(|area| area.path.as_deref())
             .is_some_and(|path| !path.trim().is_empty() && same_root(path, root)))
     })?;
+    // An old initializer can leave its store before publishing the area or binding. With
+    // no directory record anchoring that store to another root, require an explicit choice.
+    if resolved.registers
+        && req.slug.is_none()
+        && let Some(name) = req.display_name.as_deref()
+        && let Ok(legacy_slug) = slug_from_display(name)
+        && legacy_slug != resolved.slug
+    {
+        let legacy_root = workspace
+            .cached_area(&legacy_slug)
+            .and_then(|area| area.path.as_deref());
+        let legacy_store = paths.store_dir.join(format!("{legacy_slug}.fls"));
+        if legacy_root.is_none_or(|path| path.trim().is_empty() || same_root(path, &resolved.root))
+            && fl_store::store_exists(&legacy_store)
+        {
+            return Err(conflict(format!(
+                "the historical store {} may be from an interrupted project setup. Use \
+                 --slug {legacy_slug} to resume it, or --slug {} to create a separate project",
+                legacy_store.display(),
+                resolved.slug
+            )));
+        }
+    }
     let (workspace_store, registry) = workspace.open()?;
     let before = registry.get(&resolved.slug);
     check_area_for_project(before, &resolved)?;
