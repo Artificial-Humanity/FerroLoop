@@ -1100,10 +1100,9 @@ fn check_resume_store(resolved: &Resolved) -> Result<(), InitError> {
     } else {
         &physical
     };
-    // The ordinary Ferro open can initialize a zero-byte file.
     let metadata =
         std::fs::metadata(path).map_err(|e| failed(format!("store {}: {e}", path.display())))?;
-    if metadata.is_file() && metadata.len() == 0 {
+    if !metadata.is_file() || metadata.len() == 0 {
         return Err(resume_store_refusal(resolved));
     }
     let projects = if backend == fl_store::BackendKind::Redb || lone_redb {
@@ -1112,9 +1111,7 @@ fn check_resume_store(resolved: &Resolved) -> Result<(), InitError> {
             .map_err(|e| failed(format!("store {}: {e}", resolved.store.display())))?;
         read_redb_projects(path)?
     } else {
-        // Open the selected .fls by name so this read cannot fall back to redb.
-        let store = fl_store::open_store_for_scan(path).map_err(error)?;
-        store.list_projects().map_err(error)?
+        fl_store::FerroStore::list_existing_projects(path).map_err(error)?
     };
     match projects.as_slice() {
         [project] if same_root(&project.root, &resolved.root) => Ok(()),

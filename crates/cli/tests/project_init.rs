@@ -1127,6 +1127,59 @@ fn resume_flat_refuses_missing_empty_and_wrong_root_stores_before_project_change
 }
 
 #[test]
+fn resume_flat_leaves_a_partially_initialized_ferro_store_untouched() {
+    use std::time::{Duration, SystemTime};
+
+    let env = Env::new();
+    let root = env.dir("requested");
+    let store = env.home.path().join("data/fl/historical.fls");
+    let dir = store.parent().unwrap();
+    std::fs::create_dir_all(dir).unwrap();
+    let partial_header = [0u8; 64];
+    std::fs::write(&store, partial_header).unwrap();
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&store)
+        .unwrap()
+        .set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000))
+        .unwrap();
+    let modified = std::fs::metadata(&store).unwrap().modified().unwrap();
+
+    env.fl(env.work.path())
+        .args([
+            "project",
+            "create",
+            "--resume-flat",
+            "--name",
+            "Archive/Old",
+            "--slug",
+            "historical",
+            "--git-init",
+            "--path",
+        ])
+        .arg(&root)
+        .assert()
+        .failure();
+    assert_eq!(
+        std::fs::metadata(&store).unwrap().len(),
+        partial_header.len() as u64,
+        "flat recovery initialized the incomplete store"
+    );
+    assert_eq!(std::fs::read(&store).unwrap(), partial_header);
+    assert_eq!(
+        std::fs::metadata(&store).unwrap().modified().unwrap(),
+        modified
+    );
+    let files: Vec<_> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    assert_eq!(files, [store]);
+    assert!(!root.exists());
+    assert!(!env.config_path().exists());
+}
+
+#[test]
 fn resume_flat_refuses_a_wrong_root_with_forced_redb() {
     assert_resume_redb_refusal(true, false);
 }
