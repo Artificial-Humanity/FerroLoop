@@ -188,6 +188,34 @@ describe("RosterSidebar", () => {
     expect(badge("lab")).toHaveAttribute("data-severity", "important");
   });
 
+  it("leaves agents with ambiguous legacy project labels visible outside the exact projects", () => {
+    window.localStorage.setItem(PINNED_PROJECTS_STORAGE_KEY, JSON.stringify(["shared research"]));
+    window.localStorage.setItem(PINNED_PROJECT_OVERRIDES_KEY, JSON.stringify({ first: true }));
+    render(nestedRoster(
+      [nestedProject("first", "Shared Research"), nestedProject("second", "Shared Research")],
+      [
+        nestedAgent("primary-first", "FIRST", ["Shared Research"]),
+        nestedAgent("primary-second", "second"),
+        nestedAgent("legacy", "Shared Research"),
+      ],
+    ));
+
+    const sections = screen.getAllByTestId("project-group-shared research");
+    const first = sections.find(section => within(section).queryByTestId("agent-row-primary-first"))!;
+    const second = sections.find(section => within(section).queryByTestId("agent-row-primary-second"))!;
+    const legacy = screen.getByTestId("agent-row-legacy");
+    expect(legacy).toBeVisible();
+    expect(first).not.toContainElement(legacy);
+    expect(second).not.toContainElement(legacy);
+    expect(within(second).queryByTestId("agent-row-primary-first")).toBeNull();
+    expect(first).toHaveAttribute("data-pinned", "true");
+    expect(second).toHaveAttribute("data-pinned", "false");
+    const unassigned = screen.getByTestId("project-group-shared research (unassigned)");
+    expect(unassigned).toContainElement(legacy);
+    expect(unassigned).toHaveAttribute("data-pinned", "false");
+    expect(within(unassigned).queryByRole("button", { name: /project settings/i })).toBeNull();
+  });
+
   it("keeps collapse preferences independent when a project slug matches another display name", () => {
     const roster = nestedRoster(
       [nestedProject("reporting", "Analysis"), nestedProject("analysis", "Model Runs")],

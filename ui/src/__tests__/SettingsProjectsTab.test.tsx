@@ -341,6 +341,80 @@ describe("Settings Projects tab", () => {
     });
   });
 
+  it("sends only exact primary bulk targets when a legacy agent label matches two projects", async () => {
+    const projects = [
+      { ...PLAIN, slug: "first", id: "first", name: "Shared Research" },
+      { ...GROUP, slug: "second", id: "second", name: "Shared Research" },
+    ];
+    const agents = [
+      { name: "first-agent", project: "FIRST", extra_areas: ["Shared Research"] },
+      { name: "second-agent", project: "second", extra_areas: ["first"] },
+      { name: "legacy", project: " shared RESEARCH " },
+    ].map(({ name, ...data }) => ({
+      ...data,
+      id: `urn:fl:agent:${name}`,
+      name_key: name,
+      display_name: name,
+      role: "assistant",
+      status: "active" as const,
+    }));
+    const { client } = makeClient(projects);
+    const onBulkSessionAction = vi.fn().mockResolvedValue({
+      action: "teardown",
+      targeted_sessions: 1,
+      succeeded_sessions: 1,
+      failed_sessions: 0,
+      results: [],
+    });
+    await renderModal(client, { agents, onBulkSessionAction });
+
+    const filter = screen.getByTestId("settings-project-filter-select");
+    expect(screen.getByTestId("settings-agent-row-legacy")).toBeVisible();
+    for (const slug of ["first", "second"]) {
+      fireEvent.change(filter, { target: { value: slug } });
+      expect(filter).toHaveDisplayValue(`Shared Research (${slug})`);
+      if (slug === "first") {
+        expect(screen.getByTestId("agent-select-checkbox-second-agent")).toBeDisabled();
+      } else {
+        expect(screen.queryByTestId("settings-agent-row-first-agent")).toBeNull();
+      }
+      fireEvent.click(screen.getByTestId("bulk-action-teardown-btn"));
+      await act(async () => fireEvent.click(screen.getByTestId("bulk-confirm-btn")));
+      expect(onBulkSessionAction).toHaveBeenLastCalledWith("teardown", [`${slug}-agent`]);
+      expect(screen.queryByTestId("settings-agent-row-legacy")).toBeNull();
+    }
+    expect(onBulkSessionAction).toHaveBeenCalledTimes(2);
+  });
+
+  it("requires a project choice when old Settings was opened by an ambiguous label", async () => {
+    const projects = [
+      { ...PLAIN, slug: "shared", id: "shared", name: "Third Project" },
+      { ...PLAIN, slug: "first", id: "first", name: "Shared" },
+      { ...GROUP, slug: "second", id: "second", name: "Shared" },
+    ];
+    const { client } = makeClient(projects);
+    await renderModal(client, {
+      projects,
+      initialProject: "Shared",
+      initialProjectSubTab: "agents",
+      agents: [{
+        id: "urn:fl:agent:third",
+        name_key: "third",
+        display_name: "Third",
+        project: "shared",
+        status: "active",
+        role: "lead",
+      }],
+    });
+
+    const filter = screen.getByTestId("settings-project-filter-select");
+    expect(filter).toHaveDisplayValue("Select a Project");
+    expect(screen.getByTestId("bulk-action-teardown-btn")).toBeDisabled();
+    expect(screen.queryByTestId("project-pin-toggle-btn")).toBeNull();
+    fireEvent.change(filter, { target: { value: "shared" } });
+    expect(screen.getByTestId("agent-select-checkbox-third")).toBeEnabled();
+  });
+
   it("shows the artifacts directory row in the card and not on the Agents tab", async () => {
     const { client } = makeClient();
     await renderModal(client);

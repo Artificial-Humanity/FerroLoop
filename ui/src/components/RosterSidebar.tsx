@@ -12,10 +12,9 @@ import {
   type ProjectSummary,
   type WireMessage,
 } from "../types/api";
-import { AreaBadge, areaInfo, CoverageChips, extraAreaKeys } from "./AreaCoverage";
+import { AreaBadge, areaReferenceIndex, CoverageChips, extraAreaKeys, projectReferenceKey } from "./AreaCoverage";
 import { roleLabel } from "../hooks/useRoles";
 import type { RoleRecord } from "../types/api";
-import { projectLabel } from "../hooks/useProjects";
 import {
   evaluateQuotaStatus,
   resolveRosterStatusDot,
@@ -226,14 +225,14 @@ export function readPinnedAgents(): Set<string> {
 export function isProjectPreferenceSet(
   preferences: ProjectPreferences,
   project: string,
-  label = project,
+  label: string | null = project,
 ): boolean {
   // Older preferences were keyed by display name. An explicit false also overrides them.
   return preferences.overrides.get(project.trim().toLowerCase()) ??
-    preferences.legacyLabels.has(label.trim().toLowerCase());
+    (label !== null && preferences.legacyLabels.has(projectReferenceKey(label)));
 }
 
-export function togglePinnedProject(project: string, label = project): boolean {
+export function togglePinnedProject(project: string, label: string | null = project): boolean {
   const key = project.trim().toLowerCase();
   if (!key) return false;
   const preferences = readPinnedProjects();
@@ -376,8 +375,16 @@ interface ProjectGroup {
   linked: boolean;
   virtual: boolean;
   listed: boolean;
+  unassigned: boolean;
   agents: EnrichedAgent[];
   children: ProjectGroup[];
+}
+
+function legacyProjectPreferenceLabel(
+  group: ProjectGroup,
+  references: ReturnType<typeof areaReferenceIndex>,
+): string | null {
+  return group.unassigned || references.isAmbiguousLabel(group.label) ? null : group.label;
 }
 
 function rosterProjectParent(group: ProjectGroup, groups: ReadonlyMap<string, ProjectGroup>) {
@@ -386,7 +393,7 @@ function rosterProjectParent(group: ProjectGroup, groups: ReadonlyMap<string, Pr
   // cycle, or excessively deep path leaves each affected group visible as a root.
   for (let depth = 0; ancestor && depth < 3; depth += 1) {
     const parent = groups.get(ancestor);
-    if (!parent) return null;
+    if (!parent || parent.unassigned) return null;
     ancestor = parent.parent;
   }
   return ancestor ? null : group.parent;
@@ -678,6 +685,7 @@ function formatPersonaDisplayName(persona: string): string {
 function inferSessionProject(
   session: DiscoveredSessionSummary,
   projects: readonly ProjectSummary[],
+  references: ReturnType<typeof areaReferenceIndex>,
 ): string {
   const explicitProject = (
     (session as { project?: string | null }).project ?? ""
@@ -690,20 +698,15 @@ function inferSessionProject(
     for (const proj of projects) {
       const projPath = (proj.path ?? "").trim().replace(/\/+$/, "");
       if (projPath && (cwd === projPath || cwd.startsWith(`${projPath}/`))) {
-        return projectLabel(proj);
+        return proj.slug;
       }
     }
     const segments = cwd.split("/").filter(Boolean);
     for (let i = segments.length - 1; i >= 0; i--) {
-      const segLower = segments[i].toLowerCase();
-      const matched = projects.find(
-        (p) =>
-          p.slug.trim().toLowerCase() === segLower ||
-          projectLabel(p).toLowerCase() === segLower,
-      );
-      if (matched) {
-        return projectLabel(matched);
-      }
+      const segment = segments[i];
+      const matched = references.resolve(segment);
+      if (matched) return matched.slug;
+      if (references.isAmbiguousLabel(segment)) return segment;
     }
     const lastSeg = segments[segments.length - 1];
     if (lastSeg) {
@@ -766,7 +769,9 @@ export const RosterSidebar: React.FC<RosterSidebarProps> = ({
     readProjectPreferences(COLLAPSED_PROJECTS_STORAGE_KEY, COLLAPSED_PROJECT_OVERRIDES_KEY),
   );
 
-  const toggleProjectGroup = (key: string, label: string) => {
+  const areaReferences = useMemo(() => areaReferenceIndex(projects, areas), [projects, areas]);
+
+  const toggleProjectGroup = (key: string, label: string | null) => {
     setCollapsedProjects((prev) => {
       const overrides = new Map(prev.overrides);
       overrides.set(key, !isProjectPreferenceSet(prev, key, label));
@@ -838,7 +843,7 @@ export const RosterSidebar: React.FC<RosterSidebarProps> = ({
           id: `urn:fl:agent:${key}`,
           name_key: key,
           display_name: formatPersonaDisplayName(sess.persona ?? key),
-          project: inferSessionProject(sess, projects),
+          project: inferSessionProject(sess, projects, areaReferences),
           role: rawRole || "assistant",
           status: "active",
         });
@@ -853,7 +858,7 @@ export const RosterSidebar: React.FC<RosterSidebarProps> = ({
           id: `urn:fl:agent:${key}`,
           name_key: key,
           display_name: formatPersonaDisplayName(route.persona ?? key),
-          project: inferSessionProject(route, projects),
+          project: inferSessionProject(route, projects, areaReferences),
           role: rawRole || "assistant",
           status: "active",
         });
@@ -952,6 +957,7 @@ export const RosterSidebar: React.FC<RosterSidebarProps> = ({
     sessions,
     liveness,
     projects,
+    areaReferences,
     unreadByAgent,
     unreadSeverityByAgent,
     busyByAgent,
@@ -963,7 +969,6 @@ export const RosterSidebar: React.FC<RosterSidebarProps> = ({
   const groupedByProject = useMemo(() => {
     const query = searchQuery.trim().toLowerCase();
     const groups = new Map<string, ProjectGroup>();
-    const slugByName = new Map<string, string>();
     const listOrder = new Map<string, number>();
     const addGroup = (
       key: string,
@@ -971,6 +976,7 @@ export const RosterSidebar: React.FC<RosterSidebarProps> = ({
       virtual: boolean,
       listed: boolean,
       parent?: string | null,
+      unassigned = false,
     ) => {
       let group = groups.get(key);
       if (!group) {
@@ -979,40 +985,35 @@ export const RosterSidebar: React.FC<RosterSidebarProps> = ({
           label,
           virtual,
           listed,
+          unassigned,
           parent: typeof parent === "string" ? parent.trim().toLowerCase() || null : null,
           linked: false,
           agents: [],
           children: [],
         };
         groups.set(key, group);
-        slugByName.set(label.trim().toLowerCase(), key);
       }
       return group;
     };
 
-    const areaByKey = new Map(areas.map((area) => [area.area_key.trim().toLowerCase(), area]));
-    for (const project of projects) {
-      const key = project.slug.trim().toLowerCase();
-      if (groups.has(key)) continue;
-      listOrder.set(key, listOrder.size);
+    const areaByKey = new Map(areas.map((area) => [projectReferenceKey(area.area_key), area]));
+    for (const { slug, label, virtual, project } of areaReferences.bySlug.values()) {
+      if (project) listOrder.set(slug, listOrder.size);
       // An explicitly flat project wins over an older roster snapshot.
-      const parent = project.parent === undefined ? areaByKey.get(key)?.parent : project.parent;
-      addGroup(key, projectLabel(project), project.kind === "virtual", true, parent);
-    }
-    for (const [key, area] of areaByKey) {
-      addGroup(key, area.name || area.area_key, area.path === null, area.parent !== undefined, area.parent);
+      const parent = project?.parent === undefined ? areaByKey.get(slug)?.parent : project.parent;
+      addGroup(slug, label, virtual, Boolean(project) || parent !== undefined, parent);
     }
 
     for (const item of enrichedAgents) {
       const { record, adapter } = item;
       const agentGroups = new Set(
         [record.project || "Workspace", ...extraAreaKeys(record)].map((rawProject) => {
-          const normalized = rawProject.trim().toLowerCase();
-          const key = groups.has(normalized) ? normalized : slugByName.get(normalized) ?? normalized;
-          const known = groups.get(key);
+          const slug = areaReferences.resolve(rawProject)?.slug ?? projectReferenceKey(rawProject);
+          const known = groups.get(slug);
           if (known) return known;
-          const info = areaInfo(rawProject, areas, projects);
-          return addGroup(key, info.label, info.virtual, false);
+          const label = rawProject.trim();
+          const unassigned = areaReferences.isAmbiguousLabel(label);
+          return addGroup(slug, unassigned ? `${label} (unassigned)` : label, false, false, null, unassigned);
         }),
       );
       const matches = !query ||
@@ -1029,8 +1030,11 @@ export const RosterSidebar: React.FC<RosterSidebarProps> = ({
     }
 
     const byProjectOrder = (a: ProjectGroup, b: ProjectGroup) => {
-      const aPinned = isProjectPreferenceSet(pinnedProjects, a.key, a.label);
-      const bPinned = isProjectPreferenceSet(pinnedProjects, b.key, b.label);
+      const isPinned = (group: ProjectGroup) => !group.unassigned && isProjectPreferenceSet(
+        pinnedProjects, group.key, legacyProjectPreferenceLabel(group, areaReferences),
+      );
+      const aPinned = isPinned(a);
+      const bPinned = isPinned(b);
       if (aPinned !== bPinned) return aPinned ? -1 : 1;
       const aIdx = listOrder.get(a.key) ?? Infinity;
       const bIdx = listOrder.get(b.key) ?? Infinity;
@@ -1066,10 +1070,10 @@ export const RosterSidebar: React.FC<RosterSidebarProps> = ({
     searchQuery,
     pinnedProjects,
     pinnedAgents,
-    projects,
     showEmptyProjects,
     roles,
     areas,
+    areaReferences,
   ]);
 
   const selectedKey = (selectedAgentName ?? "").trim().toLowerCase();
@@ -1292,10 +1296,12 @@ export const RosterSidebar: React.FC<RosterSidebarProps> = ({
           </div>
         ) : (
           groupedByProject.map(function renderProject(group): React.ReactNode {
-            const { key, label: project, agents: items, children, linked, virtual } = group;
-            const projectLower = project.trim().toLowerCase();
-            const isGroupCollapsed = isProjectPreferenceSet(collapsedProjects, key, project);
-            const isGroupPinned = isProjectPreferenceSet(pinnedProjects, key, project);
+            const { key, label: project, agents: items, children, linked, virtual, unassigned } = group;
+            const projectLower = projectReferenceKey(project);
+            const legacyLabel = legacyProjectPreferenceLabel(group, areaReferences);
+            const collapseKey = unassigned ? `unassigned:${key}` : key;
+            const isGroupCollapsed = isProjectPreferenceSet(collapsedProjects, collapseKey, legacyLabel);
+            const isGroupPinned = !unassigned && isProjectPreferenceSet(pinnedProjects, key, legacyLabel);
             const virtualBadgeId = virtual ? `${virtualBadgePrefix}-${encodeURIComponent(key)}` : undefined;
             const { count: projectUnread, severity: projectSeverity } =
               summarizeProjectUnread(group, isGroupCollapsed);
@@ -1332,7 +1338,7 @@ export const RosterSidebar: React.FC<RosterSidebarProps> = ({
                     aria-label={project}
                     aria-describedby={virtualBadgeId}
                     title={project}
-                    onClick={() => toggleProjectGroup(key, projectLower)}
+                    onClick={() => toggleProjectGroup(collapseKey, legacyLabel)}
                     style={{
                       display: "flex",
                       alignItems: "center",
@@ -1395,39 +1401,43 @@ export const RosterSidebar: React.FC<RosterSidebarProps> = ({
                         {formatUnreadBadgeLabel(projectUnread, projectSeverity)}
                       </span>
                     )}
-                    <button
-                      type="button"
-                      className="fd-gear-btn fd-roster-project-gear-btn"
-                      data-testid={`project-settings-btn-${projectLower}`}
-                      title={`Project settings for ${project}`}
-                      aria-label={`Project settings for ${project}`}
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        onOpenProjectSettings?.(project, key);
-                      }}
-                      style={{
-                        border: "none",
-                        background: "transparent",
-                        width: "24px",
-                        height: "24px",
-                        padding: 0,
-                        display: "inline-flex",
-                        alignItems: "center",
-                        justifyContent: "center",
-                        lineHeight: 1,
-                        color: "var(--accent-primary)",
-                        cursor: "pointer",
-                        flexShrink: 0,
-                      }}
-                    >
-                      <ProjectSettingsIcon size={17} />
-                    </button>
+                    {!unassigned && (
+                      <button
+                        type="button"
+                        className="fd-gear-btn fd-roster-project-gear-btn"
+                        data-testid={`project-settings-btn-${projectLower}`}
+                        title={`Project settings for ${project}`}
+                        aria-label={`Project settings for ${project}`}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          onOpenProjectSettings?.(project, key);
+                        }}
+                        style={{
+                          border: "none",
+                          background: "transparent",
+                          width: "24px",
+                          height: "24px",
+                          padding: 0,
+                          display: "inline-flex",
+                          alignItems: "center",
+                          justifyContent: "center",
+                          lineHeight: 1,
+                          color: "var(--accent-primary)",
+                          cursor: "pointer",
+                          flexShrink: 0,
+                        }}
+                      >
+                        <ProjectSettingsIcon size={17} />
+                      </button>
+                    )}
                   </div>
                 </div>
 
                 {!isGroupCollapsed && (
                   <div style={{ display: "flex", flexDirection: "column", gap: "5px" }}>
                     {items.map(({ record, livenessState, activityState, adapter, model, quotaUsage, unreadCount, unreadSeverity, contextEstimate }) => {
+                      const primaryReference = record.project || "Workspace";
+                      const primarySlug = areaReferences.resolve(primaryReference)?.slug ?? projectReferenceKey(primaryReference);
                       const key = record.name_key.toLowerCase();
                       const isSelected = key === selectedKey;
                       const isAgentPinned = pinnedAgents.has(key);
@@ -1791,9 +1801,9 @@ export const RosterSidebar: React.FC<RosterSidebarProps> = ({
                               <span className="fd-badge" data-testid={`role-badge-${key}`}>
                                 {formatRoleLabel(record.role, roles)}
                               </span>
-                              {record.project.toLowerCase() !== project.toLowerCase() && areaInfo(record.project, areas, projects).label.toLowerCase() !== project.toLowerCase() && <span className="fd-badge">also covers</span>}
-                              <AreaBadge slug={record.project || "Workspace"} areas={areas} projects={projects} primary />
-                              <CoverageChips agent={record} areas={areas} projects={projects} />
+                              {primarySlug !== group.key && <span className="fd-badge">also covers</span>}
+                              <AreaBadge slug={primaryReference} references={areaReferences} primary />
+                              <CoverageChips agent={record} references={areaReferences} />
                               {adapter && (
                                 <span
                                   data-testid={`adapter-pill-${key}`}

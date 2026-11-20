@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
-import { AreaBadge, CoverageChips, extraAreaKeys } from "./AreaCoverage";
+import { AreaBadge, areaReferenceIndex, CoverageChips, extraAreaKeys, projectReferenceKey as projectKey } from "./AreaCoverage";
 import {
   HubApiClient,
   HubApiError,
@@ -627,7 +627,6 @@ import {
 import { roleLabel, roleOptions, selectedRoleOptions, useRoles } from "../hooks/useRoles";
 import {
   projectChoices,
-  projectLabel,
   projectLabels,
 } from "../hooks/useProjects";
 
@@ -793,8 +792,6 @@ interface SettingsProjectScope {
   project?: ProjectSummary;
   virtual?: boolean;
 }
-
-const projectKey = (value: string) => value.trim().toLowerCase();
 
 function initialSettingsProject(
   slug: string | null | undefined,
@@ -1902,49 +1899,26 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   }, [propAgents, loadedAgents]);
 
   const areaRecords = propAreas ?? loadedAreas;
-  const projectIdentities = useMemo(() => {
-    const bySlug = new Map<string, SettingsProjectScope>();
-    for (const project of effectiveProjects) {
-      const slug = projectKey(project.slug);
-      bySlug.set(slug, {
-        slug,
-        label: projectLabel(project),
-        project,
-        virtual: project.kind === "virtual",
-      });
-    }
-    for (const area of areaRecords) {
-      const slug = projectKey(area.area_key);
-      if (!bySlug.has(slug)) {
-        bySlug.set(slug, {
-          slug,
-          label: area.name.trim() || area.area_key,
-          virtual: area.path === null,
-        });
-      }
-    }
-    const byLabel = new Map<string, SettingsProjectScope>();
-    for (const scope of bySlug.values()) {
-      const label = projectKey(scope.label);
-      if (!byLabel.has(label)) byLabel.set(label, scope);
-    }
-    return { bySlug, byLabel };
-  }, [effectiveProjects, areaRecords]);
+  const projectIdentities = useMemo(
+    () => areaReferenceIndex(effectiveProjects, areaRecords),
+    [effectiveProjects, areaRecords],
+  );
 
   const projectScope = useMemo<SettingsProjectScope | null>(() => {
     if (!projectSelection) return null;
     const key = projectKey(projectSelection.slug ?? projectSelection.label ?? "");
-    const legacy = projectSelection.slug === undefined
-      ? projectIdentities.byLabel.get(key)
-      : undefined;
-    return legacy ?? projectIdentities.bySlug.get(key) ?? {
-      slug: key,
-      label: projectSelection.label ?? key,
-    };
+    // A label-only Settings entry explicitly carries a display label. Free-form
+    // agent references use the separate slug-first resolver.
+    const selected = projectSelection.slug === undefined
+      ? projectIdentities.resolveLabel(key)
+      : projectIdentities.bySlug.get(key);
+    if (selected) return selected;
+    if (projectIdentities.isAmbiguousLabel(key)) return null;
+    return projectIdentities.bySlug.get(key) ?? { slug: key, label: projectSelection.label ?? key };
   }, [projectSelection, projectIdentities]);
 
-  const isProjectScoped = Boolean(initialProject || projectScope);
-  const scopedProjectName = projectScope?.label ?? initialProject;
+  const isProjectScoped = Boolean(initialProject || projectSelection);
+  const scopedProjectName = projectScope?.label ?? initialProject ?? projectSelection?.label ?? null;
 
   // A registry refresh can rename or remove the project. Keep the resolved slug
   // after the first match so its former label cannot select a different project.
@@ -1970,18 +1944,17 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     setProjectArtifactsDirStatus(null);
   }
 
-  // Registry and area keys win for roster membership. Only an unrecognized key
-  // can be a legacy display label.
-  const projectForAgentReference = useMemo(() => (raw: string) => {
-    const slug = projectKey(raw);
-    return projectIdentities.bySlug.get(slug) ??
-      projectIdentities.byLabel.get(slug) ?? { slug, label: raw.trim() };
+  const projectForAgentReference = useMemo(() => (raw: string): SettingsProjectScope | undefined => {
+    const known = projectIdentities.resolve(raw);
+    if (known) return known;
+    if (projectIdentities.isAmbiguousLabel(raw)) return undefined;
+    return { slug: projectKey(raw), label: raw.trim() };
   }, [projectIdentities]);
 
   const projectOptions = useMemo(() => {
     const options = new Map<string, SettingsProjectScope>();
-    const add = (scope: SettingsProjectScope) => {
-      if (scope.slug && !options.has(scope.slug)) options.set(scope.slug, scope);
+    const add = (scope: SettingsProjectScope | undefined) => {
+      if (scope?.slug && !options.has(scope.slug)) options.set(scope.slug, scope);
     };
     for (const project of effectiveProjects) {
       add(projectForAgentReference(project.slug));
@@ -1998,7 +1971,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   const projectScopedAgents = useMemo(() => {
     if (!projectScope) return isProjectScoped ? [] : effectiveAgents;
     return effectiveAgents.filter(agent =>
-      projectForAgentReference(agent.project || WORKSPACE_PROJECT).slug === projectScope.slug,
+      projectForAgentReference(agent.project || WORKSPACE_PROJECT)?.slug === projectScope.slug,
     );
   }, [effectiveAgents, isProjectScoped, projectForAgentReference, projectScope]);
 
@@ -2006,7 +1979,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     if (!projectScope) return projectScopedAgents;
     return effectiveAgents.filter(agent =>
       projectScopedAgents.includes(agent) || extraAreaKeys(agent).some(area =>
-        projectForAgentReference(area).slug === projectScope.slug,
+        projectForAgentReference(area)?.slug === projectScope.slug,
       ),
     );
   }, [effectiveAgents, projectForAgentReference, projectScope, projectScopedAgents]);
@@ -2743,8 +2716,11 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     status: projectArtifactsDirStatus,
   };
 
+  const legacyPreferenceLabel = projectScope && !projectIdentities.isAmbiguousLabel(projectScope.label)
+    ? projectScope.label
+    : null;
   const projectPinned = projectScope
-    ? isProjectPreferenceSet(pinnedProjects, projectScope.slug, projectScope.label)
+    ? isProjectPreferenceSet(pinnedProjects, projectScope.slug, legacyPreferenceLabel)
     : false;
   const projectSummaryCardNode =
     projectScope ? (
@@ -2825,7 +2801,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 justifyContent: "center",
                 lineHeight: 1,
               }}
-              onClick={() => togglePinnedProject(projectScope.slug, projectScope.label)}
+              onClick={() => togglePinnedProject(projectScope.slug, legacyPreferenceLabel)}
             >
               <PinIcon
                 pinned={projectPinned}
@@ -3666,14 +3642,14 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                     selectProject(option?.slug ?? null, option?.label);
                   }}
                 >
-                  {initialProject ? (
+                  {initialProject || (isProjectScoped && !projectScope) ? (
                     !projectScope && <option value="all">Select a Project</option>
                   ) : (
                     <option value="all">All Projects ({effectiveAgents.length})</option>
                   )}
                   {projectOptions.map(({ slug, label }) => (
                     <option key={slug} value={projectFilterOptionValue(slug)}>
-                      {label}
+                      {projectIdentities.isAmbiguousLabel(label) ? `${label} (${slug})` : label}
                     </option>
                   ))}
                 </select>
@@ -3788,8 +3764,8 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                         <strong style={{ fontSize: "12.5px" }}>
                           {ag.display_name}
                         </strong>
-                        <AreaBadge slug={ag.project || "Workspace"} areas={areaRecords} projects={effectiveProjects} />
-                        <CoverageChips agent={ag} areas={areaRecords} projects={effectiveProjects} />
+                        <AreaBadge slug={ag.project || "Workspace"} references={projectIdentities} />
+                        <CoverageChips agent={ag} references={projectIdentities} />
                         <span
                           className="fd-badge fd-mono"
                           style={{ fontSize: "10.5px" }}

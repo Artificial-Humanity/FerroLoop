@@ -3,7 +3,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { HubApiClient } from "../api/client";
 import { SettingsModal } from "../components/SettingsModal";
 import { AgentSettingsModal } from "../components/AgentSettingsModal";
-import { areaInfo } from "../components/AreaCoverage";
+import { areaReferenceIndex } from "../components/AreaCoverage";
 import { RosterSidebar } from "../components/RosterSidebar";
 import type { AgentRecord, AreaRecord, ProjectSummary } from "../types/api";
 
@@ -90,7 +90,7 @@ describe("coverage review regressions", () => {
   });
   it("prefers a real project registry entry over a pathless area in chips and headers", () => {
     const pathless = areas.map(a => ({ ...a, path: null }));
-    expect(areaInfo("alpha", pathless, projects).virtual).toBe(false);
+    expect(areaReferenceIndex(projects, pathless).resolve("alpha")?.virtual).toBe(false);
     render(<RosterSidebar agents={[director]} areas={pathless} projects={projects} routes={[]} liveness={[]} unreadByAgent={{}} selectedAgentName={null} onSelectAgent={vi.fn()} embedded />);
     expect(screen.getByTestId("project-group-toggle-alpha")).not.toHaveTextContent("virtual");
     expect(within(screen.getByTestId("project-group-alpha")).queryByText("Beta · virtual")).not.toBeInTheDocument();
