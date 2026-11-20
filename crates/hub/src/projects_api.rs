@@ -21,7 +21,7 @@ use crate::project_delete::{
 };
 use crate::project_init::{
     Credential, InitError, InitPaths, InitRequest, ProjectKind, VirtualRequest, canonical_root,
-    create_virtual, init_project, user_config_path,
+    create_virtual_with_policy, init_project, user_config_path,
 };
 use crate::project_list::{ProjectSummary, UpdateRequest, list_projects, update_project};
 use crate::{HubState, ProjectOpenError, artifact_dirs, records};
@@ -168,6 +168,9 @@ struct CreateProjectBody {
     kind: Option<String>,
     #[serde(default)]
     create_parent: bool,
+    /// Request an idempotent create instead of updating an existing virtual group.
+    #[serde(default)]
+    create_only: bool,
     path: Option<String>,
     purpose: Option<String>,
     git_init: Option<bool>,
@@ -216,6 +219,9 @@ pub(crate) fn handle_post_projects(
         Ok(p) => p,
         Err(resp) => return resp,
     };
+    if body.create_only && kind != ProjectKind::Virtual {
+        return error_response(400, "`create_only` is only supported for virtual groups");
+    }
     let name = present(body.name);
     let slug = present(body.slug);
     let purpose = present(body.purpose);
@@ -233,7 +239,7 @@ pub(crate) fn handle_post_projects(
                 purpose,
                 by,
             };
-            create_virtual(&request, &paths, open_workspace(state))
+            create_virtual_with_policy(&request, &paths, body.create_only, open_workspace(state))
         }
         ProjectKind::Project => {
             let credential = match body.credential.as_deref().map(str::parse::<Credential>) {

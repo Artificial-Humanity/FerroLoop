@@ -138,6 +138,10 @@ defaults to `app` and needs `github`. `path` must be absolute, with no `..`
 and no NUL byte; the Hub also refuses one in a system directory, under a secret's directory
 (`.ssh`, `.aws` and the like), or that is, or contains, the Hub's home. For a virtual group,
 the request needs `name` or `slug`, and `path`, `git_init`, `github` and `credential` are ignored.
+FerroDeck sends `create_only: true` for virtual groups. The Hub resolves the slug before checking
+for an existing area. A matching name returns the existing group with `200` and leaves it intact.
+An unrelated group at the resolved slug returns `409`. Omit `create_only` to retain the usual
+virtual group create or update behavior.
 The author recorded is the caller's name. The config is the Hub's `$XDG_CONFIG_HOME/fl/config.toml`
 (default `$HOME/.config/fl/config.toml`), a project's store is `$HOME/.local/share/fl/<slug>.fls`,
 and the workspace area goes into the Hub store. A group writes its area and any requested missing

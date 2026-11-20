@@ -2702,6 +2702,83 @@ fn a_virtual_group_is_made_by_kind_or_by_the_earlier_flag_and_writes_only_its_ar
 }
 
 #[test]
+fn virtual_create_only_retries_historical_group_when_both_slugs_are_occupied() {
+    let hub = Hub::new();
+    let old_slug = "kaggle-pok-mon";
+    let new_slug = "kaggle-pokemon";
+    let name = "Kaggle/Pokémon";
+    hub.workspace()
+        .upsert_area(fl_core::agent::AreaRecord {
+            area_key: old_slug.into(),
+            name: name.into(),
+            path: None,
+            parent: None,
+            purpose: "original historical purpose".into(),
+            updated_at: fl_exec::stamp::now(),
+            by: "historical".into(),
+        })
+        .unwrap();
+    let existing = hub.post(
+        OWNER,
+        &json!({ "kind": "virtual", "name": "Some other group", "slug": new_slug }),
+    );
+    assert_eq!(existing.status, 201, "{}", text_of(&existing));
+    let before: Vec<_> = [old_slug, new_slug]
+        .map(|slug| hub.workspace().get_area(slug).unwrap().unwrap())
+        .into_iter()
+        .collect();
+
+    let repeated = hub.post(
+        OWNER,
+        &json!({
+            "kind": "virtual", "name": name, "create_parent": true,
+            "create_only": true, "purpose": "should not replace the original",
+        }),
+    );
+    assert_eq!(repeated.status, 200, "{}", text_of(&repeated));
+    assert_eq!(body_of(&repeated)["slug"], old_slug);
+    assert_eq!(body_of(&repeated)["parent"], Value::Null);
+    for area in before {
+        let after = hub.workspace().get_area(&area.area_key).unwrap().unwrap();
+        assert_eq!(json!(after), json!(area));
+    }
+    assert!(hub.workspace().get_area("kaggle").unwrap().is_none());
+}
+
+#[test]
+fn virtual_create_only_rejects_an_unrelated_group_even_with_a_stale_slug_list() {
+    let hub = Hub::new();
+    let created = hub.post(
+        OWNER,
+        &json!({ "kind": "virtual", "name": "Original", "slug": "taken", "create_only": true }),
+    );
+    assert_eq!(created.status, 201, "{}", text_of(&created));
+    let before = hub.workspace().get_area("taken").unwrap().unwrap();
+
+    for body in [
+        json!({ "kind": "virtual", "name": "Taken", "create_only": true, "purpose": "replacement" }),
+        json!({ "kind": "virtual", "name": "Different", "slug": "taken", "create_only": true }),
+    ] {
+        let refused = hub.post(OWNER, &body);
+        assert_eq!(refused.status, 409, "{}", text_of(&refused));
+        assert!(
+            error_of(&refused).contains("taken"),
+            "{}",
+            text_of(&refused)
+        );
+    }
+    let after = hub.workspace().get_area("taken").unwrap().unwrap();
+    assert_eq!(json!(after), json!(before));
+
+    let update = hub.post(
+        OWNER,
+        &json!({ "kind": "virtual", "name": "New Name", "slug": "taken" }),
+    );
+    assert_eq!(update.status, 200, "{}", text_of(&update));
+    assert_eq!(body_of(&update)["name"], "New Name");
+}
+
+#[test]
 fn a_slug_cannot_be_both_kinds_over_http() {
     let hub = Hub::new();
     assert_eq!(

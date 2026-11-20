@@ -1491,6 +1491,19 @@ pub fn create_virtual<W>(
 where
     W: Deref<Target = AnyStore>,
 {
+    create_virtual_with_policy(req, paths, false, open_workspace)
+}
+
+/// A creation-only caller can retry the same resolved group without changing it.
+pub(crate) fn create_virtual_with_policy<W>(
+    req: &VirtualRequest,
+    paths: &InitPaths,
+    create_only: bool,
+    open_workspace: impl FnOnce() -> Result<W, InitError>,
+) -> Result<InitOutcome, InitError>
+where
+    W: Deref<Target = AnyStore>,
+{
     let _one_at_a_time = lock_project_configuration(&paths.config_path)?;
     if req.by.trim().is_empty() {
         return Err(invalid("`by` is empty"));
@@ -1513,6 +1526,15 @@ where
         return Err(conflict(format!(
             "`{slug}` is already an area for the project at {path}, so it cannot also be a virtual group. Choose another slug"
         )));
+    }
+    if create_only && let Some(area) = before {
+        return if matches_display_path(&area.name, &display) {
+            Ok(virtual_outcome(area.clone(), false))
+        } else {
+            Err(conflict(format!(
+                "a project or group with the slug `{slug}` already exists. Choose another slug"
+            )))
+        };
     }
     let placement = plan_placement(
         &slug,

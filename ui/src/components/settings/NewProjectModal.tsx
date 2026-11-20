@@ -41,12 +41,15 @@ export function deriveProjectSlug(name: string): string {
   const normalized = name
     .normalize("NFD")
     .replace(/([A-Za-z])\p{Mark}+/gu, "$1");
-  if (/[^\x00-\x7f]/.test(normalized.replace(/[^\p{Letter}]/gu, ""))) {
+  if (/[^\x00-\x7f]/.test(normalized.replace(/[^\p{Alphabetic}]/gu, ""))) {
     return "";
   }
-  const segments = normalized.split("/").map((segment) => segment
+  const parts = normalized.split("/");
+  // Like the Hub, retain underscores in flat names and use kebab-case in paths.
+  const separators = parts.length === 1 ? /[^a-z0-9_]+/g : /[^a-z0-9]+/g;
+  const segments = parts.map((segment) => segment
     .toLowerCase()
-    .replace(/[^a-z0-9]+/g, "-")
+    .replace(separators, "-")
     .replace(/^-+|-+$/g, ""),
   );
   return segments.every(Boolean) ? segments.join("-") : "";
@@ -93,6 +96,8 @@ function NewProjectForm({
   const trimmedPath = path.trim();
   const trimmedGithub = github.trim();
   const trimmedPurpose = purpose.trim();
+  const slugTaken = existingSlugs.includes(trimmedSlug);
+  const suggestedSlugTaken = !slugManual && slugTaken;
 
   const errors: {
     name?: string;
@@ -108,7 +113,7 @@ function NewProjectForm({
   if (!trimmedSlug)
     errors.slug = trimmedName && !deriveProjectSlug(trimmedName) ? SLUG_HELP : "Slug is required.";
   else if (!SLUG_PATTERN.test(trimmedSlug)) errors.slug = SLUG_HELP;
-  else if (existingSlugs.includes(trimmedSlug))
+  else if (slugManual && slugTaken)
     errors.slug = `A project or group with the slug "${trimmedSlug}" already exists.`;
   if (isProject) {
     errors.path = validateProjectPath(trimmedPath);
@@ -185,6 +190,7 @@ function NewProjectForm({
     };
     // Let the hub resolve an untouched preview, including historical project slugs.
     if (slugManual) req.slug = trimmedSlug;
+    if (!isProject) req.create_only = true;
     if (isNested && createParent) req.create_parent = true;
     if (trimmedPurpose) req.purpose = trimmedPurpose;
     if (isProject) {
@@ -364,7 +370,11 @@ function NewProjectForm({
               value={slug}
               disabled={busy}
               aria-invalid={shown.slug ? true : undefined}
-              aria-describedby={describedBy("slug", Boolean(shown.slug))}
+              aria-describedby={describedBy(
+                "slug",
+                Boolean(shown.slug),
+                suggestedSlugTaken ? `${uid}-slug-advisory` : undefined,
+              )}
               onBlur={refillEmptySlug}
               onChange={(e) => {
                 // Any edit is manual; an empty value stays empty while typing.
@@ -372,6 +382,11 @@ function NewProjectForm({
                 setSlug(e.target.value);
               }}
             />
+            {suggestedSlugTaken && (
+              <p id={`${uid}-slug-advisory`} style={HELP_STYLE}>
+                The suggested slug is in use. The Hub will check if it can use an existing project or group.
+              </p>
+            )}
             {fieldError("slug", shown.slug)}
           </div>
 

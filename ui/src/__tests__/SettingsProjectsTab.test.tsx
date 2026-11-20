@@ -666,6 +666,7 @@ describe("Settings Projects tab", () => {
         name: "Council",
         kind: "virtual",
         purpose: "Cross-project scope",
+        create_only: true,
       });
     });
 
@@ -690,13 +691,16 @@ describe("Settings Projects tab", () => {
       );
     });
 
-    it("rejects a slug already on the list without calling the hub", async () => {
+    it("rejects a manually chosen slug already on the list without calling the hub", async () => {
       const { client, calls } = makeClient();
       await renderModal(client);
       await openProjectsTab();
       fireEvent.click(screen.getByTestId("settings-projects-create-btn"));
       fireEvent.change(screen.getByTestId("new-project-name"), {
-        target: { value: "Sonora" },
+        target: { value: "A different name" },
+      });
+      fireEvent.change(screen.getByTestId("new-project-slug"), {
+        target: { value: "sonora" },
       });
       fireEvent.change(screen.getByTestId("new-project-path"), {
         target: { value: "/work/s" },
@@ -711,6 +715,34 @@ describe("Settings Projects tab", () => {
         "aria-invalid",
         "true",
       );
+    });
+
+    it("keeps an unrelated virtual-group collision from a stale list open for correction", async () => {
+      const onProjectsChanged = vi.fn();
+      const collision = "A project or group with the slug `taken` already exists. Choose another slug";
+      const { client, calls } = makeClient([PLAIN], (url, method) =>
+        url.endsWith("/api/v1/projects") && method === "POST"
+          ? json({ error: collision }, 409)
+          : null,
+      );
+      await renderModal(client, { onProjectsChanged });
+      await openProjectsTab();
+      fireEvent.click(screen.getByTestId("settings-projects-create-btn"));
+      fireEvent.click(screen.getByTestId("new-project-kind-virtual"));
+      fireEvent.change(screen.getByTestId("new-project-name"), {
+        target: { value: "Taken" },
+      });
+      await act(async () => {
+        fireEvent.click(screen.getByTestId("new-project-submit"));
+      });
+      expect(calls.find((call) => call.method === "POST")?.body).toEqual({
+        name: "Taken", kind: "virtual", create_only: true,
+      });
+      expect(screen.getByTestId("new-project-modal")).toBeInTheDocument();
+      expect(screen.getByTestId("new-project-error")).toHaveTextContent(collision);
+      expect(screen.getByTestId("new-project-name")).toHaveValue("Taken");
+      expect(screen.queryByTestId("settings-project-card-taken")).toBeNull();
+      expect(onProjectsChanged).not.toHaveBeenCalled();
     });
 
     it("Escape closes only the New Project modal, not Settings", async () => {

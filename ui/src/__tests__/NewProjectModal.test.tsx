@@ -57,8 +57,10 @@ function fillProject() {
 }
 
 describe("deriveProjectSlug", () => {
-  it("lowercases, collapses non-alphanumerics and trims dashes", () => {
-    expect(deriveProjectSlug("  My Cool_Project!! ")).toBe("my-cool-project");
+  it("retains flat underscores and uses dashes within hierarchy segments", () => {
+    expect(deriveProjectSlug("My_Project")).toBe("my_project");
+    expect(deriveProjectSlug("  My Cool_Project!! ")).toBe("my-cool_project");
+    expect(deriveProjectSlug("Lab/My_Project")).toBe("lab-my-project");
     expect(deriveProjectSlug("--A  b--")).toBe("a-b");
     expect(deriveProjectSlug("***")).toBe("");
   });
@@ -72,7 +74,7 @@ describe("deriveProjectSlug", () => {
 
 describe("NewProjectModal", () => {
   it.each(["project", "virtual"] as const)(
-    "leaves the Hub to resolve the historical slug for an untouched %s preview",
+    "leaves the Hub to resolve the historical slug when both the old and suggested %s slugs are taken",
     async (kind) => {
       const name = "Kaggle/Pokémon";
       const path = "/work/pokemon";
@@ -89,7 +91,7 @@ describe("NewProjectModal", () => {
         Response.json(legacyProject),
       );
       const client = new HubApiClient({ baseUrl: "http://hub.test", fetchImpl });
-      const { onCreated } = setup((request) => client.createProject(request), [legacySlug]);
+      const { onCreated } = setup((request) => client.createProject(request), [legacySlug, "kaggle-pokemon"]);
       type("new-project-name", name);
       if (kind === "virtual") {
         fireEvent.click(screen.getByTestId("new-project-kind-virtual"));
@@ -107,7 +109,7 @@ describe("NewProjectModal", () => {
       expect(JSON.parse(String(init?.body))).toEqual(
         kind === "project"
           ? { name, kind, path, create_parent: true }
-          : { name, kind, create_parent: true },
+          : { name, kind, create_parent: true, create_only: true },
       );
       expect(onCreated).toHaveBeenCalledWith(legacyProject);
     },
@@ -353,6 +355,7 @@ describe("NewProjectModal", () => {
     expect(create.mock.calls[0][0]).toStrictEqual({
       name: "Alpha",
       kind: "virtual",
+      create_only: true,
       purpose: "Council scope",
     });
   });
@@ -411,9 +414,10 @@ describe("NewProjectModal", () => {
       expect(screen.getByTestId("new-project-slug")).toHaveAttribute("aria-invalid", "true");
     });
 
-    it("rejects a duplicate slug client-side", async () => {
+    it("rejects an explicitly chosen duplicate slug client-side", async () => {
       const { create } = setup();
-      type("new-project-name", "Taken");
+      type("new-project-name", "A different name");
+      type("new-project-slug", "taken");
       type("new-project-path", "/work/taken");
       await submit();
       expect(create).not.toHaveBeenCalled();
