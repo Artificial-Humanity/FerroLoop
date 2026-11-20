@@ -108,7 +108,7 @@ describe("NewProjectModal", () => {
       expect(init?.method).toBe("POST");
       expect(JSON.parse(String(init?.body))).toEqual(
         kind === "project"
-          ? { name, kind, path, create_parent: true }
+          ? { name, kind, path, create_parent: true, create_only: true }
           : { name, kind, create_parent: true, create_only: true },
       );
       expect(onCreated).toHaveBeenCalledWith(legacyProject);
@@ -127,6 +127,7 @@ describe("NewProjectModal", () => {
     expect(create).toHaveBeenCalledWith({
       name: "Café / R&D / Mobile",
       kind: "project",
+      create_only: true,
       path: "/work/mobile",
       create_parent: true,
     });
@@ -146,6 +147,7 @@ describe("NewProjectModal", () => {
       name: "Lab / 東京",
       slug: "lab_tokyo",
       kind: "project",
+      create_only: true,
       path: "/work/tokyo",
     });
   });
@@ -238,6 +240,7 @@ describe("NewProjectModal", () => {
     expect(create.mock.calls[0][0]).toStrictEqual({
       name: "Alpha Project",
       kind: "project",
+      create_only: true,
       purpose: "Does alpha things",
       path: "/work/alpha",
       git_init: true,
@@ -248,13 +251,14 @@ describe("NewProjectModal", () => {
     expect(onClose).toHaveBeenCalledTimes(1);
   });
 
-  it("sends only name, kind and path for a minimal Directory Project", async () => {
+  it("sends a create-only request for a minimal Directory Project", async () => {
     const { create } = setup();
     fillProject();
     await submit();
     expect(create.mock.calls[0][0]).toStrictEqual({
       name: "Alpha",
       kind: "project",
+      create_only: true,
       path: "/work/alpha",
     });
   });

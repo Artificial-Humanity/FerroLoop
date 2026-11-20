@@ -2779,6 +2779,148 @@ fn virtual_create_only_rejects_an_unrelated_group_even_with_a_stale_slug_list() 
 }
 
 #[test]
+fn directory_create_only_refuses_to_rename_an_existing_project_at_the_same_root() {
+    let hub = Hub::new();
+    let root = hub.work("same-root");
+    let seeded = hub.post(
+        OWNER,
+        &json!({ "name": "Original", "slug": "taken", "path": root, "purpose": "original purpose" }),
+    );
+    assert_eq!(seeded.status, 201, "{}", text_of(&seeded));
+    let before = hub.workspace().get_area("taken").unwrap().unwrap();
+    let config = fs::read(hub.config()).unwrap();
+
+    let refused = hub.post(
+        OWNER,
+        &json!({
+            "name": "Taken", "path": root, "create_only": true,
+            "purpose": "replacement purpose", "git_init": true, "github": "example/replacement",
+        }),
+    );
+    assert_eq!(refused.status, 409, "{}", text_of(&refused));
+    assert!(
+        error_of(&refused).contains("taken"),
+        "{}",
+        text_of(&refused)
+    );
+    assert_eq!(hub.workspace().get_area("taken").unwrap(), Some(before));
+    assert_eq!(fs::read(hub.config()).unwrap(), config);
+    assert!(!has_git(&root));
+
+    let update = hub.post(
+        OWNER,
+        &json!({ "name": "Taken", "path": root, "purpose": "replacement purpose" }),
+    );
+    assert_eq!(update.status, 200, "{}", text_of(&update));
+    assert_eq!(body_of(&update)["name"], "Taken");
+    assert_eq!(body_of(&update)["purpose"], "replacement purpose");
+}
+
+#[test]
+fn directory_create_only_retries_a_registered_linked_project_without_updates() {
+    let hub = Hub::new();
+    let root = hub.work("child");
+    let seeded = hub.post(
+        OWNER,
+        &json!({
+            "name": "Lab/Child", "path": root, "create_parent": true,
+            "purpose": "original purpose", "github": "example/original",
+        }),
+    );
+    assert_eq!(seeded.status, 201, "{}", text_of(&seeded));
+    let before = hub.workspace().get_area("lab-child").unwrap().unwrap();
+    let config = fs::read(hub.config()).unwrap();
+
+    let repeated = hub.post(
+        OWNER,
+        &json!({
+            "name": "Lab/Child", "path": root, "create_only": true,
+            "purpose": "replacement purpose", "git_init": true, "github": "example/replacement",
+        }),
+    );
+    assert_eq!(repeated.status, 200, "{}", text_of(&repeated));
+    assert_eq!(body_of(&repeated), body_of(&seeded));
+    assert_eq!(hub.workspace().get_area("lab-child").unwrap(), Some(before));
+    assert_eq!(fs::read(hub.config()).unwrap(), config);
+    assert!(!has_git(&root));
+}
+
+#[test]
+fn directory_create_only_resumes_historical_area_with_both_slugs_occupied() {
+    let hub = Hub::new();
+    let root = hub.work("historical");
+    let seeded = hub.post(
+        OWNER,
+        &json!({ "name": "Original", "slug": "kaggle-pok-mon", "path": root, "purpose": "historical" }),
+    );
+    assert_eq!(seeded.status, 201, "{}", text_of(&seeded));
+    fs::remove_file(hub.config()).unwrap();
+    let mut historical = hub.workspace().get_area("kaggle-pok-mon").unwrap().unwrap();
+    historical.name = "Kaggle/Pokémon".into();
+    hub.workspace().upsert_area(historical.clone()).unwrap();
+    let occupied = hub.post(
+        OWNER,
+        &json!({ "kind": "virtual", "name": "Independent", "slug": "kaggle-pokemon" }),
+    );
+    assert_eq!(occupied.status, 201, "{}", text_of(&occupied));
+
+    let resumed = hub.post(
+        OWNER,
+        &json!({
+            "name": historical.name, "path": root, "create_only": true,
+            "create_parent": true, "purpose": "replacement purpose",
+        }),
+    );
+    assert_eq!(resumed.status, 201, "{}", text_of(&resumed));
+    let resumed = body_of(&resumed);
+    assert_eq!(resumed["slug"], "kaggle-pok-mon");
+    assert_eq!(resumed["store_path"], body_of(&seeded)["store_path"]);
+    assert_eq!(resumed["parent"], Value::Null);
+    assert!(hub.config().is_file());
+    assert_eq!(
+        hub.workspace().get_area("kaggle-pok-mon").unwrap(),
+        Some(historical)
+    );
+    assert_eq!(hub.entry("kaggle-pokemon"), body_of(&occupied));
+    assert!(hub.workspace().get_area("kaggle").unwrap().is_none());
+}
+
+#[test]
+fn directory_create_only_validates_a_store_only_slug_before_setup() {
+    let hub = Hub::new();
+    let other = hub.work("other-owner");
+    fs::create_dir(&other).unwrap();
+    let store_path = hub.base.join("home/.local/share/fl/taken.fls");
+    fs::create_dir_all(store_path.parent().unwrap()).unwrap();
+    let store = fl_store::open_store(&store_path).unwrap();
+    store.add_project(other.to_str().unwrap()).unwrap();
+    drop(store);
+
+    let root = hub.work("new-root");
+    let refused = hub.post(
+        OWNER,
+        &json!({ "name": "Taken", "path": root, "create_only": true, "git_init": true }),
+    );
+    assert_eq!(refused.status, 409, "{}", text_of(&refused));
+    assert!(
+        error_of(&refused).contains("taken"),
+        "{}",
+        text_of(&refused)
+    );
+    assert!(!root.exists());
+    assert!(!hub.config().exists());
+    assert!(hub.workspace().get_area("taken").unwrap().is_none());
+
+    let resumed = hub.post(
+        OWNER,
+        &json!({ "name": "Taken", "path": other, "create_only": true }),
+    );
+    assert_eq!(resumed.status, 201, "{}", text_of(&resumed));
+    assert_eq!(body_of(&resumed)["slug"], "taken");
+    assert_eq!(body_of(&resumed)["store_path"], json!(store_path));
+}
+
+#[test]
 fn a_slug_cannot_be_both_kinds_over_http() {
     let hub = Hub::new();
     assert_eq!(

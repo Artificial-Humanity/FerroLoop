@@ -1058,7 +1058,13 @@ fn resume_flat_uses_the_existing_project_store_without_creating_ancestors() {
 
 #[test]
 fn resume_flat_refuses_missing_empty_and_wrong_root_stores_before_project_changes() {
-    for fixture in ["missing", "empty", "wrong-root", "wrong-root-redb"] {
+    for fixture in [
+        "missing",
+        "zero-byte",
+        "empty",
+        "wrong-root",
+        "wrong-root-redb",
+    ] {
         let env = Env::new();
         let root = env.dir("requested");
         let ferro = env.home.path().join("data/fl/historical.fls");
@@ -1068,6 +1074,10 @@ fn resume_flat_refuses_missing_empty_and_wrong_root_stores_before_project_change
             ferro.clone()
         };
         match fixture {
+            "zero-byte" => {
+                std::fs::create_dir_all(store.parent().unwrap()).unwrap();
+                std::fs::File::create(&store).unwrap();
+            }
             "empty" => drop(fl_store::open_store(&store).unwrap()),
             "wrong-root" | "wrong-root-redb" => {
                 let other = env.dir("other");

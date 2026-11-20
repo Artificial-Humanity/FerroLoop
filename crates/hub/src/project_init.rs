@@ -792,7 +792,7 @@ pub(crate) fn check_store_dir_overlap(root: &Path, paths: &InitPaths) -> Result<
 
 /// Checks `req` against the config and the places in `paths`. Changes nothing.
 pub fn resolve(req: &InitRequest, paths: &InitPaths) -> Result<Resolved, InitError> {
-    resolve_project(req, paths, |_, _, _| Ok(false))
+    resolve_project(req, paths, false, |_, _, _| Ok(false))
 }
 
 /// An old flat name can bypass hierarchy parsing or derivation only when it still names
@@ -821,6 +821,7 @@ fn display_identity(
 fn resolve_project(
     req: &InitRequest,
     paths: &InitPaths,
+    create_only: bool,
     matches_legacy: impl FnOnce(&str, &str, &Path) -> Result<bool, InitError>,
 ) -> Result<Resolved, InitError> {
     let root = canonical_root(&req.path)?;
@@ -900,7 +901,9 @@ fn resolve_project(
     check_store_dir_overlap(&root, paths)?;
 
     let existing = here.and_then(|e| e.tracker.as_ref());
-    let (tracker, adds_tracker) = match (&github, existing) {
+    // A create-only retry can finish registration, but cannot edit a config block.
+    let requested_tracker = github.as_ref().filter(|_| !create_only || here.is_none());
+    let (tracker, adds_tracker) = match (requested_tracker, existing) {
         (Some(g), Some((eg, ec))) => {
             let wanted = req.credential.map(Credential::as_str);
             if !g.eq_ignore_ascii_case(eg) || wanted.is_some_and(|w| w != ec) {
@@ -998,18 +1001,7 @@ fn seed_project_store(
         [p] if same_root(&p.root, &r.root) => p.id.clone(),
         _ if resume_flat => return Err(resume_store_refusal(r)),
         [] => store.add_project(&root).map_err(st)?,
-        _ => {
-            return Err(conflict(format!(
-                "the store {} already holds {}, not {}. A project's store holds only that \
-                 project: choose another name with --name or --slug",
-                r.store.display(),
-                held.iter()
-                    .map(|p| p.root.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", "),
-                r.root.display(),
-            )));
-        }
+        _ => return Err(store_owner_conflict(r, &held)),
     };
     let map = match store.routes(&id).map_err(st)? {
         Some(map) => map,
@@ -1022,6 +1014,19 @@ fn seed_project_store(
     Ok((
         id.iri().as_str().to_string(),
         map.areas.iter().map(|a| a.area.clone()).collect(),
+    ))
+}
+
+fn store_owner_conflict(resolved: &Resolved, held: &[fl_core::model::Project]) -> InitError {
+    conflict(format!(
+        "the store {} already holds {}, not {}. A project's store holds only that \
+         project: choose another name with --name or --slug",
+        resolved.store.display(),
+        held.iter()
+            .map(|project| project.root.as_str())
+            .collect::<Vec<_>>()
+            .join(", "),
+        resolved.root.display(),
     ))
 }
 
@@ -1051,6 +1056,18 @@ fn check_resume_store(resolved: &Resolved) -> Result<(), InitError> {
             "--resume-flat requires an existing project store at {}",
             resolved.store.display()
         )));
+    }
+    // Scan opens may initialize a zero-byte file. A flat recovery must find existing data.
+    let physical = fl_store::store_identity(&resolved.store);
+    let metadata = std::fs::metadata(physical).or_else(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            std::fs::metadata(&resolved.store)
+        } else {
+            Err(e)
+        }
+    });
+    if metadata.is_ok_and(|meta| meta.is_file() && meta.len() == 0) {
+        return Err(resume_store_refusal(resolved));
     }
     // A wrong root must not cause a lone redb to be migrated.
     let store = fl_store::open_store_for_scan(&resolved.store)
@@ -1339,9 +1356,24 @@ where
     P: Deref<Target = AnyStore>,
     W: Deref<Target = AnyStore>,
 {
+    init_project_with_policy(req, paths, false, open_workspace, open_project)
+}
+
+/// Create-only requests can finish a partial registration without replacing an existing area.
+pub(crate) fn init_project_with_policy<P, W>(
+    req: &InitRequest,
+    paths: &InitPaths,
+    create_only: bool,
+    open_workspace: impl FnOnce() -> Result<W, InitError>,
+    open_project: impl FnOnce(&Resolved) -> Result<P, InitError>,
+) -> Result<InitOutcome, InitError>
+where
+    P: Deref<Target = AnyStore>,
+    W: Deref<Target = AnyStore>,
+{
     let _one_at_a_time = lock_project_configuration(&paths.config_path)?;
     let mut workspace = InitWorkspace::new(open_workspace);
-    let resolved = resolve_project(req, paths, |slug, name, root| {
+    let resolved = resolve_project(req, paths, create_only, |slug, name, root| {
         let area = workspace.legacy_area(&paths.workspace_store, slug, name)?;
         Ok(area
             .and_then(|area| area.path.as_deref())
@@ -1381,7 +1413,25 @@ where
         .display_name
         .clone()
         .unwrap_or_else(|| before.map_or_else(|| resolved.slug.clone(), |area| area.name.clone()));
-    let placement = if req.resume_flat {
+    let preserve_area = create_only && before.is_some();
+    let placement = if let Some(area) = before.filter(|_| create_only) {
+        if !matches_display_path(&area.name, &name)
+            || !area
+                .path
+                .as_deref()
+                .is_some_and(|path| same_root(path, &resolved.root))
+        {
+            return Err(conflict(format!(
+                "a different project or group with the slug `{}` already exists. Choose another slug",
+                resolved.slug
+            )));
+        }
+        Placement {
+            name: area.name.clone(),
+            parent: area.parent.clone(),
+            missing: Vec::new(),
+        }
+    } else if req.resume_flat {
         if let Some(area) = before {
             if area.parent.is_some() {
                 return Err(conflict(format!(
@@ -1424,19 +1474,24 @@ where
             },
         )?
     };
-    let purpose = match (&req.purpose, before) {
+    let purpose = match (req.purpose.as_ref().filter(|_| !preserve_area), before) {
         (Some(purpose), _) => checked_purpose(purpose)?,
         (None, Some(area)) => area.purpose.clone(),
         (None, None) => default_purpose(ProjectKind::Project, &resolved.slug),
     };
 
-    std::fs::create_dir_all(&resolved.root)
-        .map_err(|e| failed(format!("could not create {}: {e}", resolved.root.display())))?;
-    let git = if req.git_init {
-        Some(ensure_git(&resolved.root, &req.by)?)
-    } else {
-        None
+    let prepare_root = || {
+        std::fs::create_dir_all(&resolved.root)
+            .map_err(|e| failed(format!("could not create {}: {e}", resolved.root.display())))?;
+        if req.git_init && (!create_only || resolved.registers) {
+            ensure_git(&resolved.root, &req.by).map(Some)
+        } else {
+            Ok(None)
+        }
     };
+    // Keep the usual flow's ordering. A create-only request checks its store
+    // first so a store-only collision cannot create a checkout or repository.
+    let mut git = if create_only { None } else { prepare_root()? };
 
     if let Some(dir) = resolved
         .store
@@ -1447,11 +1502,25 @@ where
             .map_err(|e| failed(format!("could not create {}: {e}", dir.display())))?;
     }
     let project_store = open_project(&resolved)?;
+    if create_only {
+        let held = project_store
+            .list_projects()
+            .map_err(|e| failed(format!("store: {e}")))?;
+        if !held.is_empty()
+            && !matches!(held.as_slice(), [project] if same_root(&project.root, &resolved.root))
+        {
+            return Err(store_owner_conflict(&resolved, &held));
+        }
+        git = prepare_root()?;
+    }
     let (project, areas) = seed_project_store(&project_store, &resolved, req.resume_flat)?;
     let area = AreaRecord {
         area_key: resolved.slug.clone(),
         name: placement.name,
-        path: Some(resolved.root.to_string_lossy().into_owned()),
+        path: before
+            .filter(|_| preserve_area)
+            .and_then(|area| area.path.clone())
+            .or_else(|| Some(resolved.root.to_string_lossy().into_owned())),
         parent: placement.parent,
         purpose,
         updated_at: fl_exec::stamp::now(),

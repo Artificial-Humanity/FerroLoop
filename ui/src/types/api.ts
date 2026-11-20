@@ -291,7 +291,7 @@ export interface CreateProjectRequest {
   slug?: string;
   /** Explicitly allow missing ancestors to be created as virtual groups. */
   create_parent?: boolean;
-  /** For virtual groups, allow exact retries and reject unrelated collisions. */
+  /** Allow exact retries and reject unrelated collisions for projects and virtual groups. */
   create_only?: boolean;
   kind: ProjectKind;
   path?: string | null;
