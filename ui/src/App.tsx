@@ -3763,7 +3763,7 @@ export const App: React.FC<AppProps> = ({
         void refreshSessionsAndTranscript();
         void refreshWireAndRoster();
       }}
-      getPromptAuthEpoch={() => ownerRef.current.authEpoch}
+      getPromptAuthEpoch={() => loggedOutRef.current ? null : ownerRef.current.authEpoch}
       onSendPrompt={handleSendPrompt}
       onSendQueuedNow={handleSendQueuedNow}
       onCancelQueued={handleCancelQueued}

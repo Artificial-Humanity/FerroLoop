@@ -2418,6 +2418,34 @@ describe("App transcript observation ownership", () => {
     },
   );
 
+  it("blocks direct composer sends while App sign-out is pending", async () => {
+    const h = harness();
+    await screen.findByText("Last good history");
+    let finishLogout!: (result: { authenticated: boolean }) => void;
+    const logout = new Promise<{ authenticated: boolean }>((resolve) => { finishLogout = resolve; });
+    const signOut = vi.spyOn(h.api, "logout").mockReturnValue(logout);
+    const send = vi.spyOn(h.api, "sendSessionPrompt").mockResolvedValue({
+      session_id: "session-a", status: "sent", delivered: false, queued: false, delivery_stage: "held",
+    });
+    const composer = screen.getByLabelText("Message");
+
+    try {
+      fireEvent.change(composer, { target: { value: "Draft at sign-out" } });
+      fireEvent.click(screen.getByRole("button", { name: /Sign Out/i }));
+      expect(signOut).toHaveBeenCalledOnce();
+      expect(screen.queryByPlaceholderText("Paste bearer token")).toBeNull();
+      fireEvent.click(screen.getByRole("button", { name: "Send Message" }));
+
+      expect(send).not.toHaveBeenCalled();
+      expect(screen.queryByTestId("optimistic-user-turn")).toBeNull();
+      expect(composer).toHaveValue("Draft at sign-out");
+      fireEvent.change(composer, { target: { value: "" } });
+    } finally {
+      await act(async () => { finishLogout({ authenticated: false }); await logout; });
+      h.unmount();
+    }
+  });
+
   it("ignores direct-held metadata after an App token change before a render", async () => {
     const h = harness();
     await screen.findByText("Last good history");

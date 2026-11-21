@@ -1162,8 +1162,8 @@ export interface ChatPaneProps {
   onOpenMobileRoster?: () => void;
   mobileSidebarOpen?: boolean;
   onRefresh?: () => void;
-  /** Live auth epoch from the App, including after this pane unmounts. */
-  getPromptAuthEpoch?: () => number;
+  /** Live App auth epoch, or null once sign-out begins. Available after unmount. */
+  getPromptAuthEpoch?: () => number | null;
   onSendPrompt?: (
     targetSessionOrAgentId: string,
     payload: PromptRequest,
@@ -2700,6 +2700,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
     }
     const submittedTarget = targetSessionOrAgent;
     const submittedAuthEpoch = getPromptAuthEpoch?.();
+    if (submittedAuthEpoch === null) return;
     const submittedToken = apiClient?.getToken();
     const submittedDraft = { promptText, attachments: [...attachments] };
     const content = trimmedPrompt || "Attached file(s).";
