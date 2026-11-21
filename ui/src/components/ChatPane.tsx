@@ -1162,6 +1162,8 @@ export interface ChatPaneProps {
   onOpenMobileRoster?: () => void;
   mobileSidebarOpen?: boolean;
   onRefresh?: () => void;
+  /** Live auth epoch from the App, including after this pane unmounts. */
+  getPromptAuthEpoch?: () => number;
   onSendPrompt?: (
     targetSessionOrAgentId: string,
     payload: PromptRequest,
@@ -1252,6 +1254,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
   onOpenMobileRoster,
   mobileSidebarOpen = false,
   onRefresh,
+  getPromptAuthEpoch,
   onSendPrompt,
   onSendQueuedNow,
   onCancelQueued,
@@ -2696,6 +2699,8 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
       return;
     }
     const submittedTarget = targetSessionOrAgent;
+    const submittedAuthEpoch = getPromptAuthEpoch?.();
+    const submittedToken = apiClient?.getToken();
     const submittedDraft = { promptText, attachments: [...attachments] };
     const content = trimmedPrompt || "Attached file(s).";
     const matchingBefore = effectiveTurns.filter((turn) =>
@@ -2744,6 +2749,11 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
         throw new Error("No prompt connection is available");
       }
       if (codexSendNow) res = codexSendNowReceipt(submittedTarget, res);
+      if (res?.delivery_stage === "held" && (
+        submittedAuthEpoch !== getPromptAuthEpoch?.() ||
+        owner.authEpoch !== ownerRef.current.authEpoch ||
+        submittedToken !== apiClient?.getToken()
+      )) return;
       const wasQueued = Boolean(res && (res.queued || res.status === "queued"));
       const deliveryFailed = !wasQueued && isPromptDeliveryFailure(res);
       if (

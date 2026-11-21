@@ -21,13 +21,14 @@ import {
   ChatPane,
   coalesceTurnsWithToolOutputs,
   computeLastTurnKey,
+  DRAFT_STORAGE_PREFIX,
   formatTokenCount,
   estimateSessionContextUsage,
   hasNewTurnActivity,
 } from "../components/ChatPane";
 import { ThinkingBlock } from "../components/ThinkingBlock";
 import { summarizeWireContent } from "../components/TurnCard";
-import type { TranscriptTurn } from "../types/api";
+import type { PromptResponse, TranscriptTurn } from "../types/api";
 import { TEST_WORKSPACE_AGENTS } from "./fixtures/testAgents";
 
 function turn(partial: Partial<TranscriptTurn> & { index: number }): TranscriptTurn {
@@ -2362,6 +2363,89 @@ describe("App transcript observation ownership", () => {
     expect(screen.queryByText("Old principal queue")).toBeNull();
     expect(screen.getByText("New principal history")).toBeInTheDocument();
     h.unmount();
+  });
+
+  it.each(["sign-out in progress", "re-pair with chat unmounted"] as const)(
+    "ignores a direct hold from the old App auth lifetime after %s", async (transition) => {
+      const chatUnmounted = transition === "re-pair with chat unmounted";
+      if (chatUnmounted) vi.stubGlobal("innerWidth", 390);
+      const h = harness();
+      try {
+        await screen.findByText("Last good history");
+        let releaseHold!: (result: PromptResponse) => void;
+        const hold = new Promise<PromptResponse>((resolve) => { releaseHold = resolve; });
+        vi.spyOn(h.api, "sendSessionPrompt").mockReturnValue(hold);
+        let finishLogout!: (result: { authenticated: boolean }) => void;
+        const logout = new Promise<{ authenticated: boolean }>((resolve) => { finishLogout = resolve; });
+        vi.spyOn(h.api, "logout").mockReturnValue(logout);
+        vi.spyOn(h.api, "pair").mockResolvedValue({ authenticated: true, authority: { tier: "owner", login: "next-owner" } });
+
+        fireEvent.change(screen.getByLabelText("Message"), { target: { value: "Draft from the old App login" } });
+        fireEvent.click(screen.getByRole("button", { name: "Send Message" }));
+        expect(screen.getByTestId("optimistic-user-turn")).toBeInTheDocument();
+        if (chatUnmounted) {
+          fireEvent.click(screen.getByTestId("phone-tab-agents"));
+          expect(screen.queryByLabelText("Message")).toBeNull();
+          fireEvent.click(screen.getByTestId("phone-tab-more"));
+          fireEvent.click(screen.getByTestId("phone-more-action-logout"));
+          await act(async () => { finishLogout({ authenticated: false }); await logout; });
+          fireEvent.change(await screen.findByPlaceholderText("Paste bearer token"), { target: { value: "next-token" } });
+          fireEvent.click(screen.getByRole("button", { name: "Save Token" }));
+          await waitFor(() => expect(screen.queryByPlaceholderText("Paste bearer token")).toBeNull());
+        } else {
+          fireEvent.click(screen.getByRole("button", { name: /Sign Out/i }));
+        }
+
+        await act(async () => {
+          releaseHold({ session_id: "session-a", status: "sent", delivered: false, queued: false, delivery_stage: "held" });
+          await hold;
+        });
+
+        if (chatUnmounted) {
+          expect(screen.queryByLabelText("Message")).toBeNull();
+          fireEvent.click(screen.getByTestId("phone-tab-chat"));
+          await screen.findByText("Last good history");
+        }
+        expect(screen.getByLabelText("Message")).toHaveValue("");
+        expect(screen.queryByText(/Nothing was sent or queued/)).toBeNull();
+        expect(screen.queryByTestId("optimistic-user-turn")).toBeNull();
+        expect(window.localStorage.getItem(DRAFT_STORAGE_PREFIX + "session-a")).toBeNull();
+        if (!chatUnmounted) await act(async () => { finishLogout({ authenticated: false }); await logout; });
+      } finally {
+        h.unmount();
+        if (chatUnmounted) vi.unstubAllGlobals();
+      }
+    },
+  );
+
+  it("ignores direct-held metadata after an App token change before a render", async () => {
+    const h = harness();
+    await screen.findByText("Last good history");
+    let release!: (result: PromptResponse) => void;
+    const pending = new Promise<PromptResponse>((resolve) => { release = resolve; });
+    vi.spyOn(h.api, "sendSessionPrompt").mockReturnValue(pending);
+    fireEvent.change(screen.getByLabelText("Message"), { target: { value: "A prompt dispatched with the old token" } });
+    fireEvent.click(screen.getByRole("button", { name: "Send Message" }));
+    expect(screen.getByTestId("optimistic-user-turn")).toBeInTheDocument();
+    const sessionReads = h.fetchImpl.mock.calls.filter(([input]) => String(input).endsWith("/sessions")).length;
+
+    const previousToken = h.api.getToken();
+    try {
+      h.api.setToken("new-token");
+      await act(async () => {
+        release({ session_id: "session-a", status: "sent", delivered: false, queued: false, delivery_stage: "held", is_busy: true });
+        await pending;
+      });
+
+      // A current held reply would adopt its metadata and start a session refresh.
+      expect(h.fetchImpl.mock.calls.filter(([input]) => String(input).endsWith("/sessions"))).toHaveLength(sessionReads);
+      expect(screen.getByTestId("session-busy-badge")).toHaveTextContent("Idle");
+      expect(screen.getByLabelText("Message")).toHaveValue("");
+      expect(screen.queryByTestId("optimistic-user-turn")).toBeNull();
+    } finally {
+      h.unmount();
+      h.api.setToken(previousToken);
+    }
   });
 
   it("rejects old auth initial bulk work after reauthentication", async () => {

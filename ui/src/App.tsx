@@ -2761,6 +2761,7 @@ export const App: React.FC<AppProps> = ({
 
   const handleSendPrompt = async (targetId: string, payload: PromptRequest) => {
     const submittedOwner = { ...ownerRef.current };
+    const submittedToken = apiClient.getToken();
     const submittedAgent = selectedAgentNameRef.current;
     const submittedSession = selectedSessionIdRef.current;
     const submittedActiveSession = activeSessionIdRef.current;
@@ -2769,6 +2770,7 @@ export const App: React.FC<AppProps> = ({
       ? codexSendNowReceipt(targetId, response) : response;
     if (
       !mountedRef.current || loggedOutRef.current || !sameTranscriptOwner(submittedOwner, ownerRef.current) ||
+      (res.delivery_stage === "held" && apiClient.getToken() !== submittedToken) ||
       (!res.queued && res.status !== "queued" && res.delivery_stage !== "held" && isPromptDeliveryFailure(res)) ||
       selectedAgentNameRef.current !== submittedAgent ||
       selectedSessionIdRef.current !== submittedSession ||
@@ -3761,6 +3763,7 @@ export const App: React.FC<AppProps> = ({
         void refreshSessionsAndTranscript();
         void refreshWireAndRoster();
       }}
+      getPromptAuthEpoch={() => ownerRef.current.authEpoch}
       onSendPrompt={handleSendPrompt}
       onSendQueuedNow={handleSendQueuedNow}
       onCancelQueued={handleCancelQueued}
