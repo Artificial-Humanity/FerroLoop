@@ -2580,7 +2580,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
         else recordPromptDelivery(submittedTarget, res);
         if (isCurrentOperation()) {
           const content = res.effective_body || res.prompt;
-          if (content && res.delivery_stage !== "unconfirmed") {
+          if (content && res.delivery_stage !== "unconfirmed" && res.delivery_stage !== "held") {
             appendConfirmedPrompt(content);
           }
         }
@@ -2745,22 +2745,24 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
       }
       if (codexSendNow) res = codexSendNowReceipt(submittedTarget, res);
       const wasQueued = Boolean(res && (res.queued || res.status === "queued"));
-      if (!wasQueued && isPromptDeliveryFailure(res)) {
-        throw new Error(res?.delivery_error || "Message delivery failed");
-      }
-      recordPromptDelivery(submittedTarget, res);
+      const deliveryFailed = !wasQueued && isPromptDeliveryFailure(res);
       if (
-        isCurrentOperation() && !onSendPrompt && apiClient && res
+        isCurrentOperation() && !onSendPrompt && apiClient && res &&
+        (!deliveryFailed || res.delivery_stage === "held")
       ) {
         adoptPromptMetadata(res);
         if (Array.isArray(res.queue)) setInternalQueue(res.queue);
         if (typeof res.is_busy === "boolean") setInternalIsBusy(res.is_busy);
-        if (!wasQueued && res.delivery_stage !== "unconfirmed") {
+        if (!wasQueued && res.delivery_stage !== "unconfirmed" && res.delivery_stage !== "held") {
           const body = res.effective_body || payload.prompt;
           appendConfirmedPrompt(body, matchingBefore, content);
         }
         void fetchTranscript();
       }
+      if (deliveryFailed) {
+        throw new Error(promptDeliveryStatus(res) || res?.delivery_error || "Message delivery failed");
+      }
+      recordPromptDelivery(submittedTarget, res);
       if (mountedRef.current && currentTargetRef.current === submittedTarget && !wasQueued) {
         scrollToBottom("smooth");
         requestAnimationFrame(() => scrollToBottom("smooth"));
@@ -2770,7 +2772,9 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
         recordUnconfirmedDelivery(submittedTarget);
         return;
       }
-      if (codexSendNow && attempted) recordPromptRefusal(submittedTarget);
+      if ((codexSendNow && attempted) || res?.delivery_stage === "held") {
+        recordPromptRefusal(submittedTarget);
+      }
       const message = err instanceof Error ? err.message : "Failed to send message";
       sessionSendErrors.set(submittedTarget, message);
       const currentDraft = mountedRef.current && currentTargetRef.current === submittedTarget

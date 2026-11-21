@@ -991,7 +991,11 @@ export type OperatorPromptResponse = PromptResponse;
 /** Explicit uncertainty is handled without restoring a draft that might deliver twice. */
 export function isPromptDeliveryFailure(response?: PromptResponse): boolean {
   if (!response) return false;
-  if (["vendor_queued", "app_server_accepted", "compaction_accepted", "unconfirmed", "held"].includes(response.delivery_stage ?? "")) return false;
+  if (response.delivery_stage === "held") {
+    // A zero-key hold only retains the submission if it entered the queue.
+    return response.queued === false && response.status !== "queued";
+  }
+  if (["vendor_queued", "app_server_accepted", "compaction_accepted", "unconfirmed"].includes(response.delivery_stage ?? "")) return false;
   return response.delivery_stage === "refused" || response.delivery_stage === "not_connected" || response.delivered === false;
 }
 
@@ -1009,7 +1013,10 @@ export function promptDeliveryStatus(response?: PromptResponse): string | null {
     case "vendor_queued": return "Submitted to Codex queue.";
     case "app_server_accepted": return "Codex app server accepted the submission for the targeted turn. This receipt does not confirm model consumption.";
     case "unconfirmed": return "Delivery unconfirmed. Check the session before resending; no automatic retry was made.";
-    case "held": return "Held: the session composer is occupied, so nothing was sent. It will retry automatically when the composer clears.";
+    case "held":
+      return isPromptDeliveryFailure(response)
+        ? "FerroDeck could not use the session composer. Nothing was sent or queued."
+        : "Held: the session composer is occupied, so nothing was sent.";
     default: return null;
   }
 }
