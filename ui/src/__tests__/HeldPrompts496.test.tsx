@@ -1,7 +1,8 @@
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { HubApiClient } from "../api/client";
 import { ChatPane, isComposerHeldPrompt, sessionDraftMemory } from "../components/ChatPane";
-import type { QueuedOperatorPrompt } from "../types/api";
+import type { QueuedOperatorPrompt, SessionTranscriptResponse } from "../types/api";
 
 const HOLD_REASON =
   "composer_occupied_by_non_wire_input: composer holds non-wire input or active dialog; holding delivery without sending keys";
@@ -36,6 +37,83 @@ describe("held operator prompts (#496 defect 1)", () => {
     // Post-paste error shares the wire prefix but is not a zero-key hold (B1).
     expect(isComposerHeldPrompt(heldItem({ hold_reason: null, delivery_error: "composer_occupied_by_non_wire_input: composer holds non-wire input after paste; aborting Enter retries" }))).toBe(false);
     expect(isComposerHeldPrompt(heldItem({ hold_reason: null, delivery_error: null }))).toBe(false);
+  });
+
+  it("restores a direct Claude draft and adopts the held reply's session state", async () => {
+    const target = "sess-kayla-direct-hold";
+    const draft = "  Please review the next draft  ";
+    const effectiveBody = "Please review the next draft";
+    const queue = [heldItem({ id: "other-held", session_id: target })];
+    const client = new HubApiClient({ fetchImpl: async () => new Response("{}") });
+    let resolveRefresh!: (response: SessionTranscriptResponse) => void;
+    const refresh = new Promise<SessionTranscriptResponse>((resolve) => { resolveRefresh = resolve; });
+    vi.spyOn(client, "getSessionTranscript")
+      .mockResolvedValueOnce({ session_id: target, turns: [] })
+      .mockReturnValueOnce(refresh);
+    vi.spyOn(client, "sendSessionPrompt").mockResolvedValue({
+      session_id: target,
+      status: "sent",
+      queued: false,
+      is_busy: true,
+      delivered: false,
+      delivery_stage: "held",
+      delivery_error: HOLD_REASON,
+      prompt: effectiveBody,
+      effective_body: effectiveBody,
+      queue,
+    });
+    render(<ChatPane agentName="kayla" adapter="claude" sessionId={target} apiClient={client} />);
+    await screen.findByTestId("chat-empty-state");
+
+    const composer = screen.getByLabelText("Message");
+    fireEvent.change(composer, { target: { value: draft } });
+    fireEvent.click(screen.getByRole("button", { name: "Send Message" }));
+
+    expect(await screen.findByText(/Nothing was sent or queued/)).toBeInTheDocument();
+    expect(composer).toHaveValue(draft);
+    expect(screen.queryByTestId("optimistic-user-turn")).not.toBeInTheDocument();
+    expect(screen.queryByText(effectiveBody, { ignore: "textarea" })).not.toBeInTheDocument();
+    expect(screen.getByTestId("queued-prompt-item-other-held")).toBeInTheDocument();
+    expect(screen.getByTestId("session-busy-badge")).toHaveTextContent("Busy");
+    await act(async () => resolveRefresh({
+      session_id: target,
+      turns: [{ index: 0, role: "assistant", content: "Latest session history", thinking: null, tool_calls: [] }],
+    }));
+    expect(screen.getByText("Latest session history")).toBeInTheDocument();
+    expect(screen.queryByText(effectiveBody, { ignore: "textarea" })).not.toBeInTheDocument();
+  });
+
+  it("does not promise automatic retry for a held queue item that requires Send Now", async () => {
+    const target = "sess-kayla-manual-hold";
+    const queue = [heldItem({
+      id: "manual-hold",
+      session_id: target,
+      prompt: "Queued text awaiting delivery",
+      effective_body: "Queued text awaiting delivery",
+      retries_exhausted: true,
+    })];
+    const client = new HubApiClient({ fetchImpl: async () => new Response("{}") });
+    vi.spyOn(client, "getSessionTranscript").mockResolvedValue({ session_id: target, turns: [], queue });
+    vi.spyOn(client, "sendQueuedPromptNow").mockResolvedValue({
+      session_id: target,
+      status: "delivery_failed",
+      queued: true,
+      is_busy: true,
+      delivered: false,
+      delivery_stage: "held",
+      delivery_error: HOLD_REASON,
+      prompt: "Queued text awaiting delivery",
+      effective_body: "Queued text awaiting delivery",
+      queue,
+    });
+    render(<ChatPane agentName="kayla" adapter="claude" sessionId={target} apiClient={client} />);
+
+    fireEvent.click(await screen.findByTestId("queued-send-now-manual-hold"));
+    expect(await screen.findByText("Held: the session composer is occupied, so nothing was sent.")).toBeInTheDocument();
+    expect(screen.getByTestId("queued-hold-reason-manual-hold")).toHaveTextContent(/use Send Now/);
+    expect(screen.queryByText(/will retry automatically/)).not.toBeInTheDocument();
+    const queuedText = screen.getByText("Queued text awaiting delivery");
+    expect(screen.getByTestId("queued-prompt-item-manual-hold")).toContainElement(queuedText);
   });
 
   it("shows the owner's text and sender with the hold reason as a separate status line", () => {

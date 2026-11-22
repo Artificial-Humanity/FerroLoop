@@ -1,8 +1,8 @@
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import React from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { ChatPane, sessionDraftMemory, sessionSendErrors } from "../components/ChatPane";
-import type { TranscriptTurn } from "../types/api";
+import { ChatPane, DRAFT_STORAGE_PREFIX, sessionDraftMemory, sessionSendErrors } from "../components/ChatPane";
+import type { PromptResponse, TranscriptTurn } from "../types/api";
 import { HubApiClient } from "../api/client";
 
 function deferred<T>() {
@@ -15,6 +15,9 @@ const turn = (content: string, index = 0): TranscriptTurn => ({ index, role: "us
 const input = () => screen.getByPlaceholderText(/Send a message/i) as HTMLTextAreaElement;
 const send = () => fireEvent.click(screen.getByRole("button", { name: /^Send Message$/i }));
 const props = (handler: () => Promise<unknown>) => ({ agentName: "alpha", sessionId: "a", turns: [] as TranscriptTurn[], onSendPrompt: handler });
+const directHold: PromptResponse = {
+  session_id: "a", status: "sent", delivered: false, queued: false, delivery_stage: "held",
+};
 
 beforeEach(() => { sessionDraftMemory.clear(); sessionSendErrors.clear(); window.localStorage.clear(); });
 describe("optimistic prompt submission", () => {
@@ -301,6 +304,71 @@ describe("optimistic prompt submission", () => {
     expect(screen.getByText(/route unavailable/)).toBeInTheDocument();
     expect(screen.queryByTestId("optimistic-user-turn")).toBeNull();
   });
+  it.each(["principal change", "token change"] as const)(
+    "ignores a direct hold after a standalone %s on the same target", async (transition) => {
+      const pending = deferred<PromptResponse>();
+      const apiClient = new HubApiClient({ fetchImpl: async () => new Response("{}") });
+      apiClient.setToken("original-token");
+      vi.spyOn(apiClient, "sendSessionPrompt").mockReturnValue(pending.promise);
+      const pane = (login: string) => (
+        <ChatPane agentName="alpha" sessionId="a" adapter="claude" turns={[]}
+          authority={{ tier: "owner", login }} apiClient={apiClient} />
+      );
+      const { rerender } = render(pane("original-owner"));
+      fireEvent.change(input(), { target: { value: "original principal's draft" } });
+      fireEvent.change(screen.getByTestId("prompt-file-input"), {
+        target: { files: [new File(["private"], "private.txt", { type: "text/plain" })] },
+      });
+      await screen.findByText("private.txt");
+      send();
+      expect(screen.getByTestId("optimistic-user-turn")).toBeInTheDocument();
+
+      if (transition === "principal change") rerender(pane("new-owner"));
+      else apiClient.setToken("new-token");
+      await act(async () => { pending.resolve(directHold); await pending.promise; });
+
+      expect(input()).toHaveValue("");
+      expect(screen.queryByText("private.txt")).toBeNull();
+      expect(screen.queryByText(/Nothing was sent or queued/)).toBeNull();
+      expect(screen.queryByTestId("optimistic-user-turn")).toBeNull();
+      expect(sessionDraftMemory.has("a")).toBe(false);
+      expect(window.localStorage.getItem(DRAFT_STORAGE_PREFIX + "a")).toBeNull();
+      expect(sessionSendErrors.has("a")).toBe(false);
+    },
+  );
+  it.each(["target switch", "remount"] as const)(
+    "restores the submitted draft after a direct hold during a same-auth %s", async (navigation) => {
+      const pending = deferred<PromptResponse>();
+      const handler = () => pending.promise;
+      const pane = (sessionId: string) => <ChatPane {...props(handler)} sessionId={sessionId} adapter="claude" />;
+      const first = render(pane("a"));
+      fireEvent.change(input(), { target: { value: " draft text " } });
+      fireEvent.change(screen.getByTestId("prompt-file-input"), {
+        target: { files: [new File(["draft"], "draft.txt", { type: "text/plain" })] },
+      });
+      await screen.findByText("draft.txt");
+      send();
+
+      if (navigation === "target switch") {
+        first.rerender(pane("b"));
+        fireEvent.change(input(), { target: { value: "other draft" } });
+      } else {
+        first.unmount();
+        render(pane("a"));
+      }
+      await act(async () => { pending.resolve(directHold); await pending.promise; });
+
+      if (navigation === "target switch") {
+        expect(input()).toHaveValue("other draft");
+        expect(screen.queryByText(/Nothing was sent or queued/)).toBeNull();
+        first.rerender(pane("a"));
+      }
+      expect(input()).toHaveValue(" draft text ");
+      expect(screen.getByText("draft.txt")).toBeInTheDocument();
+      expect(screen.getByText(/Nothing was sent or queued/)).toBeInTheDocument();
+      expect(screen.queryByTestId("optimistic-user-turn")).toBeNull();
+    },
+  );
   it("removes the in-flight turn when the request is queued", async () => {
     const pending = deferred<unknown>();
     render(<ChatPane {...props(() => pending.promise)} />);

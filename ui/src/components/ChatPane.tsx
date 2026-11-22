@@ -1162,6 +1162,8 @@ export interface ChatPaneProps {
   onOpenMobileRoster?: () => void;
   mobileSidebarOpen?: boolean;
   onRefresh?: () => void;
+  /** Live App auth epoch, or null once sign-out begins. Available after unmount. */
+  getPromptAuthEpoch?: () => number | null;
   onSendPrompt?: (
     targetSessionOrAgentId: string,
     payload: PromptRequest,
@@ -1252,6 +1254,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
   onOpenMobileRoster,
   mobileSidebarOpen = false,
   onRefresh,
+  getPromptAuthEpoch,
   onSendPrompt,
   onSendQueuedNow,
   onCancelQueued,
@@ -2580,7 +2583,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
         else recordPromptDelivery(submittedTarget, res);
         if (isCurrentOperation()) {
           const content = res.effective_body || res.prompt;
-          if (content && res.delivery_stage !== "unconfirmed") {
+          if (content && res.delivery_stage !== "unconfirmed" && res.delivery_stage !== "held") {
             appendConfirmedPrompt(content);
           }
         }
@@ -2696,6 +2699,9 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
       return;
     }
     const submittedTarget = targetSessionOrAgent;
+    const submittedAuthEpoch = getPromptAuthEpoch?.();
+    if (submittedAuthEpoch === null) return;
+    const submittedToken = apiClient?.getToken();
     const submittedDraft = { promptText, attachments: [...attachments] };
     const content = trimmedPrompt || "Attached file(s).";
     const matchingBefore = effectiveTurns.filter((turn) =>
@@ -2744,23 +2750,30 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
         throw new Error("No prompt connection is available");
       }
       if (codexSendNow) res = codexSendNowReceipt(submittedTarget, res);
+      if (res?.delivery_stage === "held" && (
+        submittedAuthEpoch !== getPromptAuthEpoch?.() ||
+        owner.authEpoch !== ownerRef.current.authEpoch ||
+        submittedToken !== apiClient?.getToken()
+      )) return;
       const wasQueued = Boolean(res && (res.queued || res.status === "queued"));
-      if (!wasQueued && isPromptDeliveryFailure(res)) {
-        throw new Error(res?.delivery_error || "Message delivery failed");
-      }
-      recordPromptDelivery(submittedTarget, res);
+      const deliveryFailed = !wasQueued && isPromptDeliveryFailure(res);
       if (
-        isCurrentOperation() && !onSendPrompt && apiClient && res
+        isCurrentOperation() && !onSendPrompt && apiClient && res &&
+        (!deliveryFailed || res.delivery_stage === "held")
       ) {
         adoptPromptMetadata(res);
         if (Array.isArray(res.queue)) setInternalQueue(res.queue);
         if (typeof res.is_busy === "boolean") setInternalIsBusy(res.is_busy);
-        if (!wasQueued && res.delivery_stage !== "unconfirmed") {
+        if (!wasQueued && res.delivery_stage !== "unconfirmed" && res.delivery_stage !== "held") {
           const body = res.effective_body || payload.prompt;
           appendConfirmedPrompt(body, matchingBefore, content);
         }
         void fetchTranscript();
       }
+      if (deliveryFailed) {
+        throw new Error(promptDeliveryStatus(res) || res?.delivery_error || "Message delivery failed");
+      }
+      recordPromptDelivery(submittedTarget, res);
       if (mountedRef.current && currentTargetRef.current === submittedTarget && !wasQueued) {
         scrollToBottom("smooth");
         requestAnimationFrame(() => scrollToBottom("smooth"));
@@ -2770,7 +2783,9 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
         recordUnconfirmedDelivery(submittedTarget);
         return;
       }
-      if (codexSendNow && attempted) recordPromptRefusal(submittedTarget);
+      if ((codexSendNow && attempted) || res?.delivery_stage === "held") {
+        recordPromptRefusal(submittedTarget);
+      }
       const message = err instanceof Error ? err.message : "Failed to send message";
       sessionSendErrors.set(submittedTarget, message);
       const currentDraft = mountedRef.current && currentTargetRef.current === submittedTarget

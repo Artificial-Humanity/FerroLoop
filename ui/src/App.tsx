@@ -2761,6 +2761,7 @@ export const App: React.FC<AppProps> = ({
 
   const handleSendPrompt = async (targetId: string, payload: PromptRequest) => {
     const submittedOwner = { ...ownerRef.current };
+    const submittedToken = apiClient.getToken();
     const submittedAgent = selectedAgentNameRef.current;
     const submittedSession = selectedSessionIdRef.current;
     const submittedActiveSession = activeSessionIdRef.current;
@@ -2769,7 +2770,8 @@ export const App: React.FC<AppProps> = ({
       ? codexSendNowReceipt(targetId, response) : response;
     if (
       !mountedRef.current || loggedOutRef.current || !sameTranscriptOwner(submittedOwner, ownerRef.current) ||
-      (!res.queued && res.status !== "queued" && isPromptDeliveryFailure(res)) ||
+      (res.delivery_stage === "held" && apiClient.getToken() !== submittedToken) ||
+      (!res.queued && res.status !== "queued" && res.delivery_stage !== "held" && isPromptDeliveryFailure(res)) ||
       selectedAgentNameRef.current !== submittedAgent ||
       selectedSessionIdRef.current !== submittedSession ||
       !activeSessionStillCurrent(submittedActiveSession, activeSessionIdRef.current, targetId)
@@ -2781,7 +2783,8 @@ export const App: React.FC<AppProps> = ({
       const unconfirmed = res.in_flight_unconfirmed;
       setUnconfirmedBySession((prev) => ({ ...prev, [targetId]: unconfirmed }));
     }
-    if (!res.queued && res.status !== "queued" && res.delivery_stage !== "unconfirmed") {
+    if (!res.queued && res.status !== "queued" &&
+        res.delivery_stage !== "unconfirmed" && res.delivery_stage !== "held") {
       const content = res.effective_body || payload.prompt;
       const agentKey = (selectedAgent?.name_key ?? selectedAgentName)
         .trim()
@@ -2817,7 +2820,7 @@ export const App: React.FC<AppProps> = ({
       return res;
     }
     const content = res.effective_body || res.prompt;
-    if (content && res.delivery_stage !== "unconfirmed") {
+    if (content && res.delivery_stage !== "unconfirmed" && res.delivery_stage !== "held") {
       const agentKey = (selectedAgent?.name_key ?? selectedAgentName)
         .trim()
         .toLowerCase();
@@ -3760,6 +3763,7 @@ export const App: React.FC<AppProps> = ({
         void refreshSessionsAndTranscript();
         void refreshWireAndRoster();
       }}
+      getPromptAuthEpoch={() => loggedOutRef.current ? null : ownerRef.current.authEpoch}
       onSendPrompt={handleSendPrompt}
       onSendQueuedNow={handleSendQueuedNow}
       onCancelQueued={handleCancelQueued}
