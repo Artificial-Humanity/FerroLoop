@@ -20,6 +20,7 @@ pub(crate) struct ProjectionSnapshot {
     pub generation: u64,
     pub output_seq: u64,
     pub output_bytes: u64,
+    pub dim_suffix_line: Option<u16>,
     // The response owner may move this permit alongside contents, keeping it
     // alive through serialization and write. It must separately admit JSON.
     pub(crate) _reservation: Reservation,
@@ -97,7 +98,10 @@ impl Projection {
     pub(crate) fn set_output_seq(&mut self, seq: u64) {
         self.output_seq = self.output_seq.max(seq);
     }
-    pub(crate) fn snapshot(&self) -> Result<ProjectionSnapshot, ExtensionRefusal> {
+    pub(crate) fn snapshot(
+        &self,
+        include_cursor_style: bool,
+    ) -> Result<ProjectionSnapshot, ExtensionRefusal> {
         // contents() grows a String geometrically: final capacity is at most
         // twice the text bound, and the old buffer can coexist during growth.
         // Admit all three bounds before asking vt100 to allocate anything.
@@ -113,6 +117,11 @@ impl Projection {
         }
         let (cursor_row, cursor_col) = screen.cursor_position();
         let (rows, cols) = screen.size();
+        let dim_suffix_line = if include_cursor_style {
+            dim_suffix_line(screen, cursor_row, cursor_col, cols.get())
+        } else {
+            None
+        };
         // vt100 represents pending autowrap with col == width. Expose the
         // visible cursor cell while retaining that pending state in the parser.
         let cursor_col = cursor_col.min(cols.get() - 1);
@@ -125,6 +134,7 @@ impl Projection {
             generation: self.generation,
             output_seq: self.output_seq,
             output_bytes: self.output_bytes,
+            dim_suffix_line,
             _reservation: reservation,
         })
     }
@@ -153,6 +163,51 @@ impl Projection {
         self.generation = self.generation.saturating_add(1);
         Ok(self.generation)
     }
+}
+
+/// Locate this exact unwrapped cursor row in vt100's plain-text projection.
+fn dim_suffix_line(screen: &vt100::Screen, row: u16, col: u16, cols: u16) -> Option<u16> {
+    if col >= cols
+        || screen.scrollback() != 0
+        || screen.row_wrapped(row)
+        || row
+            .checked_sub(1)
+            .is_some_and(|prev| screen.row_wrapped(prev))
+        || screen.cell(row, col)?.is_wide_continuation()
+    {
+        return None;
+    }
+    let mut has_text = false;
+    for col in col..cols {
+        let cell = screen.cell(row, col)?;
+        if !cell.contents().trim().is_empty() {
+            if !cell.dim() {
+                return None;
+            }
+            has_text = true;
+        }
+    }
+    if !has_text {
+        return None;
+    }
+    let mut line = 0;
+    for previous in 0..row {
+        if previous > 0
+            && screen.row_wrapped(previous - 1)
+            && !(0..cols).any(|col| {
+                screen
+                    .cell(previous, col)
+                    .is_some_and(vt100::Cell::has_contents)
+            })
+        {
+            // vt100 emits an extra newline for an empty continuation row.
+            line += 1;
+        }
+        if !screen.row_wrapped(previous) {
+            line += 1;
+        }
+    }
+    Some(line)
 }
 
 /// Never give vte a control-string introducer: its OSC accumulator otherwise
@@ -279,6 +334,39 @@ mod tests {
     }
 
     #[test]
+    fn dim_suffix_uses_the_visible_cursor_line_after_wrapped_history() {
+        let mut p = projection();
+        let columns = usize::from(p.parser.screen().size().1.get());
+        p.process("x".repeat(columns + 1).as_bytes());
+        p.process("\r\n❯ \x1b[2mA synthetic suggestion\x1b[22m\x1b[3G".as_bytes());
+        let dim = p.snapshot(true).unwrap();
+        assert_eq!((dim.cursor_row, dim.cursor_col), (2, 2));
+        assert_eq!(dim.dim_suffix_line, Some(1));
+
+        p.process(b"A synthetic suggestion\x1b[3G");
+        let plain = p.snapshot(true).unwrap();
+        assert_eq!(plain.contents, dim.contents);
+        assert_eq!((plain.cursor_row, plain.cursor_col), (2, 2));
+        assert_eq!(plain.dim_suffix_line, None);
+    }
+
+    #[test]
+    fn dim_suffix_rejects_mixed_style_and_ambiguous_wrap() {
+        let mut p = projection();
+        p.process("❯ Real \x1b[2mdim\x1b[22m\x1b[3G".as_bytes());
+        assert_eq!(p.snapshot(true).unwrap().dim_suffix_line, None);
+
+        let cols = usize::from(p.parser.screen().size().1.get());
+        p.process(b"\x1b[2J\x1b[H\x1b[2m");
+        p.process("x".repeat(cols).as_bytes());
+        assert_eq!(p.snapshot(true).unwrap().dim_suffix_line, None);
+        p.process(b"more dim text\x1b[1G");
+        assert_eq!(p.snapshot(true).unwrap().dim_suffix_line, None);
+        p.process(b"\x1b[1;1H");
+        assert_eq!(p.snapshot(true).unwrap().dim_suffix_line, None);
+    }
+
+    #[test]
     fn split_csi_utf8_and_alternate_screen_restore() {
         let mut p = projection();
         for chunk in [
@@ -292,7 +380,7 @@ mod tests {
         ] {
             p.process(chunk);
         }
-        let s = p.snapshot().unwrap();
+        let s = p.snapshot(false).unwrap();
         assert_eq!(s.contents, "café");
         assert_eq!((s.cursor_row, s.cursor_col), (0, 4));
         assert_eq!(s.generation, 7);
@@ -320,7 +408,7 @@ mod tests {
                     p.process(std::slice::from_ref(byte));
                 }
                 assert_eq!(
-                    p.snapshot().unwrap().contents,
+                    p.snapshot(false).unwrap().contents,
                     "aÜÝÞß",
                     "{seq:?} split {split}"
                 );
@@ -384,7 +472,7 @@ mod tests {
                 });
             }
             filter.process(b"\x07 visible", |chunk| p.parser.process(chunk));
-            assert_eq!(p.snapshot().unwrap().contents, expected);
+            assert_eq!(p.snapshot(false).unwrap().contents, expected);
         }
     }
 
@@ -421,9 +509,9 @@ mod tests {
             p.process(&chunk);
         }
         p.process(b"\xc3\x9cstill-hidden\x1b");
-        assert_eq!(p.snapshot().unwrap().contents, "safe");
+        assert_eq!(p.snapshot(false).unwrap().contents, "safe");
         p.process(b"\\ visible");
-        let s = p.snapshot().unwrap();
+        let s = p.snapshot(false).unwrap();
         assert_eq!(s.contents, "safe visible");
         assert!(s.output_bytes > 8 * 1024 * 1024);
         assert_eq!(budget.used(ChargeKind::Projection), charged);
@@ -436,14 +524,14 @@ mod tests {
         }
         p.process(b"\r\x1b[2Kdone");
         p.set_output_seq(99);
-        let s = p.snapshot().unwrap();
+        let s = p.snapshot(false).unwrap();
         assert_eq!(s.contents, "done");
         assert_eq!(s.cursor_col, 4);
         assert_eq!(s.generation, 700_001);
         assert_eq!(s.output_seq, 99);
         assert!(s.output_bytes > 8 * 1024 * 1024);
         p.process(b"");
-        assert_eq!(p.snapshot().unwrap().generation, s.generation);
+        assert_eq!(p.snapshot(false).unwrap().generation, s.generation);
     }
     #[test]
     fn geometry_scrollback_budget_and_snapshot_admission_release() {
@@ -479,9 +567,9 @@ mod tests {
         drop(held);
         let p = Projection::new(Arc::clone(&budget), PtyOptions::default()).unwrap();
         let held = reserve(&budget, ChargeKind::Snapshot, 32 * 1024 * 1024).unwrap();
-        assert!(p.snapshot().is_err());
+        assert!(p.snapshot(false).is_err());
         drop(held);
-        let s = p.snapshot().unwrap();
+        let s = p.snapshot(false).unwrap();
         assert!(budget.used(ChargeKind::Snapshot) > 0);
         drop(s);
         assert_eq!(budget.used(ChargeKind::Snapshot), 0);
@@ -498,7 +586,7 @@ mod tests {
             p.resize(160, 50, || Err(HostError::Io("ioctl failed".into())))
                 .is_err()
         );
-        let s = p.snapshot().unwrap();
+        let s = p.snapshot(false).unwrap();
         assert_eq!((s.cols, s.rows, s.generation), (120, 40, 1));
         assert_eq!(budget.used(ChargeKind::Projection), charged);
         assert!(
@@ -531,10 +619,10 @@ mod tests {
         )
         .unwrap();
         p.process(b"abcd");
-        let s = p.snapshot().unwrap();
+        let s = p.snapshot(false).unwrap();
         assert_eq!((s.cursor_row, s.cursor_col), (0, 3));
         p.process(b"e");
-        let s = p.snapshot().unwrap();
+        let s = p.snapshot(false).unwrap();
         assert_eq!(s.contents, "abcde");
         assert_eq!((s.cursor_row, s.cursor_col), (1, 1));
     }
@@ -557,7 +645,7 @@ mod tests {
         for _ in 0..8192 {
             p.process(cell.as_bytes());
         }
-        let s = p.snapshot().unwrap();
+        let s = p.snapshot(false).unwrap();
         assert_eq!(s.contents.chars().filter(|c| *c == '"').count(), 8192);
         assert_eq!(s.contents.len(), 155_648);
         assert!(s.contents.len() <= MAX_RENDERED_TEXT);
@@ -574,7 +662,7 @@ mod tests {
         p.process(b"visible");
         p.set_output_seq(1);
         assert_eq!(p.resize(120, 40, || Ok(())).unwrap(), u64::MAX);
-        let s = p.snapshot().unwrap();
+        let s = p.snapshot(false).unwrap();
         assert_eq!(
             (s.generation, s.output_bytes, s.output_seq),
             (u64::MAX, u64::MAX, u64::MAX)

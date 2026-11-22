@@ -177,7 +177,8 @@ pub fn encode_response_for_minor(minor: u16, response: &HostResponse) -> Result<
         response,
         HostResponse::Extended {
             response: crate::ExtensionResponse::Sessions { .. }
-                | crate::ExtensionResponse::RenderedCapture { .. },
+                | crate::ExtensionResponse::RenderedCapture { .. }
+                | crate::ExtensionResponse::RenderedCursorStyleCapture { .. },
             ..
         }
     ) {

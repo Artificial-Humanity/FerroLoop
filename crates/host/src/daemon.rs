@@ -542,6 +542,7 @@ pub(super) async fn extended(
             features: fl_host_proto::RELIABLE_FEATURE
                 | fl_host_proto::PTY_FEATURE
                 | fl_host_proto::RENDERED_PTY_FEATURE
+                | fl_host_proto::RENDERED_CURSOR_STYLE_FEATURE
                 | fl_host_proto::HOST_STATUS_FEATURE
                 | fl_host_proto::SESSION_OWNER_FEATURE
                 | fl_host_proto::PTY_RETENTION_FEATURE,
@@ -762,15 +763,16 @@ pub(super) async fn extended(
             };
             Ok(XResp::Input { outcome })
         }
-        XReq::CaptureRendered { stream } => {
+        XReq::CaptureRendered { ref stream } | XReq::CaptureRenderedCursorStyle { ref stream } => {
             if !cfg!(unix) {
                 return Err(Refusal::Unsupported);
             }
-            let session = host.authority.rendered_session(conn, &stream)?;
-            let snapshot = session.capture_screen()?;
+            let include_cursor_style = matches!(request, XReq::CaptureRenderedCursorStyle { .. });
+            let session = host.authority.rendered_session(conn, stream)?;
+            let snapshot = session.capture_screen(include_cursor_style)?;
             let screen = fl_host_proto::RenderedScreen {
                 schema: 1,
-                stream,
+                stream: stream.clone(),
                 contents: snapshot.contents,
                 cursor_row: snapshot.cursor_row,
                 cursor_col: snapshot.cursor_col,
@@ -782,7 +784,14 @@ pub(super) async fn extended(
             };
             screen.validate().map_err(|_| Refusal::ResourceLimit)?;
             *snapshot_reservation = Some(snapshot._reservation);
-            Ok(XResp::RenderedCapture { screen })
+            if include_cursor_style {
+                Ok(XResp::RenderedCursorStyleCapture {
+                    screen,
+                    dim_suffix_line: snapshot.dim_suffix_line,
+                })
+            } else {
+                Ok(XResp::RenderedCapture { screen })
+            }
         }
         XReq::Resize {
             stream,
@@ -1314,7 +1323,9 @@ fn admit_extension(
             8192 + fl_host_proto::MAX_RECENT_PTY_EVICTIONS
                 * (std::mem::size_of::<fl_host_proto::StreamId>() + 64 + 4 * 256)
         }
-        XReq::CaptureRendered { .. } => 2 * fl_host_proto::MAX_FRAME_PAYLOAD + 5 + 4096,
+        XReq::CaptureRendered { .. } | XReq::CaptureRenderedCursorStyle { .. } => {
+            2 * fl_host_proto::MAX_FRAME_PAYLOAD + 5 + 4096
+        }
         XReq::ListSessions => list_response_storage_bound().ok_or(Refusal::ResourceLimit)?,
         XReq::CaptureOutput { max_bytes, .. } => {
             (*max_bytes as usize).min(fl_host_proto::MAX_RAW_INPUT) + 4096

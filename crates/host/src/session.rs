@@ -131,6 +131,7 @@ impl Session {
     }
     pub(crate) fn capture_screen(
         &self,
+        include_cursor_style: bool,
     ) -> Result<crate::projection::ProjectionSnapshot, fl_host_proto::ExtensionRefusal> {
         if cfg!(windows) {
             return Err(fl_host_proto::ExtensionRefusal::Unsupported);
@@ -150,7 +151,7 @@ impl Session {
                     fl_host_proto::ExtensionRefusal::WrongMode
                 }
             })?
-            .snapshot()
+            .snapshot(include_cursor_style)
     }
     pub(crate) fn resize_pty(&self, cols: u16, rows: u16) -> Result<u64, ResizeError> {
         #[cfg(unix)]
@@ -1302,7 +1303,7 @@ mod tests {
         session.note_cleanup(CleanupReport { complete: true });
         assert_eq!(journal.budget().used(ChargeKind::Projection), 0);
         assert!(matches!(
-            session.capture_screen(),
+            session.capture_screen(false),
             Err(fl_host_proto::ExtensionRefusal::SessionFenced)
         ));
         assert!(matches!(
@@ -1325,7 +1326,7 @@ mod tests {
         assert_eq!(journal.position().0, 0);
         assert_eq!(journal.budget().used(ChargeKind::Projection), 0);
         assert!(matches!(
-            session.capture_screen(),
+            session.capture_screen(false),
             Err(fl_host_proto::ExtensionRefusal::SessionFenced)
         ));
     }
@@ -1338,7 +1339,10 @@ mod tests {
         let charged = journal.budget().used(ChargeKind::Projection);
         session.note_cleanup(CleanupReport { complete: false });
         session.drop_pty_output(&journal, b"still-visible");
-        assert_eq!(session.capture_screen().unwrap().contents, "still-visible");
+        assert_eq!(
+            session.capture_screen(false).unwrap().contents,
+            "still-visible"
+        );
         assert_eq!(journal.budget().used(ChargeKind::Projection), charged);
         assert_eq!(journal.position().0, 0);
     }
@@ -1354,7 +1358,7 @@ mod tests {
         let mut read = false;
         pump_reliable_stdout_with(&session, sink.as_ref(), &journal, |buf| {
             if read {
-                let s = session.capture_screen().unwrap();
+                let s = session.capture_screen(false).unwrap();
                 assert_eq!(s.contents, "visible");
                 assert_eq!(
                     (s.generation, s.output_seq, s.output_bytes),
@@ -1378,7 +1382,7 @@ mod tests {
         let chunks = [b"old\r\x1b[2".as_slice(), b"Knew\n"];
         let mut next = 0;
         pump_reliable_stdout_with(&session, sink.as_ref(), &journal, |buf| {
-            let s = session.capture_screen().unwrap();
+            let s = session.capture_screen(false).unwrap();
             assert_eq!(s.generation, next as u64);
             assert_eq!(s.output_seq, journal.position().1);
             assert_eq!(
@@ -1400,7 +1404,7 @@ mod tests {
     #[test]
     fn projection_refuses_pipe_and_failed_session_ioctl_preserves_screen() {
         assert!(matches!(
-            Session::new(parts()).capture_screen(),
+            Session::new(parts()).capture_screen(false),
             Err(fl_host_proto::ExtensionRefusal::WrongMode)
         ));
         let (_, journal, _) = pty_fixture();
@@ -1418,7 +1422,7 @@ mod tests {
             Some(tempfile::tempfile().unwrap()),
         );
         assert!(session.resize_pty(160, 50).is_err());
-        let s = session.capture_screen().unwrap();
+        let s = session.capture_screen(false).unwrap();
         assert_eq!((s.cols, s.rows, s.generation), (120, 40, 0));
     }
 
@@ -1438,7 +1442,7 @@ mod tests {
                 }
             });
             loop {
-                let s = session.capture_screen().unwrap();
+                let s = session.capture_screen(false).unwrap();
                 assert_eq!(s.output_bytes, s.generation * 3);
                 assert!(s.output_seq >= s.generation);
                 if s.generation == 1000 {

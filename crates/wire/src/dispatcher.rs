@@ -3737,6 +3737,20 @@ fn capture_bound_host_screen(
     Some(RenderedCursorScreen::from_host(screen))
 }
 
+fn capture_bound_claude_composer(
+    client: &mut fl_host_proto::BlockingHostClient,
+    stream: &fl_host_proto::StreamId,
+) -> Option<RenderedCursorScreen> {
+    let (screen, dim_suffix_line) = client.capture_rendered_cursor_style(stream.clone()).ok()?;
+    if screen.stream != *stream {
+        return None;
+    }
+    Some(RenderedCursorScreen::from_bound_claude_host(
+        screen,
+        dim_suffix_line,
+    ))
+}
+
 fn capture_host_rendered_screen(
     client: &mut fl_host_proto::BlockingHostClient,
     stream: &fl_host_proto::StreamId,
@@ -3952,6 +3966,22 @@ impl RenderedCursorScreen {
         }
     }
 
+    fn from_bound_claude_host(
+        screen: fl_host_proto::RenderedScreen,
+        dim_suffix_line: Option<u16>,
+    ) -> Self {
+        let mut rendered = Self::from_host(screen);
+        if let (Some(line), Some((_, col))) = (dim_suffix_line, rendered.cursor)
+            && ruled_claude_prompt_suffix_starts_at(&rendered.contents, line, col)
+        {
+            // The host identified the precise text line even if prior terminal
+            // rows wrapped. Subsequent composer checks index the plain text.
+            rendered.cursor = Some((line, col));
+            rendered.ghost_styled = true;
+        }
+        rendered
+    }
+
     fn cursor_state(&self) -> Option<CursorState> {
         self.cursor.map(|(row, col)| CursorState {
             row,
@@ -4007,6 +4037,30 @@ impl RenderedCursorScreen {
         let cursor = self.cursor_state();
         (self.contents, cursor)
     }
+}
+
+/// Accept the cursor style only for the first suffix cell of the exact framed
+/// Claude prompt line. Style on surrounding output or past input is irrelevant.
+fn ruled_claude_prompt_suffix_starts_at(screen: &str, line: u16, col: u16) -> bool {
+    let lines: Vec<_> = screen.lines().collect();
+    let Some((composer, top_rule)) = composer_region_lines(&lines) else {
+        return false;
+    };
+    let [prompt] = composer else {
+        return false;
+    };
+    if usize::from(line) != top_rule + 1 {
+        return false;
+    }
+    let trimmed = prompt.trim_start_matches(' ');
+    let Some(suffix) = trimmed
+        .strip_prefix("❯ ")
+        .or_else(|| trimmed.strip_prefix("❯\u{a0}"))
+    else {
+        return false;
+    };
+    usize::from(col) == prompt.len() - trimmed.len() + 2
+        && suffix.starts_with(|c: char| !c.is_whitespace())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4161,10 +4215,14 @@ fn check_bound_claude_input(
             ComposerStyle::Ruled,
         ),
         BoundInputPhase::FlushEarlier => {
-            composer_equals_recorded_wire_deliveries(contents, route_keys)
+            !screen.ghost_styled && composer_equals_recorded_wire_deliveries(contents, route_keys)
         }
         BoundInputPhase::Submit => {
-            composer_equals_single_target(contents, &UnconfirmedWireDelivery::from_payload(payload))
+            !screen.ghost_styled
+                && composer_equals_single_target(
+                    contents,
+                    &UnconfirmedWireDelivery::from_payload(payload),
+                )
                 .0
         }
     };
@@ -4172,6 +4230,93 @@ fn check_bound_claude_input(
         return Err("prompt submission unconfirmed: Claude composer changed before input".into());
     }
     Ok(())
+}
+
+#[cfg(test)]
+#[test]
+fn bound_claude_dim_suffix_requires_exact_visible_prompt_and_keeps_phase_fences() {
+    let screen = |prompt, footer, col, line| {
+        let capture = fl_host_proto::RenderedScreen {
+            schema: 1,
+            stream: fl_host_proto::StreamId {
+                host: fl_host_proto::HostInstance::new([0; 16]),
+                session: fl_host_proto::SessionId::new("dim-claude").unwrap(),
+                epoch: fl_host_proto::SessionEpoch(1),
+            },
+            contents: format!(
+                "Wrapped history\n────────────────────\n{prompt}\n────────────────────\n{footer}"
+            ),
+            // Host cursor row is greater than the plain-text row when earlier
+            // history spans multiple physical rows.
+            cursor_row: 4,
+            cursor_col: col,
+            rows: 40,
+            cols: 120,
+            generation: 1,
+            output_seq: 1,
+            output_bytes: 1,
+        };
+        RenderedCursorScreen::from_bound_claude_host(capture, line)
+    };
+    let prompt = "❯\u{a0}Review the synthetic change";
+    let suggestion = screen(prompt, "", 2, Some(2));
+    assert!(suggestion.ghost_styled);
+    assert!(check_bound_claude_input(&suggestion, &[], "hello", BoundInputPhase::Payload).is_ok());
+    for phase in [BoundInputPhase::FlushEarlier, BoundInputPhase::Submit] {
+        assert!(check_bound_claude_input(&suggestion, &[], "hello", phase).is_err());
+    }
+
+    let legacy = screen(prompt, "", 2, None);
+    assert_eq!(legacy.contents, suggestion.contents);
+    for draft in [
+        legacy,
+        screen(prompt, "", 2, Some(1)),
+        screen(prompt, "", 3, Some(2)),
+        screen("❯ Review the synthetic change\ncontinued", "", 2, Some(2)),
+    ] {
+        assert!(!draft.ghost_styled);
+        assert!(check_bound_claude_input(&draft, &[], "hello", BoundInputPhase::Payload).is_err());
+    }
+    for footer in ["  esc to interrupt", "  Esc to cancel"] {
+        let blocked = screen(prompt, footer, 2, Some(2));
+        assert!(blocked.ghost_styled);
+        assert!(
+            check_bound_claude_input(&blocked, &[], "hello", BoundInputPhase::Payload).is_err()
+        );
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn bound_claude_enter_rejects_exact_match_suggestion_in_both_phases() {
+    let keys = vec!["host:dim-enter-fixture".to_string()];
+    let payload = "/clear";
+    let suggestion = RenderedCursorScreen {
+        contents: format!("────────────────────\n❯ {payload}\n────────────────────\n"),
+        cursor: Some((1, 2)),
+        dims: Some((24, 80)),
+        ghost_styled: true,
+    };
+    let mut redraw = suggestion.clone();
+    redraw.ghost_styled = false;
+    record_unconfirmed_wire_delivery(&keys, "dim-enter-fixture", payload);
+    let checks = [BoundInputPhase::FlushEarlier, BoundInputPhase::Submit].map(|phase| {
+        (
+            check_bound_claude_input(&suggestion, &keys, payload, phase),
+            check_bound_claude_input(&redraw, &keys, payload, phase),
+        )
+    });
+    clear_unconfirmed_wire_deliveries(&keys);
+    for (dim, plain) in checks {
+        assert!(
+            dim.is_err(),
+            "an exact-match suggestion must never authorize Enter"
+        );
+        assert!(
+            plain.is_ok(),
+            "an exact-match plain composer must authorize Enter"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -4256,6 +4401,11 @@ fn deliver_via_tmux_paste_with_resolved_host(
     let trimmed = text.trim();
     let raw_target = target;
     let strict_claude = opts.is_claude_route && resolved.is_some();
+    let capture_claude = if strict_claude && bound_validate.is_some() {
+        capture_bound_claude_composer
+    } else {
+        capture_bound_host_screen
+    };
     if let Some((mut client, stream, is_pty)) = resolved.or_else(|| {
         (std::env::var_os("FL_WIRE_TMUX_BIN").is_none()
             && !(opts.is_claude_route && target.starts_with('%')))
@@ -4309,7 +4459,7 @@ fn deliver_via_tmux_paste_with_resolved_host(
                 }
                 let mut client = client_cell.borrow_mut();
                 let screen = if strict_claude {
-                    capture_bound_host_screen(&mut client, &stream)
+                    capture_claude(&mut client, &stream)
                 } else {
                     capture_host_rendered_screen(&mut client, &stream)
                 };
@@ -4322,7 +4472,7 @@ fn deliver_via_tmux_paste_with_resolved_host(
             || {
                 let mut client = client_cell.borrow_mut();
                 if strict_claude {
-                    let screen = capture_bound_host_screen(&mut client, &stream);
+                    let screen = capture_claude(&mut client, &stream);
                     if !screen.as_ref().is_some_and(usable_bound_claude_screen) {
                         capture_failed.set(true);
                         return None;
@@ -4349,7 +4499,7 @@ fn deliver_via_tmux_paste_with_resolved_host(
                     return Err("hosted Claude screen cannot be confirmed".into());
                 }
                 if let Some(validate) = bound_validate {
-                    let screen = capture_bound_host_screen(&mut client_cell.borrow_mut(), &stream)
+                    let screen = capture_claude(&mut client_cell.borrow_mut(), &stream)
                         .ok_or_else(|| "hosted Claude screen cannot be confirmed".to_string())?;
                     check_bound_claude_input(
                         &screen,
@@ -4394,7 +4544,7 @@ fn deliver_via_tmux_paste_with_resolved_host(
                     return Err("hosted Claude screen cannot be confirmed".into());
                 }
                 if let Some(validate) = bound_validate {
-                    let screen = capture_bound_host_screen(&mut client_cell.borrow_mut(), &stream)
+                    let screen = capture_claude(&mut client_cell.borrow_mut(), &stream)
                         .ok_or_else(|| {
                             "prompt submission unconfirmed: hosted Claude screen unavailable"
                                 .to_string()
@@ -7840,15 +7990,17 @@ mod tests {
         use fl_host_proto::{
             ChildRecord, ChildState, ControllerLease, ExtensionLimits, ExtensionRefusal,
             ExtensionRequest, ExtensionResponse, HostConfig, HostEndpoint, HostInstance,
-            HostListener, HostRequest, HostResponse, InputState, RENDERED_PTY_FEATURE,
-            RenderedScreen, SendOutcome, SessionEpoch, SessionId, SessionMode, SessionSummary,
-            SpawnKind, StreamId,
+            HostListener, HostRequest, HostResponse, InputState, RENDERED_CURSOR_STYLE_FEATURE,
+            RENDERED_PTY_FEATURE, RenderedScreen, SendOutcome, SessionEpoch, SessionId,
+            SessionMode, SessionSummary, SpawnKind, StreamId,
         };
         use std::os::unix::fs::PermissionsExt;
         use std::sync::{
             Arc,
             atomic::{AtomicUsize, Ordering},
         };
+        const STALE_DIM_SUGGESTION: usize = 13;
+        const REDRAWN_PROMPT: usize = 14;
         let _lock = TMUX_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = TempDir::new().unwrap();
         fs::set_permissions(tmp.path(), fs::Permissions::from_mode(0o700)).unwrap();
@@ -7931,16 +8083,22 @@ mod tests {
                     let record_path = record_path.clone();
                     tokio::spawn(async move {
                         while let Ok(HostRequest::Extended { id, request }) = conn.recv().await {
+                            let styled = matches!(
+                                &request,
+                                ExtensionRequest::CaptureRenderedCursorStyle { .. }
+                            );
                             let response = match request {
                                 ExtensionRequest::ListSessions => ExtensionResponse::Sessions {
                                     records: sessions.lock().unwrap().clone(),
                                 },
                                 ExtensionRequest::Capabilities => ExtensionResponse::Capabilities {
                                     host: HostInstance::new([5; 16]),
-                                    features: if scenario.load(Ordering::SeqCst) == 1 {
-                                        0
-                                    } else {
-                                        RENDERED_PTY_FEATURE
+                                    features: match scenario.load(Ordering::SeqCst) {
+                                        1 => 0,
+                                        STALE_DIM_SUGGESTION | REDRAWN_PROMPT => {
+                                            RENDERED_PTY_FEATURE | RENDERED_CURSOR_STYLE_FEATURE
+                                        }
+                                        _ => RENDERED_PTY_FEATURE,
                                     },
                                     limits: ExtensionLimits::default(),
                                 },
@@ -7964,7 +8122,8 @@ mod tests {
                                         }
                                     }
                                 }
-                                ExtensionRequest::CaptureRendered { mut stream } => {
+                                ExtensionRequest::CaptureRendered { mut stream }
+                                | ExtensionRequest::CaptureRenderedCursorStyle { mut stream } => {
                                     let capture_number = rendered_captures.fetch_add(1, Ordering::SeqCst) + 1;
                                     if scenario.load(Ordering::SeqCst) == 7 {
                                         fs::write(&record_path, r#"{"status":"idle","sessionId":"replacement"}"#).unwrap();
@@ -7972,8 +8131,8 @@ mod tests {
                                     if scenario.load(Ordering::SeqCst) == 2 {
                                         stream.epoch = SessionEpoch(4);
                                     }
-                                    ExtensionResponse::RenderedCapture {
-                                        screen: RenderedScreen {
+                                    let stale_suggestion = scenario.load(Ordering::SeqCst) == STALE_DIM_SUGGESTION;
+                                    let screen = RenderedScreen {
                                             schema: 1,
                                             stream,
                                             contents: match scenario.load(Ordering::SeqCst) {
@@ -7982,14 +8141,21 @@ mod tests {
                                                 11 if capture_number >= 4 => "────────────────────\n❯ owner draft\n────────────────────\n".into(),
                                                 _ => format!("────────────────────\n❯ {}\n────────────────────\n", composer.lock().unwrap()),
                                             },
-                                            cursor_row: 0,
-                                            cursor_col: 0,
+                                            cursor_row: u16::from(stale_suggestion),
+                                            cursor_col: if stale_suggestion { 2 } else { 0 },
                                             rows: 24,
                                             cols: 80,
                                             generation: 1,
                                             output_seq: 0,
                                             output_bytes: 0,
-                                        },
+                                    };
+                                    if styled {
+                                        ExtensionResponse::RenderedCursorStyleCapture {
+                                            screen,
+                                            dim_suffix_line: stale_suggestion.then_some(1),
+                                        }
+                                    } else {
+                                        ExtensionResponse::RenderedCapture { screen }
                                     }
                                 }
                                 ExtensionRequest::Write {
@@ -8009,7 +8175,7 @@ mod tests {
                                         let bytes = bytes.into_vec();
                                         if bytes == b"\r" {
                                             composer.lock().unwrap().clear();
-                                        } else {
+                                        } else if scenario.load(Ordering::SeqCst) != STALE_DIM_SUGGESTION {
                                             let text = String::from_utf8_lossy(&bytes);
                                             *composer.lock().unwrap() = text.trim_start_matches("\x1b[200~").trim_end_matches("\x1b[201~").to_string();
                                             if scenario.load(Ordering::SeqCst) == 9 {
@@ -8227,6 +8393,37 @@ mod tests {
             let out = writes.lock().unwrap();
             assert_eq!(out.len(), before + 1);
             assert_ne!(out.last().unwrap().1, b"\r");
+            drop(out);
+
+            // The host accepted paste bytes but Claude has not redrawn. The
+            // identical suggestion must never make Wire press Enter.
+            let slash_command = "/clear";
+            *composer.lock().unwrap() = slash_command.into();
+            scenario.store(STALE_DIM_SUGGESTION, Ordering::SeqCst);
+            let before = writes.lock().unwrap().len();
+            let result = dispatch_bound_claude_operator_prompt(&binding, "owner", slash_command);
+            {
+                let out = writes.lock().unwrap();
+                assert_eq!(
+                    &out[before..],
+                    &[(claude_stream.clone(), b"\x1b[200~/clear\x1b[201~".to_vec())],
+                    "the unchanged suggestion must permit paste and block Enter"
+                );
+            }
+            assert!(matches!(result, Err(ClaudeBoundError::Delivery(_))));
+
+            composer.lock().unwrap().clear();
+            scenario.store(REDRAWN_PROMPT, Ordering::SeqCst);
+            let before = writes.lock().unwrap().len();
+            dispatch_bound_claude_operator_prompt(&binding, "owner", slash_command).unwrap();
+            let out = writes.lock().unwrap();
+            assert_eq!(
+                &out[before..],
+                &[
+                    (claude_stream.clone(), b"\x1b[200~/clear\x1b[201~".to_vec()),
+                    (claude_stream.clone(), b"\r".to_vec()),
+                ]
+            );
         }
         let _ = stop_tx.send(());
         server.join().unwrap();
