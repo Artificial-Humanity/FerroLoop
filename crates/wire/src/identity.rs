@@ -206,6 +206,11 @@ pub struct RouteEntry {
     pub hosted_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hydration_generation: Option<String>,
+    /// Native session ID that was explicitly registered with both hosted provenance fields.
+    /// Lifecycle fencing keeps those fields across route refreshes, including some that change
+    /// the native session. Transcript attribution requires this additional exact binding.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registered_hosted_native_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pid_start_time: Option<u64>,
 }
@@ -225,6 +230,40 @@ impl RouteEntry {
             && self.hosted_id == other.hosted_id
             && self.hydration_generation == other.hydration_generation
             && self.pid_start_time == other.pid_start_time
+    }
+
+    /// Hosted launch explicitly bound to this exact native session and persona.
+    pub fn registered_hosted_launch(&self, persona: &str) -> Option<(&str, &str)> {
+        let registered_native_id = self.registered_hosted_native_id.as_deref()?;
+        let hosted_id = self.hosted_id.as_deref()?;
+        let generation = self.hydration_generation.as_deref()?;
+        let (vendor, owner) = parse_hosted_identity(hosted_id).ok()?;
+        let (_, native_id) = self.route.session_identity()?;
+        (self.explicit
+            && !generation.is_empty()
+            && owner == persona
+            && self.persona == persona
+            && vendor == self.route.canonical_vendor()
+            && registered_native_id == native_id)
+            .then_some((hosted_id, generation))
+    }
+
+    fn inherit_hosted_metadata(&mut self, prior: &Self) {
+        if self.hosted_id.is_none() {
+            self.hosted_id = prior.hosted_id.clone();
+        }
+        if self.hydration_generation.is_none() {
+            self.hydration_generation = prior.hydration_generation.clone();
+        }
+        if self.registered_hosted_native_id.is_none()
+            && let Some((hosted_id, generation)) = prior.registered_hosted_launch(&self.persona)
+            && self.hosted_id.as_deref() == Some(hosted_id)
+            && self.hydration_generation.as_deref() == Some(generation)
+            && self.route.canonical_vendor() == prior.route.canonical_vendor()
+            && self.route.session_identity() == prior.route.session_identity()
+        {
+            self.registered_hosted_native_id = prior.registered_hosted_native_id.clone();
+        }
     }
 }
 
@@ -1863,12 +1902,7 @@ impl RouteTable {
                 }
                 v.explicit = true;
                 v.identity_at = None;
-                if v.hosted_id.is_none() {
-                    v.hosted_id = existing.hosted_id.clone();
-                }
-                if v.hydration_generation.is_none() {
-                    v.hydration_generation = existing.hydration_generation.clone();
-                }
+                v.inherit_hosted_metadata(existing);
             }
             if let Some((target_kind, target_id)) = v
                 .route
@@ -1888,12 +1922,7 @@ impl RouteTable {
                             && std::mem::discriminant(&existing.route)
                                 == std::mem::discriminant(&v.route)
                         {
-                            if existing.hosted_id.is_none() {
-                                existing.hosted_id = v.hosted_id.clone();
-                            }
-                            if existing.hydration_generation.is_none() {
-                                existing.hydration_generation = v.hydration_generation.clone();
-                            }
+                            existing.inherit_hosted_metadata(&v);
                         }
                         if name == &k && !existing.explicit && !v.explicit {
                             existing.identity_at = existing
@@ -1916,12 +1945,7 @@ impl RouteTable {
                             && std::mem::discriminant(&existing.route)
                                 == std::mem::discriminant(&v.route)
                         {
-                            if existing.hosted_id.is_none() {
-                                existing.hosted_id = v.hosted_id.clone();
-                            }
-                            if existing.hydration_generation.is_none() {
-                                existing.hydration_generation = v.hydration_generation.clone();
-                            }
+                            existing.inherit_hosted_metadata(&v);
                         }
                         continue;
                     }
@@ -1931,12 +1955,7 @@ impl RouteTable {
                         && std::mem::discriminant(&existing.route)
                             == std::mem::discriminant(&v.route)
                     {
-                        if v.hosted_id.is_none() {
-                            v.hosted_id = existing.hosted_id.clone();
-                        }
-                        if v.hydration_generation.is_none() {
-                            v.hydration_generation = existing.hydration_generation.clone();
-                        }
+                        v.inherit_hosted_metadata(existing);
                     }
                     if !existing.explicit
                         && !v.explicit
@@ -1967,12 +1986,7 @@ impl RouteTable {
                             && std::mem::discriminant(&existing.route)
                                 == std::mem::discriminant(&v.route)
                         {
-                            if existing.hosted_id.is_none() {
-                                existing.hosted_id = v.hosted_id.clone();
-                            }
-                            if existing.hydration_generation.is_none() {
-                                existing.hydration_generation = v.hydration_generation.clone();
-                            }
+                            existing.inherit_hosted_metadata(&v);
                         }
                         if !existing.explicit && !v.explicit && existing.route == v.route {
                             if existing.identity_evidence_at().is_none() {
@@ -1988,12 +2002,7 @@ impl RouteTable {
                             && std::mem::discriminant(&existing.route)
                                 == std::mem::discriminant(&v.route)
                         {
-                            if v.hosted_id.is_none() {
-                                v.hosted_id = existing.hosted_id.clone();
-                            }
-                            if v.hydration_generation.is_none() {
-                                v.hydration_generation = existing.hydration_generation.clone();
-                            }
+                            v.inherit_hosted_metadata(existing);
                         }
                         self.entries.insert(k, v);
                     }
@@ -2134,6 +2143,7 @@ impl RouteTable {
                             explicit: false,
                             hosted_id: None,
                             hydration_generation: None,
+                            registered_hosted_native_id: None,
                         },
                     );
                 }
@@ -2431,19 +2441,13 @@ impl RouteTable {
                 .and_then(|raw| parse_hosted_identity(raw).ok())
                 .map(|(v, p)| format!("{v}:{p}"));
             let normalized_generation = sanitize_generation_token(hydration_generation.as_deref());
-            let (final_hosted_id, final_generation) = if !explicit {
-                (None, None)
-            } else if !clear_existing_meta
-                && let Some(existing) = self.entries.get(&norm)
-                && existing.explicit
-                && std::mem::discriminant(&existing.route) == std::mem::discriminant(&route)
+            let registered_hosted_native_id = if requested_explicit
+                && normalized_hosted_id.is_some()
+                && normalized_generation.is_some()
             {
-                (
-                    normalized_hosted_id.or_else(|| existing.hosted_id.clone()),
-                    normalized_generation.or_else(|| existing.hydration_generation.clone()),
-                )
+                route.session_identity().map(|(_, id)| id.to_owned())
             } else {
-                (normalized_hosted_id, normalized_generation)
+                None
             };
             let mut preserved_pid_start = None;
             if let Some(existing) = self.entries.get(&norm) {
@@ -2475,19 +2479,26 @@ impl RouteTable {
                 .route_pid()
                 .and_then(proc_start_time_ticks)
                 .or(preserved_pid_start);
-            self.entries.insert(
-                norm.clone(),
-                RouteEntry {
-                    persona: norm,
-                    route,
-                    updated_at: at,
-                    identity_at,
-                    explicit,
-                    hosted_id: final_hosted_id,
-                    hydration_generation: final_generation,
-                    pid_start_time,
-                },
-            );
+            let mut entry = RouteEntry {
+                persona: norm.clone(),
+                route,
+                updated_at: at,
+                identity_at,
+                explicit,
+                hosted_id: normalized_hosted_id.filter(|_| explicit),
+                hydration_generation: normalized_generation.filter(|_| explicit),
+                registered_hosted_native_id,
+                pid_start_time,
+            };
+            if !clear_existing_meta
+                && explicit
+                && let Some(existing) = self.entries.get(&norm)
+                && existing.explicit
+                && std::mem::discriminant(&existing.route) == std::mem::discriminant(&entry.route)
+            {
+                entry.inherit_hosted_metadata(existing);
+            }
+            self.entries.insert(norm, entry);
         }
     }
 
@@ -10252,6 +10263,7 @@ mod tests {
                 explicit: false,
                 hosted_id: None,
                 hydration_generation: None,
+                registered_hosted_native_id: None,
                 pid_start_time: None,
             },
         );
@@ -10265,6 +10277,7 @@ mod tests {
                 explicit: false,
                 hosted_id: None,
                 hydration_generation: None,
+                registered_hosted_native_id: None,
                 pid_start_time: None,
             },
         );
@@ -11582,6 +11595,7 @@ mod tests {
                         explicit: false,
                         hosted_id: None,
                         hydration_generation: None,
+                        registered_hosted_native_id: None,
                         pid_start_time: None,
                     },
                 );
@@ -11660,6 +11674,7 @@ mod tests {
                             explicit: false,
                             hosted_id: None,
                             hydration_generation: None,
+                            registered_hosted_native_id: None,
                             pid_start_time: None,
                         },
                     );
@@ -11751,6 +11766,7 @@ mod tests {
                 explicit: false,
                 hosted_id: None,
                 hydration_generation: None,
+                registered_hosted_native_id: None,
                 pid_start_time: None,
             },
         );
@@ -11764,6 +11780,7 @@ mod tests {
                 explicit: false,
                 hosted_id: None,
                 hydration_generation: None,
+                registered_hosted_native_id: None,
                 pid_start_time: None,
             },
         );
@@ -11778,6 +11795,7 @@ mod tests {
                 explicit: false,
                 hosted_id: None,
                 hydration_generation: None,
+                registered_hosted_native_id: None,
                 pid_start_time: None,
             },
         );
@@ -11820,6 +11838,7 @@ mod tests {
                     explicit: false,
                     hosted_id: None,
                     hydration_generation: None,
+                    registered_hosted_native_id: None,
                     pid_start_time: None,
                 },
             );
@@ -11834,6 +11853,7 @@ mod tests {
                     explicit: false,
                     hosted_id: None,
                     hydration_generation: None,
+                    registered_hosted_native_id: None,
                     pid_start_time: None,
                 },
             );
@@ -11867,6 +11887,7 @@ mod tests {
                     explicit: false,
                     hosted_id: None,
                     hydration_generation: None,
+                    registered_hosted_native_id: None,
                     pid_start_time: None,
                 },
             );
@@ -11997,6 +12018,7 @@ mod tests {
             explicit: false,
             hosted_id: None,
             hydration_generation: None,
+            registered_hosted_native_id: None,
             pid_start_time: None,
         };
         let mut merge_unknown_inc = RouteTable::default();
@@ -12056,6 +12078,7 @@ mod tests {
                 explicit: false,
                 hosted_id: None,
                 hydration_generation: None,
+                registered_hosted_native_id: None,
                 pid_start_time: None,
             },
         );
@@ -12256,6 +12279,7 @@ mod tests {
                             explicit: false,
                             hosted_id: None,
                             hydration_generation: None,
+                            registered_hosted_native_id: None,
                             pid_start_time: None,
                         },
                     );
@@ -12347,6 +12371,7 @@ mod tests {
                             explicit: false,
                             hosted_id: None,
                             hydration_generation: None,
+                            registered_hosted_native_id: None,
                             pid_start_time: None,
                         },
                     );
@@ -12401,6 +12426,7 @@ mod tests {
                             explicit: false,
                             hosted_id: None,
                             hydration_generation: None,
+                            registered_hosted_native_id: None,
                             pid_start_time: None,
                         },
                     );
@@ -12478,6 +12504,7 @@ mod tests {
                 explicit: false,
                 hosted_id: None,
                 hydration_generation: None,
+                registered_hosted_native_id: None,
                 pid_start_time: None,
             },
         );
@@ -12492,6 +12519,7 @@ mod tests {
                 explicit: false,
                 hosted_id: None,
                 hydration_generation: None,
+                registered_hosted_native_id: None,
                 pid_start_time: None,
             },
         );
@@ -12560,6 +12588,7 @@ mod tests {
                     explicit: true,
                     hosted_id: None,
                     hydration_generation: None,
+                    registered_hosted_native_id: None,
                     pid_start_time: None,
                 },
             );
@@ -12685,6 +12714,7 @@ mod tests {
                 explicit: false,
                 hosted_id: None,
                 hydration_generation: None,
+                registered_hosted_native_id: None,
                 pid_start_time: None,
             },
         );
@@ -13042,6 +13072,59 @@ mod tests {
     }
 
     #[test]
+    fn registered_hosted_launch_stays_with_exact_native_session() {
+        let route = |thread: &str| VendorRoute::Codex {
+            thread_id: thread.into(),
+            cwd: None,
+        };
+        let mut table = RouteTable::default();
+        table
+            .register_route_checked(RegisterRouteCheckArgs {
+                persona: "ada".into(),
+                route: route("native-hosted"),
+                at: At::from_unix_millis(1),
+                explicit: true,
+                replace: true,
+                hosted_id: Some("codex:ada".into()),
+                hydration_generation: Some("gen-1".into()),
+                hosted_session_verified: true,
+                unverified_process: false,
+                allow_host_probes: false,
+                incumbent_dead_override: None,
+            })
+            .unwrap();
+        let registered = Some(("codex:ada", "gen-1"));
+        let raw = serde_json::to_vec(&table).unwrap();
+        let mut table: RouteTable = serde_json::from_slice(&raw).unwrap();
+        assert_eq!(
+            table.get("ada").unwrap().registered_hosted_launch("ada"),
+            registered
+        );
+
+        table.upsert_discovered("ada", route("native-hosted"), 2, &At::from_unix_millis(2));
+        assert_eq!(
+            table.get("ada").unwrap().registered_hosted_launch("ada"),
+            registered
+        );
+
+        let mut scanned = table.clone();
+        scanned.upsert_discovered("ada", route("native-external"), 3, &At::from_unix_millis(3));
+        assert_eq!(
+            scanned.get("ada").unwrap().registered_hosted_launch("ada"),
+            None
+        );
+        table.merge_newer(scanned);
+        let external = table.get("ada").unwrap();
+        assert_eq!(
+            external.route.session_identity(),
+            Some(("codex", "native-external"))
+        );
+        assert_eq!(external.hosted_id.as_deref(), Some("codex:ada"));
+        assert_eq!(external.hydration_generation.as_deref(), Some("gen-1"));
+        assert_eq!(external.registered_hosted_launch("ada"), None);
+    }
+
+    #[test]
     fn registration_guard_preserves_metadata_caps_diagnostics_and_guards_incumbent() {
         let mut table = RouteTable::default();
         let live_agy = VendorRoute::Agy {
@@ -13357,6 +13440,7 @@ mod tests {
             explicit: true,
             hosted_id: Some("claude:fiona".to_string()),
             hydration_generation: None,
+            registered_hosted_native_id: None,
             pid_start_time: Some(self_st),
         };
         assert!(route_entry_proven_live(&claude_entry, None, None));
@@ -13397,6 +13481,7 @@ mod tests {
             explicit: true,
             hosted_id: Some("codex:fiona".to_string()),
             hydration_generation: None,
+            registered_hosted_native_id: None,
             pid_start_time: None,
         };
         assert!(!route_entry_proven_live(&codex_entry, None, None));

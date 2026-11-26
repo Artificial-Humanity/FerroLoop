@@ -806,6 +806,7 @@ mod tests {
             explicit: true,
             hosted_id: None,
             hydration_generation: None,
+            registered_hosted_native_id: None,
             pid_start_time: None,
         }
     }

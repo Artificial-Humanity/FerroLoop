@@ -35,6 +35,42 @@ Attempt rows from the store have no `quota_usage`. Claude Code, Antigravity, and
 fill `quota_usage` from a direct probe, an override JSON value, or a rate-limit error
 in the transcript.
 
+### Hosted launch versions
+
+`GET /api/v1/hosted-sessions` and `fl host list --json` expose `vendor_versions` when
+an observation has been recorded for the launch. It includes the CLI version (`cli`),
+whether a daemon version is expected (`daemon_expected`), the daemon version
+(`daemon`), and any `changes` with the component, previous version and current
+version. A null version means the observation had insufficient evidence. Direct
+`fl agent` launches record passive evidence after the persona fence is released.
+
+Most evidence is passive: the Hub reads the running process image and install
+metadata and starts no process. Automatic recovery launches and direct `fl agent`
+launches use only passive evidence. For a manual launch that the Hub observes, when
+the passive evidence is unknown, the Hub can run two active probes:
+
+* Codex daemon: one `initialize` RPC to the running `codex app-server` daemon over the
+  local control socket in the configuration directory of the launch. If the launch
+  recorded the daemon PID, the connection must reach that PID. The socket must be the
+  same file as at launch. The deadline is 500 ms. This probe never starts a daemon.
+* Antigravity CLI: one `agy --version` exec of the exact running image, pinned through
+  an open file descriptor. The image must be a non-setuid ELF file. The environment is
+  empty except `AGY_CLI_DISABLE_AUTO_UPDATE=true`, with a temporary `HOME` and an empty
+  `PATH`. The limit is 500 ms, after which the process group is killed. Linux only.
+
+The Hub runs both probes outside every launch lock, commit lock, store transaction and
+persona fence. On a Ferro store it holds only the observer's own single-worker lock.
+
+The Hub keeps only the receipts of the newest observed launch for each session.
+When a newer launch is recorded, the Hub deletes the older ones. Decommission deletes
+all receipts of the session. The per-host baseline that detects drift is kept.
+By default, `fl host list` looks up each exact Host stream in the configured Hub
+store and then in the workspace store. `--db` or `FL_DB` confines the lookup to
+the named store.
+
+FerroDeck and `fl host list` show the observed versions and flag any changes. A change
+warns the operator while allowing the launch to proceed.
+
 ## Clear and Reforge
 
 Clear and Reforge resolve targets only from saved/registered routes. A single request for

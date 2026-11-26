@@ -8,6 +8,7 @@ use std::cell::RefCell;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 #[derive(Clone, Debug)]
 struct RuntimePin {
@@ -317,6 +318,42 @@ fn lock_path(socket: &Path, persona: &str, kind: &str) -> Result<PathBuf, Lifecy
                 std::env::consts::OS
             ),
         ))
+    }
+}
+
+/// Serializes Hub sampling passes, including optional active probes.
+pub(super) fn try_version_observer(store_file: &Path) -> Result<Option<File>, LifecycleError> {
+    try_version_lock(store_file, "vendor-version-observer", Duration::ZERO)
+}
+
+/// Serializes receipt settlement across Hub and direct CLI observers. Sampling is separate.
+pub(super) fn try_version_commit(
+    store_file: &Path,
+    wait: Duration,
+) -> Result<Option<File>, LifecycleError> {
+    try_version_lock(store_file, "vendor-version-commit", wait)
+}
+
+fn try_version_lock(
+    store_file: &Path,
+    kind: &str,
+    wait: Duration,
+) -> Result<Option<File>, LifecycleError> {
+    let path = lock_path(store_file, "", kind)?;
+    let file = safe_open(&path)?;
+    let start = Instant::now();
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(Some(file)),
+            Err(std::fs::TryLockError::WouldBlock) => {
+                let remaining = wait.saturating_sub(start.elapsed());
+                if remaining.is_zero() {
+                    return Ok(None);
+                }
+                std::thread::sleep(remaining.min(Duration::from_millis(5)));
+            }
+            Err(std::fs::TryLockError::Error(err)) => return Err(failure("lock", err)),
+        }
     }
 }
 

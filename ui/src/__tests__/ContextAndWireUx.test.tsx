@@ -2235,15 +2235,16 @@ describe("App transcript observation ownership", () => {
   it.each(["success", "failure", "401", "403"])("rejects old initial success and its queue/context after newer %s", async (latest) => {
     let release!: (result: Response) => void;
     const pending = new Promise<Response>((resolve) => { release = resolve; });
-    let concreteReads = 0;
-    const h = harness(async (target) => {
+    const readInitial = vi.fn(async (target: string) => target.includes("session-a") ? pending : observed("Alias history"));
+    const h = harness(readInitial);
+    await waitFor(() => expect(readInitial).toHaveBeenCalledWith(expect.stringContaining("session-a")));
+    const readNewer = vi.fn(async (target: string) => {
       if (!target.includes("session-a")) return observed("Alias history");
-      if (++concreteReads === 1) return pending;
       return latest === "success" ? observed("Newest history") : latest === "failure" ? response({ code: "transcript_unavailable" }, 503) : response({ error: "Denied" }, Number(latest));
     });
-    await waitFor(() => expect(concreteReads).toBe(1));
+    h.setRead(readNewer);
     h.refresh();
-    await waitFor(() => expect(concreteReads).toBe(2));
+    await waitFor(() => expect(readNewer).toHaveBeenCalledWith(expect.stringContaining("session-a")));
     if (latest === "success") await screen.findByText("Newest history");
     else if (latest === "failure") await screen.findByText("History unavailable");
     else await screen.findByText("History access denied");
