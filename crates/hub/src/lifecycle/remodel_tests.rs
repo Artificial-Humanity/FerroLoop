@@ -16,6 +16,7 @@ fn env(home: &TempDir) -> LifecycleEnv<'_> {
         workspace_root: None,
         log_hydration_warnings: true,
         lifecycle_fence: None,
+        skip_launch_auth_probe: false,
     }
 }
 
@@ -900,6 +901,42 @@ fn an_old_runtime_the_teardown_cannot_stop_is_refused_before_anything_changes() 
     assert!(err.to_string().contains("it also runs codex:ada"), "{err}");
     assert!(fake.calls.borrow().is_empty() && fake.is_live("Ada"));
     assert_eq!(record(&store, "claude:ada").status, STATUS_RUNNING);
+}
+
+#[test]
+fn confirmed_codex_auth_rejection_preserves_the_source_seat() {
+    let home = TempDir::new().unwrap();
+    let _trusted = trusted_codex_home(home.path(), home.path());
+    let fake = FakeRuntime::default();
+    let env = fake.env(home.path());
+    let store = MemStore::default();
+    spin_with(
+        &store,
+        &env,
+        "ada",
+        "assistant",
+        "claude",
+        None,
+        Some(home.path()),
+    );
+    let before = record(&store, "claude:ada");
+    fake.calls.borrow_mut().clear();
+
+    let code = fl_core::LaunchPrerequisiteRefusal::VENDOR_SIGN_IN;
+    TEST_LAUNCH_PREREQUISITE.with(|slot| {
+        *slot.borrow_mut() = Some(Err(fl_core::LaunchPrerequisiteRefusal {
+            code: code.into(),
+            detail: "Codex sign-in rejected".into(),
+        }));
+    });
+    assert!(matches!(
+        remodel(&store, &env, "claude:ada", &remodel_req("codex"), Caller::Owner),
+        Err(LifecycleError::PrerequisiteUnavailable { code: actual, .. }) if actual == code
+    ));
+    assert_eq!(list_hosted_sessions(&store).unwrap(), vec![before]);
+    assert!(handoff(&store, "ada").is_none());
+    assert!(fake.calls.borrow().is_empty());
+    assert!(fake.is_live("Ada"));
 }
 
 #[test]

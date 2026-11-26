@@ -201,6 +201,8 @@ pub struct LifecycleEnv<'a> {
     pub log_hydration_warnings: bool,
     /// Borrowed proof for nested helpers; never a bypass for a different persona.
     pub(crate) lifecycle_fence: Option<&'a lock::LifecycleFence>,
+    /// Remodel checks destination credentials before teardown and restores the old seat on failure.
+    pub(crate) skip_launch_auth_probe: bool,
 }
 
 /// Process-wide [`fl_core::VendorHostAdapterRegistry`] slot injected at startup by `fl-cli`.
@@ -233,6 +235,7 @@ impl<'a> LifecycleEnv<'a> {
             workspace_root: None,
             log_hydration_warnings: true,
             lifecycle_fence: None,
+            skip_launch_auth_probe: false,
         }
     }
 
@@ -982,7 +985,8 @@ fn preflight_vendor_launch(
         .vendor_launch_options_for_vendor(vendor, fl_core::permissions::Posture::Auto)
         .remote_control
     {
-        check_vendor_launch_prerequisite(env, vendor, Some(&config_home))?;
+        let launch_cwd = (!env.skip_launch_auth_probe).then_some(checked.cwd.as_path());
+        check_vendor_launch_prerequisite(env, vendor, Some(&config_home), launch_cwd)?;
     }
     Ok(Some(config_home))
 }
@@ -991,6 +995,7 @@ fn check_vendor_launch_prerequisite(
     env: &LifecycleEnv<'_>,
     vendor: &str,
     config_home: Option<&Path>,
+    cwd: Option<&Path>,
 ) -> Result<(), LifecycleError> {
     #[cfg(test)]
     TEST_LAUNCH_PREREQUISITE_CALLS.with(|calls| calls.set(calls.get() + 1));
@@ -1017,12 +1022,12 @@ fn check_vendor_launch_prerequisite(
                 code: "codex_app_server_unavailable".into(),
                 detail: "launch adapter unavailable".into(),
             })?;
-    adapter
-        .preflight_launch(config_home)
-        .map_err(|r| LifecycleError::PrerequisiteUnavailable {
+    adapter.preflight_launch(config_home, cwd).map_err(|r| {
+        LifecycleError::PrerequisiteUnavailable {
             code: r.code,
             detail: bounded_prerequisite_detail(&r.detail),
-        })
+        }
+    })
 }
 
 fn bounded_prerequisite_detail(detail: &str) -> String {
@@ -2541,6 +2546,7 @@ impl FakeRuntime {
             workspace_root: None,
             log_hydration_warnings: true,
             lifecycle_fence: None,
+            skip_launch_auth_probe: false,
         }
     }
 
@@ -8988,7 +8994,7 @@ where
             .vendor_launch_options_for_vendor(&record.vendor, record.posture)
             .remote_control
         && let Err(err @ LifecycleError::PrerequisiteUnavailable { .. }) =
-            check_vendor_launch_prerequisite(env, &record.vendor, config_home.as_deref())
+            check_vendor_launch_prerequisite(env, &record.vendor, config_home.as_deref(), None)
     {
         if retry_prerequisite {
             if !raw_spawned {
@@ -10320,7 +10326,11 @@ fn remodel_fenced<S: AgentRegistry + StateStore + Catalog + MessageStore>(
     let spun = teardown_session(store, env, target, by, caller, clear_queue)
         .map_err(|e| format!("teardown of `{}` failed: {e}", plan.from_session_id))
         .and_then(|torn| {
-            spin(store, env, &plan.spin_up_request(), by, caller)
+            let spin_env = LifecycleEnv {
+                skip_launch_auth_probe: true,
+                ..*env
+            };
+            spin(store, &spin_env, &plan.spin_up_request(), by, caller)
                 .and_then(|out| require_runtime(env, out))
                 .map(|out| (torn, out))
                 .map_err(|e| format!("spin-up on {} failed: {e}", to.vendor))
@@ -10399,6 +10409,7 @@ fn remodel_fenced<S: AgentRegistry + StateStore + Catalog + MessageStore>(
     // vanished since the session first ran, which would leave the persona down for nothing.
     let restore_env = LifecycleEnv {
         key_probe: &RestoreKeys,
+        skip_launch_auth_probe: true,
         ..*env
     };
     let restored = match &plan.restore {
@@ -11025,6 +11036,7 @@ mod tests {
             workspace_root: None,
             log_hydration_warnings: true,
             lifecycle_fence: None,
+            skip_launch_auth_probe: false,
         }
     }
 
@@ -22605,7 +22617,13 @@ mod tests {
         let store = MemStore::default();
         let fake = FakeRuntime::default();
         let env = fake.env(home.path());
-        for reason in [STOP_REASON_CLEAN_EXIT, STOP_REASON_CRASH_LOOP] {
+        for (reason, code) in [
+            (STOP_REASON_CLEAN_EXIT, "codex_app_server_unavailable"),
+            (
+                STOP_REASON_CRASH_LOOP,
+                fl_core::LaunchPrerequisiteRefusal::VENDOR_SIGN_IN,
+            ),
+        ] {
             let mut record = hosted_record("codex", "manual-stop", STATUS_STOPPED, false);
             record.cwd = Some(home.path().display().to_string());
             record.stop_reason = Some(reason.into());
@@ -22621,13 +22639,13 @@ mod tests {
             save_hosted_respawn_state(&store, &record.session_id, &state, "owner").unwrap();
             TEST_LAUNCH_PREREQUISITE.with(|slot| {
                 *slot.borrow_mut() = Some(Err(fl_core::LaunchPrerequisiteRefusal {
-                    code: "codex_app_server_unavailable".into(),
-                    detail: "/private/control.sock: NotFound".into(),
+                    code: code.into(),
+                    detail: "Codex launch prerequisite unavailable".into(),
                 }))
             });
             assert!(matches!(
                 restart_hosted_session(&store, &env, &record.session_id, "owner"),
-                Err(LifecycleError::PrerequisiteUnavailable { .. })
+                Err(LifecycleError::PrerequisiteUnavailable { code: actual, .. }) if actual == code
             ));
             assert_eq!(
                 get_hosted_session_by_id(&store, &record.session_id)
