@@ -6,6 +6,7 @@ use std::sync::OnceLock;
 use fl_core::vendor_adapter::VendorDaemonLaunchEvidence;
 use fl_core::{RevisionId, VendorVersionRegistry};
 use fl_host_proto::StreamId;
+use fl_store::{AnyStore, BackendKind, StoreOptions, Unmigrated, choose_backend, physical_path};
 use sha2::{Digest, Sha256};
 
 use super::*;
@@ -597,57 +598,186 @@ fn commit<S: StateStore>(
     Ok(removed.then_some(versions))
 }
 
-pub(crate) fn observe_launches_in_hub(state: &crate::HubState) -> Result<(), LifecycleError> {
-    let Some(adapters) = ADAPTERS.get() else {
-        return Ok(());
-    };
-    let batch = {
-        let store = state.try_open_version_observation_store()?;
-        let now = now_ms();
-        let (mut pending, _): (Vec<LaunchReceipt>, _) = load_revision(&*store, &queue_slug())?;
-        pending.sort_unstable_by_key(|receipt| receipt.id);
-        pending
-            .into_iter()
-            .filter(|receipt| now.saturating_sub(receipt.captured_at_ms) >= SETTLE_MS)
-            .take(OBSERVATIONS_PER_PASS)
-            .collect::<Vec<_>>()
-    };
-    for receipt in batch {
-        // All process and daemon reads run outside the workspace store guard and persona fence.
-        let versions = observe(&receipt, adapters);
-        let session_id = receipt.session_id.clone();
-        let stream = receipt.stream.clone();
-        let generation = receipt.generation.clone();
-        let vendor = receipt.vendor.clone();
-        let applied = {
-            let store = state.try_open_version_observation_store()?;
-            commit(&*store, receipt, versions)?
+/// The file that owns the queue now. Re-resolve it before each commit: a migration or a
+/// changed symlink can switch the queue to a file whose observer holds a different lock.
+#[derive(PartialEq, Eq)]
+struct ObservationTarget {
+    file: PathBuf,
+    selection: BackendKind,
+    engine: BackendKind,
+}
+
+impl ObservationTarget {
+    fn resolve(state: &crate::HubState) -> Result<Option<Self>, LifecycleError> {
+        let logical = &state.config.store_path;
+        let selection = match state.store_backend {
+            Some(engine) => engine,
+            None => choose_backend(
+                logical,
+                std::env::var(fl_store::BACKEND_ENV).ok().as_deref(),
+            )?,
         };
-        if let Some(versions) = applied {
-            for change in &versions.changes {
-                eprintln!(
-                    "hub: warning ({session_id}): {vendor} {:?} version changed from {} to {}",
-                    change.component, change.previous, change.current,
+        let physical = physical_path(logical, selection);
+        let (file, engine) = match std::fs::symlink_metadata(&physical) {
+            Ok(_) => (physical, selection),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if selection != BackendKind::Ferro || physical == *logical || !logical.is_file() {
+                    return Ok(None);
+                }
+                (logical.to_path_buf(), BackendKind::Redb)
+            }
+            Err(error) => return Err(LifecycleError::Store(error.to_string())),
+        };
+        let file = file
+            .canonicalize()
+            .map_err(|error| LifecycleError::Store(error.to_string()))?;
+        Ok(file.is_file().then_some(Self {
+            file,
+            selection,
+            engine,
+        }))
+    }
+
+    fn is_current(&self, state: &crate::HubState) -> Result<bool, LifecycleError> {
+        Ok(Self::resolve(state)?.as_ref() == Some(self))
+    }
+}
+
+/// Owns only the multiprocess-safe Ferro handle. A redb open lasts one short operation.
+#[derive(Default)]
+pub(crate) struct VersionObserver {
+    ferro: Option<(PathBuf, AnyStore)>,
+}
+
+impl VersionObserver {
+    pub(crate) fn observe_launches(
+        &mut self,
+        state: &crate::HubState,
+    ) -> Result<(), LifecycleError> {
+        if let Some(adapters) = ADAPTERS.get() {
+            self.observe_with_adapters(state, adapters)?;
+        }
+        Ok(())
+    }
+
+    fn with_store<T>(
+        &mut self,
+        state: &crate::HubState,
+        target: &ObservationTarget,
+        operation: impl FnOnce(&AnyStore) -> Result<T, LifecycleError>,
+    ) -> Result<T, LifecycleError> {
+        // No Hub store guard is held during a Ferro open or use. On redb, the engine's
+        // own nonblocking file lock excludes migration and other writers.
+        let open = || {
+            let store = fl_store::open_store_with(
+                &state.config.store_path,
+                &StoreOptions {
+                    backend: Some(target.selection),
+                    retries: 0,
+                    unmigrated: Unmigrated::WriteRedb,
+                },
+            )?;
+            if store.kind() != target.engine || !target.is_current(state)? {
+                return Err(LifecycleError::Conflict(
+                    "version observer store changed".into(),
+                ));
+            }
+            Ok(store)
+        };
+        if target.engine == BackendKind::Redb {
+            self.ferro = None;
+            return operation(&open()?);
+        }
+        if self
+            .ferro
+            .as_ref()
+            .is_none_or(|(path, _)| path != &target.file)
+        {
+            self.ferro = Some((target.file.clone(), open()?));
+        }
+        let (_, store) = self.ferro.as_ref().expect("Ferro handle was opened");
+        let result = operation(store);
+        // Reconnect on the next pass if a served handle stopped responding.
+        if result.is_err() && store.is_remote() {
+            self.ferro = None;
+        }
+        result
+    }
+
+    fn observe_with_adapters(
+        &mut self,
+        state: &crate::HubState,
+        adapters: &VendorVersionRegistry,
+    ) -> Result<(), LifecycleError> {
+        let Some(target) = ObservationTarget::resolve(state)? else {
+            self.ferro = None;
+            return Ok(());
+        };
+        let _worker = match target.engine {
+            BackendKind::Ferro => {
+                let Some(worker) = lock::try_version_observer(&target.file)? else {
+                    return Ok(());
+                };
+                Some(worker)
+            }
+            // Redb exclusively owns the file for the whole commit, including the pending
+            // recheck. Competing observers may probe twice but only one can settle a launch.
+            BackendKind::Redb => None,
+        };
+        if !target.is_current(state)? {
+            return Ok(());
+        }
+        let batch = self.with_store(state, &target, |store| {
+            let now = now_ms();
+            let (mut pending, _): (Vec<LaunchReceipt>, _) = load_revision(store, &queue_slug())?;
+            pending.sort_unstable_by_key(|receipt| receipt.id);
+            Ok(pending
+                .into_iter()
+                .filter(|receipt| now.saturating_sub(receipt.captured_at_ms) >= SETTLE_MS)
+                .take(OBSERVATIONS_PER_PASS)
+                .collect::<Vec<_>>())
+        })?;
+        for receipt in batch {
+            // The observer lock is private to this worker. Process and daemon reads hold no
+            // workspace transaction, redb handle or persona fence.
+            let versions = observe(&receipt, adapters);
+            if !target.is_current(state)? {
+                // A different file means a different worker lock. Let that worker settle the
+                // persisted queue instead of applying an old observation under this lock.
+                return Ok(());
+            }
+            let session_id = receipt.session_id.clone();
+            let stream = receipt.stream.clone();
+            let generation = receipt.generation.clone();
+            let vendor = receipt.vendor.clone();
+            let applied =
+                self.with_store(state, &target, |store| commit(store, receipt, versions))?;
+            if let Some(versions) = applied {
+                for change in &versions.changes {
+                    eprintln!(
+                        "hub: warning ({session_id}): {vendor} {:?} version changed from {} to {}",
+                        change.component, change.previous, change.current,
+                    );
+                }
+                let event = if versions.changes.is_empty() {
+                    "session.vendor_versions_observed"
+                } else {
+                    "session.vendor_version_changed"
+                };
+                state.broadcast(
+                    "sessions",
+                    event,
+                    serde_json::json!({
+                        "session_id": session_id,
+                        "hydration_generation": generation,
+                        "stream": stream,
+                        "vendor_versions": versions,
+                    }),
                 );
             }
-            let event = if versions.changes.is_empty() {
-                "session.vendor_versions_observed"
-            } else {
-                "session.vendor_version_changed"
-            };
-            state.broadcast(
-                "sessions",
-                event,
-                serde_json::json!({
-                    "session_id": session_id,
-                    "hydration_generation": generation,
-                    "stream": stream,
-                    "vendor_versions": versions,
-                }),
-            );
         }
+        Ok(())
     }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -693,7 +823,7 @@ mod tests {
         }
     }
 
-    fn seed(store: &MemStore, receipt: &LaunchReceipt) {
+    fn seed(store: &impl StateStore, receipt: &LaunchReceipt) {
         assert!(
             update_pending(store, |pending| {
                 pending.push(receipt.clone());
@@ -833,5 +963,184 @@ mod tests {
         assert!(process.executable().is_some());
         process.start_ticks += 1;
         assert!(process.executable().is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    fn observer_fixture(engine: BackendKind, migrate_during_probe: bool) {
+        use std::sync::{Mutex, mpsc};
+        use std::time::Duration;
+
+        #[derive(Debug)]
+        struct PausedAdapter {
+            entered: mpsc::Sender<()>,
+            resume: Mutex<mpsc::Receiver<()>>,
+        }
+
+        impl fl_core::VendorVersionAdapter for PausedAdapter {
+            fn vendor_id(&self) -> &'static str {
+                "codex"
+            }
+
+            fn version_from_executable(&self, executable: &Path) -> Option<String> {
+                assert_eq!(executable, std::env::current_exe().unwrap());
+                self.entered.send(()).unwrap();
+                self.resume
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(3))
+                    .unwrap();
+                Some("2.0.0".into())
+            }
+        }
+
+        #[derive(Debug)]
+        struct ReadyAdapter;
+
+        impl fl_core::VendorVersionAdapter for ReadyAdapter {
+            fn vendor_id(&self) -> &'static str {
+                "codex"
+            }
+
+            fn version_from_executable(&self, _executable: &Path) -> Option<String> {
+                Some("2.0.0".into())
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(match engine {
+            BackendKind::Ferro => "workspace.fls",
+            BackendKind::Redb => "workspace.redb",
+        });
+        let make_state = |path: PathBuf, selection| {
+            let mut state = crate::HubState::new(crate::HubServerConfig {
+                store_path: path,
+                home_override: Some(dir.path().into()),
+                ..crate::HubServerConfig::default()
+            });
+            state.store_backend = Some(selection);
+            state
+        };
+        let writer = make_state(path.clone(), engine);
+        let observer = make_state(path.clone(), BackendKind::Ferro);
+        let alias = dir.path().join(match engine {
+            BackendKind::Ferro => "alias.fls",
+            BackendKind::Redb => "alias.redb",
+        });
+        std::os::unix::fs::symlink(&path, &alias).unwrap();
+        let competitor = make_state(alias, BackendKind::Ferro);
+
+        let first = receipt(1);
+        let mut second = receipt(2);
+        second.captured_at_ms = now_ms().saturating_sub(SETTLE_MS);
+        second.evidence.as_mut().unwrap().leader = ProcessIdentity::capture(std::process::id());
+        let stream = second.stream.clone().unwrap();
+        {
+            let store = writer.open_store().unwrap();
+            seed(&*store, &first);
+            commit(&*store, first, sample(Some("1.0.0"), None)).unwrap();
+            seed(&*store, &second);
+        }
+        let (entered, on_probe) = mpsc::channel();
+        let (resume_probe, resume) = mpsc::channel();
+        let mut adapters = VendorVersionRegistry::default();
+        adapters.register(PausedAdapter {
+            entered,
+            resume: Mutex::new(resume),
+        });
+        let mut events = observer.subscribe();
+        let mut competitor_events = competitor.subscribe();
+        let worker = std::thread::scope(|threads| {
+            let first_worker = threads.spawn(|| {
+                let mut worker = VersionObserver::default();
+                worker.observe_with_adapters(&observer, &adapters).unwrap();
+                worker
+            });
+            let timeout = Duration::from_secs(3);
+            on_probe.recv_timeout(timeout).unwrap();
+            // Neither the Hub lock nor a redb connection is held during the probe.
+            assert!(observer.store_lock.try_lock().is_ok());
+            {
+                let store = writer.open_store().unwrap();
+                assert!(
+                    hosted_vendor_versions_for_stream(&*store, &stream)
+                        .unwrap()
+                        .is_none()
+                );
+            }
+            if migrate_during_probe {
+                let fls = path.with_extension("fls");
+                assert!(fl_store::migrate_locked(&path, &fls).unwrap().is_clean());
+            } else if engine == BackendKind::Redb {
+                // A second redb observer may settle while the first has no open connection.
+                // The older in-flight observation must then leave its warning alone.
+                let mut ready = VendorVersionRegistry::default();
+                ready.register(ReadyAdapter);
+                VersionObserver::default()
+                    .observe_with_adapters(&competitor, &ready)
+                    .unwrap();
+                assert!(competitor_events.try_recv().is_ok());
+            } else {
+                // A second Hub on a symlink alias must see the same ownership file.
+                VersionObserver::default()
+                    .observe_with_adapters(&competitor, &adapters)
+                    .unwrap();
+                assert!(on_probe.try_recv().is_err());
+            }
+            resume_probe.send(()).unwrap();
+            first_worker.join().unwrap()
+        });
+        assert_eq!(worker.ferro.is_some(), engine == BackendKind::Ferro);
+
+        if migrate_during_probe {
+            assert!(events.try_recv().is_err());
+            let store = observer.open_store().unwrap();
+            assert_eq!(store.kind(), BackendKind::Ferro);
+            assert!(
+                hosted_vendor_versions_for_stream(&*store, &stream)
+                    .unwrap()
+                    .is_none()
+            );
+            let (pending, _): (Vec<LaunchReceipt>, _) =
+                load_revision(&*store, &queue_slug()).unwrap();
+            assert_eq!(pending.len(), 1);
+            assert_eq!(pending[0].id, second.id);
+            return;
+        }
+        if engine == BackendKind::Ferro {
+            assert_eq!(
+                events.try_recv().unwrap().event,
+                "session.vendor_version_changed"
+            );
+        } else {
+            assert!(events.try_recv().is_err());
+        }
+        let store = writer.open_store().unwrap();
+        let versions = hosted_vendor_versions_for_stream(&*store, &stream)
+            .unwrap()
+            .unwrap();
+        assert_eq!(versions.cli.as_deref(), Some("2.0.0"));
+        assert_eq!(versions.changes[0].previous, "1.0.0");
+        assert_eq!(versions.changes[0].current, "2.0.0");
+        if engine == BackendKind::Redb {
+            assert!(!path.with_extension("fls").exists());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn versions_observer_excludes_other_hubs_without_holding_the_hub_store_lock() {
+        observer_fixture(BackendKind::Ferro, false);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn versions_observer_settles_lone_redb_without_migrating() {
+        observer_fixture(BackendKind::Redb, false);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn versions_observer_does_not_commit_across_a_concurrent_migration() {
+        observer_fixture(BackendKind::Redb, true);
     }
 }

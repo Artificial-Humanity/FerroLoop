@@ -124,6 +124,9 @@ pub enum Unmigrated {
     /// writable open, which can repair a crash-damaged redb or initialise an
     /// empty file, exactly as before auto-migration existed.
     UseRedb,
+    /// Open the lone `.redb` for writing without migrating. Defer if the
+    /// migration lock or the database is busy; intended for background work.
+    WriteRedb,
     /// Refuse, naming `fl store migrate`.
     Refuse,
 }
@@ -667,6 +670,13 @@ fn open_ferro(
     }
     if options.unmigrated == Unmigrated::UseRedb {
         return redb_engine(path, physical, options.retries, None, Access::Scan);
+    }
+    if options.unmigrated == Unmigrated::WriteRedb {
+        return match MigrationLock::acquire_within(physical, std::time::Duration::ZERO) {
+            Ok(lock) => redb_engine(path, physical, 0, Some(lock), Access::Use),
+            Err(err) if lock_error_is_benign(&err) => redb_engine_unlocked(path, physical, 0),
+            Err(err) => Err(lock_failed(physical, &err)),
+        };
     }
 
     let key = memory_key(path);
@@ -2817,6 +2827,15 @@ mod tests {
             open_store_sink(&redb, &ferro_opts(Unmigrated::Migrate), &again.sink()).unwrap();
         assert_eq!(store.kind(), BackendKind::Redb);
         assert!(again.all().is_empty(), "{:?}", again.all());
+        drop(store);
+
+        let observer = open_store_with(&redb, &ferro_opts(Unmigrated::WriteRedb)).unwrap();
+        assert!(matches!(
+            &observer.as_redb().unwrap().db,
+            crate::Db::Write(_)
+        ));
+        assert!(!fls.exists());
+        assert!(!MigrationLock::path_for(&fls).exists());
     }
 
     #[test]

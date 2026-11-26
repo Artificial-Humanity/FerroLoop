@@ -304,6 +304,17 @@ fn lock_path(socket: &Path, persona: &str, kind: &str) -> Result<PathBuf, Lifecy
     }
 }
 
+/// A separate process-shared lock for the version observer. Launches never acquire it.
+pub(super) fn try_version_observer(store_file: &Path) -> Result<Option<File>, LifecycleError> {
+    let path = lock_path(store_file, "", "vendor-version-observer")?;
+    let file = safe_open(&path)?;
+    match file.try_lock() {
+        Ok(()) => Ok(Some(file)),
+        Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+        Err(std::fs::TryLockError::Error(err)) => Err(failure("lock", err)),
+    }
+}
+
 fn safe_open(path: &Path) -> Result<File, LifecycleError> {
     #[cfg(unix)]
     {
