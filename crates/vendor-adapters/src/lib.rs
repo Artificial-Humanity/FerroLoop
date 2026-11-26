@@ -6,6 +6,7 @@
 mod antigravity;
 pub mod claude;
 pub mod codex;
+mod doctor;
 mod grok;
 mod muse;
 

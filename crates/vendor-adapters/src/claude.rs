@@ -31,6 +31,8 @@ use fl_core::vendor_adapter::{
 };
 use serde_json::Value;
 
+use fl_core::{VendorDoctorContext, VendorUpdateStatus};
+
 pub use fl_core::PostCompactionContext as ClaudePostCompactionContext;
 
 /// First-launch modal printed by Claude Code when auto mode asks for environment setup.
@@ -304,7 +306,21 @@ impl fl_core::VendorVersionAdapter for ClaudeHostAdapter {
     }
 
     fn auto_update_disable_env(&self) -> Option<(&'static str, &'static str)> {
-        Some(("DISABLE_AUTOUPDATER", "1"))
+        Some(CLAUDE_AUTO_UPDATE_DISABLED)
+    }
+
+    fn configured_cli_updates(&self, context: &VendorDoctorContext<'_>) -> VendorUpdateStatus {
+        let controls = [
+            context.var(CLAUDE_AUTO_UPDATE_DISABLED.0),
+            context.var("DISABLE_UPDATES"),
+        ];
+        if controls.iter().flatten().any(|value| value == "1") {
+            VendorUpdateStatus::Disabled
+        } else if controls.iter().flatten().any(|value| !value.is_empty()) {
+            VendorUpdateStatus::Unknown
+        } else {
+            VendorUpdateStatus::Enabled
+        }
     }
 
     fn version_from_executable(&self, executable: &Path) -> Option<String> {
@@ -320,6 +336,8 @@ impl fl_core::VendorVersionAdapter for ClaudeHostAdapter {
         crate::valid_release_version(version).map(str::to_owned)
     }
 }
+
+const CLAUDE_AUTO_UPDATE_DISABLED: (&str, &str) = ("DISABLE_AUTOUPDATER", "1");
 
 impl VendorHostAdapter for ClaudeHostAdapter {
     fn vendor_id(&self) -> &str {

@@ -29,6 +29,12 @@ use std::sync::{Arc, RwLock};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+mod doctor;
+pub use doctor::{
+    VendorDoctorContext, VendorDoctorFacts, VendorInstalledVersion, VendorRuntimeFacts,
+    VendorUpdateStatus,
+};
+
 /// Exact session-identity binding pinning an adapter operation to a specific agent generation,
 /// host session, optional OS `(pid, start_time_ticks)` birth tuple, and optional explicit vendor
 /// session ID.
@@ -709,6 +715,29 @@ pub trait VendorVersionAdapter: fmt::Debug + Send + Sync {
             env.retain(|(key, _)| key != name);
             env.push((name.into(), value.into()));
         }
+    }
+
+    /// Observe documented CLI update controls in the caller's environment and config.
+    /// Implementations only read passive evidence and never start a process.
+    fn configured_cli_updates(&self, context: &VendorDoctorContext<'_>) -> VendorUpdateStatus {
+        let Some((key, disabled)) = self.auto_update_disable_env() else {
+            return VendorUpdateStatus::Unknown;
+        };
+        match context.var(key) {
+            None => VendorUpdateStatus::Enabled,
+            Some(value) if value.is_empty() => VendorUpdateStatus::Enabled,
+            Some(value) if value == disabled => VendorUpdateStatus::Disabled,
+            Some(_) => VendorUpdateStatus::Unknown,
+        }
+    }
+
+    /// Observe the separately managed daemon's installed image and on-disk update setting.
+    /// Never connect to the daemon or inspect a running service.
+    fn doctor_daemon_facts(
+        &self,
+        _context: &VendorDoctorContext<'_>,
+    ) -> Option<VendorRuntimeFacts> {
+        None
     }
 
     /// Read passive evidence for an executable the caller has already resolved to its absolute,

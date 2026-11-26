@@ -28,15 +28,19 @@ use fl_core::vendor_adapter::{
     ConfigEffectiveScope, LaunchPrerequisiteRefusal, LaunchSignInIssue, NormalizedSessionTurn,
     TeardownOutcome, TeardownTarget, TranscriptNormalizeReport, TurnDeliveryOutcome,
     TurnDeliveryRequest, VendorAdapterError, VendorConfigSpec, VendorDaemonLaunchEvidence,
-    VendorHostAdapter, VendorLaunchPlan, VendorLaunchRequest, VendorStartupPromptRule,
+    VendorDoctorContext, VendorHostAdapter, VendorInstalledVersion, VendorLaunchPlan,
+    VendorLaunchRequest, VendorRuntimeFacts, VendorStartupPromptRule, VendorUpdateStatus,
 };
 #[cfg(unix)]
 use ring::rand::{SecureRandom, SystemRandom};
+use serde::Deserialize;
 #[cfg(unix)]
 use serde::Serialize;
 use serde_json::Value;
 #[cfg(unix)]
 use serde_json::json;
+
+use crate::doctor::configured_updates;
 
 /// Default overall timeout for a Codex app-server control socket RPC sequence.
 pub const CODEX_RPC_TIMEOUT: Duration = Duration::from_secs(10);
@@ -258,6 +262,42 @@ fn codex_prerequisite_refusal(socket: &Path, result: &str) -> LaunchPrerequisite
 
 const CLI_STARTUP_UPDATE_KEY: &str = "check_for_update_on_startup";
 
+#[derive(Default, Deserialize)]
+struct CodexCliConfig {
+    check_for_update_on_startup: Option<bool>,
+}
+
+#[derive(Default, Deserialize)]
+struct DaemonSettings {
+    #[serde(default)]
+    updater: DaemonUpdaterSettings,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+struct DaemonUpdaterSettings {
+    auto_update_enabled: bool,
+}
+
+impl Default for DaemonUpdaterSettings {
+    fn default() -> Self {
+        Self {
+            auto_update_enabled: true,
+        }
+    }
+}
+
+fn doctor_codex_home(context: &VendorDoctorContext<'_>) -> Option<PathBuf> {
+    if let Some(path) = context.var("CODEX_HOME").filter(|value| !value.is_empty()) {
+        let path = PathBuf::from(path);
+        return (path.is_absolute() && path.is_dir()).then_some(path);
+    }
+    context
+        .home
+        .filter(|home| home.is_absolute())
+        .map(|home| home.join(".codex"))
+}
+
 fn is_startup_update_override(arg: &str) -> bool {
     arg.split_once('=')
         .is_some_and(|(key, _)| key.trim() == CLI_STARTUP_UPDATE_KEY)
@@ -300,6 +340,40 @@ impl fl_core::VendorVersionAdapter for CodexHostAdapter {
             1..1,
             ["-c".into(), format!("{CLI_STARTUP_UPDATE_KEY}=false")],
         );
+    }
+
+    fn configured_cli_updates(&self, context: &VendorDoctorContext<'_>) -> VendorUpdateStatus {
+        let Some(home) = doctor_codex_home(context) else {
+            return VendorUpdateStatus::Unknown;
+        };
+        configured_updates(
+            &home.join("config.toml"),
+            |source| toml::from_str::<CodexCliConfig>(source).ok(),
+            |config| config.check_for_update_on_startup.unwrap_or(true),
+        )
+    }
+
+    fn doctor_daemon_facts(&self, context: &VendorDoctorContext<'_>) -> Option<VendorRuntimeFacts> {
+        let Some(home) = doctor_codex_home(context) else {
+            return Some(VendorRuntimeFacts {
+                installed_version: VendorInstalledVersion::Unknown,
+                configured_updates: VendorUpdateStatus::Unknown,
+            });
+        };
+        let selected = home
+            .join("packages/app-server-daemon/current/bin")
+            .join(format!("codex{}", std::env::consts::EXE_SUFFIX));
+        Some(VendorRuntimeFacts {
+            installed_version: VendorInstalledVersion::for_executable(&selected, |path| {
+                let (package, version) = installed_package_version(path)?;
+                (package == "app-server-daemon").then(|| version.to_owned())
+            }),
+            configured_updates: configured_updates(
+                &home.join("app-server-daemon/settings.json"),
+                |source| serde_json::from_str::<DaemonSettings>(source).ok(),
+                |settings| settings.updater.auto_update_enabled,
+            ),
+        })
     }
 
     fn version_from_executable(&self, executable: &Path) -> Option<String> {

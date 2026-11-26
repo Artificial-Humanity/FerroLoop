@@ -225,8 +225,9 @@ pub use vendor_adapter::{
     ConfigEffectiveScope, LaunchPrerequisiteRefusal, LaunchSignInIssue, NormalizedSessionTurn,
     PostCompactionContext, RuntimePort, TeardownOutcome, TeardownTarget, TranscriptNormalizeReport,
     TurnDeliveryOutcome, TurnDeliveryRequest, VendorAdapterError, VendorConfigSpec,
-    VendorHostAdapter, VendorHostAdapterRegistry, VendorLaunchPlan, VendorLaunchRequest,
-    VendorStartupPromptRule, VendorVersionAdapter, VendorVersionRegistry,
+    VendorDoctorContext, VendorDoctorFacts, VendorHostAdapter, VendorHostAdapterRegistry,
+    VendorInstalledVersion, VendorLaunchPlan, VendorLaunchRequest, VendorRuntimeFacts,
+    VendorStartupPromptRule, VendorUpdateStatus, VendorVersionAdapter, VendorVersionRegistry,
 };
 pub use verdict::{FailReason, Population, Verdict};
 pub use workflow::{
