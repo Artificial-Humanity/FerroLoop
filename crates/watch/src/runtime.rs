@@ -31,6 +31,22 @@ pub const HOSTED_STATUS_RUNNING: &str = "running";
 /// The hosted-session status the hub writes once a session is torn down.
 pub const HOSTED_STATUS_DECOMMISSIONED: &str = "decommissioned";
 
+/// What is preventing a running hosted session from accepting work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HostedBlockReason {
+    VendorSignIn,
+    BlockingDialog,
+    HydrationOverdue,
+}
+
+/// An operator-actionable observation about a hosted session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostedBlock {
+    pub reason: HostedBlockReason,
+    pub observed_at_ms: u64,
+}
+
 /// The fields FerroWatch reads from a hub hosted-session record.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WatchHostedSession {
@@ -46,6 +62,8 @@ pub struct WatchHostedSession {
     pub status: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stop_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub block: Option<HostedBlock>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub launch_prerequisite_detail: Option<String>,
     pub restart_count: u64,
@@ -81,6 +99,9 @@ impl WatchHostedSession {
                 .get("stop_reason")
                 .and_then(Value::as_str)
                 .map(str::to_string),
+            block: obj
+                .get("block")
+                .and_then(|block| HostedBlock::deserialize(block).ok()),
             launch_prerequisite_detail: obj
                 .get("launch_prerequisite_detail")
                 .and_then(Value::as_str)

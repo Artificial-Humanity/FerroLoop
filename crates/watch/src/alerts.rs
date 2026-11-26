@@ -31,6 +31,7 @@ use std::collections::BTreeMap;
 use crate::WatchError;
 use crate::liveness::{WatchHealthReport, WatchLiveness};
 use crate::rollups::WatchTelemetryReport;
+use crate::runtime::WatchHostedSession;
 
 /// How urgent an alert is. Orders `Info < Warning < Critical`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -59,6 +60,8 @@ pub enum WatchAlertRule {
     Spend,
     /// A vendor quota window at or above a percentage threshold.
     Quota,
+    /// A vendor has running hosted sessions that need operator attention.
+    HostedBlock,
     /// An active agent whose heartbeat is stale (or whose host is unreachable).
     HeartbeatStale,
     /// An active agent whose heartbeat says live but whose process is gone.
@@ -75,6 +78,7 @@ impl WatchAlertRule {
         match self {
             WatchAlertRule::Spend => "spend",
             WatchAlertRule::Quota => "quota",
+            WatchAlertRule::HostedBlock => "hosted_block",
             WatchAlertRule::HeartbeatStale => "heartbeat_stale",
             WatchAlertRule::HeartbeatDead => "heartbeat_dead",
             WatchAlertRule::CrashLoop => "crash_loop",
@@ -317,6 +321,17 @@ pub fn evaluate_watch_alerts(
     thresholds: &WatchThresholds,
     now_ms: u64,
 ) -> Vec<WatchAlert> {
+    evaluate_watch_alerts_with_hosted_sessions(telemetry, health, quotas, &[], thresholds, now_ms)
+}
+
+pub(crate) fn evaluate_watch_alerts_with_hosted_sessions(
+    telemetry: &WatchTelemetryReport,
+    health: &WatchHealthReport,
+    quotas: &[WatchQuotaWindow],
+    hosted_sessions: &[WatchHostedSession],
+    thresholds: &WatchThresholds,
+    now_ms: u64,
+) -> Vec<WatchAlert> {
     let mut out = Vec::new();
     let mut push = |rule: WatchAlertRule,
                     severity: Severity,
@@ -511,6 +526,34 @@ pub fn evaluate_watch_alerts(
                 "remodel sessions on {vendor} onto an available vendor, or hold new work until \
                  the window resets"
             ),
+        );
+    }
+
+    let mut blocked_counts = BTreeMap::<String, u64>::new();
+    for seat in hosted_sessions {
+        let vendor = seat.vendor.trim();
+        if seat.is_running() && seat.block.is_some() && !vendor.is_empty() {
+            *blocked_counts
+                .entry(vendor.to_ascii_lowercase())
+                .or_default() += 1;
+        }
+    }
+    for (vendor, count) in blocked_counts {
+        let seats = if count == 1 { "seat" } else { "seats" };
+        push(
+            WatchAlertRule::HostedBlock,
+            Severity::Warning,
+            WatchEntity {
+                kind: WatchEntityKind::Vendor,
+                id: vendor.clone(),
+                label: None,
+            },
+            format!("vendor:{vendor}"),
+            format!("{vendor} has {count} blocked hosted {seats}"),
+            count as f64,
+            1.0,
+            None,
+            "Inspect the affected hosted sessions for sign-in, a prompt that needs a decision, or overdue hydration.".into(),
         );
     }
 
