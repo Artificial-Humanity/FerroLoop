@@ -47,6 +47,13 @@ ordered operation, returning its generation. Invalid dimensions, stale authority
 and failed ioctls leave the screen geometry unchanged. Windows PTYs, rendered
 capture and resize remain unsupported pending ConPTY. Attach remains unsupported.
 
+On Unix, the host answers the child's `CSI 6n` request with a one-based cursor
+position report from the projection. This applies with or without a controller
+subscribed to output. Raw output still contains the original query. A client
+that renders raw output must suppress its own automatic cursor report replies.
+The host can drop reports if the bounded reply queue fills or if PTY input
+stays blocked past the write deadline.
+
 Acceptance coverage uses an isolated real host and a gated child with more than
 8 MiB of redraws and control strings, unread/stalled replay consumers, eviction,
 split escapes/UTF-8 and kernel geometry reports. The deterministic in-module pump
