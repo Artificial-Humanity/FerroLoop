@@ -160,11 +160,42 @@ impl TerminalParser {
             }
             (Esc, ' '..='/') => Intermediate,
             (Csi, '@'..='~') | (Esc | Intermediate, '0'..='~') => Ground,
-            (Ground, ch) if !ch.is_control() || matches!(ch, '\n' | '\t') => return Some(ch),
+            (Ground, ch) if is_terminal_text(ch) => return Some(ch),
             (state, _) => state,
         };
         None
     }
+}
+
+fn is_terminal_text(ch: char) -> bool {
+    // Keep line feeds and tabs. Also strip Unicode format characters (Cf)
+    // and line/paragraph separators (Zl, Zp) so they cannot disguise text.
+    matches!(ch, '\n' | '\t')
+        || !(ch.is_control()
+            || matches!(
+                ch,
+                '\u{00ad}'
+                    | '\u{0600}'..='\u{0605}'
+                    | '\u{061c}'
+                    | '\u{06dd}'
+                    | '\u{070f}'
+                    | '\u{0890}'..='\u{0891}'
+                    | '\u{08e2}'
+                    | '\u{180e}'
+                    | '\u{200b}'..='\u{200f}'
+                    | '\u{2028}'..='\u{202e}'
+                    | '\u{2060}'..='\u{2064}'
+                    | '\u{2066}'..='\u{206f}'
+                    | '\u{feff}'
+                    | '\u{fff9}'..='\u{fffb}'
+                    | '\u{110bd}'
+                    | '\u{110cd}'
+                    | '\u{13430}'..='\u{1343f}'
+                    | '\u{1bca0}'..='\u{1bca3}'
+                    | '\u{1d173}'..='\u{1d17a}'
+                    | '\u{e0001}'
+                    | '\u{e0020}'..='\u{e007f}'
+            ))
 }
 
 const CAP: usize = MAX_HOSTED_EXIT_TAIL_BYTES;
@@ -218,5 +249,21 @@ impl TerminalTail {
         let mut tail = Vec::with_capacity(end - start);
         tail.extend((start..end).map(|index| self.bytes[index % CAP]));
         String::from_utf8(tail).expect("terminal tail contains complete UTF-8 scalars")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hosted_exit_tail_strips_unicode_format_characters_and_separators() {
+        let mut tail = TerminalTail::new();
+        let raw = "é\u{00ad}\u{0605}\u{180e}中\u{200b}\u{200d}\u{202e}\u{2066}\
+                   \u{2028}\u{2029}\u{feff}\u{1343f}\u{e007f}\tline\nnext";
+        for chunk in raw.as_bytes().chunks(2) {
+            tail.push(chunk);
+        }
+        assert_eq!(tail.snapshot(), "é中\tline\nnext");
     }
 }

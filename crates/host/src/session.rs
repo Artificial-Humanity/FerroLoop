@@ -1356,7 +1356,9 @@ mod tests {
         );
     }
     #[cfg(unix)]
-    fn pty_fixture() -> (
+    fn pty_fixture(
+        owner: Option<&str>,
+    ) -> (
         Arc<Session>,
         Arc<crate::reliable::ReliableJournal>,
         Arc<dyn StdoutSink>,
@@ -1377,12 +1379,10 @@ mod tests {
             fl_host_proto::PtyOptions::default(),
         )
         .unwrap();
-        let session = Arc::new(Session::with_projection(
-            parts,
-            Arc::clone(&journal),
-            projection,
-            None,
-        ));
+        let session = Arc::new(
+            Session::with_projection(parts, Arc::clone(&journal), projection, None)
+                .with_hosted_owner(owner),
+        );
         let sink: Arc<dyn StdoutSink> = crate::output::OutputSession::open(
             Arc::clone(&session),
             Arc::new(crate::output::Hub::new()),
@@ -1393,7 +1393,7 @@ mod tests {
     #[test]
     fn successful_pty_cleanup_releases_projection_without_ack_and_drain_keeps_raw_tail() {
         use crate::slice_budget::ChargeKind;
-        let (session, journal, sink) = pty_fixture();
+        let (session, journal, sink) = pty_fixture(None);
         assert!(journal.budget().used(ChargeKind::Projection) > 0);
         session.note_cleanup(CleanupReport { complete: true });
         assert_eq!(journal.budget().used(ChargeKind::Projection), 0);
@@ -1430,7 +1430,7 @@ mod tests {
     #[test]
     fn incomplete_pty_cleanup_preserves_projection_and_charge() {
         use crate::slice_budget::ChargeKind;
-        let (session, journal, _sink) = pty_fixture();
+        let (session, journal, _sink) = pty_fixture(None);
         let charged = journal.budget().used(ChargeKind::Projection);
         session.note_cleanup(CleanupReport { complete: false });
         session.drop_pty_output(&journal, b"still-visible");
@@ -1443,7 +1443,7 @@ mod tests {
     #[test]
     fn pty_projection_precedes_forced_unadmitted_drop_and_retains_raw_bytes() {
         use crate::slice_budget::{ChargeKind, EPOCH_DATA, reserve};
-        let (session, journal, sink) = pty_fixture();
+        let (session, journal, sink) = pty_fixture(None);
         let held = reserve(journal.budget(), ChargeKind::ReliableData, EPOCH_DATA).unwrap();
         assert!(journal.prepare_read().is_err());
         let raw = b"visible\x1b]secret\x07";
@@ -1469,8 +1469,60 @@ mod tests {
     }
     #[cfg(unix)]
     #[test]
+    fn hosted_exit_tail_captures_admitted_evicted_and_dropped_pty_bytes_once() {
+        use crate::slice_budget::{ChargeKind, EPOCH_DATA, reserve};
+        let (session, journal, sink) = pty_fixture(Some("agent"));
+        let accepted = b"accepted\x1b[6n\n";
+        let dropped = b"dropped\x1b[6n\n";
+        let last = b"last\n";
+        let mut first = journal.prepare_read().unwrap();
+        first.as_mut_slice()[..accepted.len()].copy_from_slice(accepted);
+        first.truncate(accepted.len());
+        session.accept_output(&journal, first).unwrap();
+        let (_, replay) = crate::reliable::begin_replay(&journal, 0).unwrap();
+        assert!(replay.gap().is_none());
+
+        // The next read evicts the first record and still cannot reserve a full
+        // read buffer. Release the pressure once its unadmitted bytes are read.
+        let available = EPOCH_DATA - journal.budget().used(ChargeKind::ReliableData);
+        let mut held =
+            Some(reserve(journal.budget(), ChargeKind::ReliableData, available).unwrap());
+        let mut chunks = [dropped.as_slice(), last.as_slice()].into_iter();
+        pump_reliable_stdout_with(&session, sink.as_ref(), &journal, |buf| {
+            let Some(chunk) = chunks.next() else {
+                return Ok(0);
+            };
+            if let Some(held) = held.take() {
+                assert_eq!(replay.gap().unwrap().next_seq, 2);
+                drop(held);
+            }
+            buf[..chunk.len()].copy_from_slice(chunk);
+            Ok(chunk.len())
+        });
+
+        let gap = replay.gap().unwrap();
+        assert_eq!((gap.from_seq, gap.next_seq), (1, 3));
+        let raw = [accepted.as_slice(), dropped, last].concat();
+        assert_eq!(session.stdout_tail(raw.len() * 2).as_bytes(), raw);
+        let screen = session.capture_screen().unwrap();
+        assert_eq!(
+            (screen.output_seq, screen.output_bytes),
+            (3, raw.len() as u64)
+        );
+        session.note_leader(ChildExit {
+            code: Some(1),
+            signal: None,
+        });
+        let HostedExitEvidenceStatus::Exited(evidence) = session.capture_hosted_exit() else {
+            panic!("expected hosted exit evidence");
+        };
+        assert_eq!(evidence.terminal_tail, "accepted\ndropped\nlast\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn pty_admitted_chunks_have_coherent_screen_and_watermark() {
-        let (session, journal, sink) = pty_fixture();
+        let (session, journal, sink) = pty_fixture(None);
         let chunks = [b"old\r\x1b[2".as_slice(), b"Knew\n"];
         let mut next = 0;
         pump_reliable_stdout_with(&session, sink.as_ref(), &journal, |buf| {
@@ -1499,7 +1551,7 @@ mod tests {
             Session::new(parts()).capture_screen(),
             Err(fl_host_proto::ExtensionRefusal::WrongMode)
         ));
-        let (_, journal, _) = pty_fixture();
+        let (_, journal, _) = pty_fixture(None);
         let projection = crate::projection::Projection::new(
             Arc::clone(journal.budget()),
             fl_host_proto::PtyOptions::default(),
@@ -1521,7 +1573,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn concurrent_snapshots_never_mix_projection_and_byte_counters() {
-        let (session, journal, _sink) = pty_fixture();
+        let (session, journal, _sink) = pty_fixture(None);
         std::thread::scope(|scope| {
             let session = &session;
             let journal = &journal;
