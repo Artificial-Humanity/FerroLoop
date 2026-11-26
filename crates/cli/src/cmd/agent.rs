@@ -166,7 +166,7 @@ pub enum AgentCmd {
         /// `prepare` (handoff prompt, status `decommissioning`) or `execute`.
         #[arg(long)]
         mode: Option<String>,
-        /// Execute even if the destination daemon has no usable sign-in.
+        /// Prepare or execute even if the destination daemon has no usable sign-in.
         #[arg(long)]
         allow_blocked_sign_in: bool,
         /// Working directory for the new runtime (default: the session's own).

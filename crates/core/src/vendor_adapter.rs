@@ -396,10 +396,10 @@ impl LaunchSignInIssue {
     pub const fn message(self) -> &'static str {
         match self {
             Self::Rejected => {
-                "The managed Codex daemon rejected its sign-in. A hosted seat will wait at the sign-in screen until the daemon has a usable sign-in. Run `codex login`, then restart `codex-app-server-daemon.service` to clear the rejected token from memory."
+                "The managed Codex daemon rejected its sign-in. A hosted seat will wait at the sign-in screen until the daemon has a usable sign-in. Run `codex login`, then run `systemctl --user restart codex-app-server-daemon.service` to clear the rejected token from memory."
             }
             Self::NotSignedIn => {
-                "The managed Codex daemon has no usable sign-in. A hosted seat will wait at the sign-in screen until the daemon has a usable sign-in. Run `codex login`, then restart `codex-app-server-daemon.service` so the daemon loads the sign-in."
+                "The managed Codex daemon has no usable sign-in. A hosted seat will wait at the sign-in screen until the daemon has a usable sign-in. Run `codex login`, then run `systemctl --user restart codex-app-server-daemon.service` so the daemon loads the sign-in."
             }
             Self::Inconclusive => "Codex sign-in not verified.",
         }

@@ -1001,17 +1001,24 @@ fn blocked_codex_sign_in_refuses_before_remodel_teardown_unless_overridden() {
         );
     }
 
-    let prepare = RemodelRequest {
+    let mut prepare = RemodelRequest {
         mode: Some("prepare".into()),
         ..remodel_req("codex")
     };
+    let err = remodel(&store, &env, "claude:ada", &prepare, Caller::Owner).unwrap_err();
+    assert_eq!(err.status(), 409);
+    assert!(err.to_string().contains("--allow-blocked-sign-in"), "{err}");
+    assert_eq!(record(&store, "claude:ada").status, STATUS_RUNNING);
+    assert!(fake.calls.borrow().is_empty());
+    assert!(handoff(&store, "ada").is_none());
+
+    prepare.allow_blocked_sign_in = true;
     let prepared = remodel(&store, &env, "claude:ada", &prepare, Caller::Owner).unwrap();
-    assert!(
-        prepared
-            .warnings
-            .iter()
-            .any(|warning| warning == LaunchSignInIssue::NotSignedIn.message())
+    assert_eq!(
+        prepared.warnings,
+        [LaunchSignInIssue::NotSignedIn.message()]
     );
+    assert_eq!(record(&store, "claude:ada").status, STATUS_DECOMMISSIONING);
     assert!(fake.is_live("Ada"));
 
     let probes = std::rc::Rc::new(std::cell::Cell::new(0));
@@ -1032,6 +1039,10 @@ fn blocked_codex_sign_in_refuses_before_remodel_teardown_unless_overridden() {
     assert_eq!(record(&store, "codex:ada").status, STATUS_RUNNING);
     assert_eq!(record(&store, "claude:ada").status, STATUS_DECOMMISSIONED);
     assert_eq!(
+        handoff(&store, "ada").unwrap().1["allow_blocked_sign_in"],
+        true
+    );
+    assert_eq!(
         probes.get(),
         1,
         "activation must reuse the destination verdict"
@@ -1042,6 +1053,44 @@ fn blocked_codex_sign_in_refuses_before_remodel_teardown_unless_overridden() {
             .filter(|warning| warning.as_str() == LaunchSignInIssue::NotSignedIn.message())
             .count(),
         1
+    );
+}
+
+#[test]
+fn inconclusive_codex_sign_in_allows_remodel_with_one_warning() {
+    let home = TempDir::new().unwrap();
+    let _trusted = trusted_codex_home(home.path(), home.path());
+    let fake = FakeRuntime::default();
+    let env = fake.env(home.path());
+    let store = MemStore::default();
+    spin_with(
+        &store,
+        &env,
+        "ada",
+        "assistant",
+        "claude",
+        None,
+        Some(home.path()),
+    );
+    TEST_LAUNCH_AUTH.with(|slot| {
+        *slot.borrow_mut() = Some(Box::new(|_| Some(LaunchSignInIssue::Inconclusive)));
+    });
+
+    let out = remodel(
+        &store,
+        &env,
+        "claude:ada",
+        &remodel_req("codex"),
+        Caller::Owner,
+    )
+    .unwrap();
+    assert_eq!(out.warnings, ["Codex sign-in not verified."]);
+    assert_eq!(out.session_id, "codex:ada");
+    assert!(out.runtime_stopped);
+    assert_eq!(record(&store, "codex:ada").status, STATUS_RUNNING);
+    assert_eq!(
+        handoff(&store, "ada").unwrap().1["allow_blocked_sign_in"],
+        false
     );
 }
 

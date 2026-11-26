@@ -10286,7 +10286,7 @@ pub struct RemodelRequest {
     /// `prepare` or `execute` (the default).
     #[serde(default)]
     pub mode: Option<String>,
-    /// Allow an execute remodel even when the destination daemon rejects sign-in or has none.
+    /// Allow prepare or execute even when the destination daemon rejects sign-in or has none.
     #[serde(default)]
     pub allow_blocked_sign_in: bool,
     #[serde(default)]
@@ -10362,6 +10362,7 @@ pub fn remodel_handoff_slug(persona: &str) -> String {
 /// A remodel that passed every check that can run before the old session is touched.
 struct RemodelPlan {
     mode: RemodelMode,
+    allow_blocked_sign_in: bool,
     persona: String,
     from_session_id: String,
     from_vendor: String,
@@ -10511,7 +10512,7 @@ pub(crate) fn observed_launch_auth(
         .ok_or_else(launch_auth_target_changed)
 }
 
-/// Apply the execute remodel's refusals using a sign-in observation from outside the store guard.
+/// Apply the remodel's refusals using a sign-in observation from outside the store guard.
 pub(crate) fn remodel_precheck<S: AgentRegistry + StateStore + Catalog>(
     store: &S,
     env: &LifecycleEnv<'_>,
@@ -10521,13 +10522,12 @@ pub(crate) fn remodel_precheck<S: AgentRegistry + StateStore + Catalog>(
     observe: impl FnOnce(&LaunchAuthTarget) -> Result<Option<LaunchSignInIssue>, LifecycleError>,
 ) -> Result<(), LifecycleError> {
     let plan = plan_remodel(store, env, target, req, caller)?;
-    check_remodel_launch(env, &plan, req, observe).map(drop)
+    check_remodel_launch(env, &plan, observe).map(drop)
 }
 
 fn check_remodel_launch(
     env: &LifecycleEnv<'_>,
     plan: &RemodelPlan,
-    req: &RemodelRequest,
     observe: impl FnOnce(&LaunchAuthTarget) -> Result<Option<LaunchSignInIssue>, LifecycleError>,
 ) -> Result<Vec<String>, LifecycleError> {
     let Some(target) = &plan.auth_target else {
@@ -10537,7 +10537,7 @@ fn check_remodel_launch(
     let Some(issue) = observe(target)? else {
         return Ok(Vec::new());
     };
-    if plan.mode == RemodelMode::Execute && issue.blocks_remodel() && !req.allow_blocked_sign_in {
+    if issue.blocks_remodel() && !plan.allow_blocked_sign_in {
         return Err(LifecycleError::Conflict(format!(
             "{} To proceed anyway, use --allow-blocked-sign-in (API: allow_blocked_sign_in).",
             issue.message()
@@ -10698,6 +10698,7 @@ fn plan_remodel<S: AgentRegistry + StateStore + Catalog>(
         launch_auth_target(env, &to.vendor, config_home.as_deref(), to.cwd.as_deref());
     Ok(RemodelPlan {
         mode,
+        allow_blocked_sign_in: req.allow_blocked_sign_in,
         persona: target.persona.clone(),
         from_session_id: target.session_id.clone(),
         from_vendor,
@@ -10757,6 +10758,7 @@ fn record_remodel_handoff<S: StateStore>(
     let notes = serde_json::json!({
         "kind": "remodel",
         "outcome": outcome.as_str(),
+        "allow_blocked_sign_in": plan.allow_blocked_sign_in,
         "persona": plan.persona,
         "from_session_id": plan.from_session_id,
         "to_session_id": report.to_session_id,
@@ -11011,7 +11013,7 @@ fn remodel_fenced<S: AgentRegistry + StateStore + Catalog + MessageStore>(
     spin: &mut SpinUpFn<'_, S>,
 ) -> Result<RemodelResponse, LifecycleError> {
     let plan = plan_remodel(store, env, target, req, caller)?;
-    let mut warnings = check_remodel_launch(env, &plan, req, |target| {
+    let mut warnings = check_remodel_launch(env, &plan, |target| {
         observed_launch_auth(observations, target)
     })?;
     let to = &plan.to;
@@ -24491,6 +24493,35 @@ mod tests {
         );
         assert!(fake.launches.borrow().is_empty());
         TEST_RESPAWN_NOW_MS.with(|clock| clock.set(None));
+    }
+
+    #[test]
+    fn fenced_automatic_codex_recovery_checks_socket_without_probing_sign_in() {
+        let _reset = RecoveryFixtureReset;
+        let home = TempDir::new().unwrap();
+        let _trusted = trusted_codex_home(home.path(), home.path());
+        let store = MemStore::default();
+        let fake = FakeRuntime::default();
+        let env = fake.env(home.path());
+        let mut record = hosted_record("codex", "worker", STATUS_STOPPED, false);
+        record.cwd = Some(home.path().display().to_string());
+        record.stop_reason = Some(STOP_REASON_RUNTIME_GONE.into());
+        persist_hosted_session(&store, &record, "owner").unwrap();
+        TEST_RESPAWN_NOW_MS.with(|clock| clock.set(Some(1_000)));
+        TEST_LAUNCH_PREREQUISITE_CALLS.with(|calls| calls.set(0));
+        TEST_LAUNCH_AUTH.with(|probe| {
+            *probe.borrow_mut() = Some(Box::new(|_| {
+                panic!("automatic recovery must not ask the daemon for sign-in")
+            }));
+        });
+
+        // The production sweep holds the persona fence before calling restart.
+        let restarted = reconcile_and_respawn_hosted_sessions(&store, &env).unwrap();
+        assert_eq!(restarted.len(), 1);
+        assert!(restarted[0].runtime_live);
+        assert_eq!(restarted[0].record.session_id, record.session_id);
+        assert_eq!(restarted[0].record.status, STATUS_RUNNING);
+        assert!(TEST_LAUNCH_PREREQUISITE_CALLS.with(|calls| calls.get()) > 0);
     }
 
     // CI only: the second probe distinguishes a vanished daemon from a broken launch.
