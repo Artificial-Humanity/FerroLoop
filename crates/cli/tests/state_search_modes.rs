@@ -10,7 +10,8 @@ use std::process::Stdio;
 use assert_cmd::Command;
 use fl_core::ids::Kind;
 use fl_core::state::{
-    MergeMode, RuntimeEntry, SensitivityPatch, StatePayload, StateScope, UpsertStateArgs,
+    HOSTED_VERSION_STATE_SLUG_PREFIXES, MergeMode, RuntimeEntry, SensitivityPatch, StatePayload,
+    StateScope, UpsertStateArgs,
 };
 use fl_core::store::{Handles, StateStore};
 use fl_hub::lifecycle::HOSTED_RESPAWN_STATE_SLUG_PREFIX;
@@ -515,10 +516,14 @@ fn mcp_fl_memory_search_takes_a_mode_and_defaults_to_auto() {
 fn internal_hosted_runtime_is_hidden_from_cli_and_mcp() {
     let cfg = TempDir::new().unwrap();
     let db = cfg.path().join("state.fls");
-    let hidden_slugs = [
-        format!("{HOSTED_RESPAWN_STATE_SLUG_PREFIX}fixture"),
-        format!("{NOTICE_STATE_SLUG_PREFIX}fixture"),
-    ];
+    let prefixes = || {
+        [HOSTED_RESPAWN_STATE_SLUG_PREFIX, NOTICE_STATE_SLUG_PREFIX]
+            .into_iter()
+            .chain(HOSTED_VERSION_STATE_SLUG_PREFIXES)
+    };
+    let hidden_slugs = prefixes()
+        .map(|prefix| format!("{prefix}fixture"))
+        .collect::<Vec<_>>();
     let store = fl_store::open_store(&db).unwrap();
     let mut hidden = Vec::new();
     for key in hidden_slugs
@@ -609,21 +614,24 @@ fn internal_hosted_runtime_is_hidden_from_cli_and_mcp() {
         assert_eq!(serde_json::from_str::<Value>(&text).unwrap(), cli);
     }
 
-    fl(&cfg, &db, None)
-        .args(["state", "runtime", "set", "--scope", "workspace"])
-        .args(["--key", &hidden_slugs[0].to_ascii_uppercase()])
-        .args(["--value", "null", "--not-sensitive", "--by", "test"])
-        .assert()
-        .code(1)
-        .stderr(predicates::str::contains("reserved"));
-    let (error, text) = mcp_call(
-        "state_set_runtime",
-        json!({
-            "scope": "workspace", "key": hidden_slugs[1].to_ascii_uppercase(),
-            "value": null, "clear_sensitive": true, "by": "test",
-        }),
-    );
-    assert!(error && text.contains("reserved"), "{text}");
+    for prefix in prefixes() {
+        let absent_key = format!("{prefix}new").to_ascii_uppercase();
+        fl(&cfg, &db, None)
+            .args(["state", "runtime", "set", "--scope", "workspace"])
+            .args(["--key", &absent_key])
+            .args(["--value", "null", "--not-sensitive", "--by", "test"])
+            .assert()
+            .code(1)
+            .stderr(predicates::str::contains("reserved"));
+        let (error, text) = mcp_call(
+            "state_set_runtime",
+            json!({
+                "scope": "workspace", "key": absent_key,
+                "value": null, "clear_sensitive": true, "by": "test",
+            }),
+        );
+        assert!(error && text.contains("reserved"), "{text}");
+    }
 
     let (error, text) = mcp_call(
         "state_set_runtime",

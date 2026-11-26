@@ -1080,8 +1080,12 @@ impl AgentRegistry for RedbStore {
     }
 }
 
-impl StateStore for RedbStore {
-    fn upsert_state(&self, args: UpsertStateArgs) -> Result<StateEntry, StoreError> {
+impl RedbStore {
+    fn upsert_state_when(
+        &self,
+        args: UpsertStateArgs,
+        expected: Option<Option<&RevisionId>>,
+    ) -> Result<Option<StateEntry>, StoreError> {
         let slug =
             validate_slug(&args.slug).map_err(|e| StoreError::InvalidState(e.to_string()))?;
         let concern = args.payload.concern();
@@ -1113,6 +1117,11 @@ impl StateStore for RedbStore {
             }
         };
 
+        if let Some(expected) = expected
+            && existing.as_ref().map(|entry| &entry.head_revision) != expected
+        {
+            return Ok(None);
+        }
         if let Some(ref ex) = existing {
             let conflicts = tx.open_table(STATE_CONFLICTS).map_err(backend)?;
             if let Some(raw_c) = conflicts.get(ex.id.as_str()).map_err(backend)? {
@@ -1221,7 +1230,22 @@ impl StateStore for RedbStore {
             )
             .map_err(backend)?;
         tx.commit().map_err(backend)?;
-        Ok(entry)
+        Ok(Some(entry))
+    }
+}
+
+impl StateStore for RedbStore {
+    fn upsert_state(&self, args: UpsertStateArgs) -> Result<StateEntry, StoreError> {
+        self.upsert_state_when(args, None)
+            .map(|entry| entry.expect("unconditional state upsert always writes"))
+    }
+
+    fn upsert_state_if_current(
+        &self,
+        args: UpsertStateArgs,
+        expected: Option<&RevisionId>,
+    ) -> Result<Option<StateEntry>, StoreError> {
+        self.upsert_state_when(args, Some(expected))
     }
 
     fn retire_memory(

@@ -412,6 +412,7 @@ enum CallerProcessContext<'a> {
 #[derive(Debug, Clone, Default)]
 struct HostedSessionVerification {
     verified: bool,
+    hosted_id: Option<String>,
     live_gen_mismatch: bool,
     process_mismatch: bool,
     process_proven: bool,
@@ -463,11 +464,8 @@ fn verify_hosted_session_in_store<S: fl_core::StateStore>(
         if !fl_wire::vendor_adapter::tool_processes_descend_from_cli(&rec.vendor)
             || !cfg!(target_os = "linux")
         {
-            out.verified = true;
             out.unverified_process = true;
-            continue;
-        }
-        if let Some(rec_pid) = rec.pid.filter(|p| *p > 0) {
+        } else if let Some(rec_pid) = rec.pid.filter(|p| *p > 0) {
             if let Some(expected_st) = rec.pid_start_time
                 && fl_wire::identity::proc_start_time_ticks(rec_pid) != Some(expected_st)
             {
@@ -537,23 +535,29 @@ fn verify_hosted_session_in_store<S: fl_core::StateStore>(
                     ancestor_ok && route_pid_ok
                 }
             };
-            if rel_ok {
-                out.verified = true;
-                out.process_proven = true;
-                out.process_mismatch = false;
-            } else {
+            if !rel_ok {
                 out.process_mismatch = true;
+                continue;
             }
-        } else {
-            out.verified = true;
-            if !out.process_proven {
-                out.unverified_process = true;
-            }
+            out.process_proven = true;
+            out.process_mismatch = false;
+        } else if !out.process_proven {
+            out.unverified_process = true;
+        }
+        out.verified = true;
+        if rec.hosted
+            && rec.status != fl_hub::lifecycle::STATUS_DECOMMISSIONING
+            && parse_hosted_identity(&rec.session_id).is_ok_and(|(vendor, owner)| {
+                vendor == canonical_vendor && owner.eq_ignore_ascii_case(persona)
+            })
+        {
+            out.hosted_id = Some(rec.session_id);
         }
     }
     if out.live_gen_mismatch {
         out.verified = false;
         out.process_proven = false;
+        out.hosted_id = None;
     }
     out
 }
@@ -746,6 +750,7 @@ fn evaluate_registration_guard<S: fl_core::StateStore>(
                     ));
                 }
                 hosted_session_verified = ver.verified;
+                effective_hosted_id = ver.hosted_id;
                 process_proven = ver.process_proven;
                 unverified_process = ver.unverified_process;
             }
@@ -4918,6 +4923,7 @@ pub(crate) mod tests {
                     explicit: true,
                     hosted_id: None,
                     hydration_generation: None,
+                    registered_hosted_native_id: None,
                     pid_start_time: None,
                 }],
                 dispatch_diagnostics: None,
@@ -5451,6 +5457,7 @@ pub(crate) mod tests {
                                 explicit: true,
                                 hosted_id: Some("antigravity:feira".into()),
                                 hydration_generation: Some("gen-1".into()),
+                                registered_hosted_native_id: None,
                                 pid_start_time: None,
                             }],
                             dispatch_diagnostics: None,
@@ -6550,6 +6557,7 @@ pub(crate) mod tests {
                                 explicit: true,
                                 hosted_id: Some("antigravity:feira".into()),
                                 hydration_generation: Some("gen-1".into()),
+                                registered_hosted_native_id: None,
                                 pid_start_time: None,
                             }],
                             dispatch_diagnostics: None,
