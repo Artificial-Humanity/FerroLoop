@@ -2866,20 +2866,37 @@ fn dispatch_diagnostics_summary(
             continue;
         };
         let reason = row.reason_label();
-        let since = row.busy_since.as_ref().map_or_else(String::new, |at| {
-            // Keep colons available as field delimiters.
-            format!(" since {}", at.as_str().replace(':', "-"))
-        });
+        let since = row
+            .busy_since
+            .as_ref()
+            .map_or_else(String::new, |at| format!(" busy_since={at}"));
         let exhausted = if row.exhausted { ":exhausted" } else { "" };
         let group = match row.outcome {
             WaitingForDelay | WaitingForWorker | SeatBusy => &mut waiting,
             _ => &mut needs_attention,
         };
-        group.push(format!("{recipient}:{reason}{since}{exhausted}"));
+        group.push(format!("{recipient}:{reason}{exhausted}{since}"));
     }
+    // Ring insertion order defines the latest observed streak for each recipient.
+    let last_busy_probe_counts = diagnostics
+        .fence_recovery_attempts
+        .iter()
+        .filter(|row| row.outcome == SeatBusy)
+        .filter_map(|row| {
+            let recipient = fl_wire::identity::normalize_persona(&row.recipient)?;
+            Some((recipient, row.busy_probe_count))
+        })
+        .collect::<std::collections::BTreeMap<_, _>>()
+        .into_iter()
+        .filter_map(|(recipient, count)| count.map(|count| format!("{recipient}:{count}")))
+        .collect();
     let recovery_status = [
         ("fence_recovery_needs_attention", needs_attention),
         ("fence_recovery_waiting", waiting),
+        (
+            "fence_recovery_last_busy_probe_counts",
+            last_busy_probe_counts,
+        ),
     ]
     .into_iter()
     .filter(|(_, rows)| !rows.is_empty())
@@ -3046,6 +3063,16 @@ pub(crate) mod tests {
             "diagnostics_partial": false,
             "omitted_evidence_total": 0,
             "omitted_evidence_total_saturated": false,
+            "fence_recovery_attempts": [
+                {"recipient": "Den", "attempt": 1, "limit": 3, "at": "2026-11-26T00:13:00.000Z", "outcome": "seat_busy", "busy_probe_count": 8},
+                {"recipient": "den", "attempt": 1, "limit": 3, "at": "2026-11-26T00:13:00.000Z", "outcome": "released"},
+                {"recipient": "den", "attempt": 1, "limit": 3, "at": "2026-11-26T00:12:34.567Z", "outcome": "seat_busy", "busy_probe_count": 2},
+                {"recipient": "sera", "attempt": 1, "limit": 3, "at": "2026-11-26T01:00:00.000Z", "outcome": "seat_busy", "busy_probe_count": 5},
+                {"recipient": "sera", "attempt": 1, "limit": 3, "at": "2026-11-26T01:00:00.000Z", "outcome": "released"},
+                {"recipient": "eve", "attempt": 1, "limit": 3, "at": "2026-11-26T01:05:41.000Z", "outcome": "seat_busy", "busy_probe_count": 12},
+                {"recipient": "max", "attempt": 1, "limit": 3, "at": "2026-11-26T01:05:41.000Z", "outcome": "seat_busy"},
+                {"recipient": "/private/path", "attempt": 1, "limit": 3, "at": "2026-11-26T01:05:41.000Z", "outcome": "seat_busy", "busy_probe_count": 4},
+            ],
             "fence_recovery_attention": [
                 {"recipient": "feira", "outcome": "vendor_sign_in", "exhausted": true},
                 {"recipient": "ada", "outcome": "dead_route", "exhausted": false},
@@ -3072,15 +3099,19 @@ pub(crate) mod tests {
         assert!(summary.contains(
             "\tfence_recovery_needs_attention=feira:vendor sign-in screen:exhausted,ada:dead route,ferris:no hosted stream binding,jarvis:hosted screen capture unavailable"
         ));
-        let (attention, waiting) = summary.split_once("\tfence_recovery_waiting=").unwrap();
+        let (attention, waiting_and_history) =
+            summary.split_once("\tfence_recovery_waiting=").unwrap();
+        let (waiting, last_busy_probe_counts) = waiting_and_history
+            .split_once("\tfence_recovery_last_busy_probe_counts=")
+            .unwrap();
         assert_eq!(
             waiting,
-            "ari:waiting for the recovery delay,bea:waiting for a delivery worker slot,den:seat is in a turn since 2026-11-26T00-12-34.567Z:exhausted"
+            "ari:waiting for the recovery delay,bea:waiting for a delivery worker slot,den:seat is in a turn:exhausted busy_since=2026-11-26T00:12:34.567Z"
         );
-        assert!(
-            attention
-                .contains("eve:seat has been in a turn for 5m 41s since 2026-11-26T01-00-00.000Z")
-        );
+        assert_eq!(last_busy_probe_counts, "den:2,eve:12,sera:5");
+        assert!(attention.contains(
+            "eve:seat has been in a turn for 5m 41s busy_since=2026-11-26T01:00:00.000Z"
+        ));
         assert!(attention.contains("max:seat is still in a turn"));
         for entry in [
             "cal:timed recovery is disabled",

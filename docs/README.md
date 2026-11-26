@@ -83,9 +83,11 @@ In addition to the guides above, `fl --help` documents the full command surface:
   and webhook routes stay fenced and report the reason. Fences caused by queue overflow,
   receipt bookkeeping errors, or global capacity limits do not start timed recovery. If the replay
   worker fails, receipt bookkeeping fails, or the store cannot confirm a successful submission,
-  timed recovery stops and the fence remains held with the failure reason. Acknowledging mail or
-  re-registering the same route leaves the fence in place. Change the route identity or restart
-  the Wire daemon to clear it.
+  the fence enters `ReplayStopped` and reports the failure reason. The
+  `initial_receipt_read_ambiguous` reason means a message has multiple stored receipts that match
+  the same recipient name case-insensitively. This stops timed replay even if one of the receipts
+  has already resolved. Acknowledging mail or re-registering the same route leaves the fence in
+  place. Change the route identity or restart the Wire daemon to clear it.
 * `fl github pr` — pull-request review and merge policy evaluation, structured review markers, and gated merges.
 * `fl flow` — DAG workflow validation, import, step execution, review loops, and human approval sign-off.
 * `fl arch` — `.fl/architecture.toml` validation, Cargo workspace dependency/source conformance checks, and LikeC4 export.
