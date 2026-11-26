@@ -879,8 +879,7 @@ fn is_rate_limit_snapshot(snapshot: &Value) -> bool {
         snapshot.get("limitId"),
         Some(Value::Null | Value::String(_))
     ) && ["primary", "secondary"].into_iter().all(|key| {
-        matches!(snapshot.get(key), Some(Value::Null))
-            || snapshot[key]["usedPercent"].as_i64().is_some()
+        matches!(snapshot.get(key), Some(Value::Null)) || snapshot[key]["usedPercent"].is_number()
     })
 }
 
@@ -2734,6 +2733,32 @@ mod tests {
                     response,
                 ]),
                 Some(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn launch_auth_accepts_any_numeric_used_percent_and_rejects_non_numbers() {
+        let capture = captured_launch_auth();
+        for (used_percent, expected) in [
+            (json!(12.5), None),
+            (json!(12), None),
+            (json!("12.5"), Some(LaunchSignInIssue::Inconclusive)),
+            (json!(null), Some(LaunchSignInIssue::Inconclusive)),
+        ] {
+            let mut reply = capture["account_rate_limits_read"].clone();
+            reply["result"]["rateLimits"]["primary"]["usedPercent"] = used_percent.clone();
+            reply["result"]["rateLimitsByLimitId"]["codex"]["primary"]["usedPercent"] =
+                used_percent.clone();
+            assert_eq!(
+                replay_launch_auth(vec![
+                    capture["initialize"].clone(),
+                    capture["config_read"].clone(),
+                    capture["get_auth_status"].clone(),
+                    reply,
+                ]),
+                expected,
+                "usedPercent {used_percent}"
             );
         }
     }

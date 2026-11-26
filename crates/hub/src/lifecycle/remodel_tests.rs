@@ -1064,7 +1064,7 @@ fn flagged_destination_sign_in_refuses_remodel_when_probe_is_inconclusive() {
     let fake = FakeRuntime::default();
     let env = fake.env(home.path());
     let store = MemStore::default();
-    for (persona, vendor) in [("ada", "claude"), ("bo", "codex")] {
+    for (persona, vendor) in [("ada", "claude"), ("bo", "codex"), ("al", "codex")] {
         spin_with(
             &store,
             &env,
@@ -1075,13 +1075,16 @@ fn flagged_destination_sign_in_refuses_remodel_when_probe_is_inconclusive() {
             Some(home.path()),
         );
     }
-    let mut flagged = record(&store, "codex:bo");
-    flagged.project = "other-project".into();
-    flagged.block = Some(fl_watch::HostedBlock {
-        reason: fl_watch::HostedBlockReason::VendorSignIn,
-        observed_at_ms: stamp::now().unix_millis(),
-    });
-    persist_hosted_session(&store, &flagged, "owner").unwrap();
+    // Two flagged seats, persisted out of order: the message names both, sorted.
+    for seat_id in ["codex:bo", "codex:al"] {
+        let mut flagged = record(&store, seat_id);
+        flagged.project = "other-project".into();
+        flagged.block = Some(fl_watch::HostedBlock {
+            reason: fl_watch::HostedBlockReason::VendorSignIn,
+            observed_at_ms: stamp::now().unix_millis(),
+        });
+        persist_hosted_session(&store, &flagged, "owner").unwrap();
+    }
     TEST_LAUNCH_AUTH.with(|slot| {
         *slot.borrow_mut() = Some(Box::new(|_| Some(LaunchSignInIssue::Inconclusive)));
     });
@@ -1097,7 +1100,11 @@ fn flagged_destination_sign_in_refuses_remodel_when_probe_is_inconclusive() {
         assert_eq!(err.status(), 409, "{err}");
         let message = err.to_string();
         assert!(
-            message.contains("flagged at a vendor sign-in screen"),
+            message.contains("flagged at a vendor sign-in screen: `codex:al`, `codex:bo`."),
+            "{message}"
+        );
+        assert!(
+            message.contains("Check sign-in on those seats"),
             "{message}"
         );
         assert!(message.contains("--allow-blocked-sign-in"), "{message}");
@@ -1137,7 +1144,7 @@ fn flagged_destination_sign_in_refuses_remodel_when_probe_is_inconclusive() {
     };
     let prepared = remodel(&store, &env, "claude:ada", &prepare, Caller::Owner).unwrap();
     assert!(matches!(prepared.warnings.as_slice(), [message]
-        if message.contains("flagged at a vendor sign-in screen")
+        if message.contains("flagged at a vendor sign-in screen: `codex:al`, `codex:bo`.")
             && message.contains("retry the remodel")));
     assert_eq!(record(&store, "claude:ada").status, STATUS_DECOMMISSIONING);
     assert!(fake.is_live("Ada"));
@@ -1151,6 +1158,74 @@ fn flagged_destination_sign_in_refuses_remodel_when_probe_is_inconclusive() {
         .filter(|message| message.contains("sign-in"))
         .collect();
     assert_eq!(sign_in_warnings, [&prepared.warnings[0]]);
+}
+
+#[test]
+fn a_healthy_codex_probe_takes_precedence_over_a_flagged_destination_seat() {
+    let home = TempDir::new().unwrap();
+    let _trusted = trusted_codex_home(home.path(), home.path());
+    let fake = FakeRuntime::default();
+    let env = fake.env(home.path());
+    let store = MemStore::default();
+    for (persona, vendor) in [("ada", "claude"), ("bo", "codex")] {
+        spin_with(
+            &store,
+            &env,
+            persona,
+            "assistant",
+            vendor,
+            None,
+            Some(home.path()),
+        );
+    }
+    let mut flagged = record(&store, "codex:bo");
+    flagged.block = Some(fl_watch::HostedBlock {
+        reason: fl_watch::HostedBlockReason::VendorSignIn,
+        observed_at_ms: stamp::now().unix_millis(),
+    });
+    persist_hosted_session(&store, &flagged, "owner").unwrap();
+    assert_eq!(record(&store, "codex:bo").active_block(), flagged.block);
+    let probes = std::rc::Rc::new(std::cell::Cell::new(0));
+    let called = probes.clone();
+    TEST_LAUNCH_AUTH.with(|slot| {
+        *slot.borrow_mut() = Some(Box::new(move |_| {
+            called.set(called.get() + 1);
+            None
+        }))
+    });
+    fake.calls.borrow_mut().clear();
+
+    let prepare = RemodelRequest {
+        mode: Some("prepare".into()),
+        ..remodel_req("codex")
+    };
+    let prepared = remodel(&store, &env, "claude:ada", &prepare, Caller::Owner).unwrap();
+    assert!(prepared.warnings.is_empty(), "{:?}", prepared.warnings);
+    assert_eq!(record(&store, "claude:ada").status, STATUS_DECOMMISSIONING);
+
+    let out = remodel(
+        &store,
+        &env,
+        "claude:ada",
+        &remodel_req("codex"),
+        Caller::Owner,
+    )
+    .unwrap();
+    assert_eq!(out.session_id, "codex:ada");
+    assert!(out.runtime_stopped);
+    assert!(
+        !out.warnings
+            .iter()
+            .any(|warning| warning.contains("sign-in")),
+        "{:?}",
+        out.warnings
+    );
+    assert_eq!(record(&store, "codex:ada").status, STATUS_RUNNING);
+    assert_eq!(
+        handoff(&store, "ada").unwrap().1["allow_blocked_sign_in"],
+        false
+    );
+    assert!(probes.get() >= 1, "the direct probe never ran");
 }
 
 #[test]

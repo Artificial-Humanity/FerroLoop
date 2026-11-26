@@ -10617,27 +10617,43 @@ fn check_remodel_launch<S: StateStore>(
     let Some(issue) = observe(target)? else {
         return Ok(Vec::new());
     };
-    let flagged = issue == LaunchSignInIssue::Inconclusive
-        && list_hosted_sessions(store)?.iter().any(|record| {
-            record.hosted
-                && record.status.eq_ignore_ascii_case(STATUS_RUNNING)
-                && record.vendor.eq_ignore_ascii_case(&plan.to.vendor)
-                && record
-                    .active_block()
-                    .is_some_and(|block| block.reason == fl_watch::HostedBlockReason::VendorSignIn)
-        });
-    let message = if flagged {
-        "Codex sign-in could not be verified, and a running hosted Codex seat is flagged at a \
-         vendor sign-in screen. Check sign-in on the affected seat, then retry the remodel."
+    let flagged_seats: BTreeSet<String> = if issue == LaunchSignInIssue::Inconclusive {
+        list_hosted_sessions(store)?
+            .into_iter()
+            .filter(|record| {
+                record.hosted
+                    && record.status.eq_ignore_ascii_case(STATUS_RUNNING)
+                    && record.vendor.eq_ignore_ascii_case(&plan.to.vendor)
+                    && record.active_block().is_some_and(|block| {
+                        block.reason == fl_watch::HostedBlockReason::VendorSignIn
+                    })
+            })
+            .map(|record| format!("`{}`", record.session_id))
+            .collect()
     } else {
-        issue.message()
+        BTreeSet::new()
+    };
+    let flagged = !flagged_seats.is_empty();
+    let message = if flagged {
+        let (seat_is, that_seat) = if flagged_seats.len() == 1 {
+            ("a running hosted Codex seat is", "that seat")
+        } else {
+            ("running hosted Codex seats are", "those seats")
+        };
+        let seats = flagged_seats.into_iter().collect::<Vec<_>>().join(", ");
+        format!(
+            "Codex sign-in could not be verified, and {seat_is} flagged at a vendor sign-in \
+             screen: {seats}. Check sign-in on {that_seat}, then retry the remodel."
+        )
+    } else {
+        issue.message().to_string()
     };
     if (issue.blocks_remodel() || flagged) && !plan.allow_blocked_sign_in {
         return Err(LifecycleError::Conflict(format!(
             "{message} To proceed anyway, use --allow-blocked-sign-in (API: allow_blocked_sign_in)."
         )));
     }
-    Ok(vec![message.into()])
+    Ok(vec![message])
 }
 
 /// Store-dependent checks before a remodel's first side effect, in the order the siblings make
