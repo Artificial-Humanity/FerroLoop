@@ -19,12 +19,14 @@ use fl_host_proto::{
 };
 use tokio::sync::oneshot;
 
+use crate::projection::{CURSOR_REPORT_LIMIT, CursorPosition};
 use crate::session::Session;
 
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
 
 const CONTROL_LIMIT: usize = 32;
+const CURSOR_REPORT_TIMEOUT: Duration = Duration::from_millis(50);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Barrier {
@@ -179,6 +181,7 @@ struct State {
     fenced: bool,
     data: VecDeque<DataJob>,
     control: VecDeque<CtrlJob>,
+    cursor_reports: VecDeque<CursorPosition>,
     claim_conns: HashSet<u64>,
     revoked: HashSet<u64>,
     queued_bytes: usize,
@@ -222,6 +225,7 @@ impl WriterHandle {
                 fenced: false,
                 data: VecDeque::new(),
                 control: VecDeque::new(),
+                cursor_reports: VecDeque::new(),
                 claim_conns: HashSet::new(),
                 revoked: HashSet::new(),
                 queued_bytes: 0,
@@ -241,6 +245,7 @@ impl WriterHandle {
     pub fn shutdown(&self) {
         let mut state = self.lock();
         state.stop = true;
+        state.cursor_reports.clear();
         self.invalidate_queued(&mut state, SendBlock::SessionFenced);
         for job in state.control.drain(..) {
             let _ = job.reply.send(Err(ControlError::WriterStopped));
@@ -618,7 +623,20 @@ impl WriterHandle {
         None
     }
 
+    pub(crate) fn enqueue_cursor_reports(&self, positions: &[CursorPosition]) {
+        let mut state = self.lock();
+        if state.stop || state.fenced {
+            return;
+        }
+        let room = CURSOR_REPORT_LIMIT - state.cursor_reports.len();
+        state
+            .cursor_reports
+            .extend(positions.iter().copied().take(room));
+        self.cv.notify_one();
+    }
+
     pub(crate) fn run(self: Arc<Self>, host_stop: impl Fn() -> bool) {
+        let mut prefer_cursor_report = true;
         loop {
             let next = {
                 let mut state = self.lock();
@@ -632,7 +650,15 @@ impl WriterHandle {
                         state.inflight = Some(job.conn);
                         break Job::Ctrl(job);
                     }
+                    // Alternate with client data so a query flood cannot monopolize stdin.
+                    if (prefer_cursor_report || state.data.is_empty())
+                        && let Some(position) = state.cursor_reports.pop_front()
+                    {
+                        prefer_cursor_report = false;
+                        break Job::CursorReport(position);
+                    }
                     if let Some(job) = state.data.pop_front() {
+                        prefer_cursor_report = true;
                         state.queued_bytes = state.queued_bytes.saturating_sub(job.bytes.len());
                         state.inflight = Some(job.conn);
                         state.active = true;
@@ -650,11 +676,43 @@ impl WriterHandle {
             match next {
                 Job::Ctrl(job) => self.run_ctrl(job),
                 Job::Data(job) => self.run_send(job),
+                Job::CursorReport(position) => self.run_cursor_report(position),
             }
             let mut state = self.lock();
             if let Some(conn) = state.inflight.take() {
                 state.revoked.remove(&conn);
             }
+        }
+    }
+
+    fn run_cursor_report(&self, (row, col): CursorPosition) {
+        let mut file = {
+            let mut state = self.lock();
+            if state.stop || state.fenced || self.completed() {
+                return;
+            }
+            let Some(file) = state.stdin.take() else {
+                return;
+            };
+            file
+        };
+
+        // Host-generated terminal input shares the writer but owns no client lease.
+        let report = format!("\x1b[{};{}R", row + 1, col + 1);
+        let deadline = Instant::now() + CURSOR_REPORT_TIMEOUT;
+        let mut written = 0;
+        while written < report.len() {
+            match write_some(&mut file, &report.as_bytes()[written..], deadline) {
+                WriteStep::Wrote(count) if count > 0 => written += count,
+                _ => break,
+            }
+        }
+        let mut state = self.lock();
+        if written > 0 && written < report.len() {
+            self.fence_locked(&mut state);
+        }
+        if !state.fenced {
+            state.stdin = Some(file);
         }
     }
 
@@ -1083,6 +1141,7 @@ impl WriterHandle {
     }
 
     fn fence_locked(&self, state: &mut State) {
+        state.cursor_reports.clear();
         if !state.fenced {
             state.fenced = true;
             state.stdin.take();
@@ -1107,6 +1166,7 @@ impl WriterHandle {
 enum Job {
     Data(DataJob),
     Ctrl(CtrlJob),
+    CursorReport(CursorPosition),
 }
 
 enum Pause {
