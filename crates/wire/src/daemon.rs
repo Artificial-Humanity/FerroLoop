@@ -1066,7 +1066,7 @@ const MAX_OVERFLOW_RECIPIENTS: usize = 128;
 const DEFAULT_FENCE_RECOVERY_DELAY_SECS: u64 = 300;
 const DEFAULT_FENCE_RECOVERY_MAX_ATTEMPTS: u32 = 3;
 const MAX_FENCE_PROBES_PER_POLL: usize = 4;
-const FENCE_BUSY_ATTENTION_PROBES: u8 = 12;
+const FENCE_BUSY_ATTENTION_PROBES: u32 = 12;
 
 #[derive(Clone, Copy)]
 struct FenceRecoveryPolicy {
@@ -1155,7 +1155,7 @@ struct RetainedFenceRecovery {
     last_attempt: Option<At>,
     attempts: u32,
     busy_since: Option<At>,
-    consecutive_busy_probes: u8,
+    consecutive_busy_probes: u32,
     phase: RetainedFencePhase,
     deferred_release: DeferredFenceRelease,
 }
@@ -2671,6 +2671,7 @@ where
             state.consecutive_busy_probes = 0;
         }
         let mut diagnostics = lock(&self.dispatch_diagnostics);
+        let mut busy_probe_count = None;
         let outcome = match current {
             Some(state) if outcome == FenceRecoveryOutcome::SeatBusy => {
                 // A typed busy refusal proves zero writes. Keep the delay
@@ -2678,6 +2679,7 @@ where
                 state.attempts = state.attempts.saturating_sub(1);
                 state.phase = RetainedFencePhase::Waiting;
                 state.consecutive_busy_probes = state.consecutive_busy_probes.saturating_add(1);
+                busy_probe_count = Some(state.consecutive_busy_probes);
                 let busy_since = state.busy_since.get_or_insert_with(|| run.at.clone());
                 let status = if state.consecutive_busy_probes >= FENCE_BUSY_ATTENTION_PROBES {
                     FenceRecoveryOutcome::SeatBusyProlonged
@@ -2751,6 +2753,7 @@ where
             limit: self.fence_recovery_policy.max_attempts,
             at: run.at.clone(),
             outcome,
+            busy_probe_count,
         };
         diagnostics.record_fence_recovery(attempt);
     }
@@ -6807,7 +6810,7 @@ mod tests {
             assert!(screen.busy_captures > 0);
         }
 
-        const BUSY_POLLS: usize = 13;
+        const BUSY_POLLS: u32 = 13;
         if exhaust_busy_parks {
             let busy_since = lock(&inner.dispatch_queues)["held"]
                 .composer_busy_since
@@ -6843,19 +6846,24 @@ mod tests {
             let hold_at = status.records[0].hold_observed_at.unix_millis();
             let delay = inner.fence_recovery_policy.delay_ms;
             for probe in 1..=BUSY_POLLS {
-                let due = hold_at + probe as u64 * delay;
+                let due = hold_at + u64::from(probe) * delay;
                 inner.poll_retained_fences(At::from_unix_millis(due - 1));
                 assert_eq!(
-                    inner.diagnostics_snapshot().fence_recovery_attempts.len(),
-                    probe
+                    inner
+                        .diagnostics_snapshot()
+                        .fence_recovery_attempts
+                        .last()
+                        .unwrap()
+                        .busy_probe_count,
+                    (probe > 1).then_some(probe - 1)
                 );
                 inner.poll_retained_fences(At::from_unix_millis(due));
                 let status = inner.diagnostics_snapshot();
-                assert_eq!(status.fence_recovery_attempts.len(), probe + 1);
-                assert_eq!(
-                    status.fence_recovery_attempts[probe].outcome,
-                    FenceRecoveryOutcome::SeatBusy
-                );
+                assert_eq!(status.fence_recovery_attempts.len(), 2);
+                let probe_row = &status.fence_recovery_attempts[1];
+                assert_eq!(probe_row.outcome, FenceRecoveryOutcome::SeatBusy);
+                assert_eq!(probe_row.busy_probe_count, Some(probe));
+                assert_eq!(probe_row.at.unix_millis(), due);
                 assert_eq!(lock(&inner.fence_recoveries)["held"].attempts, 0);
                 let busy = &status.fence_recovery_attention[0];
                 assert_eq!(
@@ -6885,7 +6893,7 @@ mod tests {
                 screen.busy = false;
             }
             inner.poll_retained_fences(At::from_unix_millis(
-                hold_at + (BUSY_POLLS as u64 + 1) * delay,
+                hold_at + (u64::from(BUSY_POLLS) + 1) * delay,
             ));
             wait_on_recovery(|| {
                 lock(&inner.dispatch_queues)
@@ -6893,7 +6901,7 @@ mod tests {
                     .is_some_and(|queue| queue.composer_retry_at.is_some())
             });
             let status = inner.diagnostics_snapshot();
-            assert_eq!(status.fence_recovery_attempts.len(), BUSY_POLLS + 2);
+            assert_eq!(status.fence_recovery_attempts.len(), 3);
             let replay = status.fence_recovery_attempts.last().unwrap();
             assert_eq!(replay.attempt, 1);
             assert_eq!(replay.outcome, FenceRecoveryOutcome::Released);
@@ -6928,11 +6936,7 @@ mod tests {
         );
         assert_eq!(
             inner.diagnostics_snapshot().fence_recovery_attempts.len(),
-            if exhaust_busy_parks {
-                BUSY_POLLS + 2
-            } else {
-                1
-            }
+            if exhaust_busy_parks { 3 } else { 1 }
         );
         assert_eq!(
             lock(&screen_state).writes.len(),
@@ -7063,8 +7067,20 @@ mod tests {
         // waited longer and must be probed before those busy seats retry.
         inner.poll_retained_fences(At::from_unix_millis(since + 3_000));
         let attempts = inner.diagnostics_snapshot().fence_recovery_attempts;
-        assert_eq!(attempts.len(), 2 * MAX_FENCE_PROBES_PER_POLL);
-        assert_eq!(attempts[MAX_FENCE_PROBES_PER_POLL].recipient, "agent-e");
+        assert_eq!(attempts.len(), recipients.len());
+        assert_eq!(
+            attempts
+                .iter()
+                .map(|row| (row.recipient.as_str(), row.busy_probe_count))
+                .collect::<Vec<_>>(),
+            [
+                ("agent-d", Some(1)),
+                ("agent-e", Some(1)),
+                ("agent-a", Some(2)),
+                ("agent-b", Some(2)),
+                ("agent-c", Some(2)),
+            ]
+        );
         assert!(
             attempts
                 .iter()
@@ -7102,13 +7118,11 @@ mod tests {
         }
         wait_on_recovery(|| !lock(&inner.dispatch_queues).contains_key("held"));
         let diagnostics = inner.diagnostics_snapshot();
-        assert_eq!(diagnostics.fence_recovery_attempts.len(), 12);
-        assert!(
-            diagnostics
-                .fence_recovery_attempts
-                .iter()
-                .all(|row| { row.attempt == 1 && row.outcome == FenceRecoveryOutcome::SeatBusy })
-        );
+        assert_eq!(diagnostics.fence_recovery_attempts.len(), 1);
+        let probe_row = &diagnostics.fence_recovery_attempts[0];
+        assert_eq!(probe_row.attempt, 1);
+        assert_eq!(probe_row.outcome, FenceRecoveryOutcome::SeatBusy);
+        assert_eq!(probe_row.busy_probe_count, Some(12));
         let busy = &diagnostics.fence_recovery_attention[0];
         assert_eq!(busy.outcome, FenceRecoveryOutcome::SeatBusyProlonged);
         assert_eq!(busy.busy_since, Some(due(1)));
@@ -7125,6 +7139,11 @@ mod tests {
 
         inner.poll_retained_fences(due(14));
         let diagnostics = inner.diagnostics_snapshot();
+        assert_eq!(diagnostics.fence_recovery_attempts.len(), 3);
+        assert_eq!(
+            diagnostics.fence_recovery_attempts[2].busy_probe_count,
+            Some(1)
+        );
         assert_eq!(
             diagnostics.fence_recovery_attention[0].outcome,
             FenceRecoveryOutcome::SeatBusy

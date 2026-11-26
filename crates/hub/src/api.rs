@@ -2006,6 +2006,8 @@ pub struct HubFenceRecoveryAttempt {
     pub limit: u32,
     pub at: fl_core::at::At,
     pub outcome: fl_wire::dispatch_diagnostics::FenceRecoveryOutcome,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub busy_probe_count: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2222,6 +2224,7 @@ impl HubDispatchDiagnostics {
                         limit: row.limit,
                         at: row.at,
                         outcome: row.outcome,
+                        busy_probe_count: row.busy_probe_count,
                     })
                 })
                 .collect(),
@@ -13507,6 +13510,15 @@ mod council_guidance_tests {
                             limit: 3,
                             at: ts_for_status.clone(),
                             outcome: FenceRecoveryOutcome::VendorSignIn,
+                            busy_probe_count: None,
+                        },
+                        FenceRecoveryAttempt {
+                            recipient: "ada".into(),
+                            attempt: 1,
+                            limit: 3,
+                            at: ts_for_status.clone(),
+                            outcome: FenceRecoveryOutcome::SeatBusy,
+                            busy_probe_count: Some(300),
                         },
                         FenceRecoveryAttempt {
                             recipient: "/secret/recovery-diagnostic".into(),
@@ -13514,6 +13526,7 @@ mod council_guidance_tests {
                             limit: 3,
                             at: ts_for_status.clone(),
                             outcome: FenceRecoveryOutcome::Inconclusive,
+                            busy_probe_count: None,
                         },
                     ],
                     fence_recovery_attention: vec![
@@ -13639,7 +13652,7 @@ mod council_guidance_tests {
         let attempts = body["dispatch_diagnostics"]["fence_recovery_attempts"]
             .as_array()
             .unwrap();
-        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts.len(), 2);
         assert_eq!(
             attempts[0],
             json!({
@@ -13648,6 +13661,17 @@ mod council_guidance_tests {
                 "limit": 3,
                 "at": ts,
                 "outcome": "vendor_sign_in",
+            })
+        );
+        assert_eq!(
+            attempts[1],
+            json!({
+                "recipient": "ada",
+                "attempt": 1,
+                "limit": 3,
+                "at": ts,
+                "outcome": "seat_busy",
+                "busy_probe_count": 300,
             })
         );
         assert_eq!(
