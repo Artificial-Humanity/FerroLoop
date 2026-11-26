@@ -21561,8 +21561,16 @@ mod tests {
         });
         let mut respawn = HostedRespawnState::default();
         assert!(
-            exit_evidence::spawn_and_remember(&store, &env, &mut respawn, &record, None, "owner")
-                .unwrap()
+            exit_evidence::spawn_and_remember(
+                &store,
+                &env,
+                &mut respawn,
+                &record,
+                None,
+                None,
+                "owner",
+            )
+            .unwrap()
         );
         assert_eq!(respawn.exit_evidence.bound_stream(&record), Some(&stream));
         let respawn_entry = || {

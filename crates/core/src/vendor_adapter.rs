@@ -647,6 +647,13 @@ impl VendorDaemonLaunchEvidence {
     }
 }
 
+/// A vendor adapter's `--version` probe for a running native CLI image.
+pub struct VendorCliVersionProbe {
+    /// Settings that disable the vendor's updater during the probe.
+    pub env: &'static [(&'static str, &'static str)],
+    pub parse: fn(&str) -> Option<&str>,
+}
+
 /// Version evidence for one hosted vendor. Concrete install and protocol knowledge stays in the
 /// vendor adapter crate. Unknown evidence is `None`.
 pub trait VendorVersionAdapter: fmt::Debug + Send + Sync {
@@ -655,6 +662,13 @@ pub trait VendorVersionAdapter: fmt::Debug + Send + Sync {
     /// Read passive evidence for an executable the caller has already resolved to its absolute,
     /// canonical path. This may read install metadata but must not start a process.
     fn version_from_executable(&self, executable: &Path) -> Option<String>;
+
+    /// Opt in for a recognized CLI image without passive version evidence. Only the observer for
+    /// a manual launch may run this. It must pin the exact image, clear the environment, and
+    /// enforce a short timeout away from launch locks.
+    fn manual_cli_version_probe(&self, _executable: &Path) -> Option<VendorCliVersionProbe> {
+        None
+    }
 
     /// Decode an exact, observed running daemon image path. This must not resolve a mutable
     /// install symlink, inspect a different process, or choose the newest installed release.

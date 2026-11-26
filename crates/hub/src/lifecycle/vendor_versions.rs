@@ -77,6 +77,54 @@ impl ProcessIdentity {
         (path.is_absolute() && self.is_current()).then_some(path)
     }
 
+    #[cfg(target_os = "linux")]
+    fn manual_cli_version(&self, adapter: &dyn fl_core::VendorVersionAdapter) -> Option<String> {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::{FileExt, MetadataExt};
+        use std::os::unix::process::CommandExt;
+        use std::process::Command;
+        use std::time::Duration;
+
+        const TIMEOUT: Duration = Duration::from_millis(500);
+
+        let executable = self.executable()?;
+        let probe = adapter.manual_cli_version_probe(&executable)?;
+        let process_image = PathBuf::from(format!("/proc/{}/exe", self.pid));
+        let image = std::fs::File::open(&process_image).ok()?;
+        // Keep the observed inode open through exec even if the installer replaces its pathname.
+        let pinned = PathBuf::from(format!(
+            "/proc/{}/fd/{}",
+            std::process::id(),
+            image.as_raw_fd()
+        ));
+        let metadata = image.metadata().ok()?;
+        let current = std::fs::metadata(process_image).ok()?;
+        let mut magic = [0; 4];
+        if !metadata.is_file()
+            || metadata.mode() & 0o6000 != 0
+            || (metadata.dev(), metadata.ino()) != (current.dev(), current.ino())
+            || std::fs::read_link(&pinned).ok()? != executable
+            || !self.is_current()
+            || image.read_exact_at(&mut magic, 0).is_err()
+            || &magic != b"\x7fELF"
+        {
+            return None;
+        }
+
+        let home = tempfile::tempdir().ok()?;
+        let mut command = Command::new(pinned);
+        command
+            .arg0(executable)
+            .env_clear()
+            .env("HOME", home.path())
+            .env("TMPDIR", home.path())
+            .env("PATH", "")
+            .envs(probe.env.iter().copied())
+            .current_dir(home.path());
+        let output = crate::runtime_matrix::run_version_command(command, TIMEOUT).ok()?;
+        (probe.parse)(&output).map(str::to_owned)
+    }
+
     fn children(&self) -> Vec<Self> {
         use std::io::Read as _;
 
@@ -506,10 +554,14 @@ fn observe(receipt: &LaunchReceipt, adapters: &VendorVersionRegistry) -> HostedV
     {
         return versions;
     }
-    versions.cli = evidence
-        .leader
-        .as_ref()
-        .and_then(|leader| leader.cli_version(adapter, 2));
+    versions.cli = evidence.leader.as_ref().and_then(|leader| {
+        let passive = leader.cli_version(adapter, 2);
+        #[cfg(target_os = "linux")]
+        if passive.is_none() && !evidence.automatic {
+            return leader.manual_cli_version(adapter);
+        }
+        passive
+    });
     versions.daemon = evidence
         .daemon
         .as_ref()
@@ -996,6 +1048,69 @@ mod tests {
         assert!(process.executable().is_some());
         process.start_ticks += 1;
         assert!(process.executable().is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn versions_probe_a_manual_hosted_image_and_skip_automatic_launches() {
+        use fl_core::vendor_adapter::VendorCliVersionProbe;
+        use std::os::unix::fs::symlink;
+        use std::process::Command;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[derive(Debug)]
+        struct FixtureAdapter(Arc<AtomicUsize>);
+
+        impl fl_core::VendorVersionAdapter for FixtureAdapter {
+            fn vendor_id(&self) -> &'static str {
+                "fixture"
+            }
+
+            fn version_from_executable(&self, _executable: &Path) -> Option<String> {
+                None
+            }
+
+            fn manual_cli_version_probe(&self, executable: &Path) -> Option<VendorCliVersionProbe> {
+                assert_eq!(executable.file_name()?, "sleep");
+                self.0.fetch_add(1, Ordering::Relaxed);
+                Some(VendorCliVersionProbe {
+                    env: &[],
+                    parse: |line| line.starts_with("sleep (").then_some("1.2.3"),
+                })
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let executable = dir.path().join("sleep");
+        let installed = dir.path().join("bin/sleep");
+        std::fs::create_dir(dir.path().join("bin")).unwrap();
+        std::fs::copy("/bin/sleep", &executable).unwrap();
+        symlink(&executable, &installed).unwrap();
+        let mut child = Command::new(&installed).arg("10").spawn().unwrap();
+        let process = ProcessIdentity::capture(child.id()).unwrap();
+        std::fs::remove_file(&installed).unwrap();
+        symlink("/bin/true", &installed).unwrap();
+
+        let probes = Arc::new(AtomicUsize::new(0));
+        let mut adapters = VendorVersionRegistry::default();
+        adapters.register(FixtureAdapter(probes.clone()));
+        let mut launch = receipt(1);
+        launch.vendor = "fixture".into();
+        let evidence = launch.evidence.as_mut().unwrap();
+        evidence.leader = Some(process);
+        evidence.automatic = true;
+        let automatic = observe(&launch, &adapters);
+        let automatic_probes = probes.load(Ordering::Relaxed);
+        launch.evidence.as_mut().unwrap().automatic = false;
+        let manual = observe(&launch, &adapters);
+
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert_eq!(automatic.cli, None);
+        assert_eq!(automatic_probes, 0);
+        assert_eq!(manual.cli.as_deref(), Some("1.2.3"));
+        assert_eq!(probes.load(Ordering::Relaxed), 1);
     }
 
     #[cfg(target_os = "linux")]
