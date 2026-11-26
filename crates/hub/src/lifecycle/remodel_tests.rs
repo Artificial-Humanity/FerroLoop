@@ -17,6 +17,7 @@ fn env(home: &TempDir) -> LifecycleEnv<'_> {
         log_hydration_warnings: true,
         lifecycle_fence: None,
         blocker_evidence: None,
+        direct_version_receipts: None,
     }
 }
 

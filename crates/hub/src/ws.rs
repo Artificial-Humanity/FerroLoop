@@ -331,6 +331,29 @@ impl HubServer {
                 }
             }
         });
+        // Independent from hosted recovery: a daemon read can consume its whole deadline.
+        if run_hosted_reconcile {
+            let version_state = state.clone();
+            let mut version_stop = shutdown_rx.clone();
+            tokio::spawn(async move {
+                let mut observer = crate::lifecycle::launch_versions::VersionObserver::default();
+                let mut tick = tokio::time::interval(Duration::from_secs(1));
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    tokio::select! {
+                        _ = tick.tick() => {}
+                        _ = version_stop.wait_for(|down| *down) => break,
+                    }
+                    let state = version_state.clone();
+                    observer = tokio::task::spawn_blocking(move || {
+                        let _ = observer.observe_launches(&state);
+                        observer
+                    })
+                    .await
+                    .unwrap_or_default();
+                }
+            });
+        }
         let mut drain_tick = tokio::time::interval(Duration::from_secs(1));
         drain_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut hosted_reconcile_tick = tokio::time::interval_at(

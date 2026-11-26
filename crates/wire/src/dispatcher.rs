@@ -8978,6 +8978,7 @@ mod tests {
                 explicit: true,
                 hosted_id: Some("claude:fixture-536".into()),
                 hydration_generation: Some("test-generation".into()),
+                registered_hosted_native_id: None,
                 pid_start_time: proc_start_time_ticks(pid),
             };
             let source = tmp.path().join("registered-routes.json");

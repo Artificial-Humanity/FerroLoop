@@ -1996,12 +1996,26 @@ impl FerroStore {
         if let Some(remote) = Self::try_auto_remote(path)? {
             return remote.list_projects();
         }
+        Self::read_existing_snapshot(path, |txn, _| doc::scan_json(txn, doc::PROJECTS))
+    }
+
+    fn read_existing_snapshot<T>(
+        path: &Path,
+        read_state: impl FnOnce(&Txn, &str) -> Result<T, StoreError>,
+    ) -> Result<T, StoreError> {
+        use std::os::unix::fs::OpenOptionsExt as _;
+
         let resolved = RealFs.resolve(path)?;
         RealFs.check_restore_admission(&resolved)?;
-        let file = RealFs
-            .open_ro(&resolved)
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&resolved)
             .map_err(|err| backend(format!("open {}: {err}", resolved.display())))?;
-        let read = Descriptor::new(file, &resolved)?;
+        if !file.metadata().map_err(io_err)?.is_file() {
+            return Err(backend(format!("{} is not a regular file", path.display())));
+        }
+        let read = Descriptor::new(Box::new(file), &resolved)?;
         let (_, sb) = latest_superblock(&*read.file).map_err(|err| name_store(err, path))?;
         let cache = load_full(&*read.file, read.id, sb).map_err(|err| name_store(err, path))?;
         if let Some(found) =
@@ -2014,11 +2028,11 @@ impl FerroStore {
             .map_err(|err| backend(format!("stat {}: {err}", path.display())))?;
         if current != read.id {
             return Err(backend(format!(
-                "{} changed while reading its catalog",
+                "{} changed while reading its snapshot",
                 path.display()
             )));
         }
-        doc::scan_json(&Txn::new(cache.state), doc::PROJECTS)
+        read_state(&Txn::new(cache.state), &path.display().to_string())
     }
 
     fn try_auto_remote(path: &Path) -> Result<Option<Self>, StoreError> {

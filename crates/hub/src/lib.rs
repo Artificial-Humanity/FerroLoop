@@ -77,10 +77,10 @@ pub use auth::{
     session_state_slug, sha256_hex, try_generate_hex_token,
 };
 pub use discovery::{
-    ContextWindowSource, DiscoveredSessionSummary, QuotaWindowUsage, SessionContextUsage,
-    SessionQuotaUsage, TranscriptToolCall, TranscriptTurn, WorkspaceArchScan, WorktreeDiff,
-    WorktreeFileStatus, WorktreeSummary, discover_sessions, discover_sessions_with_home,
-    is_transcript_busy, list_git_worktrees, parse_jsonl_transcript,
+    ContextWindowSource, DiscoveredHostedLaunch, DiscoveredSessionSummary, QuotaWindowUsage,
+    SessionContextUsage, SessionQuotaUsage, TranscriptToolCall, TranscriptTurn, WorkspaceArchScan,
+    WorktreeDiff, WorktreeFileStatus, WorktreeSummary, discover_sessions,
+    discover_sessions_with_home, is_transcript_busy, list_git_worktrees, parse_jsonl_transcript,
     read_session_context_usage_with_home, read_session_quota_usage_with_home,
     read_session_transcript, read_session_transcript_with_home, read_worktree_diff,
     scan_cargo_architecture_conformance, scan_workspace_for_arch,
@@ -2681,6 +2681,79 @@ mod tests {
             );
             assert_eq!(resp.status, 400, "{target}");
             assert!(resp.json_value().unwrap()["error"].is_string(), "{target}");
+        }
+    }
+
+    #[test]
+    fn hosted_version_state_is_private_to_the_hub() {
+        use fl_core::state::{
+            HOSTED_VERSION_STATE_SLUG_PREFIXES, MergeMode, RuntimeEntry, SensitivityPatch,
+            StateConcern, StatePayload, StateScope, UpsertStateArgs,
+        };
+        use fl_core::store::StateStore;
+
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        let keys = HOSTED_VERSION_STATE_SLUG_PREFIXES.map(|prefix| format!("{prefix}fixture"));
+        let request = |method: &str, path: &str, token: &str| {
+            HttpRequest::new(method, path).with_header("Authorization", format!("Bearer {token}"))
+        };
+        for key in &keys {
+            for token in ["owner-tok-secret", "peer-tok-secret"] {
+                let write = request("POST", "/api/v1/state", token).with_json_body(&json!({
+                    "scope": "workspace",
+                    "concern": "runtime",
+                    "slug": key.to_ascii_uppercase(),
+                    "value": "fixture",
+                }));
+                let response = handle_http_request(&state, &write);
+                assert_eq!(response.status, 403, "{key} with {token}");
+                assert_eq!(
+                    response.json_value().unwrap()["error"],
+                    "reserved internal hub slug prefix"
+                );
+            }
+        }
+        {
+            let store = state.open_store().unwrap();
+            for key in keys.iter().map(String::as_str).chain(["visible-runtime"]) {
+                assert!(
+                    store
+                        .get_state_by_key(&StateScope::Workspace, StateConcern::Runtime, key)
+                        .unwrap()
+                        .is_none(),
+                    "generic write persisted {key}"
+                );
+                store
+                    .upsert_state(UpsertStateArgs {
+                        scope: StateScope::Workspace,
+                        slug: key.into(),
+                        sensitivity: SensitivityPatch::Inherit,
+                        payload: StatePayload::Runtime(RuntimeEntry {
+                            value: json!("zephyr"),
+                            merge_mode: MergeMode::LastWriter,
+                        }),
+                        at: stamp::now(),
+                        by: "test".into(),
+                    })
+                    .unwrap();
+            }
+        }
+        for token in ["owner-tok-secret", "peer-tok-secret"] {
+            let list = handle_http_request(&state, &request("GET", "/api/v1/state", token));
+            assert_eq!(list.status, 200);
+            let list = list.json_value().unwrap();
+            assert_eq!(list["entries"].as_array().unwrap().len(), 1);
+            assert_eq!(list["entries"][0]["slug"], "visible-runtime");
+
+            let search = handle_http_request(
+                &state,
+                &request("GET", "/api/v1/state/search?q=zephyr", token),
+            );
+            assert_eq!(search.status, 200);
+            let search = search.json_value().unwrap();
+            assert_eq!(search["total_hits"], 1);
+            assert_eq!(search["hits"][0]["entry"]["slug"], "visible-runtime");
         }
     }
 
@@ -8154,6 +8227,7 @@ mod tests {
                 source: "route".to_string(),
                 adapter: "claude".to_string(),
                 persona: Some("Ada".to_string()),
+                hosted_launch: None,
                 status: "active".to_string(),
                 updated_at: None,
                 cwd: None,
@@ -8195,6 +8269,7 @@ mod tests {
                 source: "route".to_string(),
                 adapter: "claude".to_string(),
                 persona: Some("Ada".to_string()),
+                hosted_launch: None,
                 status: "active".to_string(),
                 updated_at: None,
                 cwd: None,

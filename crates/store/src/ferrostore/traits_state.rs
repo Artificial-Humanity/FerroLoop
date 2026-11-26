@@ -1,6 +1,7 @@
 //! Agent registry and state store.
 
 use std::collections::BTreeMap;
+use std::path::Path;
 
 use super::FerroStore;
 use super::doc::{
@@ -36,6 +37,27 @@ fn append_state_revision(txn: &mut super::Txn, rev: &StateRevision) -> Result<u6
     doc::put_json(txn, STATE_REVISIONS, &doc::key_u64(seq), rev)?;
     doc::put_json(txn, STATE_REVISION_IDS, rev.revision_id.as_str(), &seq)?;
     Ok(seq)
+}
+
+fn state_key(scope: &StateScope, concern: StateConcern, slug: &str) -> Result<String, StoreError> {
+    let slug = validate_slug(slug).map_err(|err| StoreError::InvalidState(err.to_string()))?;
+    Ok(doc::triple(&scope.as_wire(), concern.as_wire(), &slug))
+}
+
+fn state_by_key(
+    txn: &super::Txn,
+    label: &str,
+    key: &str,
+) -> Result<Option<StateEntry>, StoreError> {
+    let Some(id_str) = doc::get_json::<String>(txn, STATE_KEYS, key)? else {
+        return Ok(None);
+    };
+    let id_iri = Iri::parse(&id_str).map_err(decode)?;
+    let (target, kind) = doc::locate(txn, label, &id_iri)?;
+    if kind != Kind::State {
+        return Ok(None);
+    }
+    doc::get_json(txn, STATE_ENTRIES, target.as_str())
 }
 
 fn load_revisions(
@@ -658,20 +680,46 @@ impl AgentRegistry for FerroStore {
     }
 }
 
-impl StateStore for FerroStore {
-    fn upsert_state(&self, args: UpsertStateArgs) -> Result<StateEntry, StoreError> {
+impl FerroStore {
+    pub(crate) fn read_state_keys_at(
+        path: &Path,
+        scope: &StateScope,
+        concern: StateConcern,
+        slugs: &[String],
+    ) -> Result<Vec<Option<StateEntry>>, StoreError> {
+        let keys = slugs
+            .iter()
+            .map(|slug| state_key(scope, concern, slug))
+            .collect::<Result<Vec<_>, _>>()?;
+        Self::read_existing_snapshot(path, |txn, label| {
+            keys.iter()
+                .map(|key| state_by_key(txn, label, key))
+                .collect()
+        })
+    }
+
+    fn upsert_state_when(
+        &self,
+        args: UpsertStateArgs,
+        expected: Option<Option<&RevisionId>>,
+    ) -> Result<Option<StateEntry>, StoreError> {
         let slug =
             validate_slug(&args.slug).map_err(|err| StoreError::InvalidState(err.to_string()))?;
         let concern = args.payload.concern();
         let scope_wire = args.scope.as_wire();
         let concern_wire = concern.as_wire();
         self.with_write(|txn| {
-            doc::raise_format(txn, FORMAT_WITH_STATE)?;
             let key = doc::triple(&scope_wire, concern_wire, &slug);
             let existing = match doc::get_json::<String>(txn, STATE_KEYS, &key)? {
                 Some(id_str) => doc::get_json::<StateEntry>(txn, STATE_ENTRIES, &id_str)?,
                 None => None,
             };
+            if let Some(expected) = expected
+                && existing.as_ref().map(|entry| &entry.head_revision) != expected
+            {
+                return Ok(None);
+            }
+            doc::raise_format(txn, FORMAT_WITH_STATE)?;
             if let Some(ref existing) = existing
                 && let Some(conflict) =
                     doc::get_json::<StateConflict>(txn, STATE_CONFLICTS, existing.id.as_str())?
@@ -753,8 +801,23 @@ impl StateStore for FerroStore {
             append_state_revision(txn, &rev)?;
             doc::put_json(txn, STATE_ENTRIES, entry_id.as_str(), &entry)?;
             doc::put_json(txn, STATE_KEYS, &key, &entry_id.as_str())?;
-            Ok(entry)
+            Ok(Some(entry))
         })
+    }
+}
+
+impl StateStore for FerroStore {
+    fn upsert_state(&self, args: UpsertStateArgs) -> Result<StateEntry, StoreError> {
+        self.upsert_state_when(args, None)
+            .map(|entry| entry.expect("unconditional state upsert always writes"))
+    }
+
+    fn upsert_state_if_current(
+        &self,
+        args: UpsertStateArgs,
+        expected: Option<&RevisionId>,
+    ) -> Result<Option<StateEntry>, StoreError> {
+        self.upsert_state_when(args, Some(expected))
     }
 
     fn retire_memory(
@@ -810,19 +873,8 @@ impl StateStore for FerroStore {
         concern: StateConcern,
         slug: &str,
     ) -> Result<Option<StateEntry>, StoreError> {
-        let slug = validate_slug(slug).map_err(|err| StoreError::InvalidState(err.to_string()))?;
-        let key = doc::triple(&scope.as_wire(), concern.as_wire(), &slug);
-        self.with_read(|txn| {
-            let Some(id_str) = doc::get_json::<String>(txn, STATE_KEYS, &key)? else {
-                return Ok(None);
-            };
-            let id_iri = Iri::parse(&id_str).map_err(decode)?;
-            let (target, kind) = doc::locate(txn, &self.label, &id_iri)?;
-            if kind != Kind::State {
-                return Ok(None);
-            }
-            doc::get_json(txn, STATE_ENTRIES, target.as_str())
-        })
+        let key = state_key(scope, concern, slug)?;
+        self.with_read(|txn| state_by_key(txn, &self.label, &key))
     }
 
     fn delete_state_by_key(
@@ -1032,5 +1084,38 @@ impl StateStore for FerroStore {
             doc::put_json(txn, STATE_SYNC_CURSORS, &cursor.remote, &cursor)?;
             Ok(())
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn conditional_miss_leaves_pre_state_schema_unchanged() {
+        let store = FerroStore::in_memory();
+        let old = crate::FORMAT_VERSION;
+        store
+            .put_doc_unchecked("__meta", "schema_version", &serde_json::json!(old), false)
+            .unwrap();
+        let expected = RevisionId(mint().unwrap());
+        let result = store
+            .upsert_state_if_current(
+                UpsertStateArgs {
+                    scope: StateScope::Workspace,
+                    slug: "absent-runtime".into(),
+                    sensitivity: SensitivityPatch::Inherit,
+                    payload: StatePayload::Runtime(RuntimeEntry {
+                        value: serde_json::Value::Null,
+                        merge_mode: MergeMode::LastWriter,
+                    }),
+                    at: At::from_unix_millis(1),
+                    by: "fixture".into(),
+                },
+                Some(&expected),
+            )
+            .unwrap();
+        assert!(result.is_none());
+        assert_eq!(store.format_version().unwrap(), Some(old));
     }
 }

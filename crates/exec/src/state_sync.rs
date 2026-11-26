@@ -1420,8 +1420,9 @@ mod tests {
     use fl_core::agent::{AgentRole, RegisterAgentArgs};
     use fl_core::mem::MemStore;
     use fl_core::state::{
-        HOSTED_RESPAWN_STATE_SLUG_PREFIX, HandoffEntry, MergeMode, RuntimeEntry, SensitivityPatch,
-        StateConcern, StatePayload, StateScope, UpsertStateArgs,
+        HOSTED_RESPAWN_STATE_SLUG_PREFIX, HOSTED_VERSION_QUEUE_PREFIX,
+        HOSTED_VERSION_STATE_SLUG_PREFIXES, HandoffEntry, MergeMode, RuntimeEntry,
+        SensitivityPatch, StateConcern, StatePayload, StateScope, UpsertStateArgs,
     };
     use std::process::Command;
     use tempfile::TempDir;
@@ -1641,13 +1642,17 @@ mod tests {
     }
 
     #[test]
-    fn sync_preserves_legacy_hosted_recovery_history_without_importing_it() {
+    fn sync_preserves_legacy_hosted_runtime_history_without_importing_it() {
         let (_tmp, clone_a, clone_b) = setup_two_clones();
         let legacy_store = MemStore::default();
-        let slug = format!("{HOSTED_RESPAWN_STATE_SLUG_PREFIX}fixture");
-        let runtime = |scope, at| UpsertStateArgs {
+        let slugs = [HOSTED_RESPAWN_STATE_SLUG_PREFIX]
+            .into_iter()
+            .chain(HOSTED_VERSION_STATE_SLUG_PREFIXES)
+            .map(|prefix| format!("{prefix}fixture"))
+            .collect::<Vec<_>>();
+        let runtime = |scope, slug: &str, at| UpsertStateArgs {
             scope,
-            slug: slug.clone(),
+            slug: slug.into(),
             sensitivity: SensitivityPatch::Inherit,
             payload: StatePayload::Runtime(RuntimeEntry {
                 value: serde_json::json!({"respawns": 1}),
@@ -1656,13 +1661,16 @@ mod tests {
             at: At::from_unix_millis(at),
             by: "fixture".into(),
         };
-        legacy_store
-            .upsert_state(runtime(StateScope::Workspace, 10))
-            .unwrap();
+        for slug in &slugs {
+            legacy_store
+                .upsert_state(runtime(StateScope::Workspace, slug, 10))
+                .unwrap();
+        }
         let mut snapshot = BranchSnapshot::default();
         let revisions = legacy_store.state_revisions_after(0).unwrap();
-        let (_, revision) = &revisions[0];
-        append_revision_to_segments(&mut snapshot.segments, revision);
+        for (_, revision) in &revisions {
+            append_revision_to_segments(&mut snapshot.segments, revision);
+        }
         let tree = write_snapshot_tree(&clone_a, &snapshot).unwrap();
         let tip = Git::commit_tree(&clone_a, &tree, None, "legacy state", "fixture").unwrap();
         assert_eq!(
@@ -1671,9 +1679,18 @@ mod tests {
         );
 
         let store = MemStore::starting_at(100);
-        // The same slug under a project scope is ordinary syncable runtime state.
+        // Internal workspace state stays local even when it predates sensitivity marking.
+        let local_slug = format!("{HOSTED_VERSION_QUEUE_PREFIX}local");
+        store
+            .upsert_state(runtime(StateScope::Workspace, &local_slug, 11))
+            .unwrap();
+        // The same prefix under a project scope is ordinary syncable runtime state.
         let ordinary = store
-            .upsert_state(runtime(StateScope::Project("fixture".into()), 11))
+            .upsert_state(runtime(
+                StateScope::Project("fixture".into()),
+                &slugs[1],
+                11,
+            ))
             .unwrap();
         let target = StateSyncTarget {
             repo_dir: clone_b,
@@ -1689,16 +1706,18 @@ mod tests {
         assert_eq!(report.previous_commit, Some(tip));
         assert_eq!(report.imported_revisions, 0);
         assert_eq!(report.published_revisions, 1);
-        assert_eq!(
-            store
-                .get_state_by_key(&StateScope::Workspace, StateConcern::Runtime, &slug)
-                .unwrap(),
-            None
-        );
+        for slug in &slugs {
+            assert_eq!(
+                store
+                    .get_state_by_key(&StateScope::Workspace, StateConcern::Runtime, slug)
+                    .unwrap(),
+                None
+            );
+        }
         assert_eq!(store.get_state(&ordinary.id).unwrap(), Some(ordinary));
         let verify = verify_state(&store, &target).unwrap();
         assert_eq!(verify.verified_commits, 2);
-        assert_eq!(verify.verified_revisions, 2);
+        assert_eq!(verify.verified_revisions, slugs.len() + 1);
     }
 
     #[test]

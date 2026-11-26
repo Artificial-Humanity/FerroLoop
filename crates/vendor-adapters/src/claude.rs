@@ -298,6 +298,25 @@ fn parse_cursor_line(after_cursor: Option<&str>) -> Result<usize, VendorAdapterE
         })
 }
 
+impl fl_core::VendorVersionAdapter for ClaudeHostAdapter {
+    fn vendor_id(&self) -> &'static str {
+        "claude"
+    }
+
+    fn version_from_executable(&self, executable: &Path) -> Option<String> {
+        if !executable.is_absolute()
+            || !executable
+                .parent()?
+                .ends_with(".local/share/claude/versions")
+        {
+            return None;
+        }
+        let version = executable.file_name()?.to_str()?;
+        let version = version.strip_suffix(".exe").unwrap_or(version);
+        crate::valid_release_version(version).map(str::to_owned)
+    }
+}
+
 impl VendorHostAdapter for ClaudeHostAdapter {
     fn vendor_id(&self) -> &str {
         "claude"

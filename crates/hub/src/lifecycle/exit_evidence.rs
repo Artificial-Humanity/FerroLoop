@@ -341,18 +341,22 @@ pub(super) fn spawn_and_remember<S: StateStore>(
     state: &mut HostedRespawnState,
     record: &HostedSessionRecord,
     launch: Option<&LaunchSpec>,
+    config: Option<&CheckedVendorConfig>,
     by: &str,
 ) -> Result<bool, LifecycleError> {
     let (session, window) = runtime_names(&record.vendor, &record.persona);
-    let (spawned, stream) = env.runtime.spawn_with_stream(
+    let launched = env.runtime.spawn_with_launch_identity(
         &session,
         &window,
         record.cwd.as_deref(),
         launch,
         &record.session_id,
     );
+    let (spawned, stream, leader_pid) = launched;
     if spawned {
-        remember_spawn(store, env, state, record, stream, by)?;
+        let leader = leader_pid.and_then(launch_versions::ProcessIdentity::capture);
+        remember_spawn(store, env, state, record, stream.clone(), by)?;
+        launch_versions::remember_launch(store, env, record, stream, leader, config, by);
     }
     Ok(spawned)
 }

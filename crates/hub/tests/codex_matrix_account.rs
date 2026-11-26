@@ -32,6 +32,7 @@ fn codex_matrix_account_is_bound_to_credential_home() {
             source: "route".into(),
             adapter: "codex".into(),
             persona: None,
+            hosted_launch: None,
             status: "active".into(),
             updated_at: Some("2026-11-01T10:00:00Z".into()),
             cwd: None,

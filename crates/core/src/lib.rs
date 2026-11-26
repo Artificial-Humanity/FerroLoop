@@ -226,7 +226,7 @@ pub use vendor_adapter::{
     PostCompactionContext, RuntimePort, TeardownOutcome, TeardownTarget, TranscriptNormalizeReport,
     TurnDeliveryOutcome, TurnDeliveryRequest, VendorAdapterError, VendorConfigSpec,
     VendorHostAdapter, VendorHostAdapterRegistry, VendorLaunchPlan, VendorLaunchRequest,
-    VendorStartupPromptRule,
+    VendorStartupPromptRule, VendorVersionAdapter, VendorVersionRegistry,
 };
 pub use verdict::{FailReason, Population, Verdict};
 pub use workflow::{

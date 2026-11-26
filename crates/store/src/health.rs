@@ -12,10 +12,11 @@
 //! [`StoreOutcome::WouldMigrate`], and the migration is not run.
 
 use crate::any::{BackendKind, choose_backend, is_redb_busy, physical_path};
-use crate::ferrostore::inspect_at;
+use crate::ferrostore::{FerroStore, inspect_at};
 use crate::{BACKEND_ENV, FORMAT_WITH_AREA_PARENT, RedbStore, check_format};
-use fl_core::StoreError;
 use fl_core::doctor::StoreOutcome;
+use fl_core::state::{StateConcern, StateEntry, StateScope};
+use fl_core::{StateStore, StoreError};
 use std::path::Path;
 
 /// How many 15 ms waits a locked `.redb` gets: about 300 ms in all.
@@ -44,6 +45,50 @@ fn regular(path: &Path) -> Result<(), String> {
         Ok(_) => Err("is not a regular file".into()),
         Err(e) => Err(e.kind().to_string()),
     }
+}
+
+/// Read the requested state keys, in order, from an existing local snapshot. The keys
+/// share one Ferro snapshot or one read-only Redb handle. Missing keys return `None`.
+/// A lone Redb is read in place, and a present Ferro file always takes precedence over
+/// its backup. No server connection, creation, repair, or migration is performed.
+pub fn read_state_keys(
+    path: &Path,
+    forced: Option<BackendKind>,
+    scope: &StateScope,
+    concern: StateConcern,
+    slugs: &[String],
+    redb_retries: u32,
+) -> Result<Vec<Option<StateEntry>>, StoreError> {
+    if slugs.is_empty() {
+        return Ok(Vec::new());
+    }
+    let kind = match forced {
+        Some(kind) => kind,
+        None => choose_backend(path, std::env::var(BACKEND_ENV).ok().as_deref())?,
+    };
+    let physical = physical_path(path, kind);
+    if kind == BackendKind::Ferro {
+        match exists(&physical) {
+            Ok(true) => return FerroStore::read_state_keys_at(&physical, scope, concern, slugs),
+            Ok(false) if physical != path => {}
+            Ok(false) => return Ok(vec![None; slugs.len()]),
+            Err(error) => {
+                return Err(StoreError::Backend(format!(
+                    "{}: {error}",
+                    physical.display()
+                )));
+            }
+        }
+    }
+    if !exists(path).map_err(StoreError::Backend)? {
+        return Ok(vec![None; slugs.len()]);
+    }
+    regular(path).map_err(|error| StoreError::Backend(format!("{}: {error}", path.display())))?;
+    let store = RedbStore::open_read_only(path, redb_retries)?;
+    slugs
+        .iter()
+        .map(|slug| store.get_state_by_key(scope, concern, slug))
+        .collect()
 }
 
 /// Verify the store named by the logical `path`. `forced` overrides the engine choice (the
