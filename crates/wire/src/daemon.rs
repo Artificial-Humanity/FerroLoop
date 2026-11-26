@@ -2871,36 +2871,49 @@ where
         self.release_deferred_fences();
         self.wake_dispatch_waiters(Some(&now));
         let policy = self.fence_recovery_policy;
-        let due: Vec<_> = lock(&self.fence_recoveries)
-            .iter_mut()
-            .filter(|(_, state)| {
-                state.phase == RetainedFencePhase::Waiting
-                    && !state.pending.is_empty()
-                    && state.attempts < policy.max_attempts
-                    && now.unix_millis()
-                        >= state
-                            .last_attempt
-                            .as_ref()
-                            .unwrap_or(&state.since)
-                            .unix_millis()
-                            .saturating_add(policy.delay_ms)
-            })
-            .take(MAX_FENCE_PROBES_PER_POLL)
-            .map(|(name, state)| {
-                state.phase = RetainedFencePhase::InProgress;
-                state.attempts += 1;
-                state.last_attempt = Some(now.clone());
-                (
-                    name.clone(),
-                    FenceRecoveryRun {
-                        token: Arc::clone(&state.token),
-                        route: state.route.clone(),
-                        attempt: state.attempts,
-                        at: now.clone(),
-                    },
-                )
-            })
-            .collect();
+        let now_ms = now.unix_millis();
+        let due: Vec<_> = {
+            let mut recoveries = lock(&self.fence_recoveries);
+            let mut eligible: Vec<_> = recoveries
+                .iter_mut()
+                .filter_map(|(name, state)| {
+                    if state.phase != RetainedFencePhase::Waiting
+                        || state.pending.is_empty()
+                        || state.attempts >= policy.max_attempts
+                    {
+                        return None;
+                    }
+                    let eligible_at = state
+                        .last_attempt
+                        .as_ref()
+                        .unwrap_or(&state.since)
+                        .unix_millis()
+                        .saturating_add(policy.delay_ms);
+                    (now_ms >= eligible_at).then_some((eligible_at, name, state))
+                })
+                .collect();
+            // Read-only busy probes can retry indefinitely. Serve the oldest
+            // eligibility time first, keeping recipient order for equal times.
+            eligible.sort_by_key(|(eligible_at, _, _)| *eligible_at);
+            eligible
+                .into_iter()
+                .take(MAX_FENCE_PROBES_PER_POLL)
+                .map(|(_, name, state)| {
+                    state.phase = RetainedFencePhase::InProgress;
+                    state.attempts += 1;
+                    state.last_attempt = Some(now.clone());
+                    (
+                        name.clone(),
+                        FenceRecoveryRun {
+                            token: Arc::clone(&state.token),
+                            route: state.route.clone(),
+                            attempt: state.attempts,
+                            at: now.clone(),
+                        },
+                    )
+                })
+                .collect()
+        };
         for (recipient, run) in due {
             let result = self
                 .probe_fence_recovery_route(&recipient, run.route.as_ref())
@@ -7008,6 +7021,64 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         assert!(!lock(&inner.overflow_recipients).contains("held"));
+    }
+
+    #[test]
+    fn timed_fence_recovery_busy_reprobes_do_not_starve_older_eligible_fences() {
+        let (tmp, mut inner) = fault_rig();
+        Arc::get_mut(&mut inner)
+            .unwrap()
+            .fence_recovery_policy
+            .delay_ms = 1_000;
+        let socket_path = tmp.path().join("busy-reprobes.sock");
+        let listener = crate::test_isolation::bind_unix_fixture(&socket_path).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let recipients = ["agent-a", "agent-b", "agent-c", "agent-d", "agent-e"];
+        with_transport(Err("initial delivery uncertain".into()), || {
+            for recipient in recipients {
+                lock(&inner.routes).upsert_explicit(
+                    recipient,
+                    VendorRoute::Webhook {
+                        socket_path: socket_path.clone(),
+                    },
+                    now_at(),
+                );
+                run_fault_job(&inner, recipient);
+            }
+        });
+        *lock(&inner.fence_recovery_probe_hook) = Some(Box::new(|| {
+            RecoveryReadiness::Hold(FenceRecoveryOutcome::SeatBusy)
+        }));
+        let since = 100_000;
+        for state in lock(&inner.fence_recoveries).values_mut() {
+            state.since = At::from_unix_millis(since);
+        }
+
+        inner.poll_retained_fences(At::from_unix_millis(since + 1_000));
+        let attempts = inner.diagnostics_snapshot().fence_recovery_attempts;
+        assert_eq!(attempts.len(), MAX_FENCE_PROBES_PER_POLL);
+        assert!(attempts.iter().all(|row| row.recipient != "agent-e"));
+
+        // The first four are due again by this tick. The last recipient has
+        // waited longer and must be probed before those busy seats retry.
+        inner.poll_retained_fences(At::from_unix_millis(since + 3_000));
+        let attempts = inner.diagnostics_snapshot().fence_recovery_attempts;
+        assert_eq!(attempts.len(), 2 * MAX_FENCE_PROBES_PER_POLL);
+        assert_eq!(attempts[MAX_FENCE_PROBES_PER_POLL].recipient, "agent-e");
+        assert!(
+            attempts
+                .iter()
+                .all(|row| { row.attempt == 1 && row.outcome == FenceRecoveryOutcome::SeatBusy })
+        );
+        assert!(
+            recipients
+                .iter()
+                .all(|name| inner.is_recipient_fenced(name))
+        );
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
     }
 
     #[test]
