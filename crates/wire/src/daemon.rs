@@ -2646,7 +2646,7 @@ where
                 outcome
             }
             Some(state) if outcome == FenceRecoveryOutcome::Resolved => {
-                state.attempts -= 1;
+                state.attempts = state.attempts.saturating_sub(1);
                 if resolved_prefix_overflowed {
                     state.phase = RetainedFencePhase::OverflowOnly;
                     state.pending.clear();
@@ -5764,8 +5764,8 @@ mod tests {
     }
 
     #[test]
-    fn timed_fence_recovery_keeps_fence_after_submit_receipt_write_failure() {
-        let (_tmp, inner, listener, first, since) = timed_recovery_fixture();
+    fn timed_fence_recovery_keeps_fence_after_submit_receipt_write_failure_until_route_change() {
+        let (tmp, inner, listener, first, since) = timed_recovery_fixture();
         let tail = send_to_held_recipient(&inner, "waiting behind the failed receipt");
         lock(&inner.store.writes).push_back(Fault::Error);
         *lock(&inner.fence_recovery_probe_hook) = Some(Box::new(|| {
@@ -5822,6 +5822,146 @@ mod tests {
             inner.store.list_wire_receipts(&first).unwrap()[0].attempts,
             1
         );
+        let replacement_path = tmp.path().join("timed-receipt-failure-replacement.sock");
+        let replacement = crate::test_isolation::bind_unix_fixture(&replacement_path).unwrap();
+        replacement.set_nonblocking(true).unwrap();
+        let (response, _) = inner.handle_local_request(LocalRequest::RegisterRoute {
+            persona: "held".into(),
+            route: VendorRoute::Webhook {
+                socket_path: replacement_path,
+            },
+            explicit: true,
+            replace: true,
+            hosted_id: None,
+            hydration_generation: None,
+            hosted_session_verified: false,
+            unverified_process: false,
+        });
+        assert!(matches!(response, LocalResponse::RouteRegistered));
+        wait_on_recovery(|| !lock(&inner.dispatch_queues).contains_key("held"));
+        assert!(!inner.is_recipient_fenced("held"));
+        assert!(
+            inner
+                .diagnostics_snapshot()
+                .fence_recovery_attention
+                .is_empty()
+        );
+        let (stream, _) = replacement.accept().unwrap();
+        let mut line = String::new();
+        BufReader::new(stream).read_line(&mut line).unwrap();
+        let delivered: WireMessage = serde_json::from_str(&line).unwrap();
+        assert_eq!(delivered.id, tail);
+    }
+
+    #[test]
+    fn timed_fence_recovery_stops_when_run_is_missing_after_confirmed_submit() {
+        let (_tmp, inner, listener, first, since) = timed_recovery_fixture();
+        let tail = send_to_held_recipient(&inner, "waiting behind the submitted message");
+        let daemon = Arc::downgrade(&inner);
+        *lock(&inner.store.before_receipt_write) = Some(Box::new(move || {
+            let inner = daemon.upgrade().unwrap();
+            let mut queues = lock(&inner.dispatch_queues);
+            assert!(queues.get_mut("held").unwrap().recovery.take().is_some());
+        }));
+        *lock(&inner.fence_recovery_probe_hook) = Some(Box::new(|| {
+            RecoveryReadiness::Ready(RecoveryTarget::FixtureWebhook)
+        }));
+        let due = since.unix_millis() + 300_000;
+        inner.poll_retained_fences(At::from_unix_millis(due));
+        wait_on_recovery(|| !lock(&inner.dispatch_queues).contains_key("held"));
+
+        let (stream, _) = listener.accept().unwrap();
+        let mut line = String::new();
+        BufReader::new(stream).read_line(&mut line).unwrap();
+        let replayed: WireMessage = serde_json::from_str(&line).unwrap();
+        assert_eq!(replayed.id, first);
+        assert_eq!(
+            inner.store.list_wire_receipts(&first).unwrap()[0].status,
+            DeliveryStatus::Acked
+        );
+        assert_eq!(
+            inner.store.list_wire_receipts(&tail).unwrap()[0].attempts,
+            0
+        );
+        assert!(inner.is_recipient_fenced("held"));
+        let status = inner.diagnostics_snapshot();
+        assert_eq!(
+            status.records[0].decisive_reason,
+            FenceReason::ReplayStateUnavailable
+        );
+        assert_eq!(
+            status.fence_recovery_attempts[0].outcome,
+            FenceRecoveryOutcome::ReplayWorkerFailed
+        );
+        assert_eq!(
+            status.fence_recovery_attention[0].outcome,
+            FenceRecoveryOutcome::ReplayWorkerFailed
+        );
+
+        inner.poll_retained_fences(At::from_unix_millis(due + 300_001));
+        wait_on_recovery(|| !lock(&inner.dispatch_queues).contains_key("held"));
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        assert_eq!(
+            inner.diagnostics_snapshot().fence_recovery_attempts.len(),
+            1
+        );
+    }
+
+    #[test]
+    fn timed_fence_recovery_stops_on_pre_submit_store_faults() {
+        for (fault, stage) in [
+            (Fault::Error, FailureStage::MessageLookupError),
+            (Fault::Missing, FailureStage::MessageLookupMissing),
+            (Fault::Error, FailureStage::InitialReceiptReadError),
+            (Fault::Missing, FailureStage::InitialReceiptReadMissing),
+        ] {
+            let (_tmp, inner, listener, first, since) = timed_recovery_fixture();
+            let faults = match stage {
+                FailureStage::MessageLookupError | FailureStage::MessageLookupMissing => {
+                    &inner.store.gets
+                }
+                _ => &inner.store.reads,
+            };
+            lock(faults).push_back(fault);
+            *lock(&inner.fence_recovery_probe_hook) = Some(Box::new(|| {
+                RecoveryReadiness::Ready(RecoveryTarget::FixtureWebhook)
+            }));
+            let due = since.unix_millis() + 300_000;
+            inner.poll_retained_fences(At::from_unix_millis(due));
+            wait_on_recovery(|| !lock(&inner.dispatch_queues).contains_key("held"));
+            assert_eq!(
+                listener.accept().unwrap_err().kind(),
+                io::ErrorKind::WouldBlock
+            );
+            let status = inner.diagnostics_snapshot();
+            assert!(status.records[0].failure_stages.contains(&stage));
+            assert_eq!(
+                status.fence_recovery_attempts[0].outcome,
+                FenceRecoveryOutcome::ReceiptBookkeepingFailed
+            );
+            assert_eq!(
+                status.fence_recovery_attention[0].outcome,
+                FenceRecoveryOutcome::ReceiptBookkeepingFailed
+            );
+
+            inner.poll_retained_fences(At::from_unix_millis(due + 300_001));
+            wait_on_recovery(|| !lock(&inner.dispatch_queues).contains_key("held"));
+            assert_eq!(
+                listener.accept().unwrap_err().kind(),
+                io::ErrorKind::WouldBlock
+            );
+            assert_eq!(
+                inner.diagnostics_snapshot().fence_recovery_attempts.len(),
+                1
+            );
+            assert!(inner.is_recipient_fenced("held"));
+            let receipt = inner.store.list_wire_receipts(&first).unwrap().remove(0);
+            assert_eq!(receipt.status, DeliveryStatus::Pending);
+            assert_eq!(receipt.attempts, 1);
+        }
     }
 
     #[test]
@@ -6902,6 +7042,72 @@ mod tests {
         assert_eq!(
             inner.store.list_wire_receipts(&first).unwrap()[0].attempts,
             4
+        );
+    }
+
+    #[test]
+    fn timed_fence_recovery_transport_failure_preserves_ack_release() {
+        let (_tmp, inner, listener, first, since) = timed_recovery_fixture();
+        let acked_while_held = send_to_held_recipient(&inner, "read manually while held");
+        let tail = send_to_held_recipient(&inner, "waiting for the ACK to resume dispatch");
+        let socket = listener
+            .local_addr()
+            .unwrap()
+            .as_pathname()
+            .unwrap()
+            .to_path_buf();
+        let failed_socket = crate::test_isolation::register_unix_socket(&socket).unwrap();
+        drop(listener);
+        *lock(&inner.fence_recovery_probe_hook) = Some(Box::new(|| {
+            RecoveryReadiness::Ready(RecoveryTarget::FixtureWebhook)
+        }));
+        inner.poll_retained_fences(At::from_unix_millis(since.unix_millis() + 300_000));
+        wait_on_recovery(|| !lock(&inner.dispatch_queues).contains_key("held"));
+        assert_eq!(
+            inner.diagnostics_snapshot().fence_recovery_attempts[0].outcome,
+            FenceRecoveryOutcome::ReplayFailed
+        );
+        assert_eq!(
+            inner.store.list_wire_receipts(&first).unwrap()[0].attempts,
+            2
+        );
+
+        drop(failed_socket);
+        std::fs::remove_file(&socket).unwrap();
+        let listener = crate::test_isolation::bind_unix_fixture(&socket).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let (response, _) = inner.handle_local_request(LocalRequest::Ack {
+            recipient: "held".into(),
+            message_ids: vec![acked_while_held],
+        });
+        assert!(matches!(response, LocalResponse::Acked { .. }));
+        assert!(inner.is_recipient_fenced("held"));
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+
+        let (response, _) = inner.handle_local_request(LocalRequest::Ack {
+            recipient: "held".into(),
+            message_ids: vec![first],
+        });
+        assert!(matches!(response, LocalResponse::Acked { .. }));
+        wait_on_recovery(|| !lock(&inner.dispatch_queues).contains_key("held"));
+        assert!(!inner.is_recipient_fenced("held"));
+        assert!(
+            inner
+                .diagnostics_snapshot()
+                .fence_recovery_attention
+                .is_empty()
+        );
+        let (stream, _) = listener.accept().unwrap();
+        let mut line = String::new();
+        BufReader::new(stream).read_line(&mut line).unwrap();
+        let delivered: WireMessage = serde_json::from_str(&line).unwrap();
+        assert_eq!(delivered.id, tail);
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
         );
     }
 
