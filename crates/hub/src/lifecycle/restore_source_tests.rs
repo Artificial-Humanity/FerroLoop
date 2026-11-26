@@ -219,6 +219,7 @@ fn teardown_that_stops_nothing_leaves_the_restore_source_alone() {
     let off = LifecycleEnv {
         log_hydration_warnings: true,
         lifecycle_fence: None,
+        blocker_evidence: None,
         home_override: Some(home.path()),
         spawn_runtime: false,
         runtime: &TmuxRuntime,
