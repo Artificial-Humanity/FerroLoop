@@ -10395,7 +10395,7 @@ type SpinUpFn<'f, S> = dyn FnMut(
 ///
 /// A same-vendor remodel ends with the same session id, `running`, on the new model and `cwd`.
 ///
-/// The shared persona fence covers prepare, teardown, both vendor identities and rollback.
+/// The shared persona fence covers preflight, prepare, teardown, both vendor identities and rollback.
 /// Hub callers release their initial store guard before acquiring it and reopen afterward.
 pub fn remodel_session<S: AgentRegistry + StateStore + Catalog + MessageStore>(
     store: &S,
@@ -10406,21 +10406,23 @@ pub fn remodel_session<S: AgentRegistry + StateStore + Catalog + MessageStore>(
     caller: Caller,
     clear_queue: impl FnMut(&str),
 ) -> Result<RemodelResponse, LifecycleError> {
-    let mut observations = LaunchAuthObservations::new();
-    if let Some(target) = remodel_auth_target(store, env, target, req, caller)? {
-        let issue = target.probe(env);
-        observations.insert(target, issue);
-    }
-    remodel_session_with_auth(
-        store,
-        env,
-        target,
-        req,
-        by,
-        caller,
-        &observations,
-        clear_queue,
-    )
+    with_lifecycle_fence(env, &target.persona, "remodel", |env| {
+        let mut observations = LaunchAuthObservations::new();
+        if let Some(target) = remodel_auth_target(store, env, target, req, caller)? {
+            let issue = target.probe(env);
+            observations.insert(target, issue);
+        }
+        remodel_session_with_auth(
+            store,
+            env,
+            target,
+            req,
+            by,
+            caller,
+            &observations,
+            clear_queue,
+        )
+    })
 }
 
 #[allow(clippy::too_many_arguments)]

@@ -904,6 +904,60 @@ fn an_old_runtime_the_teardown_cannot_stop_is_refused_before_anything_changes() 
 }
 
 #[test]
+fn direct_remodel_refuses_persona_contention_before_probing_sign_in() {
+    let home = TempDir::new().unwrap();
+    let _trusted = trusted_codex_home(home.path(), home.path());
+    let fake = FakeRuntime::default();
+    let env = fake.env(home.path());
+    let store = MemStore::default();
+    spin_with(
+        &store,
+        &env,
+        "ada",
+        "assistant",
+        "claude",
+        None,
+        Some(home.path()),
+    );
+
+    let probes = std::rc::Rc::new(std::cell::Cell::new(0));
+    let called = probes.clone();
+    TEST_LAUNCH_AUTH.with(|slot| {
+        *slot.borrow_mut() = Some(Box::new(move |_| {
+            called.set(called.get() + 1);
+            Some(LaunchSignInIssue::Rejected)
+        }));
+    });
+    let attempt = || {
+        remodel(
+            &store,
+            &env,
+            "claude:ada",
+            &remodel_req("codex"),
+            Caller::Owner,
+        )
+        .unwrap_err()
+    };
+    with_lifecycle_fence(&env, "ada", "restart", |_| {
+        // Use the original environment to model a caller without the held fence.
+        let error = attempt();
+        assert_eq!(error.status(), 409);
+        assert!(error.to_string().contains("in progress"), "{error}");
+        assert_eq!(probes.get(), 0);
+        Ok(())
+    })
+    .unwrap();
+
+    let error = attempt();
+    assert!(
+        error
+            .to_string()
+            .contains(LaunchSignInIssue::Rejected.message())
+    );
+    assert_eq!(probes.get(), 1);
+}
+
+#[test]
 fn blocked_codex_sign_in_refuses_before_remodel_teardown_unless_overridden() {
     let home = TempDir::new().unwrap();
     let _trusted = trusted_codex_home(home.path(), home.path());
