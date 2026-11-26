@@ -1423,6 +1423,7 @@ struct AwaitingDaemonEntry {
 struct DaemonInner<S> {
     store: Arc<S>,
     hosted_lookup: HostedLookup<S>,
+    attach_recovery_excerpts: fn(&S, &WireFilter, &mut [WireInboxItem]),
     recovery_host_lookup: RecoveryHostLookup<S>,
     fence_recovery_policy: FenceRecoveryPolicy,
     fence_recoveries: Mutex<BTreeMap<String, RetainedFenceRecovery>>,
@@ -3547,10 +3548,14 @@ where
                     drop(_order);
                     self.reset_composer_occupied_reprobe(rec, &now);
                     self.maybe_unfence_and_resume(rec, now);
+                    (self.attach_recovery_excerpts)(&self.store, &filter, &mut items);
                     (LocalResponse::Inbox { items }, None)
                 } else {
                     match self.store.list_wire_inbox(&filter) {
-                        Ok(items) => (LocalResponse::Inbox { items }, None),
+                        Ok(mut items) => {
+                            (self.attach_recovery_excerpts)(&self.store, &filter, &mut items);
+                            (LocalResponse::Inbox { items }, None)
+                        }
                         Err(e) => (
                             LocalResponse::Error {
                                 message: e.to_string(),
@@ -4616,6 +4621,7 @@ where
     let inner = Arc::new(DaemonInner {
         store,
         hosted_lookup: hosted_reference::<S>,
+        attach_recovery_excerpts: crate::hosted_recovery_notice::attach_to_local_inbox,
         recovery_host_lookup: recovery_host_session::<S>,
         fence_recovery_policy: FenceRecoveryPolicy::from_env(),
         fence_recoveries: Mutex::new(BTreeMap::new()),
@@ -4866,10 +4872,12 @@ mod tests {
         tmp: &TempDir,
         store: Arc<S>,
         hosted_lookup: HostedLookup<S>,
+        attach_recovery_excerpts: fn(&S, &WireFilter, &mut [WireInboxItem]),
     ) -> Arc<DaemonInner<S>> {
         Arc::new(DaemonInner {
             store,
             hosted_lookup,
+            attach_recovery_excerpts,
             recovery_host_lookup: |_, _, _| Ok(None),
             fence_recovery_policy: FenceRecoveryPolicy::default(),
             fence_recoveries: Mutex::new(BTreeMap::new()),
@@ -4916,7 +4924,12 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let store = Arc::new(RedbStore::open(&tmp.path().join("dest.redb")).unwrap());
         let source = RedbStore::open(&tmp.path().join("src.redb")).unwrap();
-        let inner = rig_inner(&tmp, store, hosted_reference::<RedbStore>);
+        let inner = rig_inner(
+            &tmp,
+            store,
+            hosted_reference::<RedbStore>,
+            crate::hosted_recovery_notice::attach_to_local_inbox,
+        );
         let (tx, _unused) = mpsc::channel();
         let sender = inner.register_peer("peer-a".into(), tx);
         let (tx, observed) = mpsc::channel();
@@ -5126,9 +5139,14 @@ mod tests {
             before_receipt_write: Mutex::new(None),
             calls: Mutex::new(Vec::new()),
         });
-        let inner = rig_inner(&tmp, store, |store: &FaultStore, p, v, h, g| {
-            hosted_reference(&store.inner, p, v, h, g)
-        });
+        let inner = rig_inner(
+            &tmp,
+            store,
+            |store: &FaultStore, p, v, h, g| hosted_reference(&store.inner, p, v, h, g),
+            |store, filter, items| {
+                crate::hosted_recovery_notice::attach_to_local_inbox(&store.inner, filter, items);
+            },
+        );
         lock(&inner.routes).upsert_explicit(
             "held",
             VendorRoute::Codex {
@@ -11427,6 +11445,102 @@ mod tests {
     }
 
     #[test]
+    fn hosted_recovery_notice_tail_is_local_to_its_active_direct_recipient() {
+        use fl_core::agent::AgentRole;
+
+        const SAFE: &str = "Exited with status 2 (vendor failure)";
+        const TAIL: &str = "synthetic terminal excerpt";
+        let rig = rig();
+        let store = rig.inner.store.as_ref();
+        let at = At::from_unix_millis(10);
+        let system = store
+            .register_agent(RegisterAgentArgs {
+                display_name: "system".into(),
+                email: None,
+                project: "ferroloop".into(),
+                role: AgentRole::Assistant,
+                extra_areas: vec![],
+                create_area: true,
+                replace: false,
+                at: at.clone(),
+                by: "system".into(),
+            })
+            .unwrap();
+        let lead = store
+            .register_agent(RegisterAgentArgs {
+                display_name: "Notice-Lead".into(),
+                email: None,
+                project: "ferroloop".into(),
+                role: AgentRole::Lead,
+                extra_areas: vec![],
+                create_area: true,
+                replace: false,
+                at: at.clone(),
+                by: "system".into(),
+            })
+            .unwrap();
+        let id = crate::hosted_recovery_notice::prepare(
+            store,
+            &lead.id,
+            "ferroloop",
+            "codex:fixture",
+            TAIL,
+            at.clone(),
+            "system",
+        )
+        .unwrap();
+        let (notice, _) = store
+            .send_wire(SendWireArgs {
+                id: Some(id),
+                sender_name: "system".into(),
+                to: WireAddress::AgentId(lead.id.clone()),
+                body: SAFE.into(),
+                ..mail(&lead.name_key, "Crash loop")
+            })
+            .unwrap();
+
+        assert_eq!(notice.sender_id.as_ref(), Some(&system.id));
+
+        let read = |recipient: Option<&str>, ack| {
+            let (LocalResponse::Inbox { items }, _) =
+                rig.inner.handle_local_request(LocalRequest::Read {
+                    filter: WireFilter {
+                        recipient: recipient.map(str::to_owned),
+                        ..Default::default()
+                    },
+                    ack,
+                })
+            else {
+                panic!("expected local inbox");
+            };
+            items
+        };
+        assert_eq!(read(None, false)[0].message.body, SAFE);
+        for recipient in ["", "*", "another-agent"] {
+            assert!(read(Some(recipient), false).is_empty());
+        }
+        let direct_recipient = lead.id.as_str();
+        assert_eq!(
+            [" Notice-Lead ", direct_recipient]
+                .map(|recipient| read(Some(recipient), false)[0].message.body.contains(TAIL)),
+            [true, true],
+            "named and ID-scoped inbox reads should include the excerpt"
+        );
+        let acked = &read(Some(direct_recipient), true)[0];
+        assert!(acked.message.body.contains(TAIL));
+        assert_eq!(acked.receipt.status, DeliveryStatus::Acked);
+        assert_eq!(
+            store.get_wire_message(&notice.id).unwrap().unwrap().body,
+            SAFE
+        );
+
+        store.retire_agent(&lead.id, at, "system").unwrap();
+        for recipient in [lead.name_key.as_str(), direct_recipient] {
+            assert_eq!(read(Some(recipient), false)[0].message.body, SAFE);
+        }
+    }
+
+    #[test]
     fn non_opt_in_status_skips_host_tcp_probes_for_explicit_routes() {
         let mut child = std::process::Command::new("sh")
             .args(["-c", "exit 0"])
@@ -11444,7 +11558,12 @@ mod tests {
 
         let tmp = TempDir::new().unwrap();
         let store = Arc::new(RedbStore::open(&tmp.path().join("dest.redb")).unwrap());
-        let mut inner = rig_inner(&tmp, store, hosted_reference::<RedbStore>);
+        let mut inner = rig_inner(
+            &tmp,
+            store,
+            hosted_reference::<RedbStore>,
+            crate::hosted_recovery_notice::attach_to_local_inbox,
+        );
         Arc::get_mut(&mut inner)
             .expect("unique inner")
             .config

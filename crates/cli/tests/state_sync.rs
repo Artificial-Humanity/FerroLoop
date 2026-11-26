@@ -2,6 +2,12 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
+use fl_core::at::At;
+use fl_core::state::{
+    HOSTED_RESPAWN_STATE_SLUG_PREFIX, MergeMode, NOTICE_STATE_SLUG_PREFIX, RuntimeEntry,
+    SensitivityPatch, StateConcern, StatePayload, StateScope, UpsertStateArgs,
+};
+use fl_core::store::StateStore;
 use serde_json::Value;
 use tempfile::TempDir;
 
@@ -756,6 +762,104 @@ fn sensitive_entry_is_refused_on_non_private_remote() {
         .output()
         .unwrap();
     assert!(ls.stdout.is_empty());
+}
+
+#[test]
+fn sync_keeps_hosted_recovery_runtime_local() {
+    let fixture_tail = "synthetic private terminal excerpt";
+    for private_remote in [false, true] {
+        let (_tmp, bare, a, b) = setup_two_machines(private_remote);
+        let mut set = a.fl();
+        set.args([
+            "state",
+            "runtime",
+            "set",
+            "--scope",
+            "workspace",
+            "--key",
+            "normal-runtime",
+            "--value",
+            "42",
+            "--by",
+            "test",
+            "--json",
+        ]);
+        let ordinary = run_json(set);
+
+        let store = fl_store::open_store(&a.data_dir.join("fl/fl.redb")).unwrap();
+        for prefix in [HOSTED_RESPAWN_STATE_SLUG_PREFIX, NOTICE_STATE_SLUG_PREFIX] {
+            for key in ["live", "deleted"] {
+                let slug = format!("{prefix}{key}");
+                store
+                    .upsert_state(UpsertStateArgs {
+                        scope: StateScope::Workspace,
+                        slug: slug.clone(),
+                        sensitivity: SensitivityPatch::SetSensitive,
+                        payload: StatePayload::Runtime(RuntimeEntry {
+                            value: serde_json::json!({ "terminal_tail": fixture_tail }),
+                            merge_mode: MergeMode::Conflict,
+                        }),
+                        at: At::from_unix_millis(10),
+                        by: "test".into(),
+                    })
+                    .unwrap();
+                if key == "deleted" {
+                    assert!(
+                        store
+                            .delete_state_by_key(
+                                &StateScope::Workspace,
+                                StateConcern::Runtime,
+                                &slug
+                            )
+                            .unwrap()
+                    );
+                }
+            }
+        }
+        assert_eq!(store.state_revisions_after(0).unwrap().len(), 5);
+        drop(store);
+
+        let mut publish = a.fl();
+        publish.args(["state", "sync", "--json"]);
+        assert_eq!(run_json(publish)["published_revisions"], 1);
+
+        let recovery_output = Command::new("git")
+            .arg("-C")
+            .arg(&bare)
+            .args([
+                "grep",
+                "-E",
+                &format!(
+                    "{HOSTED_RESPAWN_STATE_SLUG_PREFIX}|{NOTICE_STATE_SLUG_PREFIX}|{fixture_tail}"
+                ),
+                "refs/heads/fl/state",
+                "--",
+                "revisions",
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(
+            recovery_output.status.code(),
+            Some(1),
+            "{recovery_output:?}"
+        );
+
+        let mut pull = b.fl();
+        pull.args(["state", "sync", "--json"]);
+        assert_eq!(run_json(pull)["imported_revisions"], 1);
+        let mut get = b.fl();
+        get.args([
+            "state",
+            "get",
+            "normal-runtime",
+            "--scope",
+            "workspace",
+            "--concern",
+            "runtime",
+            "--json",
+        ]);
+        assert_eq!(run_json(get), ordinary);
+    }
 }
 
 #[test]
