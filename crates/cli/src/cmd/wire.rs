@@ -3054,6 +3054,8 @@ pub(crate) mod tests {
                 {"recipient": "hal", "outcome": "blank_screen", "exhausted": false},
                 {"recipient": "ira", "outcome": "host_probes_disabled", "exhausted": false},
                 {"recipient": "jan", "outcome": "hosted_leader_pid_unavailable", "exhausted": false},
+                {"recipient": "kim", "outcome": "receipt_bookkeeping_failed", "exhausted": false},
+                {"recipient": "lee", "outcome": "replay_worker_failed", "exhausted": false},
                 {"recipient": "/private/path", "outcome": "inconclusive", "exhausted": false},
             ],
         }))
@@ -3073,6 +3075,14 @@ pub(crate) mod tests {
             "hal:hosted screen is blank",
             "ira:host probes are disabled",
             "jan:no recorded hosted leader PID",
+            concat!(
+                "kim:receipt bookkeeping failed. Timed replay stopped. ",
+                "ACK leaves the fence in place. Change the route identity or restart the Wire daemon."
+            ),
+            concat!(
+                "lee:replay worker failed. Timed replay stopped. ",
+                "ACK leaves the fence in place. Change the route identity or restart the Wire daemon."
+            ),
         ] {
             assert!(summary.contains(entry), "{summary}");
         }

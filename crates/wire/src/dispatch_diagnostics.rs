@@ -103,8 +103,14 @@ impl FenceRecoveryOutcome {
             Self::InboxUnavailable => "inbox unavailable",
             Self::ReplayFailed => "replay failed",
             Self::Resolved => "held receipts already resolved",
-            Self::ReceiptBookkeepingFailed => "receipt bookkeeping failed, timed replay stopped",
-            Self::ReplayWorkerFailed => "replay worker failed, timed replay stopped",
+            Self::ReceiptBookkeepingFailed => concat!(
+                "receipt bookkeeping failed. Timed replay stopped. ",
+                "ACK leaves the fence in place. Change the route identity or restart the Wire daemon."
+            ),
+            Self::ReplayWorkerFailed => concat!(
+                "replay worker failed. Timed replay stopped. ",
+                "ACK leaves the fence in place. Change the route identity or restart the Wire daemon."
+            ),
             Self::PrefixOverflow => "backlog exceeded the admitted delivery queue",
             Self::Unsupported => "unrecognized recovery outcome",
         }
