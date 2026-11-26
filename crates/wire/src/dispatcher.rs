@@ -7437,7 +7437,8 @@ fn retained_fence_codex_gate(cleaned: &str) -> Result<(), FenceRecoveryOutcome> 
     let mut saw_preview = false;
     let mut unanchored_continuation = false;
     for &row in lines[..composer.start].iter().rev() {
-        if retained_fence_codex_working(row) {
+        // Indented preview text can repeat the status wording.
+        if !row.starts_with("  ") && retained_fence_codex_working(row) {
             if !unanchored_continuation {
                 return Err(SeatBusy);
             }
@@ -21687,8 +21688,10 @@ exit 1"#,
             BusyBeforePaste,
             HookAndTipBeforePaste,
             CapturedBusyBeforePaste,
+            RejectedSteerBeforePaste,
             BusyBeforeEnter,
             CapturedBusyBeforeEnter,
+            RejectedSteerBeforeEnter,
             AckedBeforeEnter,
             WriteError,
             CodexIncidentMail,
@@ -21721,6 +21724,9 @@ exit 1"#,
         let server_counts = Arc::clone(&counts);
         let footer = "  GPT-6.1-Sol medium · ~/project\n  ← for agents · ? for shortcuts";
         let busy_preview = "• Working (4s · esc to interrupt)\n\n  Queued follow-up inputs\n  ↳ later\n    shift+← edit last queued message";
+        // Codex 0.172.0 indents rejected-steer preview continuations by four spaces.
+        let rejected_steer_preview = "• Working (4s · esc to interrupt)\n\n\
+            • Messages to be submitted at end of turn\n  ↳ first\n    • Working...\n    more";
         let idle_capture =
             &CODEX_BUSY_WARNING_CAPTURE[CODEX_BUSY_WARNING_CAPTURE.find("› ").unwrap()..];
         let scenarios = [
@@ -21731,8 +21737,10 @@ exit 1"#,
             BusyBeforePaste,
             HookAndTipBeforePaste,
             CapturedBusyBeforePaste,
+            RejectedSteerBeforePaste,
             BusyBeforeEnter,
             CapturedBusyBeforeEnter,
+            RejectedSteerBeforeEnter,
             AckedBeforeEnter,
             WriteError,
             CodexIncidentMail,
@@ -21788,6 +21796,9 @@ exit 1"#,
                                         )
                                     }
                                     (CapturedBusyBeforePaste, 2, _) => CODEX_BUSY_CAPTURE.into(),
+                                    (RejectedSteerBeforePaste, 2, _) => {
+                                        format!("{rejected_steer_preview}\n\n{idle_capture}")
+                                    }
                                     (_, _, 1) => {
                                         let composer = scenario.payload().replace('\n', "\n  ");
                                         match scenario {
@@ -21796,14 +21807,26 @@ exit 1"#,
                                             }
                                             CapturedBusyBeforeEnter => CODEX_BUSY_WARNING_CAPTURE
                                                 .replacen(CODEX_GHOST_PLACEHOLDER, &composer, 1),
+                                            RejectedSteerBeforeEnter => {
+                                                let pasted = idle_capture.replacen(
+                                                    CODEX_GHOST_PLACEHOLDER,
+                                                    &composer,
+                                                    1,
+                                                );
+                                                format!("{rejected_steer_preview}\n\n{pasted}")
+                                            }
                                             CodexIncidentMail => idle_capture
                                                 .replacen(CODEX_GHOST_PLACEHOLDER, &composer, 1),
                                             _ => format!("› {composer}\n\n{footer}"),
                                         }
                                     }
-                                    (CapturedBusyBeforeEnter | CodexIncidentMail, _, _) => {
-                                        idle_capture.into()
-                                    }
+                                    (
+                                        CapturedBusyBeforeEnter
+                                        | RejectedSteerBeforeEnter
+                                        | CodexIncidentMail,
+                                        _,
+                                        _,
+                                    ) => idle_capture.into(),
                                     _ => format!("› Ask Codex to do anything\n\n{footer}"),
                                 };
                                 if scenario == LostCapture && observed.0 == 2 {
@@ -21900,13 +21923,15 @@ exit 1"#,
             let (reason, expected_writes) = match scenario {
                 SignIn => (Some(FenceRecoveryOutcome::VendorSignIn), 0),
                 LostCapture => (Some(FenceRecoveryOutcome::HostedCaptureUnavailable), 0),
-                BusyBeforePaste | HookAndTipBeforePaste | CapturedBusyBeforePaste => {
-                    (Some(FenceRecoveryOutcome::SeatBusy), 0)
-                }
+                BusyBeforePaste
+                | HookAndTipBeforePaste
+                | CapturedBusyBeforePaste
+                | RejectedSteerBeforePaste => (Some(FenceRecoveryOutcome::SeatBusy), 0),
                 ReplacedBeforePayload => (Some(FenceRecoveryOutcome::RouteChanged), 0),
                 ReplacedBeforeEnter
                 | BusyBeforeEnter
                 | CapturedBusyBeforeEnter
+                | RejectedSteerBeforeEnter
                 | AckedBeforeEnter
                 | WriteError => (None, 1),
                 CodexIncidentMail | GrokIncidentMail => (None, 2),
@@ -21920,7 +21945,7 @@ exit 1"#,
                     )]));
                 }
                 (
-                    BusyBeforeEnter | CapturedBusyBeforeEnter,
+                    BusyBeforeEnter | CapturedBusyBeforeEnter | RejectedSteerBeforeEnter,
                     Err(RecoveryPasteError::Uncertain(_)),
                 ) => {
                     assert_eq!(guard.permission.get(), Err(FenceRecoveryOutcome::SeatBusy));

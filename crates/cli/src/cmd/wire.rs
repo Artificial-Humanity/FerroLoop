@@ -2878,15 +2878,15 @@ fn dispatch_diagnostics_summary(
         group.push(format!("{recipient}:{reason}{exhausted}{since}"));
     }
     // Ring insertion order defines the latest observed streak for each recipient.
-    let last_busy_probe_counts = diagnostics
-        .fence_recovery_attempts
-        .iter()
-        .filter(|row| row.outcome == SeatBusy)
-        .filter_map(|row| {
-            let recipient = fl_wire::identity::normalize_persona(&row.recipient)?;
-            Some((recipient, row.busy_probe_count))
-        })
-        .collect::<std::collections::BTreeMap<_, _>>()
+    let mut last_busy_probe_counts = std::collections::BTreeMap::new();
+    for row in &diagnostics.fence_recovery_attempts {
+        if row.outcome == SeatBusy
+            && let Some(recipient) = fl_wire::identity::normalize_persona(&row.recipient)
+        {
+            last_busy_probe_counts.insert(recipient, row.busy_probe_count);
+        }
+    }
+    let last_busy_probe_counts = last_busy_probe_counts
         .into_iter()
         .filter_map(|(recipient, count)| count.map(|count| format!("{recipient}:{count}")))
         .collect();
