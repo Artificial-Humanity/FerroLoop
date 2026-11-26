@@ -223,7 +223,8 @@ impl PromptQueueTarget {
 
 /// Bounded re-probe budget for a prompt held by an occupied composer: first probe is
 /// immediate, then 10s doubling to 120s (10, 20, 40, 80, 120, ...). A known busy
-/// session keeps probing, and an obstructed or unlocated composer gets 16 probes.
+/// session keeps probing; an obstructed or unlocated composer, or a Claude inline
+/// suggestion that refused a pre-paste flush, gets 16 probes.
 pub(crate) const COMPOSER_HELD_MAX_PROBES: u32 = 16;
 pub(crate) const COMPOSER_HELD_INITIAL_BACKOFF_MS: i64 = 10_000;
 pub(crate) const COMPOSER_HELD_MAX_BACKOFF_MS: i64 = 120_000;
@@ -234,11 +235,13 @@ fn is_composer_occupied_error(error: &str) -> bool {
 }
 
 /// Hold reason stored on a queue item for a zero-keys wire hold (#545-3): exactly
-/// `composer_occupied`, `composer_unlocated`, or `session_busy`. A generic zero-keys
-/// hold (including the legacy generic text) is an occupied composer.
+/// `composer_occupied`, `composer_unlocated`, `composer_suggestion`, or `session_busy`.
+/// A generic zero-keys hold (including the legacy generic text) is an occupied composer.
 pub(crate) fn composer_hold_reason(error: &str) -> &'static str {
     if error.contains("composer_unlocated") {
         "composer_unlocated"
+    } else if error.contains("composer_suggestion") {
+        "composer_suggestion"
     } else if error.contains("session_busy") {
         "session_busy"
     } else {
@@ -2563,6 +2566,45 @@ mod tests {
         let queue = state.finish_queued_prompt("ada", &item.id, Ok(()));
         claim2.finish();
         assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn composer_suggestion_hold_is_retryable_and_bounded_like_an_occupied_composer() {
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        let (item, _) = state.enqueue_session_prompt(
+            "ada",
+            None,
+            "hello".into(),
+            "hello".into(),
+            "owner".into(),
+            vec![],
+        );
+        let (_c, claim) = state
+            .claim_queued_for_dispatch("ada", "ada", &item.id, false)
+            .unwrap();
+        let queue = state.finish_queued_prompt(
+            "ada",
+            &item.id,
+            Err(fl_wire::dispatcher::PushError::Failed(
+                "composer_occupied_by_non_wire_input: composer_suggestion: Claude shows an inline suggestion; holding delivery without sending keys and retrying later".into(),
+            )),
+        );
+        claim.finish();
+        assert_eq!(queue[0].delivery_state, QueuedDeliveryState::Pending);
+        assert_eq!(queue[0].hold_reason.as_deref(), Some("composer_suggestion"));
+        assert!(state.is_composer_held_prompt("ada", &item.id));
+        // Not a busy hold: the probe budget is spent and then exhausts.
+        let (count, _, busy) = state.prompt_queues.lock().unwrap().composer_hold_probes[&item.id];
+        assert_eq!((count, busy), (0, false));
+        let now_ms = stamp::now().unix_millis() as i64;
+        for index in 0..COMPOSER_HELD_MAX_PROBES {
+            let next_at = now_ms + i64::from(index) * COMPOSER_HELD_MAX_BACKOFF_MS;
+            assert!(state.note_composer_hold_probe(&item.id, next_at).is_some());
+        }
+        assert!(state.note_composer_hold_probe(&item.id, now_ms).is_none());
+        assert!(state.mark_hold_retries_exhausted("ada", &item.id));
+        assert!(state.session_queue("ada")[0].retries_exhausted);
     }
 
     #[test]

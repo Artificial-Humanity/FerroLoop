@@ -1024,6 +1024,7 @@ export const sessionDeliveryReceipts = new Map<string, {
 export function isComposerHeldPrompt(item: QueuedOperatorPrompt): boolean {
   return item.hold_reason === "composer_occupied"
     || item.hold_reason === "composer_unlocated"
+    || item.hold_reason === "composer_suggestion"
     || item.hold_reason === "session_busy";
 }
 export function composerHoldText(item: QueuedOperatorPrompt): string {

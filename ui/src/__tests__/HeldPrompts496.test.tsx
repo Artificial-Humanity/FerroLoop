@@ -34,6 +34,7 @@ describe("held operator prompts (#496 defect 1)", () => {
     expect(isComposerHeldPrompt(heldItem())).toBe(true);
     expect(isComposerHeldPrompt(heldItem({ hold_reason: "composer_unlocated" }))).toBe(true);
     expect(isComposerHeldPrompt(heldItem({ hold_reason: "session_busy" }))).toBe(true);
+    expect(isComposerHeldPrompt(heldItem({ hold_reason: "composer_suggestion" }))).toBe(true);
     expect(isComposerHeldPrompt(heldItem({ hold_reason: "composer_occupied_zero_keys" }))).toBe(false);
     // Post-paste error shares the wire prefix but is not a zero-key hold (B1).
     expect(isComposerHeldPrompt(heldItem({ hold_reason: null, delivery_error: "composer_occupied_by_non_wire_input: composer holds non-wire input after paste; aborting Enter retries" }))).toBe(false);
@@ -87,6 +88,7 @@ describe("held operator prompts (#496 defect 1)", () => {
   it.each([
     ["session_busy", "the session is busy"],
     ["composer_unlocated", "the session composer could not be located"],
+    ["composer_suggestion", "the session composer shows an inline suggestion"],
   ])("shows the specific %s reason on the removable queue item", (hold_reason, detail) => {
     render(<ChatPane sessionId="claude-619-reason" turns={[]} queue={[heldItem({ hold_reason })]} />);
     expect(screen.getByTestId("queued-hold-reason-held-1")).toHaveTextContent(detail);
@@ -539,7 +541,7 @@ describe("held operator prompts (#496 defect 1)", () => {
     await waitFor(() => expect(onSendQueuedNow).toHaveBeenCalledWith("held-idle"));
   });
 
-  it.each(["session_busy", "composer_occupied", "composer_unlocated"])(
+  it.each(["session_busy", "composer_occupied", "composer_unlocated", "composer_suggestion"])(
     "keeps Send Now and Remove enabled for a %s hold while busy", (hold_reason) => {
       render(
         <ChatPane

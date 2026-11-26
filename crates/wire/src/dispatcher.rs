@@ -2921,6 +2921,47 @@ fn composer_occupied_error() -> String {
     )
 }
 
+/// Zero-key pre-paste flush refusal on a composer that changed since the flush was
+/// chosen. A recognised payload keeps its repair hint; otherwise nothing is claimed
+/// about what the composer now holds.
+fn composer_changed_error_for_screen(screen: &str) -> String {
+    match recognised_composer_payload_in_screen(screen) {
+        Some(payload) => composer_occupied_error_with_payload(Some(payload)),
+        None => format!(
+            "{COMPOSER_OCCUPIED_BY_NON_WIRE_INPUT_PREFIX} composer_occupied: Claude composer changed before input; holding delivery without sending keys"
+        ),
+    }
+}
+
+/// Zero-key pre-paste flush refusal on a dim Claude inline suggestion. There is
+/// nothing for the operator to clear; a later probe retries the prompt.
+fn composer_suggestion_error() -> String {
+    format!(
+        "{COMPOSER_OCCUPIED_BY_NON_WIRE_INPUT_PREFIX} composer_suggestion: Claude shows an inline suggestion; holding delivery without sending keys and retrying later"
+    )
+}
+
+#[cfg(test)]
+#[test]
+fn flush_hold_reasons_stay_zero_key_and_truthful() {
+    let suggestion = composer_suggestion_error();
+    let changed = composer_changed_error_for_screen(
+        "────────────────────\n❯ other text\n────────────────────\n",
+    );
+    for err in [&suggestion, &changed] {
+        assert!(is_composer_occupied_zero_keys_error(err), "{err}");
+        assert!(!err.contains("repair:"), "{err}");
+        assert!(!err.contains("non-wire input"), "{err}");
+        assert!(!is_composer_session_busy_error(err), "{err}");
+    }
+    assert!(suggestion.contains("composer_suggestion: Claude shows an inline suggestion"));
+    assert!(changed.contains("composer_occupied: Claude composer changed before input"));
+    assert_eq!(
+        composer_changed_error_for_screen("────────────────────\n❯ /clear\n────────────────────\n"),
+        composer_occupied_error_with_payload(Some("/clear"))
+    );
+}
+
 /// Composer could not be located, so nothing was proven about its contents (#545-3).
 fn composer_unlocated_error() -> String {
     format!(
@@ -4655,10 +4696,12 @@ fn deliver_via_tmux_paste_with_resolved_host(
                                     format!("prompt submission unconfirmed: {err}")
                                 } else if is_composer_occupied_zero_keys_error(&err) {
                                     err
-                                } else {
-                                    // Zero-key FlushEarlier refusal, e.g. a dim
+                                } else if screen.ghost_styled {
+                                    // Zero-key FlushEarlier refusal on a dim
                                     // suggestion: hold rather than fence.
-                                    composer_occupied_error_for_screen(&screen.contents)
+                                    composer_suggestion_error()
+                                } else {
+                                    composer_changed_error_for_screen(&screen.contents)
                                 }
                             })?;
                         input.validate(keys_attempted.get())?;
@@ -8972,6 +9015,7 @@ mod tests {
         const STALE_DIM_SUGGESTION: usize = 18;
         const REDRAWN_PROMPT: usize = 19;
         const DIM_AT_FLUSH: usize = 20;
+        const PLAIN_HOST_DIM_SUGGESTION: usize = 21;
         let _lock = TMUX_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = TempDir::new().unwrap();
         fs::set_permissions(tmp.path(), fs::Permissions::from_mode(0o700)).unwrap();
@@ -9104,8 +9148,10 @@ mod tests {
                                     {
                                         stream.epoch = SessionEpoch(4);
                                     }
-                                    let stale_suggestion = scenario.load(Ordering::SeqCst) == STALE_DIM_SUGGESTION
-                                        || (scenario.load(Ordering::SeqCst) == DIM_AT_FLUSH && capture_number >= 5);
+                                    let stale_suggestion = matches!(
+                                        scenario.load(Ordering::SeqCst),
+                                        STALE_DIM_SUGGESTION | PLAIN_HOST_DIM_SUGGESTION
+                                    ) || (scenario.load(Ordering::SeqCst) == DIM_AT_FLUSH && capture_number >= 5);
                                     let screen = RenderedScreen {
                                             schema: 1,
                                             stream,
@@ -9624,6 +9670,20 @@ mod tests {
                 probe_bound_claude_composer_ready(&binding, &claude_stream),
                 Err(bound_claude_hold(&claude_stream, composer_occupied_error()))
             );
+            // The same cursor-at-suggestion screen from a host that advertises
+            // only the rendered PTY feature: no dim style is reported, so the
+            // probe holds and nothing is delivered or recorded.
+            let probe_keys = vec![format!("host:{}", claude_stream.session.as_str())];
+            scenario.store(PLAIN_HOST_DIM_SUGGESTION, Ordering::SeqCst);
+            let before = writes.lock().unwrap().len();
+            let attempted_before = attempted_writes.lock().unwrap().len();
+            assert_eq!(
+                probe_bound_claude_composer_ready(&binding, &claude_stream),
+                Err(bound_claude_hold(&claude_stream, composer_occupied_error()))
+            );
+            assert_eq!(writes.lock().unwrap().len(), before);
+            assert_eq!(attempted_writes.lock().unwrap().len(), attempted_before);
+            assert!(!route_has_unconfirmed_wire_deliveries(&probe_keys));
 
             // A dim suggestion that appears at the pre-paste flush Enter is
             // refused before any key write, so it holds instead of fencing.
@@ -9638,7 +9698,9 @@ mod tests {
             clear_unconfirmed_wire_deliveries(&flush_keys);
             assert!(
                 matches!(&result, Err(ClaudeBoundError::Held { reason, stream })
-                    if stream == &claude_stream && is_composer_occupied_zero_keys_error(reason)),
+                    if stream == &claude_stream
+                        && is_composer_occupied_zero_keys_error(reason)
+                        && *reason == composer_suggestion_error()),
                 "{result:?}"
             );
             assert_eq!(writes.lock().unwrap().len(), before);

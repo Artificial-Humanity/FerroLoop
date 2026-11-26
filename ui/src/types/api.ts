@@ -1049,6 +1049,7 @@ export function composerHoldDetail(reason?: string | null): string {
   switch (reason) {
     case "session_busy": return "the session is busy";
     case "composer_unlocated": return "the session composer could not be located";
+    case "composer_suggestion": return "the session composer shows an inline suggestion";
     default: return "the session composer is occupied";
   }
 }

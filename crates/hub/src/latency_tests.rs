@@ -924,6 +924,14 @@ fn distinct_zero_key_holds_map_to_exact_hold_reasons_545() {
             "composer_occupied_by_non_wire_input: composer_occupied: composer holds non-wire input or active dialog; holding delivery without sending keys",
             "composer_occupied",
         ),
+        (
+            "composer_occupied_by_non_wire_input: composer_suggestion: Claude shows an inline suggestion; holding delivery without sending keys and retrying later",
+            "composer_suggestion",
+        ),
+        (
+            "composer_occupied_by_non_wire_input: composer_occupied: Claude composer changed before input; holding delivery without sending keys",
+            "composer_occupied",
+        ),
     ] {
         let _err = crate::api::stub_queued_delivery_error(wire_error);
         crate::api::reset_queued_delivery_calls();
@@ -948,7 +956,7 @@ fn distinct_zero_key_holds_map_to_exact_hold_reasons_545() {
         assert!(state.is_composer_held_prompt("conv-ferris-1", &item.id));
         drop(_err);
     }
-    // The mapping itself: exactly the three names, generic falls to occupied.
+    // The mapping itself: exactly the four names, generic falls to occupied.
     assert_eq!(
         crate::composer_hold_reason(
             "composer_occupied_by_non_wire_input: composer holds non-wire input or active dialog; holding delivery without sending keys"
