@@ -28,6 +28,7 @@ pub(crate) fn attach(
     let stdin = session.take_stdin();
     let output = OutputSession::open(Arc::clone(session), Arc::clone(&host.hub));
     let writer = WriterHandle::start(Arc::clone(session), stdin);
+    session.set_cursor_reply_writer(&writer);
     if let Some(admission) = admission {
         host.authority.register(admission, session, &writer);
     }

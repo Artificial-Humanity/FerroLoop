@@ -3,7 +3,7 @@
 use std::fs::File;
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, Weak};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use fl_host_proto::{
@@ -13,6 +13,8 @@ use fl_host_proto::{
 
 use crate::child::{CleanupReport, DescendantExit};
 use crate::exit_evidence::TerminalTail;
+use crate::input::WriterHandle;
+use crate::projection::CursorReports;
 
 // A total completion order, independent of map iteration and session names.
 static COMPLETION_ORDER: AtomicU64 = AtomicU64::new(1);
@@ -59,6 +61,7 @@ pub struct Session {
     sink: Mutex<Option<Weak<dyn StdoutSink>>>,
     reliable: Option<Arc<crate::reliable::ReliableJournal>>,
     projection: Mutex<Option<crate::projection::Projection>>,
+    cursor_reply_writer: OnceLock<Weak<WriterHandle>>,
     #[cfg(unix)]
     resize_master: Option<File>,
     #[cfg(unix)]
@@ -217,6 +220,22 @@ impl Session {
         }
     }
 
+    pub(crate) fn set_cursor_reply_writer(&self, writer: &Arc<WriterHandle>) {
+        if self.mode() == fl_host_proto::SessionMode::Pty {
+            self.cursor_reply_writer
+                .get_or_init(|| Arc::downgrade(writer));
+        }
+    }
+
+    fn enqueue_cursor_reports(&self, reports: Option<CursorReports>) {
+        let Some(reports) = reports.filter(|reports| !reports.positions().is_empty()) else {
+            return;
+        };
+        if let Some(writer) = self.cursor_reply_writer.get().and_then(Weak::upgrade) {
+            writer.enqueue_cursor_reports(reports.positions());
+        }
+    }
+
     // The projection lock covers every byte's parser update, raw tail, journal
     // admission/drop and watermark. Reads, polls and waits occur outside it.
     fn accept_output(
@@ -225,26 +244,26 @@ impl Session {
         bytes: crate::reliable::ChargedBytes,
     ) -> Result<(), fl_host_proto::ExtensionRefusal> {
         let mut projection = self.projection.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(projection) = projection.as_mut() {
-            projection.process(bytes.as_slice());
-        }
+        let reports = projection.as_mut().map(|p| p.process(bytes.as_slice()));
         self.push_stdout_tail(bytes.as_slice(), 64 * 1024);
         let result = journal.accept_read(bytes);
         if let Some(projection) = projection.as_mut() {
             projection.set_output_seq(journal.position().1);
         }
+        drop(projection);
+        self.enqueue_cursor_reports(reports);
         result
     }
     fn drop_pty_output(&self, journal: &crate::reliable::ReliableJournal, bytes: &[u8]) {
         let mut projection = self.projection.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(projection) = projection.as_mut() {
-            projection.process(bytes);
-        }
+        let reports = projection.as_mut().map(|p| p.process(bytes));
         self.push_stdout_tail(bytes, 64 * 1024);
         journal.drop_pty_unadmitted();
         if let Some(projection) = projection.as_mut() {
             projection.set_output_seq(journal.position().1);
         }
+        drop(projection);
+        self.enqueue_cursor_reports(reports);
     }
 
     pub fn new(parts: SessionParts) -> Self {
@@ -319,6 +338,7 @@ impl Session {
             sink: Mutex::new(None),
             reliable,
             projection: Mutex::new(None),
+            cursor_reply_writer: OnceLock::new(),
             #[cfg(unix)]
             resize_master: None,
             #[cfg(unix)]
