@@ -1832,7 +1832,12 @@ where
             row.first_reason = FenceReason::WorkerSpawnFailure;
             row.decisive_reason = FenceReason::WorkerSpawnFailure;
             if let Some(log) = self
-                .retain_overflow_fence_at(recipient, row, recovery.as_ref(), false)
+                .retain_overflow_fence_at(
+                    recipient,
+                    row,
+                    recovery.as_ref().and_then(|run| run.route.as_ref()),
+                    false,
+                )
                 .0
             {
                 first_holds.push(log);
@@ -2117,7 +2122,7 @@ where
                         self.retain_overflow_fence_at(
                             &recipient,
                             empty_evidence,
-                            recovery.as_ref(),
+                            recovery.as_ref().and_then(|run| run.route.as_ref()),
                             false,
                         )
                         .0
@@ -2362,14 +2367,21 @@ where
                 // Fence and remove while holding the same map lock: no sender may create
                 // a replacement worker between those two actions.
                 // A prefix overflow has already left untracked messages in the inbox.
-                let retryable_transport = replay_stop.is_none()
+                // A long hosted turn can exhaust the ordinary parks without
+                // any push call. Reuse the exact registration released by the
+                // preceding timed submit so the next probe cannot switch routes.
+                let exhausted_busy_route = released_route.as_ref().filter(|_| composer_exhausted);
+                let retryable = replay_stop.is_none()
                     && !prefix_overflowed
-                    && !composer_exhausted
-                    && transport_fence_can_recover(&evidence);
+                    && (exhausted_busy_route.is_some() || transport_fence_can_recover(&evidence));
+                let fenced_route = recovery
+                    .as_ref()
+                    .and_then(|run| run.route.as_ref())
+                    .or(exhausted_busy_route);
                 let since = self.retain_overflow_fence_at(
                     &recipient,
                     evidence,
-                    recovery.as_ref(),
+                    fenced_route,
                     replay_stop.is_some(),
                 );
                 first_hold = since.0;
@@ -2393,7 +2405,7 @@ where
                             .unwrap_or(FenceRecoveryOutcome::ReplayFailed),
                         false,
                     );
-                } else if retryable_transport
+                } else if retryable
                     && normalize_persona(&recipient).as_deref() == Some(recipient.as_str())
                     && lock(&self.overflow_recipients).contains(&recipient)
                 {
@@ -2403,6 +2415,8 @@ where
                             &recipient,
                             if self.fence_recovery_policy.max_attempts == 0 {
                                 FenceRecoveryOutcome::RecoveryDisabled
+                            } else if exhausted_busy_route.is_some() {
+                                FenceRecoveryOutcome::SeatBusy
                             } else {
                                 FenceRecoveryOutcome::WaitingForDelay
                             },
@@ -2410,7 +2424,7 @@ where
                         );
                         RetainedFenceRecovery {
                             token: Arc::new(()),
-                            route: attempted_route,
+                            route: exhausted_busy_route.cloned().or(attempted_route),
                             pending: VecDeque::new(),
                             pending_capacity_exhausted: false,
                             since: since.1,
@@ -2484,10 +2498,10 @@ where
         &self,
         recipient: &str,
         mut row: FenceDiagnostic,
-        recovery: Option<&FenceRecoveryRun>,
+        fenced_route: Option<&RouteEntry>,
         replace_evidence: bool,
     ) -> (Option<FenceDiagnostic>, At) {
-        if let Some(entry) = recovery.and_then(|run| run.route.as_ref()) {
+        if let Some(entry) = fenced_route {
             lock(&self.fence_routes).insert(recipient.to_string(), entry.route.clone());
         } else if !lock(&self.fence_recoveries)
             .get(recipient)
@@ -6112,6 +6126,15 @@ mod tests {
 
     #[test]
     fn timed_fence_recovery_one_submit_releases_hosted_backlog_before_claude_turn_finishes() {
+        exercise_timed_recovery_hosted_busy_backlog(false);
+    }
+
+    #[test]
+    fn timed_fence_recovery_retries_after_hosted_busy_parks_are_exhausted() {
+        exercise_timed_recovery_hosted_busy_backlog(true);
+    }
+
+    fn exercise_timed_recovery_hosted_busy_backlog(exhaust_busy_parks: bool) {
         use fl_host_proto::{
             ChildRecord, ChildState, ControllerLease, ExtensionLimits, ExtensionRequest,
             ExtensionResponse, HostConfig, HostEndpoint, HostInstance, HostListener, HostRequest,
@@ -6209,9 +6232,11 @@ mod tests {
                                     let (composer, footer) = if state.busy {
                                         state.busy_captures += 1;
                                         (String::new(), "esc to interrupt")
-                                    } else if state.writes.len() == 1 {
+                                    } else if let Some(paste) =
+                                        state.writes.last().filter(|write| write.as_str() != "\r")
+                                    {
                                         (
-                                            state.writes[0]
+                                            paste
                                                 .strip_prefix("\x1b[200~")
                                                 .unwrap()
                                                 .strip_suffix("\x1b[201~")
@@ -6352,43 +6377,134 @@ mod tests {
             io::ErrorKind::WouldBlock
         );
         {
-            let mut screen = lock(&screen_state);
+            let screen = lock(&screen_state);
             assert_eq!(screen.writes.len(), 2);
             assert!(screen.writes[0].contains(first.as_str()));
             assert!(screen.writes[0].contains(TIMED_FENCE_REDELIVERY_NOTICE));
             assert_eq!(screen.writes[1], "\r");
             assert!(screen.busy_captures > 0);
-            screen.busy = false;
         }
+
+        if exhaust_busy_parks {
+            // The first park is already in place. Revisit each parked head
+            // without sleeping for the production backoff.
+            for reprobes in 1..=COMPOSER_OCCUPIED_MAX_REPROBES {
+                let retry_at = {
+                    let queues = lock(&inner.dispatch_queues);
+                    let queue = &queues["held"];
+                    assert_eq!(queue.composer_reprobes, reprobes);
+                    queue.composer_retry_at.clone().unwrap()
+                };
+                inner.poll_retained_fences(retry_at);
+                wait_on_recovery(|| {
+                    lock(&inner.dispatch_queues)
+                        .get("held")
+                        .is_none_or(|queue| {
+                            queue.composer_reprobes > reprobes && queue.composer_retry_at.is_some()
+                        })
+                });
+            }
+
+            let status = inner.diagnostics_snapshot();
+            assert!(inner.is_recipient_fenced("held"));
+            assert_eq!(status.fence_recovery_attempts.len(), 1);
+            assert_eq!(
+                status.fence_recovery_attention[0].outcome,
+                FenceRecoveryOutcome::SeatBusy
+            );
+            let hold_at = status.records[0].hold_observed_at.unix_millis();
+            let delay = inner.fence_recovery_policy.delay_ms;
+            inner.poll_retained_fences(At::from_unix_millis(hold_at + delay));
+            let status = inner.diagnostics_snapshot();
+            assert_eq!(status.fence_recovery_attempts.len(), 2);
+            assert_eq!(status.fence_recovery_attempts[1].attempt, 1);
+            assert_eq!(
+                status.fence_recovery_attempts[1].outcome,
+                FenceRecoveryOutcome::SeatBusy
+            );
+            assert!(inner.is_recipient_fenced("held"));
+            assert_eq!(
+                listener.accept().unwrap_err().kind(),
+                io::ErrorKind::WouldBlock
+            );
+            assert_eq!(
+                inner.store.list_wire_receipts(&second).unwrap()[0].attempts,
+                1
+            );
+            {
+                let mut screen = lock(&screen_state);
+                assert_eq!(screen.writes.len(), 2);
+                assert!(screen.busy_captures > COMPOSER_OCCUPIED_MAX_REPROBES as usize);
+                screen.busy = false;
+            }
+            inner.poll_retained_fences(At::from_unix_millis(hold_at + 2 * delay));
+            wait_on_recovery(|| {
+                lock(&inner.dispatch_queues)
+                    .get("held")
+                    .is_some_and(|queue| queue.composer_retry_at.is_some())
+            });
+            let status = inner.diagnostics_snapshot();
+            assert_eq!(status.fence_recovery_attempts.len(), 3);
+            assert_eq!(status.fence_recovery_attempts[2].attempt, 2);
+            assert_eq!(
+                status.fence_recovery_attempts[2].outcome,
+                FenceRecoveryOutcome::Released
+            );
+            assert!(!inner.is_recipient_fenced("held"));
+            let screen = lock(&screen_state);
+            assert_eq!(screen.writes.len(), 4);
+            assert!(screen.writes[2].contains(second.as_str()));
+            assert!(screen.writes[2].contains(TIMED_FENCE_REDELIVERY_NOTICE));
+            assert_eq!(screen.writes[3], "\r");
+        }
+
+        lock(&screen_state).busy = false;
         let retry_at = lock(&inner.dispatch_queues)["held"]
             .composer_retry_at
             .clone()
             .unwrap();
         inner.poll_retained_fences(retry_at);
         wait_on_recovery(|| !lock(&inner.dispatch_queues).contains_key("held"));
-        for (id, already_attempted) in [(&second, true), (&third, false)] {
-            let (socket, _) = listener.accept().unwrap();
-            let user_frame: serde_json::Value =
-                serde_json::from_str(&BufReader::new(socket).lines().nth(1).unwrap().unwrap())
-                    .unwrap();
-            let body = user_frame["message"]["content"].as_str().unwrap();
-            assert!(body.contains(id.as_str()), "{body}");
-            assert_eq!(
-                body.contains(TIMED_FENCE_REDELIVERY_NOTICE),
-                already_attempted
-            );
+        if !exhaust_busy_parks {
+            assert_hosted_claude_peer_delivery(&listener, &second, true);
+        }
+        assert_hosted_claude_peer_delivery(&listener, &third, false);
+        for id in [&second, &third] {
             assert_eq!(
                 inner.store.list_wire_receipts(id).unwrap()[0].status,
                 DeliveryStatus::Acked
             );
         }
         assert_eq!(
-            inner.diagnostics_snapshot().fence_recovery_attempts.len(),
-            1
+            listener.accept().unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
         );
-        assert_eq!(lock(&screen_state).writes.len(), 2);
+        assert_eq!(
+            inner.diagnostics_snapshot().fence_recovery_attempts.len(),
+            if exhaust_busy_parks { 3 } else { 1 }
+        );
+        assert_eq!(
+            lock(&screen_state).writes.len(),
+            if exhaust_busy_parks { 4 } else { 2 }
+        );
         stop_tx.send(()).unwrap();
         server.join().unwrap();
+    }
+
+    fn assert_hosted_claude_peer_delivery(
+        listener: &crate::test_isolation::RegisteredUnixListener,
+        id: &MessageId,
+        already_attempted: bool,
+    ) {
+        let (socket, _) = listener.accept().unwrap();
+        let user_frame: serde_json::Value =
+            serde_json::from_str(&BufReader::new(socket).lines().nth(1).unwrap().unwrap()).unwrap();
+        let body = user_frame["message"]["content"].as_str().unwrap();
+        assert!(body.contains(id.as_str()), "{body}");
+        assert_eq!(
+            body.contains(TIMED_FENCE_REDELIVERY_NOTICE),
+            already_attempted
+        );
     }
 
     #[test]
