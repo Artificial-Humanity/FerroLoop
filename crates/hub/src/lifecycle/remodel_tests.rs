@@ -1058,6 +1058,149 @@ fn blocked_codex_sign_in_refuses_before_remodel_teardown_unless_overridden() {
 }
 
 #[test]
+fn flagged_destination_sign_in_refuses_remodel_when_probe_is_inconclusive() {
+    let home = TempDir::new().unwrap();
+    let _trusted = trusted_codex_home(home.path(), home.path());
+    let fake = FakeRuntime::default();
+    let env = fake.env(home.path());
+    let store = MemStore::default();
+    for (persona, vendor) in [("ada", "claude"), ("bo", "codex")] {
+        spin_with(
+            &store,
+            &env,
+            persona,
+            "assistant",
+            vendor,
+            None,
+            Some(home.path()),
+        );
+    }
+    let mut flagged = record(&store, "codex:bo");
+    flagged.project = "other-project".into();
+    flagged.block = Some(fl_watch::HostedBlock {
+        reason: fl_watch::HostedBlockReason::VendorSignIn,
+        observed_at_ms: stamp::now().unix_millis(),
+    });
+    persist_hosted_session(&store, &flagged, "owner").unwrap();
+    TEST_LAUNCH_AUTH.with(|slot| {
+        *slot.borrow_mut() = Some(Box::new(|_| Some(LaunchSignInIssue::Inconclusive)));
+    });
+    fake.calls.borrow_mut().clear();
+    let before = list_hosted_sessions(&store).unwrap();
+
+    for mode in ["prepare", "execute"] {
+        let request = RemodelRequest {
+            mode: Some(mode.into()),
+            ..remodel_req(" CODEX ")
+        };
+        let err = remodel(&store, &env, "claude:ada", &request, Caller::Owner).unwrap_err();
+        assert_eq!(err.status(), 409, "{err}");
+        let message = err.to_string();
+        assert!(
+            message.contains("flagged at a vendor sign-in screen"),
+            "{message}"
+        );
+        assert!(message.contains("--allow-blocked-sign-in"), "{message}");
+        assert_eq!(list_hosted_sessions(&store).unwrap(), before);
+        assert!(handoff(&store, "ada").is_none());
+        assert!(fake.calls.borrow().is_empty());
+        assert!(fake.is_live("Ada"));
+    }
+
+    TEST_LAUNCH_AUTH.with(|slot| {
+        *slot.borrow_mut() = Some(Box::new(|_| Some(LaunchSignInIssue::Rejected)));
+    });
+    let err = remodel(
+        &store,
+        &env,
+        "claude:ada",
+        &remodel_req("codex"),
+        Caller::Owner,
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains(LaunchSignInIssue::Rejected.message()),
+        "{err}"
+    );
+
+    TEST_LAUNCH_AUTH.with(|slot| {
+        *slot.borrow_mut() = Some(Box::new(|_| Some(LaunchSignInIssue::Inconclusive)));
+    });
+    let request = RemodelRequest {
+        allow_blocked_sign_in: true,
+        ..remodel_req("codex")
+    };
+    let prepare = RemodelRequest {
+        mode: Some("prepare".into()),
+        ..request.clone()
+    };
+    let prepared = remodel(&store, &env, "claude:ada", &prepare, Caller::Owner).unwrap();
+    assert!(matches!(prepared.warnings.as_slice(), [message]
+        if message.contains("flagged at a vendor sign-in screen")
+            && message.contains("retry the remodel")));
+    assert_eq!(record(&store, "claude:ada").status, STATUS_DECOMMISSIONING);
+    assert!(fake.is_live("Ada"));
+
+    let out = remodel(&store, &env, "claude:ada", &request, Caller::Owner).unwrap();
+    assert_eq!(out.session_id, "codex:ada");
+    assert!(out.runtime_stopped);
+    let sign_in_warnings: Vec<_> = out
+        .warnings
+        .iter()
+        .filter(|message| message.contains("sign-in"))
+        .collect();
+    assert_eq!(sign_in_warnings, [&prepared.warnings[0]]);
+}
+
+#[test]
+fn irrelevant_flags_do_not_make_an_inconclusive_codex_probe_block_remodel() {
+    use fl_watch::HostedBlockReason::{BlockingDialog, HydrationOverdue, VendorSignIn};
+
+    let home = TempDir::new().unwrap();
+    let _trusted = trusted_codex_home(home.path(), home.path());
+    let fake = FakeRuntime::default();
+    let env = fake.env(home.path());
+    let store = MemStore::default();
+    for (persona, vendor) in [("ada", "claude"), ("bo", "codex")] {
+        spin_with(
+            &store,
+            &env,
+            persona,
+            "assistant",
+            vendor,
+            None,
+            Some(home.path()),
+        );
+    }
+    let source = target(&store, "claude:ada");
+    let req = remodel_req("codex");
+    for (seat_id, reason, status, hosted) in [
+        ("claude:ada", VendorSignIn, STATUS_RUNNING, true),
+        ("codex:bo", BlockingDialog, STATUS_RUNNING, true),
+        ("codex:bo", HydrationOverdue, STATUS_RUNNING, true),
+        ("codex:bo", VendorSignIn, STATUS_STOPPED, true),
+        ("codex:bo", VendorSignIn, STATUS_RUNNING, false),
+    ] {
+        let mut seat = record(&store, seat_id);
+        seat.block = Some(fl_watch::HostedBlock {
+            reason,
+            observed_at_ms: stamp::now().unix_millis(),
+        });
+        seat.status = status.into();
+        seat.hosted = hosted;
+        seat.hydration_status = HydrationStatus::Unconfirmed;
+        seat.stop_reason = (status == STATUS_STOPPED).then(|| STOP_REASON_STARTUP_BLOCKED.into());
+        persist_hosted_session(&store, &seat, "owner").unwrap();
+        assert_eq!(record(&store, seat_id).active_block(), seat.block);
+        remodel_precheck(&store, &env, &source, &req, Caller::Owner, |_| {
+            Ok(Some(LaunchSignInIssue::Inconclusive))
+        })
+        .unwrap_or_else(|err| panic!("{seat_id} {reason:?} {status} {hosted}: {err}"));
+    }
+}
+
+#[test]
 fn inconclusive_codex_sign_in_allows_remodel_with_one_warning() {
     let home = TempDir::new().unwrap();
     let workspace = home.path().join("workspace");
