@@ -562,9 +562,14 @@ pub(super) async fn extended(
         XReq::PtyRetentionStatus => Ok(XResp::PtyRetentionStatus {
             status: host.pty_retention_status(),
         }),
-        XReq::HostedExitEvidence { stream, hosted_id } => Ok(XResp::HostedExitEvidence {
-            status: host.hosted_exit_evidence(&stream, &hosted_id),
-        }),
+        XReq::HostedExitEvidence { stream, hosted_id } => {
+            if !cfg!(unix) {
+                return Err(Refusal::Unsupported);
+            }
+            Ok(XResp::HostedExitEvidence {
+                status: host.hosted_exit_evidence(&stream, &hosted_id),
+            })
+        }
         XReq::CheckSessionOwner { stream, hosted_id } => {
             let sessions = host.sessions.lock().unwrap_or_else(|e| e.into_inner());
             let matches = stream.host == *host.authority.instance()

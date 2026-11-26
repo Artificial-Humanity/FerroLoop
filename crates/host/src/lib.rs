@@ -3063,6 +3063,63 @@ mod deadline_tests {
     }
 
     #[test]
+    fn hosted_exit_evidence_preserves_visible_output_through_long_terminal_strings() {
+        use fl_host_proto::HostedExitEvidenceStatus::Exited;
+        let dir = tempfile::tempdir().unwrap();
+        let host = evidence_host(&dir);
+        let hidden = [b'z'; 512];
+        for (epoch, introducer, terminator) in [
+            (1, b"]0;".as_slice(), Some(b"\x07".as_slice())),
+            (2, b"P".as_slice(), None),
+        ] {
+            let (session, journal, writer) =
+                retained_output_fixture(&host, "owned", epoch, true, Some("agent"));
+            let mut chunks = vec![b"fatal: child failed\r\n".as_slice(), b"\x1b", introducer];
+            chunks.extend(std::iter::repeat_n(
+                hidden.as_slice(),
+                70 * 1024 / hidden.len(),
+            ));
+            chunks.extend(terminator);
+            pump_evidence_fixture(&host, &session, &journal, &chunks, Ok(0));
+            session.note_leader(fl_host_proto::ChildExit {
+                code: Some(1),
+                signal: None,
+            });
+            let Exited(evidence) = fixture_evidence(&host, journal.stream(), "agent") else {
+                panic!("expected sanitized terminal evidence");
+            };
+            assert_eq!(evidence.terminal_tail, "fatal: child failed\n");
+            session.note_cleanup(CleanupReport { complete: true });
+            writer.shutdown();
+        }
+        host.shutdown().unwrap();
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn hosted_exit_evidence_dispatch_refuses_unsupported_platform() {
+        use fl_host_proto::{ConnId, ExtensionRefusal, ExtensionRequest, StreamId};
+
+        let dir = tempfile::tempdir().unwrap();
+        let host = evidence_host(&dir);
+        let result = host.inner.handle.block_on(super::daemon::extended(
+            &host.inner,
+            ConnId(1),
+            ExtensionRequest::HostedExitEvidence {
+                stream: StreamId {
+                    host: host.inner.authority.instance().clone(),
+                    session: SessionId::new("owned").unwrap(),
+                    epoch: fl_host_proto::SessionEpoch(1),
+                },
+                hosted_id: "agent".into(),
+            },
+            &mut None,
+        ));
+        assert!(matches!(result, Err(ExtensionRefusal::Unsupported)));
+        host.shutdown().unwrap();
+    }
+
+    #[test]
     fn hosted_exit_evidence_keeps_latest_lines_and_utf8_within_both_limits() {
         use fl_host_proto::HostedExitEvidenceStatus::Exited;
         let dir = tempfile::tempdir().unwrap();

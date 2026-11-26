@@ -97,20 +97,16 @@ enum Escape {
     },
 }
 
-// Carry the parse state from the beginning of the raw stream to the oldest
-// retained byte. Otherwise a truncated OSC/DCS prefix could expose its body.
-#[derive(Clone, Copy, Default)]
-pub(crate) struct TerminalPrefix {
+// Keep the parser across reads so split escape strings and UTF-8 scalars
+// are interpreted correctly even after their raw bytes leave the backlog.
+#[derive(Default)]
+struct TerminalParser {
     escape: Escape,
     utf8: [u8; 4],
     utf8_len: usize,
 }
 
-impl TerminalPrefix {
-    pub(crate) fn skip(&mut self, bytes: &[u8]) {
-        self.scan(bytes, |_| {});
-    }
-
+impl TerminalParser {
     fn scan(&mut self, bytes: &[u8], mut emit: impl FnMut(char)) {
         for &byte in bytes {
             if self.utf8_len != 0 {
@@ -169,22 +165,46 @@ impl TerminalPrefix {
         };
         None
     }
+}
 
-    pub(crate) fn tail(mut self, raw: &[u8]) -> String {
-        const CAP: usize = MAX_HOSTED_EXIT_TAIL_BYTES;
-        let mut ring = [0; CAP];
-        let mut end = 0;
-        self.scan(raw, |ch| {
+const CAP: usize = MAX_HOSTED_EXIT_TAIL_BYTES;
+
+pub(crate) struct TerminalTail {
+    parser: TerminalParser,
+    bytes: [u8; CAP],
+    end: usize,
+    len: usize,
+}
+
+impl TerminalTail {
+    pub(crate) const STORAGE_BYTES: usize = size_of::<Self>() + size_of::<Option<Box<Self>>>();
+
+    pub(crate) fn new() -> Self {
+        Self {
+            parser: TerminalParser::default(),
+            bytes: [0; CAP],
+            end: 0,
+            len: 0,
+        }
+    }
+
+    pub(crate) fn push(&mut self, raw: &[u8]) {
+        self.parser.scan(raw, |ch| {
             for &byte in ch.encode_utf8(&mut [0; 4]).as_bytes() {
-                ring[end % CAP] = byte;
-                end += 1;
+                self.bytes[self.end] = byte;
+                self.end = (self.end + 1) % CAP;
+                self.len = (self.len + 1).min(CAP);
             }
         });
-        let mut start = end.saturating_sub(CAP);
+    }
+
+    pub(crate) fn snapshot(&self) -> String {
+        let end = self.end + CAP;
+        let mut start = end - self.len;
         let mut lines = 0;
-        let trailing_lf = end > 0 && ring[(end - 1) % CAP] == b'\n';
+        let trailing_lf = self.len > 0 && self.bytes[(end - 1) % CAP] == b'\n';
         for index in (start..end - usize::from(trailing_lf)).rev() {
-            if ring[index % CAP] == b'\n' {
+            if self.bytes[index % CAP] == b'\n' {
                 lines += 1;
                 if lines == MAX_HOSTED_EXIT_TAIL_LINES {
                     start = index + 1;
@@ -192,11 +212,11 @@ impl TerminalPrefix {
                 }
             }
         }
-        while start < end && ring[start % CAP] & 0xc0 == 0x80 {
+        while start < end && self.bytes[start % CAP] & 0xc0 == 0x80 {
             start += 1;
         }
         let mut tail = Vec::with_capacity(end - start);
-        tail.extend((start..end).map(|index| ring[index % CAP]));
+        tail.extend((start..end).map(|index| self.bytes[index % CAP]));
         String::from_utf8(tail).expect("terminal tail contains complete UTF-8 scalars")
     }
 }

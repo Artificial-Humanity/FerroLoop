@@ -12,7 +12,7 @@ use fl_host_proto::{
 };
 
 use crate::child::{CleanupReport, DescendantExit};
-use crate::exit_evidence::TerminalPrefix;
+use crate::exit_evidence::TerminalTail;
 
 // A total completion order, independent of map iteration and session names.
 static COMPLETION_ORDER: AtomicU64 = AtomicU64::new(1);
@@ -73,7 +73,7 @@ struct OutBuf {
     bytes: Vec<u8>,
     eof: bool,
     terminal_eof: bool,
-    terminal_prefix: TerminalPrefix,
+    terminal_tail: Option<Box<TerminalTail>>,
     evidence_capture_ms: Option<u64>,
 }
 
@@ -103,6 +103,12 @@ impl Session {
         if let Some(owner) = owner.filter(|s| !s.is_empty() && s.len() <= self.hosted_owner.len()) {
             self.hosted_owner[..owner.len()].copy_from_slice(owner.as_bytes());
             self.hosted_owner_len = owner.len();
+            if self.mode() == fl_host_proto::SessionMode::Pty {
+                self.stdout
+                    .get_mut()
+                    .unwrap_or_else(|err| err.into_inner())
+                    .terminal_tail = Some(Box::new(TerminalTail::new()));
+            }
         }
         self
     }
@@ -297,7 +303,7 @@ impl Session {
                 bytes: Vec::new(),
                 eof: false,
                 terminal_eof: false,
-                terminal_prefix: TerminalPrefix::default(),
+                terminal_tail: None,
                 evidence_capture_ms: None,
             }),
             stdout_cv: Condvar::new(),
@@ -510,19 +516,12 @@ impl Session {
 
     pub fn push_stdout_tail(&self, chunk: &[u8], max_cap: usize) {
         let mut buf = self.stdout.lock().unwrap_or_else(|err| err.into_inner());
-        let track_prefix =
-            self.has_hosted_owner() && self.mode() == fl_host_proto::SessionMode::Pty;
-        let OutBuf {
-            bytes,
-            terminal_prefix,
-            ..
-        } = &mut *buf;
+        if let Some(tail) = &mut buf.terminal_tail {
+            tail.push(chunk);
+        }
+        let bytes = &mut buf.bytes;
         if chunk.len() >= max_cap {
             let drop_n = chunk.len() - max_cap;
-            if track_prefix {
-                terminal_prefix.skip(bytes);
-                terminal_prefix.skip(&chunk[..drop_n]);
-            }
             bytes.clear();
             bytes.extend_from_slice(&chunk[drop_n..]);
         } else {
@@ -530,9 +529,6 @@ impl Session {
                 .len()
                 .saturating_add(chunk.len())
                 .saturating_sub(max_cap);
-            if track_prefix {
-                terminal_prefix.skip(&bytes[..drop_n]);
-            }
             if drop_n > 0 {
                 bytes.drain(..drop_n);
             }
@@ -569,11 +565,11 @@ impl Session {
             exit,
             started_at_ms: self.started_at_ms,
             captured_at_ms,
-            terminal_tail: if journal.pty_mode() {
-                out.terminal_prefix.tail(&out.bytes)
-            } else {
-                String::new()
-            },
+            terminal_tail: out
+                .terminal_tail
+                .as_deref()
+                .map(TerminalTail::snapshot)
+                .unwrap_or_default(),
         })
     }
 
