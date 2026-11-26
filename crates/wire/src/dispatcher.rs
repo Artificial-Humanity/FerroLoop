@@ -7407,9 +7407,7 @@ fn retained_fence_screen_gate(
     }
     let busy = match vendor {
         "claude" => claude_screen_is_busy_main(contents),
-        "codex" => cleaned.lines().map(str::trim).any(|line| {
-            line.starts_with("• Working (") || matches!(line, "• Working..." | "• Working…")
-        }),
+        "codex" => retained_fence_codex_busy(&cleaned),
         "grok" => cleaned
             .lines()
             .any(|line| matches!(line.trim(), "Thinking..." | "Thinking…")),
@@ -7419,6 +7417,37 @@ fn retained_fence_screen_gate(
         return Err(SeatBusy);
     }
     Ok(())
+}
+
+fn retained_fence_codex_busy(cleaned: &str) -> bool {
+    let lines: Vec<_> = cleaned.lines().collect();
+    let Some(composer) = codex_composer_range(&lines) else {
+        return false;
+    };
+    let mut rows = lines[..composer.start].iter().rev().copied();
+    // Codex puts the live status immediately above the composer, with a blank
+    // spacer. A marker elsewhere could be transcript or draft text.
+    let mut row = rows.next();
+    if row.is_some_and(|line| line.trim().is_empty()) {
+        row = rows.next();
+    }
+    let Some(row) = row else {
+        return false;
+    };
+    let is_working = |line: &str| {
+        let line = line.trim();
+        line.starts_with("• Working (") || matches!(line, "• Working..." | "• Working…")
+    };
+    if is_working(row) {
+        return true;
+    }
+    // The status widget may add up to three detail rows. Wrapped rows use
+    // three spaces, and the first detail row has a branch marker.
+    let detail_start = std::iter::once(row)
+        .chain(rows.by_ref())
+        .take(3)
+        .find(|line| !line.starts_with("   "));
+    detail_start.is_some_and(|line| line.starts_with(" └ ")) && rows.next().is_some_and(is_working)
 }
 
 fn retained_fence_codex_onboarding(cleaned: &str) -> bool {
@@ -7497,12 +7526,12 @@ fn retained_fence_submit_proven(
     {
         // The visible composer exactly matches this Wire paste. Inspect the
         // surrounding UI with an empty prompt so mail text cannot mimic it.
-        let empty_prompt = match vendor {
-            "codex" => "› ",
-            "grok" => "> ",
-            _ => "❯ ",
+        let empty_composer: &[&str] = match vendor {
+            "codex" => &["› ", ""], // Keep the blank separator above the footer.
+            "grok" => &["> "],
+            _ => &["❯ "],
         };
-        lines.splice(composer, [empty_prompt]);
+        lines.splice(composer, empty_composer.iter().copied());
         return retained_fence_screen_gate(route, &lines.join("\n"));
     }
     retained_fence_screen_readiness(route, contents, screen.cursor_state())?;
@@ -21259,12 +21288,33 @@ exit 1"#,
         let idle = format!("› Ask Codex to do anything\n\n{footer}");
         let draft = format!("› owner draft\n\n{footer}");
         let busy = format!("• Working (4s · esc to interrupt)\n\n{idle}");
+        let busy_with_details = format!(
+            "• Working (4s · esc to interrupt)\n └ Reading source\n   and its tests\n\n{idle}"
+        );
+        let old_busy = format!("• Working…\nPrevious turn completed.\n\n{idle}");
+        let distant_busy = format!("• Working...\n\n\n{idle}");
+        let busy_draft = format!("› owner draft\n  • Working...\n\n{footer}");
+        let unlocated_busy = format!("• Working...\n\n{footer}");
         let sign_in =
             "\x1b[1mWelcome to Codex\x1b[0m\n\n  › 1. Sign in with ChatGPT\n    2. Use an API key";
         for (screen, expected) in [
             (idle.as_str(), Ok(())),
             (draft.as_str(), Err(FenceRecoveryOutcome::ComposerDraft)),
             (busy.as_str(), Err(FenceRecoveryOutcome::SeatBusy)),
+            (
+                busy_with_details.as_str(),
+                Err(FenceRecoveryOutcome::SeatBusy),
+            ),
+            (old_busy.as_str(), Ok(())),
+            (distant_busy.as_str(), Ok(())),
+            (
+                busy_draft.as_str(),
+                Err(FenceRecoveryOutcome::ComposerDraft),
+            ),
+            (
+                unlocated_busy.as_str(),
+                Err(FenceRecoveryOutcome::Inconclusive),
+            ),
             (footer, Err(FenceRecoveryOutcome::Inconclusive)),
             ("", Err(FenceRecoveryOutcome::BlankScreen)),
             (sign_in, Err(FenceRecoveryOutcome::VendorSignIn)),
@@ -21640,7 +21690,7 @@ exit 1"#,
                                     (_, _, 1) => {
                                         let composer = scenario.payload().replace('\n', "\n  ");
                                         if scenario == BusyBeforeEnter {
-                                            format!("› {composer}\n\n• Working...\n{footer}")
+                                            format!("• Working...\n\n› {composer}\n\n{footer}")
                                         } else {
                                             format!("› {composer}\n\n{footer}")
                                         }
