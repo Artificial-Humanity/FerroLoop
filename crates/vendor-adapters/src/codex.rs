@@ -25,10 +25,10 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use fl_core::vendor_adapter::{
     AdapterIdentityBinding, AdapterReadiness, AttachOrResumeOutcome, AttachOrResumeRequest,
-    ConfigEffectiveScope, LaunchPrerequisiteRefusal, NormalizedSessionTurn, TeardownOutcome,
-    TeardownTarget, TranscriptNormalizeReport, TurnDeliveryOutcome, TurnDeliveryRequest,
-    VendorAdapterError, VendorConfigSpec, VendorHostAdapter, VendorLaunchPlan, VendorLaunchRequest,
-    VendorStartupPromptRule,
+    ConfigEffectiveScope, LaunchPrerequisiteRefusal, LaunchSignInIssue, NormalizedSessionTurn,
+    TeardownOutcome, TeardownTarget, TranscriptNormalizeReport, TurnDeliveryOutcome,
+    TurnDeliveryRequest, VendorAdapterError, VendorConfigSpec, VendorHostAdapter, VendorLaunchPlan,
+    VendorLaunchRequest, VendorStartupPromptRule,
 };
 #[cfg(unix)]
 use ring::rand::{SecureRandom, SystemRandom};
@@ -57,6 +57,20 @@ const MAX_RPC_REQUEST: usize = 1024 * 1024;
 const MAX_ERROR_TEXT: usize = 300;
 /// Control socket relative to `CODEX_HOME` or `~/.codex`.
 pub const CODEX_CONTROL_SOCKET_REL: &str = "app-server-control/app-server-control.sock";
+/// Deadline for connecting to the hosted client's managed daemon.
+#[cfg(unix)]
+const LAUNCH_CONNECT_TIMEOUT: Duration = Duration::from_millis(250);
+/// Shared deadline for the sign-in RPCs after connecting.
+#[cfg(unix)]
+const LAUNCH_AUTH_PROBE_TIMEOUT: Duration = Duration::from_millis(750);
+#[cfg(unix)]
+const LAUNCH_AUTH_DAEMON_VERSION: &str = "0.172.0";
+#[cfg(unix)]
+const ACCOUNT_RATE_LIMITS_READ: &str = "account/rateLimits/read";
+#[cfg(unix)]
+const CODEX_DEFAULT_CHATGPT_BASE_URL: &str = "https://chatgpt.com/backend-api";
+#[cfg(unix)]
+const CODEX_DEFAULT_CHATGPT_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
 
 #[cfg(unix)]
 const WS_GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
@@ -256,8 +270,8 @@ impl VendorHostAdapter for CodexHostAdapter {
         let socket = codex_launch_control_socket(config_home);
         #[cfg(unix)]
         {
-            connect_unix_with_deadline(&socket, Instant::now() + Duration::from_millis(250))
-                .map(drop)
+            connect_unix_with_deadline(&socket, Instant::now() + LAUNCH_CONNECT_TIMEOUT)
+                .map(|_| ())
                 .map_err(|e| codex_prerequisite_refusal(&socket, &format!("{:?}", e.kind())))
         }
         #[cfg(not(unix))]
@@ -268,6 +282,21 @@ impl VendorHostAdapter for CodexHostAdapter {
             ))
         }
     }
+
+    fn probe_launch_auth(&self, config_home: &Path, cwd: &Path) -> Option<LaunchSignInIssue> {
+        #[cfg(unix)]
+        if let Some(cwd) = cwd.to_str() {
+            let socket = codex_launch_control_socket(config_home);
+            let connect_deadline = Instant::now() + LAUNCH_CONNECT_TIMEOUT;
+            if let Ok(stream) = connect_unix_with_deadline(&socket, connect_deadline) {
+                return launch_account_sign_in_issue(stream, cwd);
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = (config_home, cwd);
+        Some(LaunchSignInIssue::Inconclusive)
+    }
+
     fn vendor_id(&self) -> &str {
         "codex"
     }
@@ -727,6 +756,138 @@ impl RpcStage {
             self,
             Self::TurnStart | Self::CompactStart | Self::TurnSteer | Self::TurnInterrupt
         )
+    }
+}
+
+/// Verify managed ChatGPT sign-in through the daemon's authenticated backend usage request.
+#[cfg(unix)]
+fn launch_account_sign_in_issue(stream: UnixStream, cwd: &str) -> Option<LaunchSignInIssue> {
+    let deadline = Instant::now() + LAUNCH_AUTH_PROBE_TIMEOUT;
+    let Ok((mut conn, initialize)) = Conn::initialize_stream(stream, deadline) else {
+        return Some(LaunchSignInIssue::Inconclusive);
+    };
+    // The first initialize can latch the originator for the daemon's lifetime. Allow any
+    // existing originator and check the version in the first userAgent product token.
+    let product_and_version = initialize["userAgent"]
+        .as_str()
+        .and_then(|ua| ua.split_whitespace().next())
+        .and_then(|token| token.split_once('/'));
+    let issue = match product_and_version {
+        Some((originator, LAUNCH_AUTH_DAEMON_VERSION)) if !originator.is_empty() => {
+            check_default_route_sign_in(&mut conn, cwd)
+        }
+        _ => Some(LaunchSignInIssue::Inconclusive),
+    };
+    let _ = conn.send(OP_CLOSE, &1000u16.to_be_bytes());
+    issue
+}
+
+#[cfg(unix)]
+fn check_default_route_sign_in(conn: &mut Conn, cwd: &str) -> Option<LaunchSignInIssue> {
+    use LaunchSignInIssue::{Inconclusive, NotSignedIn};
+
+    let Ok(config) = conn.rpc_reply(2, "config/read", json!({ "cwd": cwd })) else {
+        return Some(Inconclusive);
+    };
+    let config = &config["config"];
+    // A custom provider or backend can launch independently of the managed ChatGPT account.
+    match config.get("model_provider") {
+        Some(Value::Null) => {}
+        Some(Value::String(provider)) if provider == "openai" => {}
+        Some(Value::String(provider)) if !provider.is_empty() => return None,
+        _ => return Some(Inconclusive),
+    }
+    match config.get("chatgpt_base_url") {
+        Some(Value::Null) => {}
+        Some(Value::String(url)) if url.trim_end_matches('/') == CODEX_DEFAULT_CHATGPT_BASE_URL => {
+        }
+        Some(Value::String(url)) if !url.is_empty() => return None,
+        _ => return Some(Inconclusive),
+    }
+    match config.get("openai_base_url") {
+        Some(Value::Null) => {}
+        Some(Value::String(url)) if !url.is_empty() => return None,
+        _ => return Some(Inconclusive),
+    }
+
+    // The legacy status response exposes the exact auth mode. Account summaries
+    // can group agent identity and programmatic tokens under "chatgpt".
+    let Ok(auth) = conn.rpc_reply(
+        3,
+        "getAuthStatus",
+        json!({ "includeToken": false, "refreshToken": false }),
+    ) else {
+        return Some(Inconclusive);
+    };
+    let Some(requires_auth) = auth["requiresOpenaiAuth"].as_bool() else {
+        return Some(Inconclusive);
+    };
+    match auth.get("authMethod") {
+        Some(Value::Null) if requires_auth => return Some(NotSignedIn),
+        Some(Value::Null) => return None,
+        Some(Value::String(method)) => match method.as_str() {
+            "chatgpt" if requires_auth => {}
+            "chatgpt"
+            | "apikey"
+            | "agentIdentity"
+            | "personalAccessToken"
+            | "chatgptAuthTokens"
+            | "headers"
+            | "bedrockApiKey"
+            | "bedrockAccessKeys" => {
+                return None;
+            }
+            _ => return Some(Inconclusive),
+        },
+        _ => return Some(Inconclusive),
+    }
+
+    match conn.rpc_reply(
+        4,
+        ACCOUNT_RATE_LIMITS_READ,
+        json!({ "excludeResetCreditDetails": true }),
+    ) {
+        Ok(reply)
+            if reply["rateLimits"]
+                .as_object()
+                .is_some_and(|limits| !limits.is_empty())
+                && reply["rateLimitsByLimitId"]
+                    .as_object()
+                    .is_some_and(|limits| !limits.is_empty()) =>
+        {
+            None
+        }
+        Err(RpcReplyError::Rejected(error)) => Some(classify_launch_auth_error(&error)),
+        _ => Some(Inconclusive),
+    }
+}
+
+#[cfg(unix)]
+fn classify_launch_auth_error(error: &Value) -> LaunchSignInIssue {
+    use LaunchSignInIssue::{Inconclusive, NotSignedIn, Rejected};
+
+    match (error["code"].as_i64(), error["message"].as_str()) {
+        (
+            Some(-32600),
+            Some(
+                "codex account authentication required to read rate limits"
+                | "chatgpt authentication required to read rate limits",
+            ),
+        ) => NotSignedIn,
+        // Codex 0.172.0 wraps the backend GET error in a JSON-RPC internal error.
+        // Match the endpoint and HTTP status before the untrusted body.
+        (Some(-32603), Some(message))
+            if message
+                .strip_prefix("failed to fetch codex rate limits: GET ")
+                .and_then(|request| request.split_once(' '))
+                .is_some_and(|(url, status)| {
+                    url == CODEX_DEFAULT_CHATGPT_USAGE_URL
+                        && status.starts_with("failed: 401 Unauthorized; content-type=")
+                }) =>
+        {
+            Rejected
+        }
+        _ => Inconclusive,
     }
 }
 
@@ -1393,6 +1554,12 @@ struct Conn {
 }
 
 #[cfg(unix)]
+enum RpcReplyError {
+    Protocol(String),
+    Rejected(Value),
+}
+
+#[cfg(unix)]
 impl Conn {
     fn connect_and_initialize(sock: &Path, deadline: Instant) -> Result<Self, (RpcStage, String)> {
         let stream = connect_unix_with_deadline(sock, deadline).map_err(|e| {
@@ -1404,6 +1571,13 @@ impl Conn {
                 ),
             )
         })?;
+        Self::initialize_stream(stream, deadline).map(|(conn, _)| conn)
+    }
+
+    fn initialize_stream(
+        stream: UnixStream,
+        deadline: Instant,
+    ) -> Result<(Self, Value), (RpcStage, String)> {
         let mut conn = Self {
             stream,
             rbuf: Vec::new(),
@@ -1411,17 +1585,19 @@ impl Conn {
             deadline,
         };
         conn.handshake().map_err(|msg| (RpcStage::Handshake, msg))?;
+        // Keep the same client identity as Wire's managed-daemon control connection.
         conn.send_json(&json!({
             "id": 1,
             "method": "initialize",
             "params": { "clientInfo": { "name": "ferroloop", "version": "0.1.0" } },
         }))
         .map_err(|msg| (RpcStage::Initialize, msg))?;
-        conn.await_rpc_result(1, "initialize", RpcStage::Initialize)
+        let initialize = conn
+            .await_rpc_result(1, "initialize", RpcStage::Initialize)
             .map_err(|(_, msg)| (RpcStage::Initialize, msg))?;
         conn.send_json(&json!({ "method": "initialized", "params": {} }))
             .map_err(|msg| (RpcStage::Initialize, msg))?;
-        Ok(conn)
+        Ok((conn, initialize))
     }
 
     fn io_budget(&self) -> Result<Duration, String> {
@@ -1564,13 +1740,42 @@ impl Conn {
         } else {
             OutcomeClass::Rejected
         };
+        self.await_rpc_reply(id, method)
+            .map_err(|error| match error {
+                RpcReplyError::Protocol(description) => (default_class, description),
+                RpcReplyError::Rejected(error) => {
+                    let description = format!(
+                        "Codex app-server rejected `{method}`: {}",
+                        describe_rpc_error(&error)
+                    );
+                    let code = error.get("code").and_then(Value::as_i64);
+                    // JSON-RPC protocol/validation errors (-32602..-32600) establish definite
+                    // rejection even on mutating requests (for example stale expectedTurnId).
+                    let class = if error.get("message").is_some_and(Value::is_string)
+                        && matches!(code, Some(-32602..=-32600))
+                    {
+                        OutcomeClass::Rejected
+                    } else {
+                        default_class
+                    };
+                    (class, description)
+                }
+            })
+    }
+
+    fn rpc_reply(&mut self, id: i64, method: &str, params: Value) -> Result<Value, RpcReplyError> {
+        self.send_json(&json!({ "id": id, "method": method, "params": params }))
+            .map_err(RpcReplyError::Protocol)?;
+        self.await_rpc_reply(id, method)
+    }
+
+    fn await_rpc_reply(&mut self, id: i64, method: &str) -> Result<Value, RpcReplyError> {
         loop {
-            let text = self.recv_text().map_err(|msg| (default_class, msg))?;
+            let text = self.recv_text().map_err(RpcReplyError::Protocol)?;
             let malformed = || {
-                (
-                    default_class,
-                    format!("Codex app-server sent a malformed response to `{method}`"),
-                )
+                RpcReplyError::Protocol(format!(
+                    "Codex app-server sent a malformed response to `{method}`"
+                ))
             };
             let message: Value = serde_json::from_str(&text).map_err(|_| malformed())?;
             if !message.is_object() {
@@ -1586,31 +1791,15 @@ impl Conn {
                 return Err(malformed());
             }
             if message.get("id").and_then(Value::as_i64) != Some(id) {
-                return Err((
-                    default_class,
-                    format!("Codex app-server response ID did not match `{method}`"),
-                ));
+                return Err(RpcReplyError::Protocol(format!(
+                    "Codex app-server response ID did not match `{method}`"
+                )));
             }
             return match (
                 message.get("error").filter(|error| !error.is_null()),
                 message.get("result"),
             ) {
-                (Some(error), None) => {
-                    let description = format!(
-                        "Codex app-server rejected `{method}`: {}",
-                        describe_rpc_error(error)
-                    );
-                    let code = error.get("code").and_then(Value::as_i64);
-                    // JSON-RPC protocol/validation errors (-32602..-32600) establish definite
-                    // rejection even on mutating requests (for example stale expectedTurnId).
-                    if error.get("message").is_some_and(Value::is_string)
-                        && matches!(code, Some(-32602..=-32600))
-                    {
-                        Err((OutcomeClass::Rejected, description))
-                    } else {
-                        Err((default_class, description))
-                    }
-                }
+                (Some(error), None) => Err(RpcReplyError::Rejected(error.clone())),
                 (None, Some(result)) if result.is_object() => Ok(result.clone()),
                 _ => Err(malformed()),
             };
@@ -1996,8 +2185,16 @@ mod tests {
     ) -> (PathBuf, JoinHandle<Vec<Received>>) {
         let sock = dir.join("codex.sock");
         let _ = std::fs::remove_file(&sock);
-        let listener = UnixListener::bind(&sock).expect("bind fake control socket");
-        let handle = std::thread::spawn(move || {
+        let handle = spawn_fake_server_at(&sock, script);
+        (sock, handle)
+    }
+
+    fn spawn_fake_server_at(
+        socket: &Path,
+        script: impl FnOnce(&mut ServerConn) + Send + 'static,
+    ) -> JoinHandle<Vec<Received>> {
+        let listener = UnixListener::bind(socket).expect("bind fake control socket");
+        std::thread::spawn(move || {
             listener.set_nonblocking(true).unwrap();
             let give_up = Instant::now() + Duration::from_secs(3);
             let stream = loop {
@@ -2021,8 +2218,7 @@ mod tests {
             };
             script(&mut conn);
             conn.log
-        });
-        (sock, handle)
+        })
     }
 
     fn sample_binding() -> AdapterIdentityBinding {
@@ -2373,6 +2569,243 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
         assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"));
+    }
+
+    fn captured_launch_auth() -> Value {
+        serde_json::from_str(include_str!(
+            "../tests/fixtures/codex-0.172.0-launch-sign-in.json"
+        ))
+        .unwrap()
+    }
+
+    fn replay_launch_auth(replies: Vec<Value>) -> Option<LaunchSignInIssue> {
+        let home = tempfile::tempdir().unwrap();
+        let socket = codex_launch_control_socket(home.path());
+        std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+        let project = home.path().join("project");
+        let cwd = project.clone();
+        let replies_count = replies.len();
+        let server = spawn_fake_server_at(&socket, move |conn| {
+            conn.handshake();
+            assert_eq!(
+                conn.expect_json(),
+                json!({
+                    "id": 1,
+                    "method": "initialize",
+                    "params": {"clientInfo": {"name": "ferroloop", "version": "0.1.0"}},
+                })
+            );
+            let mut replies = replies.into_iter();
+            conn.send_text(&replies.next().unwrap().to_string());
+            assert_eq!(conn.expect_json()["method"], "initialized");
+            let expected_requests = [
+                json!({"id": 2, "method": "config/read", "params": {"cwd": cwd}}),
+                json!({
+                    "id": 3,
+                    "method": "getAuthStatus",
+                    "params": {"includeToken": false, "refreshToken": false},
+                }),
+                json!({
+                    "id": 4,
+                    "method": "account/rateLimits/read",
+                    "params": {"excludeResetCreditDetails": true},
+                }),
+            ];
+            for (reply, expected_request) in replies.zip(expected_requests) {
+                assert_eq!(conn.expect_json(), expected_request);
+                conn.send_text(&reply.to_string());
+            }
+            conn.drain_until_eof();
+        });
+        let issue = CodexHostAdapter::default().probe_launch_auth(home.path(), &project);
+        let frames = server.join().unwrap();
+        // One initialize notification in addition to the correlated request/reply pairs.
+        assert_eq!(
+            frames
+                .iter()
+                .filter(|frame| frame.opcode == OP_TEXT)
+                .count(),
+            replies_count + 1
+        );
+        issue
+    }
+
+    #[test]
+    fn launch_auth_accepts_redacted_replies_from_the_live_codex_daemon() {
+        let capture = captured_launch_auth();
+        assert_eq!(
+            replay_launch_auth(vec![
+                capture["initialize"].clone(),
+                capture["config_read"].clone(),
+                capture["get_auth_status"].clone(),
+                capture["account_rate_limits_read"].clone(),
+            ]),
+            None
+        );
+    }
+
+    #[test]
+    fn launch_auth_classifies_only_correlated_rate_limit_results() {
+        use LaunchSignInIssue::{Inconclusive, NotSignedIn, Rejected};
+
+        const AUTH_REJECTION: &str = "failed to fetch codex rate limits: GET https://chatgpt.com/backend-api/wham/usage failed: 401 Unauthorized; content-type=application/json; body=private detail";
+        let responses = [
+            (
+                json!({"id": 4, "error": {"code": -32603, "message": AUTH_REJECTION}}),
+                Rejected,
+            ),
+            (
+                json!({"id": 4, "error": {"code": -32600, "message": "chatgpt authentication required to read rate limits"}}),
+                NotSignedIn,
+            ),
+            (
+                json!({"id": 4, "error": {"code": -32600, "message": "codex account authentication required to read rate limits"}}),
+                NotSignedIn,
+            ),
+            (
+                json!({"id": 4, "error": {"code": -32600, "message": "chatgpt authentication required to read rate limits: additional text"}}),
+                Inconclusive,
+            ),
+            (
+                json!({"id": 4, "error": {"code": -32603, "message": AUTH_REJECTION.replace("chatgpt.com", "other.example")}}),
+                Inconclusive,
+            ),
+            (
+                json!({"id": 4, "error": {"code": -32601, "message": "method not found"}}),
+                Inconclusive,
+            ),
+            (
+                json!({"id": 4, "error": {"code": -32603, "message": "failed to fetch codex rate limits: GET https://chatgpt.com/backend-api/wham/usage failed: 503 Service Unavailable; content-type=application/json; body=failed: 401 Unauthorized; content-type=application/json"}}),
+                Inconclusive,
+            ),
+            (
+                json!({"id": 5, "error": {"code": -32603, "message": AUTH_REJECTION}}),
+                Inconclusive,
+            ),
+            (
+                json!({"id": 4, "error": {"code": -32603, "message": AUTH_REJECTION}, "result": {}}),
+                Inconclusive,
+            ),
+            (json!({"id": 4, "result": {"rateLimits": {}}}), Inconclusive),
+        ];
+        let capture = captured_launch_auth();
+        for (response, expected) in responses {
+            assert_eq!(
+                replay_launch_auth(vec![
+                    capture["initialize"].clone(),
+                    capture["config_read"].clone(),
+                    capture["get_auth_status"].clone(),
+                    response,
+                ]),
+                Some(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn launch_auth_skips_usage_for_other_providers_or_auth_modes() {
+        let capture = captured_launch_auth();
+        for (field, value) in [
+            ("model_provider", "custom"),
+            ("chatgpt_base_url", "https://other.example"),
+            ("openai_base_url", "https://other.example"),
+        ] {
+            let mut config = capture["config_read"].clone();
+            config["result"]["config"][field] = json!(value);
+            assert_eq!(
+                replay_launch_auth(vec![capture["initialize"].clone(), config]),
+                None
+            );
+        }
+        for method in [
+            "apikey",
+            "agentIdentity",
+            "personalAccessToken",
+            "chatgptAuthTokens",
+            "headers",
+            "bedrockApiKey",
+            "bedrockAccessKeys",
+        ] {
+            let mut auth = capture["get_auth_status"].clone();
+            auth["result"]["authMethod"] = json!(method);
+            assert_eq!(
+                replay_launch_auth(vec![
+                    capture["initialize"].clone(),
+                    capture["config_read"].clone(),
+                    auth,
+                ]),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn launch_auth_reports_daemon_sign_in_status_before_checking_rate_limits() {
+        use LaunchSignInIssue::{Inconclusive, NotSignedIn};
+
+        let capture = captured_launch_auth();
+        for (status, expected) in [
+            (
+                json!({"authMethod": null, "authToken": null, "requiresOpenaiAuth": true}),
+                Some(NotSignedIn),
+            ),
+            (
+                json!({"authMethod": null, "authToken": null, "requiresOpenaiAuth": false}),
+                None,
+            ),
+            (json!({"requiresOpenaiAuth": true}), Some(Inconclusive)),
+            (json!({"authMethod": null}), Some(Inconclusive)),
+            (
+                json!({"authMethod": "unknown-mode", "requiresOpenaiAuth": true}),
+                Some(Inconclusive),
+            ),
+        ] {
+            assert_eq!(
+                replay_launch_auth(vec![
+                    capture["initialize"].clone(),
+                    capture["config_read"].clone(),
+                    json!({"id": 3, "result": status}),
+                ]),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn launch_auth_does_not_query_unknown_daemon_versions_or_config_shapes() {
+        let capture = captured_launch_auth();
+        for user_agent in ["codex-tui/0.173.0", "codex-tui/0.172.0-beta.1", "unknown"] {
+            assert_eq!(
+                replay_launch_auth(vec![json!({"id": 1, "result": {"userAgent": user_agent}})]),
+                Some(LaunchSignInIssue::Inconclusive)
+            );
+        }
+        for config in [json!({}), json!({"model_provider": 0}), Value::Null] {
+            assert_eq!(
+                replay_launch_auth(vec![
+                    capture["initialize"].clone(),
+                    json!({"id": 2, "result": {"config": config}}),
+                ]),
+                Some(LaunchSignInIssue::Inconclusive)
+            );
+        }
+    }
+
+    #[test]
+    fn launch_auth_reports_an_unresponsive_daemon_as_inconclusive() {
+        let home = tempfile::tempdir().unwrap();
+        let socket = codex_launch_control_socket(home.path());
+        std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+        let server = spawn_fake_server_at(&socket, |conn| {
+            conn.handshake();
+            assert_eq!(conn.expect_json()["method"], "initialize");
+            conn.drain_until_eof();
+        });
+        assert_eq!(
+            CodexHostAdapter::default().probe_launch_auth(home.path(), home.path()),
+            Some(LaunchSignInIssue::Inconclusive)
+        );
+        server.join().unwrap();
     }
 
     #[test]

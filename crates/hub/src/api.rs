@@ -8901,6 +8901,16 @@ fn handle_post_session_remodel(
     session_id: &str,
     req: &HttpRequest,
 ) -> HttpResponse {
+    handle_post_session_remodel_with_env(state, authority, session_id, req, &lifecycle_env(state))
+}
+
+pub(crate) fn handle_post_session_remodel_with_env(
+    state: &HubState,
+    authority: &HubAuthority,
+    session_id: &str,
+    req: &HttpRequest,
+    env: &LifecycleEnv<'_>,
+) -> HttpResponse {
     if !authority.is_owner() {
         return HttpResponse::json(
             403,
@@ -8917,8 +8927,7 @@ fn handle_post_session_remodel(
     };
     let by = authority.actor_name();
     let persona = target.persona.clone();
-    let env = lifecycle_env(state);
-    match lifecycle::with_lifecycle_fence(&env, &persona, "remodel", |env| {
+    match lifecycle::with_lifecycle_fence(env, &persona, "remodel", |env| {
         #[cfg(test)]
         BEFORE_REMODEL_STORE_READ.with_borrow_mut(|hook| {
             if let Some(f) = hook.take() {
@@ -8926,6 +8935,18 @@ fn handle_post_session_remodel(
             }
         });
         let (store, target) = owned_lifecycle_target(state, session_id, &persona)?;
+        let caller = caller_of(authority);
+        let mut observations = lifecycle::LaunchAuthObservations::new();
+        let (store, target) = if let Some(auth_target) =
+            lifecycle::remodel_auth_target(&*store, env, &target, &payload, caller)?
+        {
+            drop(store);
+            let issue = auth_target.probe(env);
+            observations.insert(auth_target, issue);
+            owned_lifecycle_target(state, session_id, &persona)?
+        } else {
+            (store, target)
+        };
         Ok(
             match run_remodel(
                 state,
@@ -8934,7 +8955,8 @@ fn handle_post_session_remodel(
                 &target,
                 &payload,
                 by,
-                caller_of(authority),
+                caller,
+                &observations,
             ) {
                 RemodelRun::Done { data, .. } => HttpResponse::json(200, data),
                 RemodelRun::Failed { data, .. } => HttpResponse::json(502, data),
@@ -8971,6 +8993,7 @@ pub(crate) enum RemodelRun {
 /// handshake queueing for `prepare`, and the `session.remodeled` / `session.remodel_failed`
 /// broadcast. The caller acquires the persona fence before reopening `store` and passes
 /// its borrowed proof in `env`; both remain held until this returns.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn run_remodel(
     state: &HubState,
     store: &AnyStore,
@@ -8979,20 +9002,30 @@ pub(crate) fn run_remodel(
     payload: &RemodelRequest,
     by: &str,
     caller: lifecycle::Caller,
+    observations: &lifecycle::LaunchAuthObservations,
 ) -> RemodelRun {
     // The overrides the teardown clears, as they were, so a restore can put them back.
     let mut cleared_overrides: Vec<(String, ModelOverride)> = Vec::new();
-    let result = lifecycle::remodel_session(store, env, target, payload, by, caller, |key| {
-        for k in [key.to_string(), key.to_ascii_lowercase()] {
-            if let Some(o) = state.session_model_override(&k)
-                && !cleared_overrides.iter().any(|(seen, _)| *seen == k)
-            {
-                cleared_overrides.push((k, o));
+    let result = lifecycle::remodel_session_with_auth(
+        store,
+        env,
+        target,
+        payload,
+        by,
+        caller,
+        observations,
+        |key| {
+            for k in [key.to_string(), key.to_ascii_lowercase()] {
+                if let Some(o) = state.session_model_override(&k)
+                    && !cleared_overrides.iter().any(|(seen, _)| *seen == k)
+                {
+                    cleared_overrides.push((k, o));
+                }
             }
-        }
-        state.clear_session_prompt_queue(key);
-        state.clear_session_model_override(key);
-    });
+            state.clear_session_prompt_queue(key);
+            state.clear_session_model_override(key);
+        },
+    );
     // Teardown and spin-up dropped the route scan; the store snapshot is dropped for every
     // write request. Drop the scan here too, so a failed remodel's restore shows at once.
     crate::discovery::invalidate_route_discovery_cache();

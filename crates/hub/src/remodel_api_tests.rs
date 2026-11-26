@@ -84,6 +84,83 @@ fn override_model(state: &HubState, key: &str) -> Option<String> {
 }
 
 #[test]
+fn remodel_revalidates_the_destination_after_probing_without_the_store_lock() {
+    use crate::auth::HubAuthority;
+    use lifecycle::{Caller, FakeRuntime, SpinUpRequest, TEST_LAUNCH_AUTH};
+    use std::io::Write;
+
+    let tmp = TempDir::new().unwrap();
+    let old_cwd = tmp.path().join("old-cwd");
+    let updated_cwd = tmp.path().join("updated-cwd");
+    std::fs::create_dir(&old_cwd).unwrap();
+    std::fs::create_dir(&updated_cwd).unwrap();
+    let _trusted = lifecycle::trusted_codex_home(tmp.path(), &old_cwd);
+    writeln!(
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(tmp.path().join(".codex/config.toml"))
+            .unwrap(),
+        "\n[projects.{}]\ntrust_level = \"trusted\"",
+        serde_json::to_string(updated_cwd.canonicalize().unwrap().to_str().unwrap()).unwrap(),
+    )
+    .unwrap();
+
+    let state = hub(&tmp);
+    let fake = FakeRuntime::default();
+    let env = fake.env(tmp.path());
+    lifecycle::spin_up(
+        &*state.open_store().unwrap(),
+        &env,
+        &SpinUpRequest {
+            persona: "ada".into(),
+            project: "ferroloop".into(),
+            role: "assistant".into(),
+            vendor: "claude".into(),
+            cwd: Some(old_cwd.display().to_string()),
+            ..SpinUpRequest::default()
+        },
+        "owner",
+        Caller::Owner,
+    )
+    .unwrap();
+    fake.calls.borrow_mut().clear();
+
+    let probe_state = state.clone();
+    let old_cwd = old_cwd.canonicalize().unwrap();
+    TEST_LAUNCH_AUTH.with(|slot| {
+        *slot.borrow_mut() = Some(Box::new(move |target| {
+            assert_eq!(target.cwd, old_cwd);
+            let store = probe_state
+                .try_open_lifecycle_store()
+                .expect("the HTTP remodel must release the store during the sign-in request");
+            let mut record = lifecycle::list_hosted_sessions(&*store).unwrap().remove(0);
+            record.cwd = Some(updated_cwd.display().to_string());
+            lifecycle::persist_hosted_session(&*store, &record, "owner").unwrap();
+            None
+        }))
+    });
+    let req = HttpRequest::new("POST", "/api/v1/sessions/claude:ada/remodel")
+        .with_json_body(&json!({"vendor": "codex"}));
+    let response = crate::api::handle_post_session_remodel_with_env(
+        &state,
+        &HubAuthority::Owner {
+            login: "owner".into(),
+        },
+        "claude:ada",
+        &req,
+        &env,
+    );
+    assert_eq!(response.status, 409, "{}", body_text(&response));
+    assert!(body_text(&response).contains("launch target changed"));
+    assert!(
+        fake.calls.borrow().is_empty(),
+        "the old runtime must remain intact"
+    );
+    assert_eq!(records(&state).len(), 1);
+    assert_eq!(records(&state)[0].status, lifecycle::STATUS_RUNNING);
+}
+
+#[test]
 fn execute_returns_the_new_session_sets_the_model_override_and_broadcasts() {
     let tmp = TempDir::new().unwrap();
     let state = hub(&tmp);
