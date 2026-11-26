@@ -182,6 +182,11 @@ fn host_list_preserves_live_rows_without_migrating_a_store() {
     assert_eq!(row.get("vendor_versions"), Some(&Value::Null));
     assert!(!f.root.path().join("fl.fls").exists());
 
+    let empty_ferro = f.root.path().join("fl.fls");
+    std::fs::write(&empty_ferro, []).unwrap();
+    assert_eq!(f.json(&["host", "list", "--json"], false), rows);
+    assert_eq!(std::fs::metadata(&empty_ferro).unwrap().len(), 0);
+
     let legacy = f.root.path().join("legacy.redb");
     drop(fl_store::open_redb(&legacy).unwrap());
     let original = std::fs::read(&legacy).unwrap();

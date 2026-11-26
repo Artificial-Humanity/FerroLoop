@@ -783,6 +783,8 @@ export interface HostedVendorVersions {
 
 export interface HostedSessionSummary {
   session_id: string;
+  vendor_session_id?: string | null;
+  hosted?: boolean;
   persona: string;
   project: string;
   role: string;

@@ -78,6 +78,14 @@ function makeRoutedApiClient(routes: Record<string, unknown>): HubApiClient {
   return new HubApiClient({ fetchImpl: fetchImpl as unknown as typeof fetch });
 }
 
+function deferredHostedSessions() {
+  let resolve!: (value: { sessions: HostedSessionSummary[] }) => void;
+  const promise = new Promise<{ sessions: HostedSessionSummary[] }>((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
+}
+
 const PANE_TEST_IDS: Record<string, string> = {
   git: "git-pr-pane",
   terminal: "terminal-pane",
@@ -330,6 +338,87 @@ describe("Phone shell (< 768px)", () => {
     expect(
       screen.getByRole("img", { name: "Hosted vendor version changed for JARVIS" }),
     ).toBeVisible();
+  });
+
+  it("shows the version of the selected concrete session for a persona", async () => {
+    setViewport(1280, 844);
+    const hosted = {
+      persona: "jarvis", project: "AI-Lab-AMD", role: "lab_manager",
+      hydration_dispatched: true, hosted: true, node_id: "lab", status: "running",
+    };
+    const versions = (cli: string) => ({ cli, daemon: null, daemon_expected: false, changes: [] });
+    const apiClient = makeRoutedApiClient({
+      "/api/v1/auth/session": { authenticated: true, authority: { tier: "owner", login: "owner" } },
+      "/api/v1/agents": { agents: TEST_WORKSPACE_AGENTS, routes: [] },
+      "/api/v1/projects": { projects: TEST_PROJECTS },
+      "/api/v1/hosted-sessions": { sessions: [
+        { ...hosted, session_id: "codex:jarvis", vendor_session_id: "codex-native", vendor: "codex", vendor_versions: versions("1.0.0") },
+        { ...hosted, session_id: "claude:jarvis", vendor_session_id: "claude-native", vendor: "claude", vendor_versions: versions("2.0.0") },
+        { ...hosted, session_id: "grok:jarvis", vendor_session_id: "external", vendor: "grok", hosted: false, vendor_versions: versions("9.0.0") },
+      ] },
+      "/api/v1/sessions": { sessions: [
+        { id: "codex-native", persona: "jarvis", adapter: "codex", source: "route", status: "active" },
+        { id: "claude-native", persona: "jarvis", adapter: "claude", source: "route", status: "active" },
+        { id: "external", persona: "jarvis", adapter: "grok", source: "route", status: "active" },
+      ] },
+    });
+    render(<App apiClient={apiClient} wsClient={makeStubWsClient()} />);
+    fireEvent.click(await screen.findByTestId("agent-row-jarvis"));
+    expect(await screen.findByText("CLI version 1.0.0")).toBeVisible();
+    const selector = screen.getByTestId("session-selector");
+    fireEvent.change(selector, { target: { value: "claude-native" } });
+    expect(await screen.findByText("CLI version 2.0.0")).toBeVisible();
+    expect(screen.queryByText("CLI version 1.0.0")).not.toBeInTheDocument();
+    fireEvent.change(selector, { target: { value: "external" } });
+    expect(screen.queryByText(/CLI version/)).not.toBeInTheDocument();
+  });
+
+  it("ignores a hosted GET started before a restart reused the same session id", async () => {
+    setViewport(1280, 844);
+    const hosted: HostedSessionSummary = {
+      session_id: "codex:jarvis", persona: "jarvis", project: "AI-Lab-AMD",
+      role: "lab_manager", vendor: "codex", hosted: true, hydration_dispatched: true,
+      node_id: "lab", status: "running",
+      vendor_versions: { cli: "1.0.0", daemon: null, daemon_expected: false, changes: [] },
+    };
+    const apiClient = makeRoutedApiClient({
+      "/api/v1/auth/session": { authenticated: true, authority: { tier: "owner", login: "owner" } },
+      "/api/v1/agents": { agents: TEST_WORKSPACE_AGENTS, routes: [] },
+      "/api/v1/projects": { projects: TEST_PROJECTS },
+      "/api/v1/hosted-sessions": { sessions: [hosted] },
+    });
+    const subscriptions = new Map<string, WsFrameHandler>();
+    const wsClient = Object.assign(makeStubWsClient(), {
+      subscribe: (channel: string, handler: WsFrameHandler) => {
+        subscriptions.set(channel, handler);
+        return () => subscriptions.delete(channel);
+      },
+    });
+    render(<App apiClient={apiClient} wsClient={wsClient} />);
+    fireEvent.click(await screen.findByTestId("agent-row-jarvis"));
+    expect(await screen.findByText("CLI version 1.0.0")).toBeVisible();
+    const beforeRestart = deferredHostedSessions();
+    const afterRestart = deferredHostedSessions();
+    const getHostedSessions = vi.spyOn(apiClient, "getHostedSessions")
+      .mockReturnValueOnce(beforeRestart.promise)
+      .mockReturnValue(afterRestart.promise);
+    const deliver = (event: string) => act(() => {
+      subscriptions.get("sessions")!({
+        channel: "sessions", event,
+        data: { session_id: hosted.session_id, persona: hosted.persona, vendor: hosted.vendor },
+      });
+    });
+    deliver("session.vendor_versions_observed");
+    await waitFor(() => expect(getHostedSessions).toHaveBeenCalledTimes(1));
+    deliver("session.restarted");
+    expect(await screen.findByText("CLI version unknown")).toBeVisible();
+    await waitFor(() => expect(getHostedSessions).toHaveBeenCalledTimes(2));
+    await act(async () => beforeRestart.resolve({ sessions: [hosted] }));
+    expect(screen.queryByText("CLI version 1.0.0")).not.toBeInTheDocument();
+    await act(async () => afterRestart.resolve({
+      sessions: [{ ...hosted, vendor_versions: { ...hosted.vendor_versions!, cli: "2.0.0" } }],
+    }));
+    expect(await screen.findByText("CLI version 2.0.0")).toBeVisible();
   });
 
   it("routes an artifact open event to the artifacts view without touching desktop state", () => {

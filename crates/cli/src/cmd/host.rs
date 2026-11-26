@@ -8,7 +8,7 @@ use fl_host_proto::{
     BlockingHostClient, ChildState, HostConfig, HostEndpoint, SendOutcome, SessionSummary,
 };
 use fl_hub::lifecycle::{
-    HostedVendorVersionComponent, HostedVendorVersions, hosted_vendor_versions_for_stream,
+    HostedVendorVersionComponent, HostedVendorVersions, read_hosted_vendor_versions,
 };
 use fl_wire::vendor_adapter::{
     host_session_id_to_unit, lifecycle_id_to_host_session_id, matching_live_host_sessions,
@@ -244,17 +244,14 @@ fn resolve_target_session_with_agents<'a>(
         .ok_or_else(|| anyhow::anyhow!("no fl-host session matching `{target}`"))
 }
 
-fn host_workspace_store_path(db: Option<&Path>) -> Option<PathBuf> {
+fn host_store_path(db: Option<&Path>, bound_cwd: Option<&Path>) -> Option<PathBuf> {
     match crate::explicit_db(db.map(Path::to_path_buf)) {
         Some(p) => Some(p),
         None => {
             let default = crate::default_state_store_path().ok();
             let config_path = crate::config::path();
             match crate::config::load(config_path.as_deref()) {
-                Ok(cfg) => match default {
-                    Some(d) => Some(cfg.workspace_state_store(&d)),
-                    None => cfg.state.as_ref().and_then(|s| s.store.clone()),
-                },
+                Ok(cfg) => super::hub::configured_hub_store_path(&cfg, bound_cwd).or(default),
                 Err(error) => {
                     eprintln!(
                         "warning: failed to load {}: {error:#}; using default store",
@@ -271,7 +268,7 @@ fn host_workspace_store_path(db: Option<&Path>) -> Option<PathBuf> {
 }
 
 fn load_registry_agents(db: Option<&Path>) -> Result<Vec<fl_core::AgentRecord>> {
-    let Some(path) = host_workspace_store_path(db) else {
+    let Some(path) = host_store_path(db, None) else {
         return Ok(Vec::new());
     };
     if !fl_store::store_exists(&path) {
@@ -285,38 +282,6 @@ fn load_registry_agents(db: Option<&Path>) -> Result<Vec<fl_core::AgentRecord>> 
         .with_context(|| format!("could not list agents from {}", path.display()))
 }
 
-fn open_host_version_store(path: &Path) -> Option<fl_store::AnyStore> {
-    use fl_store::{BackendKind, StoreOptions, Unmigrated};
-
-    let configured = std::env::var(fl_store::BACKEND_ENV).ok();
-    let backend = fl_store::choose_backend(path, configured.as_deref()).ok()?;
-    let physical = fl_store::physical_path(path, backend);
-    if backend == BackendKind::Ferro && physical.is_file() {
-        return fl_store::open_store_with(
-            path,
-            &StoreOptions {
-                backend: Some(backend),
-                retries: 0,
-                unmigrated: Unmigrated::Refuse,
-            },
-        )
-        .ok();
-    }
-    // Read a lone redb in place, without migration or recovery. A present but
-    // unusable .fls still owns the store identity, so don't show its old backup.
-    if (backend == BackendKind::Redb
-        || (path != physical
-            && std::fs::symlink_metadata(&physical)
-                .is_err_and(|err| err.kind() == std::io::ErrorKind::NotFound)))
-        && path.is_file()
-    {
-        return fl_store::RedbStore::open_read_only(path, 0)
-            .ok()
-            .map(Into::into);
-    }
-    None
-}
-
 #[derive(serde::Serialize)]
 struct HostListRow<'a> {
     id: &'a str,
@@ -328,13 +293,11 @@ struct HostListRow<'a> {
 }
 
 impl<'a> HostListRow<'a> {
-    fn from_session(summary: &'a SessionSummary, store: Option<&impl fl_core::StateStore>) -> Self {
+    fn from_session(
+        summary: &'a SessionSummary,
+        vendor_versions: Option<HostedVendorVersions>,
+    ) -> Self {
         let (vendor, state, pid) = session_vendor_and_state(summary);
-        let vendor_versions = store.and_then(|store| {
-            hosted_vendor_versions_for_stream(store, &summary.stream)
-                .ok()
-                .flatten()
-        });
         Self {
             id: summary.stream.session.as_str(),
             unit: host_session_id_to_unit(&summary.stream.session),
@@ -526,14 +489,21 @@ pub fn execute_with_db(cmd: HostCmd, db: Option<&Path>) -> Result<()> {
                     .list_sessions()
                     .context("failed to list fl-host sessions")?,
             );
-            let store = if sessions.is_empty() {
-                None
+            let versions = if sessions.is_empty() {
+                Vec::new()
             } else {
-                host_workspace_store_path(db).and_then(|path| open_host_version_store(&path))
+                let cwd = std::env::current_dir().ok();
+                host_store_path(db, cwd.as_deref())
+                    .and_then(|path| {
+                        let streams = sessions.iter().map(|s| &s.stream).collect::<Vec<_>>();
+                        read_hosted_vendor_versions(&path, &streams).ok()
+                    })
+                    .unwrap_or_default()
             };
             let rows: Vec<_> = sessions
                 .iter()
-                .map(|session| HostListRow::from_session(session, store.as_ref()))
+                .zip(versions.into_iter().chain(std::iter::repeat(None)))
+                .map(|(session, versions)| HostListRow::from_session(session, versions))
                 .collect();
             if json {
                 println!("{}", serde_json::to_string_pretty(&rows)?);
@@ -703,7 +673,7 @@ mod tests {
         use fl_hub::lifecycle::HostedVendorVersionChange;
 
         let session = make_summary("Bea.codex", 102);
-        let mut row = HostListRow::from_session(&session, None::<&fl_store::AnyStore>);
+        let mut row = HostListRow::from_session(&session, None);
         let json = serde_json::to_value(&row).unwrap();
         assert_eq!(
             json,
@@ -744,6 +714,27 @@ mod tests {
         );
         let text = row.render_text();
         assert!(text.contains("unknown  ! CLI changed: 0.167.0 -> 0.172.0"));
+    }
+
+    #[test]
+    fn host_list_follows_the_hubs_bound_project() {
+        let work = tempfile::tempdir().unwrap();
+        let project = work.path().join("project");
+        std::fs::create_dir(&project).unwrap();
+        let store = work.path().join("project.fls");
+        let config = crate::config::parse(
+            &work.path().join("config.toml"),
+            &format!("[[project]]\nroot = {:?}\nstore = {:?}\n", project, store),
+        )
+        .unwrap();
+        assert_eq!(
+            super::super::hub::configured_hub_store_path(&config, Some(&project)),
+            Some(store)
+        );
+        assert_eq!(
+            super::super::hub::configured_hub_store_path(&config, None),
+            None
+        );
     }
 
     #[test]
