@@ -23485,8 +23485,11 @@ mod tests {
             )
             .unwrap()
         );
-        let evidence = state.exit_evidence.capture(&fake, &record).unwrap();
-        assert!(state.exit_evidence.count_exit(&record, Some(evidence), 20));
+        TEST_RESPAWN_NOW_MS.with(|clock| clock.set(Some(20)));
+        let evidence = state.exit_evidence.capture(&fake, &record);
+        exit_evidence::save_counted_exit(&store, &record, &mut state, evidence, AUTO_RESPAWN_ACTOR)
+            .unwrap();
+        assert!(state.exit_evidence.latest_evidence().is_some());
 
         let recipient_filter = |name: &str| fl_core::ferrowire::WireFilter {
             recipient: Some(name.into()),
