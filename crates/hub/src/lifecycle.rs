@@ -8229,8 +8229,8 @@ fn reconcile_dead_hosted_session_fenced<S: StateStore>(
                     }
                 } else {
                     let observed_at_ms = current_respawn_clock_ms();
-                    let evidence = if record.active_block().is_some() {
-                        // A saved flag can outlive its screen sample. Count the exit without
+                    let evidence = if blockers::screen_block(&record).is_some() {
+                        // A saved screen flag can outlive its sample. Count the exit without
                         // fetching a terminal tail that may contain sign-in material.
                         fl_host_proto::HostedExitEvidenceStatus::Unavailable
                     } else {
@@ -21532,23 +21532,47 @@ mod tests {
     }
 
     #[test]
-    fn persisted_sign_in_flag_without_current_evidence_skips_terminal_capture() {
+    fn persisted_screen_block_without_current_evidence_skips_terminal_capture() {
         use fl_host_proto::{
             ChildExit, ChildRecord, ChildState, HostInstance, HostedExitEvidence, InputState,
             SessionEpoch, SessionId, SessionMode, SessionSummary, SpawnKind, StreamId,
         };
+        use fl_watch::HostedBlockReason::{BlockingDialog, HydrationOverdue, VendorSignIn};
 
+        let tail = "private terminal content";
         let first_fast_ms = 1_000;
         let last_in_window_ms = first_fast_ms + AUTO_RESPAWN_WINDOW_MS - 1;
-        for (exit_code, stop_reason, pending_at_ms) in [
-            (1, STOP_REASON_RUNTIME_GONE, None),
-            (1, STOP_REASON_RUNTIME_GONE, Some(last_in_window_ms)),
-            (0, STOP_REASON_CLEAN_EXIT, None),
+        for (block_reason, exit_code, stop_reason, pending_at_ms, expect_capture) in [
+            (
+                Some(HydrationOverdue),
+                1,
+                STOP_REASON_RUNTIME_GONE,
+                None,
+                true,
+            ),
+            (None, 1, STOP_REASON_RUNTIME_GONE, None, true),
+            (
+                Some(BlockingDialog),
+                1,
+                STOP_REASON_RUNTIME_GONE,
+                None,
+                false,
+            ),
+            (Some(VendorSignIn), 1, STOP_REASON_RUNTIME_GONE, None, false),
+            (
+                Some(VendorSignIn),
+                1,
+                STOP_REASON_RUNTIME_GONE,
+                Some(last_in_window_ms),
+                false,
+            ),
+            (Some(VendorSignIn), 0, STOP_REASON_CLEAN_EXIT, None, false),
         ] {
             let _reset = RecoveryFixtureReset;
             let home = TempDir::new().unwrap();
             let _trusted = trusted_codex_home(home.path(), home.path());
             let store = MemStore::default();
+            register(&store, "captain", "ferroloop", AgentRole::Lead);
             let fake = FakeRuntime::default();
             let evidence = blockers::PromptExitEvidence::default();
             let mut env = fake.env(home.path());
@@ -21557,8 +21581,8 @@ mod tests {
             record.cwd = Some(home.path().display().to_string());
             record.hydration_generation = Some(next_hydration_generation());
             record.runtime_leader_pid = Some(9876);
-            record.block = Some(fl_watch::HostedBlock {
-                reason: fl_watch::HostedBlockReason::VendorSignIn,
+            record.block = block_reason.map(|reason| fl_watch::HostedBlock {
+                reason,
                 observed_at_ms: 1,
             });
             persist_hosted_session(&store, &record, "test").unwrap();
@@ -21580,7 +21604,7 @@ mod tests {
                 exit: exit.clone(),
                 started_at_ms: 10,
                 captured_at_ms: 20,
-                terminal_tail: "private sign-in prompt content".into(),
+                terminal_tail: tail.into(),
             });
             let mut respawn = HostedRespawnState::default();
             let launcher = if pending_at_ms.is_some() {
@@ -21624,6 +21648,7 @@ mod tests {
                 let incident = serde_json::to_value(&respawn.exit_evidence).unwrap();
                 let mut entry = incident["exits"][0].as_object().unwrap().clone();
                 assert_eq!(entry.remove("pending"), Some(serde_json::Value::Bool(true)));
+                entry.insert("screen_tail_withheld".into(), serde_json::Value::Bool(true));
                 (observed_at_ms, serde_json::Value::Object(entry))
             });
 
@@ -21664,7 +21689,13 @@ mod tests {
                 .unwrap();
             assert_eq!(stopped.status, STATUS_STOPPED);
             assert_eq!(stopped.stop_reason.as_deref(), Some(stop_reason));
-            assert!(fake.hosted_exit_lookups.borrow().is_empty());
+            assert!(stopped.block.is_none());
+            let expected_lookups = if expect_capture {
+                vec![(stream.clone(), record.session_id.clone())]
+            } else {
+                Vec::new()
+            };
+            assert_eq!(*fake.hosted_exit_lookups.borrow(), expected_lookups);
 
             let counted = load_hosted_respawn_state(&store, &record.session_id).unwrap();
             if prior_exit.is_some() {
@@ -21691,7 +21722,20 @@ mod tests {
                 let exits = incident["exits"].as_array().unwrap();
                 assert_eq!(exits.len(), 1);
                 assert_eq!(exits[0]["stream"], serde_json::to_value(stream).unwrap());
-                assert_eq!(exits[0].get("evidence"), Some(&serde_json::Value::Null));
+                if expect_capture {
+                    assert_eq!(
+                        counted
+                            .exit_evidence
+                            .latest_evidence()
+                            .unwrap()
+                            .terminal_tail,
+                        tail
+                    );
+                    assert!(exits[0].get("screen_tail_withheld").is_none());
+                } else {
+                    assert_eq!(exits[0].get("evidence"), Some(&serde_json::Value::Null));
+                    assert_eq!(exits[0]["screen_tail_withheld"], true);
+                }
                 assert!(exits[0].get("pending").is_none());
                 if let Some((observed_at_ms, prior_exit)) = prior_exit {
                     assert!(
@@ -21708,13 +21752,27 @@ mod tests {
                     assert_eq!(state.respawn_timestamps_ms, respawn.respawn_timestamps_ms);
                     let incident = serde_json::to_value(&state.exit_evidence).unwrap();
                     assert_eq!(incident["exits"], serde_json::json!([prior_exit]));
+                    let filter = fl_core::ferrowire::WireFilter {
+                        recipient: Some("captain".into()),
+                        ..Default::default()
+                    };
+                    let mut inbox = store.list_wire_inbox(&filter).unwrap();
+                    assert_eq!(inbox.len(), 1);
+                    let message = &inbox[0].message;
+                    assert!(message.subject.contains("Crash loop"));
+                    assert!(message.body.contains("evidence: unavailable"));
+                    assert!(message.body.contains(
+                        "A vendor sign-in screen or blocking prompt was flagged before an exit"
+                    ));
+                    hosted_recovery_notice::attach_to_local_inbox(&store, &filter, &mut inbox);
+                    assert!(!inbox[0].message.body.contains(tail));
                 } else {
                     assert_eq!(recovered.len(), 1);
                     assert_eq!(recovered[0].record.status, STATUS_RUNNING);
                     assert_eq!(fake.launches.borrow().len(), 1);
                 }
             }
-            assert!(fake.hosted_exit_lookups.borrow().is_empty());
+            assert_eq!(*fake.hosted_exit_lookups.borrow(), expected_lookups);
         }
     }
 

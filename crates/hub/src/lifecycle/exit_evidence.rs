@@ -32,6 +32,8 @@ struct CountedExit {
     // A withheld Pending exit still needs its first budget decision at the original time.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     classify_at_observation: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    screen_tail_withheld: bool,
 }
 
 impl CountedExit {
@@ -48,6 +50,7 @@ impl CountedExit {
             evidence,
             pending,
             classify_at_observation: false,
+            screen_tail_withheld: false,
         }
     }
 }
@@ -277,12 +280,13 @@ impl HostedExitIncident {
         let Some(launch) = self.matching_launch(record) else {
             return false;
         };
-        let suppress_pending = record.active_block().is_some()
+        let screen_tail_withheld = blockers::screen_block(record).is_some()
             && matches!(status, HostedExitEvidenceStatus::Unavailable);
-        let exit = CountedExit::new(launch, status, now);
+        let mut exit = CountedExit::new(launch, status, now);
+        exit.screen_tail_withheld = screen_tail_withheld;
         // A prior reconcile can have saved Pending before the stopped record.
-        // Finalize it before recovery can fetch a flagged launch's terminal tail.
-        if suppress_pending
+        // Finalize it before recovery can fetch the flagged screen's terminal tail.
+        if screen_tail_withheld
             && let Some(previous) = self
                 .exits
                 .iter_mut()
@@ -290,6 +294,7 @@ impl HostedExitIncident {
         {
             previous.pending = false;
             previous.classify_at_observation = true;
+            previous.screen_tail_withheld = true;
             return true;
         }
         self.push_counted_exit(exit)
@@ -468,10 +473,15 @@ fn exit_status(evidence: &HostedExitEvidence) -> String {
 
 /// Safe to use in journal messages, durable Wire bodies and other API-visible summaries.
 pub(super) fn summary(state: &HostedRespawnState) -> String {
-    let Some(evidence) = state.exit_evidence.latest_evidence() else {
-        return "evidence: unavailable".into();
-    };
     let exits = &state.exit_evidence.exits;
+    let withheld = if exits.iter().any(|exit| exit.screen_tail_withheld) {
+        ". A vendor sign-in screen or blocking prompt was flagged before an exit, so its terminal tail was withheld"
+    } else {
+        ""
+    };
+    let Some(evidence) = state.exit_evidence.latest_evidence() else {
+        return format!("evidence: unavailable{withheld}");
+    };
     let mut available = exits.iter().filter_map(|entry| entry.evidence.as_ref());
     let statuses_match =
         complete_failure(evidence) && available.clone().all(|other| other.exit == evidence.exit);
@@ -484,7 +494,7 @@ pub(super) fn summary(state: &HostedRespawnState) -> String {
         _ => "mixed or incomplete launch evidence",
     };
     format!(
-        "evidence: {assessment}. Latest available {}, launched {} UTC, captured {} UTC",
+        "evidence: {assessment}. Latest available {}, launched {} UTC, captured {} UTC{withheld}",
         exit_status(evidence),
         fl_core::At::from_unix_millis(evidence.started_at_ms),
         fl_core::At::from_unix_millis(evidence.captured_at_ms),
@@ -533,6 +543,7 @@ mod tests {
                 evidence: Some(failure),
                 pending: false,
                 classify_at_observation: false,
+                screen_tail_withheld: false,
             });
         }
 
@@ -588,6 +599,7 @@ mod tests {
                         evidence: Some(baseline),
                         pending: false,
                         classify_at_observation: false,
+                        screen_tail_withheld: false,
                     },
                     CountedExit {
                         stream: fast.stream.clone(),
@@ -596,6 +608,7 @@ mod tests {
                         evidence: Some(fast),
                         pending: false,
                         classify_at_observation: false,
+                        screen_tail_withheld: false,
                     },
                 ],
             },
@@ -618,5 +631,11 @@ mod tests {
         }
         state.exit_evidence.exits[0].evidence = None;
         assert_eq!(summary(&state), "evidence: unavailable");
+        state.exit_evidence.exits[0].evidence = Some(evidence(1, Some(1), None, fixed_tail));
+        state.exit_evidence.exits[1].screen_tail_withheld = true;
+        let mixed = summary(&state);
+        assert!(mixed.contains("mixed or incomplete launch evidence"));
+        assert!(mixed.contains("A vendor sign-in screen or blocking prompt was flagged"));
+        assert!(!mixed.contains(fixed_tail));
     }
 }

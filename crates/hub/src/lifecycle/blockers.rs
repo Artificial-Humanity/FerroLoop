@@ -158,16 +158,22 @@ pub(super) fn remember_test_block(evidence: &PromptExitEvidence, record: &Hosted
     evidence.remember(record, &sample);
 }
 
+pub(super) fn screen_block(record: &HostedSessionRecord) -> Option<HostedBlock> {
+    // A missing hydration receipt leaves the seat's ability to run unknown.
+    record.active_block().filter(|block| {
+        matches!(
+            block.reason,
+            HostedBlockReason::VendorSignIn | HostedBlockReason::BlockingDialog
+        )
+    })
+}
+
 pub(super) fn blocked_at_exit(
     record: &HostedSessionRecord,
     evidence: Option<&PromptExitEvidence>,
 ) -> bool {
-    record.active_block().is_some_and(|block| {
-        // A missing hydration receipt leaves the seat's ability to run unknown.
-        matches!(
-            block.reason,
-            HostedBlockReason::VendorSignIn | HostedBlockReason::BlockingDialog
-        ) && evidence.is_some_and(|evidence| evidence.matches(record, block, Instant::now()))
+    screen_block(record).is_some_and(|block| {
+        evidence.is_some_and(|evidence| evidence.matches(record, block, Instant::now()))
     })
 }
 
