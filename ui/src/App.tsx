@@ -1255,6 +1255,7 @@ export const App: React.FC<AppProps> = ({
     mountedRef.current = false; transcriptGuard.invalidate();
   }; }, [transcriptGuard]);
   const [rawSessionQueue, setSessionQueue] = useState<QueuedOperatorPrompt[]>([]);
+  const [sessionQueueEpoch, setSessionQueueEpoch] = useState<string>();
   const [rawIsSessionBusy, setIsSessionBusy] = useState<boolean>(false);
   /** Latest busy-or-unconfirmed flag, for callbacks that keep optimistic prompts alive. */
   const sessionBusyRef = useRef<boolean>(false);
@@ -1466,7 +1467,7 @@ export const App: React.FC<AppProps> = ({
   }, []);
 
   // Independent queue observations supersede older reads, but can only adopt their dispatch owner.
-  const adoptPromptMetadata = useCallback((response: { queue?: unknown; is_busy?: unknown }, owner: TranscriptReadOwner) => {
+  const adoptPromptMetadata = useCallback((response: { queue?: unknown; is_busy?: unknown; queue_epoch?: unknown }, owner: TranscriptReadOwner) => {
     if (!mountedRef.current || loggedOutRef.current || isTranscriptResetPending(ownerRef.current) ||
       !sameTranscriptOwner(owner, ownerRef.current) ||
       (!Array.isArray(response.queue) && typeof response.is_busy !== "boolean")) return;
@@ -1479,12 +1480,14 @@ export const App: React.FC<AppProps> = ({
     });
     if (!sessionMetadataOwnerRef.current || !sameTranscriptOwner(sessionMetadataOwnerRef.current, owner)) {
       setSessionQueue([]);
+      setSessionQueueEpoch(undefined);
       setIsSessionBusy(false);
       setSessionContextUsage(null);
       setSessionQuotaUsage(null);
     }
     setSessionMetadataOwner({ ...owner });
     if (Array.isArray(response.queue)) setSessionQueue(response.queue as QueuedOperatorPrompt[]);
+    if (typeof response.queue_epoch === "string") setSessionQueueEpoch(response.queue_epoch);
     if (typeof response.is_busy === "boolean") setIsSessionBusy(response.is_busy);
   }, [transcriptGuard, setSessionMetadataOwner, isTranscriptResetPending]);
 
@@ -1523,6 +1526,7 @@ export const App: React.FC<AppProps> = ({
         recordAgentQuotaUsage(owner.agentKey, result.quota_usage);
         recordAgentBusy(owner.agentKey, typeof result.is_busy === "boolean" ? result.is_busy : hasTrailingIncompleteWork(result.turns));
         if (Array.isArray(result.queue)) setSessionQueue(result.queue);
+        setSessionQueueEpoch(result.queue_epoch);
         if (typeof result.is_busy === "boolean") setIsSessionBusy(result.is_busy);
         setUnconfirmedBySession((previous) => ({ ...previous, [targetId]: Boolean(result.in_flight_unconfirmed) }));
         setSessionContextUsage(result.context_usage ?? null);
@@ -3740,6 +3744,7 @@ export const App: React.FC<AppProps> = ({
       isBusy={metadataMatches ? isSessionBusy : false}
       inFlightUnconfirmed={unconfirmedBySession[activeSession?.id ?? selectedAgent?.name_key ?? ""] ?? false}
       queue={metadataMatches ? sessionQueue : []}
+      queueEpoch={metadataMatches ? sessionQueueEpoch : undefined}
       loading={loading}
       wsConnected={wsConnected}
       agentSettingsOpen={agentSettingsOpen}

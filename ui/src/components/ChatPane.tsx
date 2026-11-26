@@ -3,6 +3,7 @@ import { HubApiError, type HubApiClient } from "../api/client";
 import {
   DEFAULT_SLASH_COMMANDS,
   codexSendNowReceipt,
+  composerHoldDetail,
   isPromptDeliveryFailure,
   normalizeHydrationStatus,
   normalizeHydrationWarnings,
@@ -34,6 +35,12 @@ import {
   type TranscriptReadOwner,
 } from "../lib/transcriptReadGuard";
 import { formatTimestamp, useActiveTimeZone } from "../lib/datetime";
+import {
+  parkedPromptDraftScope,
+  readParkedPromptDrafts,
+  writeParkedPromptDraft,
+  type ParkedPromptDraft,
+} from "../lib/parkedPromptDrafts";
 import { AgentSettingsModal } from "./AgentSettingsModal";
 import { dispatchOpenHelp, type HelpTopicId } from "./HelpDrawer";
 import {
@@ -1019,9 +1026,10 @@ export function isComposerHeldPrompt(item: QueuedOperatorPrompt): boolean {
     || item.hold_reason === "session_busy";
 }
 export function composerHoldText(item: QueuedOperatorPrompt): string {
+  const reason = composerHoldDetail(item.hold_reason);
   return item.retries_exhausted
-    ? "Held: the session composer is occupied, so nothing was sent. Automatic retries have stopped — use Send Now or remove this item."
-    : "Held: the session composer is occupied, so nothing was sent. It will retry automatically when the composer clears.";
+    ? `Held: ${reason}, so nothing was sent. Automatic retries have stopped. You can use Send Now or remove this item.`
+    : `Held: ${reason}, so nothing was sent. It will retry automatically when the session is ready.`;
 }
 // A lost Send Now reply must also hold its queue item against another click.
 const unconfirmedQueuedPrompts = new Map<string, Set<string>>();
@@ -1144,6 +1152,7 @@ export interface ChatPaneProps {
   isBusy?: boolean;
   inFlightUnconfirmed?: boolean;
   queue?: QueuedOperatorPrompt[];
+  queueEpoch?: string;
   transcriptRefreshState?: TranscriptRefreshState;
   onResetSession?: (targetId: string, mode: ClearSessionMode) => Promise<unknown>;
   loading?: boolean;
@@ -1237,6 +1246,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
   isBusy,
   inFlightUnconfirmed,
   queue,
+  queueEpoch,
   transcriptRefreshState,
   onResetSession,
   loading = false,
@@ -1272,6 +1282,8 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
   const token = apiClient?.getToken();
   const principal = authority?.tier === "owner" ? authority.login : authority?.agent;
   const identityRef = React.useRef({ apiClient, token, tier: authority?.tier, principal, agentName, sessionId });
+  const getAuthEpochRef = React.useRef(getPromptAuthEpoch);
+  getAuthEpochRef.current = getPromptAuthEpoch;
   const ownerRef = React.useRef<TranscriptReadOwner>({
     authEpoch: 0, selectionEpoch: 0, agentKey: agentName || "", sessionId: sessionId || null, resetEpoch: 0,
   });
@@ -1319,6 +1331,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
   const [internalIsBusy, setInternalIsBusy] = React.useState<boolean>(false);
   const [internalInFlightUnconfirmed, setInternalInFlightUnconfirmed] = React.useState(false);
   const [internalQueue, setInternalQueue] = React.useState<QueuedOperatorPrompt[]>([]);
+  const [internalQueueEpoch, setInternalQueueEpoch] = React.useState<string>();
   const [editingQueueId, setEditingQueueId] = React.useState<string | null>(null);
   const [editingQueueText, setEditingQueueText] = React.useState<string>("");
   const [internalLoading, setInternalLoading] = React.useState<boolean>(false);
@@ -1390,6 +1403,9 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
   >("all");
   useActiveTimeZone();
   const targetSessionOrAgent = sessionId || agentName || "";
+  const recoveryScope = authority?.tier === "owner" && apiClient && targetSessionOrAgent
+    ? parkedPromptDraftScope(apiClient.getBaseUrl(), authority.login, agentName?.trim().toLowerCase() || targetSessionOrAgent)
+    : null;
   const initialDraftRef = React.useRef<SessionDraft | null>(null);
   if (initialDraftRef.current === null) {
     initialDraftRef.current = loadSessionDraft(targetSessionOrAgent);
@@ -1430,7 +1446,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
     setCompactFeedback(null);
     setSubmitError(null);
   }, [targetSessionOrAgent]);
-  const [, refreshPendingPrompts] = React.useReducer((n: number) => n + 1, 0);
+  const [promptUpdates, refreshPendingPrompts] = React.useReducer((n: number) => n + 1, 0);
   React.useEffect(() => {
     pendingPromptListeners.add(refreshPendingPrompts);
     deliveryReceiptListeners.add(refreshPendingPrompts);
@@ -1490,7 +1506,9 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
   const effectiveTurns = turns ?? [...observedTurns, ...optimisticTurns];
   const metadataMatches = sameTranscriptOwner(metadataOwner, owner);
   const effectiveIsBusy = isBusy ?? (metadataMatches ? internalIsBusy : false);
-  const effectiveQueue = (queue ?? (metadataMatches ? internalQueue : [])).map((item) =>
+  const observedQueue = queue ?? (metadataMatches ? internalQueue : []);
+  const queueEpochEvidence = queueEpoch ?? (metadataMatches ? internalQueueEpoch : undefined);
+  const effectiveQueue = observedQueue.map((item) =>
     // A composer-held prompt is known not to have landed, so a lost-reply fence must not mask it as unconfirmed (#496).
     isComposerHeldPrompt(item) ? item :
     unconfirmedQueuedPrompts.get(targetSessionOrAgent)?.has(item.id)
@@ -1503,6 +1521,53 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
   const isCurrentOperation = () => mountedRef.current && !resetPendingRef.current &&
     sameTranscriptOwner(owner, ownerRef.current) && identityRef.current.apiClient === apiClient &&
     apiClient?.getToken() === token;
+
+  const parkedDrafts = React.useMemo(() => recoveryScope ? readParkedPromptDrafts(recoveryScope) : [], [recoveryScope, promptUpdates]);
+  const waitingDrafts = parkedDrafts.filter((draft) => !draft.recovery);
+  const waitingDraftKey = JSON.stringify(waitingDrafts.map((draft) => [draft.epoch, draft.id]));
+  const queueEvidence = JSON.stringify(waitingDrafts.map((draft) => {
+    const item = observedQueue.find((row) => row.id === draft.id);
+    return item ? [item.delivery_state, item.prompt] : null;
+  }));
+  const [recovering, setRecovering] = React.useState(false);
+  React.useEffect(() => {
+    if (!apiClient || !recoveryScope) return;
+    const drafts = readParkedPromptDrafts(recoveryScope).filter((draft) => !draft.recovery);
+    const appAuthEpoch = getAuthEpochRef.current?.();
+    if (appAuthEpoch === null) return;
+    let cancelled = false;
+    for (const nativeId of new Set(drafts.map((draft) => draft.sessionId))) {
+      // Read after the admission receipt. Transcript snapshots may have been
+      // requested before this item entered the queue or under a different alias.
+      void apiClient.getSessionQueue(nativeId).then((response) => {
+        if (cancelled || apiClient.getToken() !== token || appAuthEpoch !== getAuthEpochRef.current?.() ||
+          response.session_id !== nativeId || !response.queue_epoch || !Array.isArray(response.queue)) return;
+        let changed = false;
+        const currentDrafts = readParkedPromptDrafts(recoveryScope);
+        for (const draft of drafts.filter((entry) => entry.sessionId === nativeId)) {
+          const current = currentDrafts.find((entry) => entry.id === draft.id && entry.epoch === draft.epoch);
+          if (!current || current.recovery || current.queuedText !== draft.queuedText) continue;
+          const item = response.queue.find((row) => row.id === draft.id);
+          if (response.queue_epoch !== draft.epoch) {
+            writeParkedPromptDraft(recoveryScope, { ...draft, recovery: "hub_restarted" });
+          } else if (!item) {
+            writeParkedPromptDraft(recoveryScope, draft, true);
+          } else if (item.delivery_state === "refused" || item.prompt !== draft.queuedText) {
+            const refusal = item.refusal_reason === "session_replaced" ? "session_replaced" : "refused";
+            writeParkedPromptDraft(recoveryScope, {
+              ...draft, queuedText: item.prompt,
+              text: item.prompt === draft.queuedText ? draft.text : item.prompt,
+              recovery: item.delivery_state === "refused" ? refusal : undefined,
+            });
+          } else continue;
+          changed = true;
+        }
+        if (changed) refreshPendingPrompts();
+      }).catch(() => { /* Keep the draft until a fresh queue read succeeds. */ });
+    }
+    return () => { cancelled = true; };
+  }, [apiClient, recoveryScope, token, owner.authEpoch, owner.resetEpoch, targetSessionOrAgent,
+    waitingDraftKey, queueEvidence, queueEpochEvidence, wsConnected]);
 
   // Confirmed local sends are independent of whether any transcript has been observed.
   // A successful transcript (including empty) replaces this optimistic view as before.
@@ -1526,7 +1591,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
   };
 
   // Prompt/queue replies are independent observations, even before a transcript is readable.
-  const adoptPromptMetadata = (response: { queue?: unknown; is_busy?: unknown }) => {
+  const adoptPromptMetadata = (response: { queue?: unknown; is_busy?: unknown; queue_epoch?: string }) => {
     if (!isCurrentOperation() || (!Array.isArray(response.queue) && typeof response.is_busy !== "boolean")) return;
     readGuard.invalidate();
     setInternalLoading(false);
@@ -1537,12 +1602,14 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
     if (!sameTranscriptOwner(metadataOwnerRef.current, owner)) {
       // Hidden values belonging to a previous owner must not reappear with this reply.
       setInternalQueue([]);
+      setInternalQueueEpoch(undefined);
       setInternalIsBusy(false);
       setInternalInFlightUnconfirmed(false);
       setInternalContextUsage(null);
       setInternalQuotaUsage(null);
     }
     setMetadataOwner({ ...owner });
+    if (response.queue_epoch) setInternalQueueEpoch(response.queue_epoch);
   };
 
   const displayTarget = agentDisplayName || agentName || sessionId || "Agent";
@@ -2308,6 +2375,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
       setInternalIsBusy(Boolean(response.is_busy));
       setInternalInFlightUnconfirmed(Boolean(response.in_flight_unconfirmed));
       setInternalQueue(response.queue ?? []);
+      setInternalQueueEpoch(response.queue_epoch);
       setInternalContextUsage(response.context_usage ?? null);
       setInternalQuotaUsage(response.quota_usage ?? null);
     } catch (err) {
@@ -2535,9 +2603,66 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
     }
   };
 
+  const handleRecoverParkedPrompt = async (draft: ParkedPromptDraft, restore: boolean) => {
+    const authEpoch = getAuthEpochRef.current?.();
+    const accepts = () => authEpoch !== null && authEpoch === getAuthEpochRef.current?.() && isCurrentOperation();
+    if (!apiClient || !recoveryScope || recovering || !accepts()) return;
+    const composerAvailable = () => !draftRef.current.promptText && !draftRef.current.attachments.length &&
+      !pendingPrompts.has(targetSessionOrAgent) && !pendingAttachmentReads.has(targetSessionOrAgent);
+    if (restore && (!sessionId || !composerAvailable())) return;
+    setRecovering(true);
+    try {
+      let files = draft.attachments ?? [];
+      if (restore && !draft.attachments) {
+        const restored = await Promise.allSettled(draft.files.map(async (file) => {
+          const blob = await apiClient.getQueuedPromptAttachment(file.url);
+          return fileToPromptAttachment(new File([blob], file.name, { type: file.media_type }));
+        }));
+        files = restored.flatMap((result) => result.status === "fulfilled" ? [result.value] : []);
+      }
+      if (!accepts() || (restore && !composerAvailable())) return;
+      if (draft.recovery !== "hub_restarted") {
+        try {
+          const response = await apiClient.cancelQueuedPrompt(draft.sessionId, draft.id);
+          if (accepts() && !onCancelQueued && response.session_id === targetSessionOrAgent) {
+            adoptPromptMetadata(response);
+            setInternalQueue(response.queue);
+          }
+        } catch (error) {
+          if (!(error instanceof HubApiError && error.status === 404)) throw error;
+        }
+      }
+      if (!accepts() || (restore && !composerAvailable())) return;
+      if (restore) {
+        const restored = { promptText: draft.text, attachments: files };
+        saveSessionDraft(targetSessionOrAgent, restored);
+        notifyDraft(targetSessionOrAgent, restored);
+        if (files.length !== draft.files.length) setSubmitError("Reattach any unavailable files before sending this draft.");
+      }
+      writeParkedPromptDraft(recoveryScope, draft, true);
+      refreshPendingPrompts();
+      onRefresh?.();
+    } catch (error) {
+      if (accepts()) setSubmitError(error instanceof Error ? error.message : "Could not recover the queued prompt.");
+    } finally {
+      if (mountedRef.current) setRecovering(false);
+    }
+  };
+
+  const updateParkedBackup = (promptId: string, authEpoch: number | null | undefined, edited?: string) => {
+    if (!recoveryScope || authEpoch === null || authEpoch !== getAuthEpochRef.current?.() ||
+      owner.authEpoch !== ownerRef.current.authEpoch || apiClient?.getToken() !== token) return;
+    const draft = readParkedPromptDrafts(recoveryScope).find((entry) => entry.id === promptId);
+    if (!draft) return;
+    if (edited === undefined) writeParkedPromptDraft(recoveryScope, draft, true);
+    else writeParkedPromptDraft(recoveryScope, { ...draft, text: edited, queuedText: edited });
+    refreshPendingPrompts();
+  };
+
   const handleSendQueuedNow = async (promptId: string) => {
     if (!targetSessionOrAgent) return;
     const submittedTarget = targetSessionOrAgent;
+    const authEpoch = getAuthEpochRef.current?.();
     // Composer-held prompts are known not to have landed; Send Now goes through the hub send-now endpoint, which re-runs the clean-composer check and fails closed over non-wire input (#496).
     const heldItem = effectiveQueue.find((queued) => queued.id === promptId);
     if (!heldItem || !isComposerHeldPrompt(heldItem)) {
@@ -2588,6 +2713,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
           }
         }
       }
+      if (response?.delivered === true && response.delivery_stage === "transport_accepted") updateParkedBackup(promptId, authEpoch);
       if (isCurrentOperation()) {
         scrollToBottom("smooth");
       }
@@ -2605,6 +2731,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
 
   const handleCancelQueued = async (promptId: string) => {
     if (!targetSessionOrAgent) return;
+    const authEpoch = getAuthEpochRef.current?.();
     const item = effectiveQueue.find((queued) => queued.id === promptId);
     if (item?.delivery_state === "unconfirmed" && !(item && isComposerHeldPrompt(item)) && !window.confirm(
       "Delivery may have succeeded. Check the session before removing this record. Remove it anyway?",
@@ -2630,6 +2757,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
         }
       }
       unconfirmedQueuedPrompts.get(submittedTarget)?.delete(promptId);
+      updateParkedBackup(promptId, authEpoch);
     } catch (err) {
       if (isCurrentOperation()) {
         setSubmitError(
@@ -2643,6 +2771,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
     const trimmed = editingQueueText.trim();
     if (!targetSessionOrAgent || !trimmed) return;
     const submittedTarget = targetSessionOrAgent;
+    const authEpoch = getAuthEpochRef.current?.();
     try {
       if (onUpdateQueued) {
         await onUpdateQueued(promptId, trimmed);
@@ -2670,6 +2799,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
           ),
         );
       }
+      updateParkedBackup(promptId, authEpoch, trimmed);
       if (isCurrentOperation()) {
         setEditingQueueId(null);
         setEditingQueueText("");
@@ -2757,6 +2887,19 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
       )) return;
       const wasQueued = Boolean(res && (res.queued || res.status === "queued"));
       const deliveryFailed = !wasQueued && isPromptDeliveryFailure(res);
+      const queuedItem = res?.queued_prompt;
+      const epoch = res?.queue_epoch;
+      const backupParked = wasQueued && Boolean(recoveryScope && epoch && queuedItem?.claude_terminal && queuedItem.session_id === res?.session_id) &&
+        submittedAuthEpoch === getPromptAuthEpoch?.() && owner.authEpoch === ownerRef.current.authEpoch && submittedToken === apiClient?.getToken();
+      if (backupParked && recoveryScope && epoch && queuedItem &&
+        !readParkedPromptDrafts(recoveryScope).some((draft) => draft.epoch === epoch && draft.id === queuedItem.id)) {
+        writeParkedPromptDraft(recoveryScope, {
+          id: queuedItem.id, sessionId: queuedItem.session_id, epoch,
+          text: submittedDraft.promptText, queuedText: queuedItem.prompt,
+          files: (queuedItem.attachments ?? []).map(({ name, media_type, url }) => ({ name, media_type, url })),
+          attachments: submittedDraft.attachments,
+        });
+      }
       if (
         isCurrentOperation() && !onSendPrompt && apiClient && res &&
         (!deliveryFailed || res.delivery_stage === "held")
@@ -2773,7 +2916,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
       if (deliveryFailed) {
         throw new Error(promptDeliveryStatus(res) || res?.delivery_error || "Message delivery failed");
       }
-      recordPromptDelivery(submittedTarget, res);
+      recordPromptDelivery(submittedTarget, backupParked ? undefined : res);
       if (mountedRef.current && currentTargetRef.current === submittedTarget && !wasQueued) {
         scrollToBottom("smooth");
         requestAnimationFrame(() => scrollToBottom("smooth"));
@@ -4048,6 +4191,24 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
           />
         </div>
         {deliveryStatus && <div role="status" className="fd-composer-delivery-receipt">{deliveryStatus}</div>}
+        {parkedDrafts.filter((draft) => draft.recovery).map((draft) => (
+          <div role="status" className="fd-composer-delivery-receipt" key={`${draft.epoch}.${draft.id}`}>
+            <div>{draft.recovery === "hub_restarted"
+              ? "The Hub restarted before FerroDeck could verify this queued prompt. Check the session before resending."
+              : draft.recovery === "session_replaced"
+                ? "The original conversation changed. Its queued prompt is available as a draft."
+                : "The original session refused this queued prompt. Its draft is available to restore."}</div>
+            <div style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={draft.text}>{draft.text || "Attached files"}</div>
+            <button type="button" className="fd-btn" disabled={!sessionId || recovering || Boolean(promptText || attachments.length) || submitting}
+              onClick={() => void handleRecoverParkedPrompt(draft, true)}>
+              Restore draft
+            </button>{" "}
+            <button type="button" className="fd-btn" disabled={recovering}
+              onClick={() => void handleRecoverParkedPrompt(draft, false)}>
+              Discard draft
+            </button>
+          </div>
+        ))}
         {(submitError || sendErrorsByTarget[targetSessionOrAgent]) && (
           <div
             role="alert"
@@ -4191,7 +4352,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
                             by {item.by}
                           </span>
                         )}
-                        {item.delivery_state === "refused" && <span role="status">Send now refused. Remove this item before submitting a new prompt.</span>}
+                        {item.delivery_state === "refused" && item.refusal_reason !== "session_replaced" && <span role="status">Send now refused. Remove this item before submitting a new prompt.</span>}
                         {!isHeld && item.delivery_state === "unconfirmed" && deliveryReceipt?.stage !== "unconfirmed" && (
                           <span role="status">Delivery unconfirmed. Check the session before removing this item.</span>
                         )}

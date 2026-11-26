@@ -1,7 +1,8 @@
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { HubApiClient } from "../api/client";
+import { HubApiClient, HubApiError } from "../api/client";
 import { ChatPane, isComposerHeldPrompt, sessionDraftMemory } from "../components/ChatPane";
+import { parkedPromptDraftScope } from "../lib/parkedPromptDrafts";
 import type { QueuedOperatorPrompt, SessionTranscriptResponse } from "../types/api";
 
 const HOLD_REASON =
@@ -81,6 +82,109 @@ describe("held operator prompts (#496 defect 1)", () => {
     }));
     expect(screen.getByText("Latest session history")).toBeInTheDocument();
     expect(screen.queryByText(effectiveBody, { ignore: "textarea" })).not.toBeInTheDocument();
+  });
+
+  it.each([
+    ["session_busy", "the session is busy"],
+    ["composer_unlocated", "the session composer could not be located"],
+  ])("shows the specific %s reason on the removable queue item", (hold_reason, detail) => {
+    render(<ChatPane sessionId="claude-619-reason" turns={[]} queue={[heldItem({ hold_reason })]} />);
+    expect(screen.getByTestId("queued-hold-reason-held-1")).toHaveTextContent(detail);
+    expect(screen.getByTestId("queued-cancel-held-1")).toBeEnabled();
+  });
+
+  it.each(["hub restart", "conversation replacement"] as const)(
+    "preserves a parked draft after a %s without sending it again", async (change) => {
+      const target = `claude-619-${change}`;
+      const nextTarget = change === "hub restart" ? target : `${target}-new`;
+      const initial = "Draft parked before the change";
+      const item = heldItem({ id: target, session_id: target, prompt: initial,
+        hold_reason: "session_busy", claude_terminal: true });
+      let epoch = "original-hub";
+      let queue: QueuedOperatorPrompt[] = [];
+      const client = new HubApiClient({ fetchImpl: async () => new Response("{}") });
+      vi.spyOn(client, "getSessionTranscript").mockImplementation(async (session_id) => ({
+        session_id, turns: [], queue_epoch: epoch, queue: session_id === target ? queue : [],
+      }));
+      const readQueue = vi.spyOn(client, "getSessionQueue").mockImplementation(async (session_id) => ({
+        session_id, is_busy: false, queue_epoch: epoch, queue: session_id === target ? queue : [],
+      }));
+      const send = vi.spyOn(client, "sendSessionPrompt").mockImplementation(async () => {
+        queue = [item];
+        return { session_id: target, queue_epoch: epoch, queued: true, status: "queued",
+          delivery_stage: "held", hold_reason: "session_busy", queued_prompt: item, queue };
+      });
+      const cancel = vi.spyOn(client, "cancelQueuedPrompt").mockImplementation(async (session_id, prompt_id) => {
+        queue = [];
+        return { session_id, prompt_id, status: "cancelled", queue };
+      });
+      const props = { agentName: target, adapter: "claude", sessionId: target, apiClient: client,
+        authority: { tier: "owner", login: "owner" } as const };
+      const { rerender } = render(<ChatPane {...props} wsConnected />);
+      const composer = screen.getByLabelText("Message");
+      fireEvent.change(composer, { target: { value: initial } });
+      fireEvent.click(screen.getByRole("button", { name: "Send Message" }));
+      expect(await screen.findByTestId(`queued-hold-reason-${target}`)).toHaveTextContent("the session is busy");
+      expect(composer).toHaveValue("");
+      expect(screen.queryByTestId("optimistic-user-turn")).not.toBeInTheDocument();
+      await waitFor(() => expect(readQueue).toHaveBeenCalledWith(target));
+
+      const edited = "Edited text retained by the original queue";
+      if (change === "hub restart") {
+        epoch = "replacement-hub";
+        queue = [];
+      } else {
+        queue = [{ ...item, prompt: edited, hold_reason: null, delivery_state: "refused", refusal_reason: "session_replaced" }];
+      }
+      rerender(<ChatPane {...props} sessionId={nextTarget} wsConnected={false} />);
+      const restore = await screen.findByRole("button", { name: "Restore draft" });
+      expect(screen.getByText(change === "hub restart" ? /Hub restarted/ : /original conversation changed/)).toBeVisible();
+      fireEvent.change(composer, { target: { value: "A new draft" } });
+      expect(restore).toBeDisabled();
+      expect(composer).toHaveValue("A new draft");
+      fireEvent.change(composer, { target: { value: "" } });
+      fireEvent.click(restore);
+      await waitFor(() => expect(composer).toHaveValue(change === "hub restart" ? initial : edited));
+      expect(send).toHaveBeenCalledTimes(1);
+      if (change === "hub restart") expect(cancel).not.toHaveBeenCalled();
+      else expect(cancel).toHaveBeenCalledWith(target, item.id);
+    },
+  );
+
+  it("keeps the draft when the queue is full", async () => {
+    const target = "claude-619-full";
+    const client = new HubApiClient({ fetchImpl: async () => new Response("{}") });
+    vi.spyOn(client, "getSessionTranscript").mockResolvedValue({ session_id: target, turns: [] });
+    vi.spyOn(client, "sendSessionPrompt").mockRejectedValue(new HubApiError(409,
+      "The prompt queue is full. Remove an item or wait for delivery.", undefined, undefined, { refusal_reason: "queue_full" }));
+    render(<ChatPane sessionId={target} adapter="claude" apiClient={client} />);
+    const composer = screen.getByLabelText("Message");
+    fireEvent.change(composer, { target: { value: "Keep this draft" } });
+    fireEvent.click(screen.getByRole("button", { name: "Send Message" }));
+    expect(await screen.findByText(/prompt queue is full/)).toBeVisible();
+    expect(composer).toHaveValue("Keep this draft");
+  });
+
+  it("restores persisted draft files where available and identifies that files need reattaching", async () => {
+    const target = "claude-619-reopened";
+    const files = ["saved.txt", "expired.txt"].map((name) => ({
+      name, media_type: "text/plain", url: `/api/v1/attachments/${name}`, path: name,
+    }));
+    const scope = parkedPromptDraftScope("", "owner", target);
+    window.localStorage.setItem(`${scope}old.reopened`, JSON.stringify({ id: "reopened", sessionId: target,
+      epoch: "old", text: "A draft from a previous page", queuedText: "A draft from a previous page", files }));
+    const client = new HubApiClient({ fetchImpl: async () => new Response("{}") });
+    vi.spyOn(client, "getSessionTranscript").mockResolvedValue({ session_id: target, turns: [] });
+    vi.spyOn(client, "getSessionQueue").mockResolvedValue({ session_id: target, is_busy: false, queue: [], queue_epoch: "new" });
+    const readFile = vi.spyOn(client, "getQueuedPromptAttachment")
+      .mockResolvedValueOnce(new Blob(["contents"], { type: "text/plain" }))
+      .mockRejectedValueOnce(new HubApiError(404, "Attachment expired"));
+    render(<ChatPane agentName={target} sessionId={target} apiClient={client} authority={{ tier: "owner", login: "owner" }} />);
+    fireEvent.click(await screen.findByRole("button", { name: "Restore draft" }));
+    expect(await screen.findByText(/Reattach any unavailable files/)).toBeVisible();
+    expect(screen.getByLabelText("Message")).toHaveValue("A draft from a previous page");
+    expect(screen.getByTestId("attachment-chip-list")).toHaveTextContent("saved.txt");
+    expect(readFile.mock.calls).toEqual(files.map((file) => [file.url]));
   });
 
   it("does not promise automatic retry for a held queue item that requires Send Now", async () => {
