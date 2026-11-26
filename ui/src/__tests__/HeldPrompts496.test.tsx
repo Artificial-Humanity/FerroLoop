@@ -2,7 +2,7 @@ import { act, fireEvent, render, screen, waitFor, within } from "@testing-librar
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { HubApiClient, HubApiError } from "../api/client";
 import { ChatPane, isComposerHeldPrompt, sessionDraftMemory } from "../components/ChatPane";
-import { parkedPromptDraftScope, readParkedPromptDrafts, writeParkedPromptDraft, type ParkedPromptDraft } from "../lib/parkedPromptDrafts";
+import { clearParkedPromptDrafts, parkedPromptDraftScope, readParkedPromptDrafts, writeParkedPromptDraft, type ParkedPromptDraft } from "../lib/parkedPromptDrafts";
 import type { QueuedOperatorPrompt, SessionTranscriptResponse } from "../types/api";
 
 const HOLD_REASON =
@@ -159,6 +159,58 @@ describe("held operator prompts (#496 defect 1)", () => {
       else expect(cancel).toHaveBeenCalledWith(target, item.id);
     },
   );
+
+  it("shows and dismisses a refused draft on a fresh device before the new transcript exists", async () => {
+    const target = "claude-619-fresh-device";
+    const client = new HubApiClient({ fetchImpl: async () => new Response("{}") });
+    const item = heldItem({ id: "old-prompt", session_id: "old-native", prompt: "Keep this draft",
+      hold_reason: null, delivery_state: "refused", refusal_reason: "session_replaced",
+      delivery_error: "The original conversation changed.", retained_as_draft: true, claude_terminal: true });
+    vi.spyOn(client, "getSessionTranscript").mockRejectedValue(new HubApiError(503, "HTTP 503", undefined, undefined, {
+      code: "transcript_unavailable", queue: [item], queue_epoch: "hub-1", is_busy: false,
+    }));
+    const cancel = vi.spyOn(client, "cancelQueuedPrompt").mockResolvedValue({
+      session_id: target, prompt_id: item.id, status: "cancelled", queue: [], queue_epoch: "hub-1",
+    });
+    const send = vi.spyOn(client, "sendSessionPrompt");
+    render(<ChatPane agentName={target} adapter="claude" sessionId={target} apiClient={client}
+      authority={{ tier: "owner", login: "owner" }} />);
+    const dismiss = await screen.findByRole("button", { name: "Discard draft" });
+    expect(screen.getByText("Keep this draft")).toBeVisible();
+    expect(screen.getByText("The original conversation changed.")).toBeVisible();
+    expect(screen.queryByTestId("prompt-queue-bar")).toBeNull();
+    fireEvent.click(dismiss);
+    await waitFor(() => expect(dismiss).not.toBeInTheDocument());
+    expect(cancel).toHaveBeenCalledWith(target, item.id);
+    expect(send).not.toHaveBeenCalled();
+  });
+
+  it("bounds recovery records across seats and clears only parked drafts on sign-out", () => {
+    clearParkedPromptDrafts();
+    const scope = parkedPromptDraftScope("", "owner", "seat-one");
+    const other = parkedPromptDraftScope("", "owner", "seat-two");
+    const draft = { id: "waiting", sessionId: "seat-one", epoch: "hub", text: "Waiting", queuedText: "Waiting", files: [] };
+    window.localStorage.setItem("unrelated-setting", "keep");
+    try {
+      writeParkedPromptDraft(scope, draft);
+      for (let i = 0; i < 130; i++) {
+        writeParkedPromptDraft(i % 2 === 0 ? scope : other, {
+          ...draft, id: String(i), recovery: "hub_restarted",
+        });
+      }
+      const records = [...readParkedPromptDrafts(scope), ...readParkedPromptDrafts(other)];
+      expect(records.filter((entry) => entry.recovery)).toHaveLength(128);
+      expect(records.map((entry) => entry.id)).toContain("129");
+      expect(records.map((entry) => entry.id)).toContain("waiting");
+      clearParkedPromptDrafts();
+      expect(readParkedPromptDrafts(scope)).toHaveLength(0);
+      expect(readParkedPromptDrafts(other)).toHaveLength(0);
+      expect(window.localStorage.length).toBe(1);
+      expect(window.localStorage.getItem("unrelated-setting")).toBe("keep");
+    } finally {
+      clearParkedPromptDrafts();
+    }
+  });
 
   it("keeps the draft when the queue is full", async () => {
     const target = "claude-619-full";
@@ -428,24 +480,26 @@ describe("held operator prompts (#496 defect 1)", () => {
     await waitFor(() => expect(onSendQueuedNow).toHaveBeenCalledWith("held-idle"));
   });
 
-  it("disables Send now for a held prompt when the session is busy", () => {
-    render(
-      <ChatPane
-        agentName="kayla"
-        sessionId="sess-kayla-send-busy"
-        turns={[]}
-        isBusy
-        queue={[heldItem({ id: "held-busy-send", session_id: "sess-kayla-send-busy" })]}
-        onSendQueuedNow={vi.fn()}
-        onCancelQueued={vi.fn()}
-      />,
-    );
-    expect(screen.getByTestId("queued-send-now-held-busy-send")).toBeDisabled();
-    // Delete stays enabled while Send now is gated.
-    expect(screen.getByTestId("queued-cancel-held-busy-send")).toBeEnabled();
-  });
+  it.each(["session_busy", "composer_occupied", "composer_unlocated"])(
+    "keeps Send Now and Remove enabled for a %s hold while busy", (hold_reason) => {
+      render(
+        <ChatPane
+          agentName="kayla"
+          sessionId="sess-kayla-send-busy"
+          turns={[]}
+          isBusy
+          queue={[heldItem({ id: "held-busy-send", session_id: "sess-kayla-send-busy", hold_reason })]}
+          onSendQueuedNow={vi.fn()}
+          onCancelQueued={vi.fn()}
+        />,
+      );
+      expect(screen.getByTestId("queued-send-now-held-busy-send")).toBeEnabled();
+      expect(screen.getByTestId("queued-cancel-held-busy-send")).toBeEnabled();
+    },
+  );
 
-  it("disables Send now for a held prompt while the composer holds text, and re-enables when cleared", () => {
+  it("sends a held prompt without changing the local composer draft", async () => {
+    const sendQueued = vi.fn();
     render(
       <ChatPane
         agentName="kayla"
@@ -453,7 +507,7 @@ describe("held operator prompts (#496 defect 1)", () => {
         turns={[]}
         isBusy={false}
         queue={[heldItem({ id: "held-composer", session_id: "sess-kayla-send-composer" })]}
-        onSendQueuedNow={vi.fn()}
+        onSendQueuedNow={sendQueued}
         onCancelQueued={vi.fn()}
       />,
     );
@@ -462,10 +516,10 @@ describe("held operator prompts (#496 defect 1)", () => {
 
     const composer = screen.getByLabelText("Message");
     fireEvent.change(composer, { target: { value: "draft in progress" } });
-    expect(sendNow).toBeDisabled();
-
-    fireEvent.change(composer, { target: { value: "" } });
     expect(sendNow).toBeEnabled();
+    fireEvent.click(sendNow);
+    await waitFor(() => expect(sendQueued).toHaveBeenCalledWith("held-composer"));
+    expect(composer).toHaveValue("draft in progress");
   });
 
   it("S7: Delete is disabled while a non-held prompt is sending", () => {

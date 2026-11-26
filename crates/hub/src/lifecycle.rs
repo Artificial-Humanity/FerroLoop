@@ -8364,7 +8364,7 @@ fn clear_queue_keys(mut clear_queue: impl FnMut(&str)) -> impl FnMut(TeardownQue
     }
 }
 
-fn teardown_session_with_queue_cleanup<S: AgentRegistry + StateStore>(
+pub(crate) fn teardown_session_with_queue_cleanup<S: AgentRegistry + StateStore>(
     store: &S,
     env: &LifecycleEnv<'_>,
     target: &SessionTarget,

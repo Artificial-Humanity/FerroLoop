@@ -706,6 +706,7 @@ export interface QueuedOperatorPrompt {
   delivery_error?: string | null;
   hold_reason?: string | null;
   refusal_reason?: string | null;
+  retained_as_draft?: boolean;
   claude_terminal?: boolean;
   retries_exhausted?: boolean;
   id: string;

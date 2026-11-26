@@ -1274,6 +1274,7 @@ export class HubApiClient {
     prompt_id: string;
     is_busy?: boolean;
     queue: QueuedOperatorPrompt[];
+    queue_epoch?: string;
   }> {
     return this.request(
       `/api/v1/sessions/${encodeURIComponent(sessionId)}/queue/${encodeURIComponent(promptId)}`,

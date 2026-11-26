@@ -1517,7 +1517,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
   const effectiveIsBusy = isBusy ?? (metadataMatches ? internalIsBusy : false);
   const observedQueue = queue ?? (metadataMatches ? internalQueue : []);
   const queueEpochEvidence = queueEpoch ?? (metadataMatches ? internalQueueEpoch : undefined);
-  const effectiveQueue = observedQueue.map((item) =>
+  const effectiveQueue = observedQueue.filter((item) => !item.retained_as_draft).map((item) =>
     // A composer-held prompt is known not to have landed, so a lost-reply fence must not mask it as unconfirmed (#496).
     isComposerHeldPrompt(item) ? item :
     unconfirmedQueuedPrompts.get(targetSessionOrAgent)?.has(item.id)
@@ -1532,6 +1532,16 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
     apiClient?.getToken() === token;
 
   const parkedDrafts = React.useMemo(() => recoveryScope ? readParkedPromptDrafts(recoveryScope) : [], [recoveryScope, promptUpdates]);
+  const retainedDrafts: ParkedPromptDraft[] = !recoveryScope || !queueEpochEvidence ? [] : observedQueue
+    .filter((item) => item.retained_as_draft && item.delivery_state === "refused")
+    .map((item) => ({
+      id: item.id, sessionId: item.session_id, epoch: queueEpochEvidence,
+      text: item.prompt, queuedText: item.prompt, files: item.attachments ?? [],
+      recovery: item.refusal_reason === "session_replaced" ? "session_replaced" : "refused",
+      retainedByHub: true, refusalDetail: item.delivery_error,
+    }));
+  const recoverableDrafts = [...retainedDrafts, ...parkedDrafts.filter((draft) => draft.recovery &&
+    !retainedDrafts.some((item) => item.id === draft.id && item.epoch === draft.epoch))];
   const waitingDrafts = parkedDrafts.filter((draft) => !draft.recovery);
   const waitingDraftKey = JSON.stringify(waitingDrafts.map((draft) => [draft.epoch, draft.id]));
   const queueEvidence = JSON.stringify(waitingDrafts.map((draft) => {
@@ -1561,12 +1571,12 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
             writeParkedPromptDraft(recoveryScope, { ...draft, recovery: "hub_restarted" });
           } else if (!item) {
             writeParkedPromptDraft(recoveryScope, draft, true);
-          } else if (item.delivery_state === "refused" || item.prompt !== draft.queuedText) {
+          } else if ((item.delivery_state === "refused" && !item.retained_as_draft) || item.prompt !== draft.queuedText) {
             const refusal = item.refusal_reason === "session_replaced" ? "session_replaced" : "refused";
             writeParkedPromptDraft(recoveryScope, {
               ...draft, queuedText: item.prompt,
               text: item.prompt === draft.queuedText ? draft.text : item.prompt,
-              recovery: item.delivery_state === "refused" ? refusal : undefined,
+              recovery: item.delivery_state === "refused" && !item.retained_as_draft ? refusal : undefined,
             });
           } else continue;
           changed = true;
@@ -2379,6 +2389,16 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
       if (!accepts()) return;
       const denied = err instanceof HubApiError && (err.status === 401 || err.status === 403);
       if (denied) setMetadataOwner(null);
+      if (err instanceof HubApiError && err.details?.code === "transcript_unavailable") {
+        const queue = err.details.queue;
+        if (Array.isArray(queue)) {
+          setMetadataOwner(readOwner);
+          setInternalQueue(queue);
+          setInternalQueueEpoch(typeof err.details.queue_epoch === "string" ? err.details.queue_epoch : undefined);
+          setInternalIsBusy(Boolean(err.details.is_busy));
+          setInternalInFlightUnconfirmed(Boolean(err.details.in_flight_unconfirmed));
+        }
+      }
       const canRetain = isTransientTranscriptReadError(err) &&
         sameTranscriptOwner(snapshotRef.current?.owner ?? null, readOwner) && Boolean(snapshotRef.current?.concreteSessionId);
       if (!canRetain) {
@@ -2621,10 +2641,15 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
       if (!accepts() || (restore && !composerAvailable())) return;
       if (draft.recovery === "session_replaced" || draft.recovery === "refused") {
         try {
-          const response = await apiClient.cancelQueuedPrompt(draft.sessionId, draft.id);
-          if (accepts() && !onCancelQueued && response.session_id === targetSessionOrAgent) {
-            adoptPromptMetadata(response);
-            setInternalQueue(response.queue);
+          if (draft.retainedByHub && onCancelQueued) {
+            await onCancelQueued(draft.id);
+          } else {
+            const target = draft.retainedByHub ? targetSessionOrAgent : draft.sessionId;
+            const response = await apiClient.cancelQueuedPrompt(target, draft.id);
+            if (accepts() && !onCancelQueued && target === targetSessionOrAgent) {
+              adoptPromptMetadata(response);
+              setInternalQueue(response.queue);
+            }
           }
         } catch (error) {
           if (!(error instanceof HubApiError && error.status === 404)) throw error;
@@ -4212,9 +4237,9 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
           />
         </div>
         {deliveryStatus && <div role="status" className="fd-composer-delivery-receipt">{deliveryStatus}</div>}
-        {parkedDrafts.filter((draft) => draft.recovery).map((draft) => (
+        {recoverableDrafts.map((draft) => (
           <div role="status" className="fd-composer-delivery-receipt" key={`${draft.epoch}.${draft.id}`}>
-            <div>{draft.recovery === "hub_restarted"
+            <div>{draft.refusalDetail || (draft.recovery === "hub_restarted"
               ? "The Hub restarted before FerroDeck could verify this queued prompt. Check the session before resending."
               : draft.recovery === "session_replaced"
                 ? "The original conversation changed. Its queued prompt is available as a draft."
@@ -4222,7 +4247,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
                   ? "The submitted prompt was refused. Its draft is available to restore."
                   : draft.recovery === "submission_unconfirmed"
                     ? "Delivery unconfirmed. Check the session and queue before resending."
-                    : "The original session refused this queued prompt. Its draft is available to restore."}</div>
+                    : "The original session refused this queued prompt. Its draft is available to restore.")}</div>
             <div style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={draft.text}>{draft.text || "Attached files"}</div>
             <button type="button" className="fd-btn" disabled={(!sessionId && draft.epoch !== "local") || recovering || Boolean(promptText || attachments.length) || submitting}
               onClick={() => void handleRecoverParkedPrompt(draft, true)}>
@@ -4282,9 +4307,8 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
               {effectiveQueue.map((item, idx) => {
                 const isEditing = editingQueueId === item.id;
                 const isHeld = isComposerHeldPrompt(item);
-                const composerEmpty = promptText.trim().length === 0 && attachments.length === 0;
                 const sendNowDisabled = isHeld
-                  ? effectiveIsBusy || !composerEmpty || item.delivery_state === "sending"
+                  ? item.delivery_state === "sending"
                   : Boolean(item.delivery_state && item.delivery_state !== "pending");
                 const deleteDisabled = isHeld ? false : item.delivery_state === "sending";
                 return (

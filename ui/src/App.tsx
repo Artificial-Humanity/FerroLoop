@@ -8,6 +8,7 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import "./styles/tokens.css";
 import { HubApiClient, HubApiError, normalizeHubSettings } from "./api/client";
 import { HubWsClient } from "./api/ws";
+import { clearParkedPromptDrafts } from "./lib/parkedPromptDrafts";
 import { createTranscriptReadGuard, isObservedTranscriptTurns, isTransientTranscriptReadError, type TranscriptReadOwner, type TranscriptReadTicket } from "./lib/transcriptReadGuard";
 import { ArtifactPreviewPane } from "./components/ArtifactPreviewPane";
 import { ChatPane, coalesceTurnsWithToolOutputs } from "./components/ChatPane";
@@ -1557,6 +1558,13 @@ export const App: React.FC<AppProps> = ({
           const retain = transient && owner.sessionId && previous && sameTranscriptOwner(previous.owner, owner) && (previous.status === "ready" || previous.status === "stale");
           return { owner, turns: retain ? previous.turns : [], status: retain ? "stale" : denied ? "denied" : "unavailable" };
         });
+        if (error instanceof HubApiError && error.details?.code === "transcript_unavailable") {
+          adoptPromptMetadata(error.details, owner);
+          const unconfirmed = error.details.in_flight_unconfirmed;
+          if (typeof unconfirmed === "boolean") {
+            setUnconfirmedBySession((previous) => ({ ...previous, [targetId]: unconfirmed }));
+          }
+        }
         if (error instanceof HubApiError && error.status === 401) {
           setAuthority(null); setAuthRequired(true); setPairingOpen(true);
         }
@@ -1569,7 +1577,7 @@ export const App: React.FC<AppProps> = ({
     });
     passiveTranscriptReadRef.current = entry;
     return entry.promise;
-  }, [apiClient, transcriptGuard, applyTranscriptTurns, recordTranscript, recordAgentBusy, recordAgentContextUsage, recordAgentQuotaUsage, isTranscriptResetPending, setSessionMetadataOwner]);
+  }, [apiClient, transcriptGuard, applyTranscriptTurns, recordTranscript, recordAgentBusy, recordAgentContextUsage, recordAgentQuotaUsage, isTranscriptResetPending, setSessionMetadataOwner, adoptPromptMetadata]);
 
   const [worktrees, setWorktrees] = useState<WorktreeSummary[]>([]);
   const [selectedWorktreeId, setSelectedWorktreeId] = useState<string | null>(null);
@@ -2759,6 +2767,7 @@ export const App: React.FC<AppProps> = ({
 
   const handleLogout = async () => {
     loggedOutRef.current = true;
+    clearParkedPromptDrafts();
     setRecoveryAttentionByAgent({});
     setRecoveryEvidenceTarget(null);
     ownerRef.current = { ...ownerRef.current, authEpoch: ownerRef.current.authEpoch + 1 };
@@ -3072,6 +3081,9 @@ export const App: React.FC<AppProps> = ({
         setTranscriptSnapshot(reset.lastGood ? { ...reset.lastGood, owner: reset.resetOwner } : null);
       }
       if (reset) pendingTranscriptResetsRef.current.delete(reset.resetOwner);
+      if (error instanceof HubApiError && typeof error.details?.handshake_queue_error === "string") {
+        await refreshHostedSessions();
+      }
       throw error;
     }
     if (reset) {

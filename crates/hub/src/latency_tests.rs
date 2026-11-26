@@ -439,10 +439,12 @@ fn transcript_get_unstable_observation_is_unavailable_then_recovers() {
     crate::discovery::after_next_transcript_read(move || write_ferris_transcript(&home, 4));
     let unavailable = get(&state, path).0;
     assert_eq!(unavailable.status, 503);
-    assert_eq!(
-        unavailable.json_value().unwrap(),
-        json!({"code":"transcript_unavailable", "reason":"unstable_or_unreadable"})
-    );
+    let body = unavailable.json_value().unwrap();
+    assert_eq!(body["code"], "transcript_unavailable");
+    assert_eq!(body["reason"], "unstable_or_unreadable");
+    assert!(body.get("turns").is_none());
+    assert_eq!(body["queue"], json!([]));
+    assert_eq!(body["queue_epoch"], json!(state.queue_epoch));
     assert!(!String::from_utf8_lossy(&unavailable.body).contains(tmp.path().to_str().unwrap()));
     let recovered = get(&state, path).0;
     assert_eq!(recovered.status, 200);
@@ -498,10 +500,12 @@ fn transcript_get_distinguishes_observed_empty_absent_and_fallback() {
 
     let absent = get(&state, "/api/v1/sessions/no-such-session/transcript").0;
     assert_eq!(absent.status, 503);
-    assert_eq!(
-        absent.json_value().unwrap(),
-        json!({"code":"transcript_unavailable", "reason":"source_not_available"})
-    );
+    let body = absent.json_value().unwrap();
+    assert_eq!(body["code"], "transcript_unavailable");
+    assert_eq!(body["reason"], "source_not_available");
+    assert!(body.get("turns").is_none());
+    assert_eq!(body["queue"], json!([]));
+    assert_eq!(body["queue_epoch"], json!(state.queue_epoch));
 
     let sessions = get(&state, "/api/v1/sessions").0.json_value().unwrap();
     let attempt = sessions["sessions"]

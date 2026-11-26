@@ -5564,7 +5564,7 @@ fn handle_dynamic_api_routes(
                 // One route lookup and one read and parse per transcript file serve every step.
                 let sessions = lookup_sessions(&snap, home);
                 let mut files = TranscriptReads::default();
-                let (canonical_id, _persona) = resolve_session_target_in(&sessions, &session_id);
+                let (canonical_id, persona) = resolve_session_target_in(&sessions, &session_id);
                 let resolved_session_id = sessions
                     .iter()
                     .find(|session| {
@@ -5598,6 +5598,12 @@ fn handle_dynamic_api_routes(
                     &canonical_id,
                     canonical_observation.as_deref(),
                 );
+                let draft_persona = queue_view_persona(&session_id, persona.as_deref());
+                let queue = state.session_prompt_queue_view(
+                    &canonical_id,
+                    draft_persona.as_deref(),
+                    authority.is_owner(),
+                );
                 let all_turns = match all_observation {
                     TranscriptObservation::Observed(turns) => turns,
                     unavailable => {
@@ -5611,6 +5617,10 @@ fn handle_dynamic_api_routes(
                             json!({
                                 "code": "transcript_unavailable",
                                 "reason": reason,
+                                "is_busy": is_busy,
+                                "in_flight_unconfirmed": state.session_in_flight_unconfirmed(&canonical_id),
+                                "queue": queue,
+                                "queue_epoch": state.queue_epoch,
                             }),
                         );
                     }
@@ -5625,7 +5635,6 @@ fn handle_dynamic_api_routes(
                     Some(limit) if total_turns > limit => &all_turns[total_turns - limit..],
                     _ => &all_turns[..],
                 };
-                let queue = state.session_queue(&canonical_id);
                 let context_usage =
                     context_usage_from_sessions(&session_id, &sessions, home, &mut files);
                 let quota_usage =
@@ -5656,14 +5665,18 @@ fn handle_dynamic_api_routes(
             }
             ("GET", "queue") => {
                 drain_ready_session_queues(state);
-                let mut queue = state.session_queue(&session_id);
-                let canonical_id = if queue.is_empty() {
-                    let (id, _) = resolve_session_target(state, &session_id);
-                    queue = state.session_queue(&id);
-                    id
+                let (resolved_id, persona) = resolve_session_target(state, &session_id);
+                let canonical_id = if state.session_queue(&session_id).is_empty() {
+                    resolved_id
                 } else {
-                    session_id
+                    session_id.clone()
                 };
+                let draft_persona = queue_view_persona(&session_id, persona.as_deref());
+                let queue = state.session_prompt_queue_view(
+                    &canonical_id,
+                    draft_persona.as_deref(),
+                    authority.is_owner(),
+                );
                 let is_busy = state.is_session_busy_released(&canonical_id);
                 return HttpResponse::json(
                     200,
@@ -5991,6 +6004,24 @@ pub(crate) fn resolve_session_target_in(
     (trimmed.to_string(), Some(trimmed.to_ascii_lowercase()))
 }
 
+fn queue_view_persona(raw: &str, resolved: Option<&str>) -> Option<String> {
+    fl_wire::identity::parse_hosted_identity(raw)
+        .ok()
+        .map(|(_, persona)| persona)
+        .or_else(|| {
+            resolved
+                .filter(|name| !name.eq_ignore_ascii_case(raw))
+                .map(str::to_owned)
+        })
+        // An unresolved bare request can still name a persona (e.g. after teardown).
+        // Recognize native ids separately so old-native reads can recover their own draft.
+        .or_else(|| {
+            uuid::Uuid::parse_str(raw.trim())
+                .is_err()
+                .then(|| raw.trim().to_ascii_lowercase())
+        })
+}
+
 pub(crate) fn route_matches_session_id(
     route: &fl_wire::identity::VendorRoute,
     raw_id: &str,
@@ -6279,7 +6310,7 @@ enum OperatorPromptError {
     Push(PushError),
     #[error("{0}")]
     Steer(CodexSteerError),
-    #[error("Claude terminal delivery refused: {0}; re-register and resubmit")]
+    #[error("Claude terminal delivery refused: {}; re-register and resubmit", .0.trim_end_matches("; re-register and resubmit"))]
     ClaudeRefused(String),
     #[error("Claude delivery is unconfirmed. Check the session before resending.")]
     ClaudeUnconfirmed,
@@ -6673,6 +6704,10 @@ fn dispatch_operator_prompt_for_session(
 /// Automatically drain and dispatch the next queued operator prompt for any session whose
 /// transcript/in-flight state has transitioned from busy to idle.
 pub fn drain_ready_session_queues(state: &HubState) {
+    drain_ready_session_queues_at(state, stamp::now().unix_millis() as i64);
+}
+
+fn drain_ready_session_queues_at(state: &HubState, now_ms: i64) {
     let keys = state.queued_session_keys();
     if keys.is_empty() {
         return;
@@ -6788,8 +6823,8 @@ pub fn drain_ready_session_queues(state: &HubState) {
             continue;
         }
         // A composer-occupied hold is retried only when a passive, key-free probe
-        // positively observes a clean composer (`Some(true)`), on the bounded
-        // backoff schedule in `HubState` — never over non-wire input or a dialog.
+        // positively observes a clean composer (`Some(true)`) on the backoff
+        // schedule in `HubState`.
         if let Some(prompt_id) = &next
             && state.is_composer_held_prompt(&session_id, prompt_id)
         {
@@ -6800,10 +6835,10 @@ pub fn drain_ready_session_queues(state: &HubState) {
                 // Legacy Claude holds lack a stream pin and cannot auto-retry.
                 continue;
             }
-            let now_ms = stamp::now().unix_millis() as i64;
-            let Some(probes) = state.note_composer_hold_probe(prompt_id, now_ms) else {
+            if state.note_composer_hold_probe(prompt_id, now_ms).is_none() {
                 continue;
-            };
+            }
+            let mut reason_changed = false;
             let ready = if let Some((binding, stream)) = held
                 .claude_binding
                 .as_ref()
@@ -6818,7 +6853,7 @@ pub fn drain_ready_session_queues(state: &HubState) {
                             prompt_id,
                             false,
                         ) {
-                            let queue = state.hold_refused_queued_prompt(
+                            state.hold_refused_queued_prompt(
                                 &session_id,
                                 prompt_id,
                                 crate::PARKED_PROMPT_REPLACED.into(),
@@ -6831,20 +6866,31 @@ pub fn drain_ready_session_queues(state: &HubState) {
                                 "queue_updated",
                                 json!({
                                     "session_id": session_id, "persona": held.persona,
-                                    "is_busy": true, "queue": queue,
                                 }),
                             );
                         }
                         continue;
                     }
-                    Err(ClaudeBoundError::Delivery(_) | ClaudeBoundError::Held { .. }) => None,
+                    Err(ClaudeBoundError::Held { reason, .. }) => {
+                        let hold_reason = crate::composer_hold_reason(&reason);
+                        reason_changed =
+                            state.update_bound_hold_reason(&session_id, prompt_id, reason);
+                        if reason_changed {
+                            operator_prompt_log(&canonical_id, "held", hold_reason);
+                        }
+                        None
+                    }
+                    Err(ClaudeBoundError::Delivery(_)) => None,
                 }
             } else {
                 drain_composer_probe(home, held, &canonical_id)
             };
-            if probes == crate::COMPOSER_HELD_MAX_PROBES && ready != Some(true) {
-                state.mark_hold_retries_exhausted(&session_id, prompt_id);
+            let exhausted =
+                ready != Some(true) && state.mark_hold_retries_exhausted(&session_id, prompt_id);
+            if exhausted {
                 operator_prompt_log(&canonical_id, "held", "retries_exhausted");
+            }
+            if reason_changed || exhausted {
                 state.broadcast(
                     "session",
                     "queue_updated",
@@ -6942,7 +6988,7 @@ pub fn drain_ready_session_queues(state: &HubState) {
                     "session_id": item.session_id,
                     "persona": item.persona,
                     "is_busy": true,
-                    "queue": queue,
+                    "queue": queue.iter().filter(|item| !item.retained_as_draft).collect::<Vec<_>>(),
                 }),
             );
         }
@@ -7030,6 +7076,18 @@ fn handle_post_queued_prompt_send_now(
     }
     let claimed = state.claim_queued_for_dispatch(&canonical_id, raw_session_id, prompt_id, false);
     let Some((item, claim)) = claimed else {
+        let draft_persona = queue_view_persona(raw_session_id, target_persona.as_deref());
+        if authority.is_owner()
+            && state
+                .session_prompt_queue_view(&canonical_id, draft_persona.as_deref(), true)
+                .iter()
+                .any(|item| item.id == prompt_id && item.retained_as_draft)
+        {
+            return HttpResponse::json(
+                409,
+                json!({ "error": "This prompt was refused. Restore its draft to submit it again." }),
+            );
+        }
         let exists = state
             .session_queue(&canonical_id)
             .iter()
@@ -7131,7 +7189,7 @@ fn handle_post_queued_prompt_send_now(
             "session_id": canonical_id,
             "persona": item.persona.or(target_persona),
             "is_busy": true,
-            "queue": queue,
+            "queue": queue.iter().filter(|item| !item.retained_as_draft).collect::<Vec<_>>(),
         }),
     );
     HttpResponse::json(200, data)
@@ -7214,14 +7272,30 @@ fn handle_delete_queued_prompt(
     {
         return refusal;
     }
-    let removed = state
-        .remove_queued_prompt(&canonical_id, prompt_id)
+    let draft_persona = queue_view_persona(raw_session_id, target_persona.as_deref());
+    let archived = authority
+        .is_owner()
+        .then(|| {
+            state.dismiss_refused_claude_draft(&canonical_id, draft_persona.as_deref(), prompt_id)
+        })
+        .flatten();
+    let removed = archived
+        .map(|item| (item, Vec::new()))
+        .or_else(|| state.remove_queued_prompt(&canonical_id, prompt_id))
         .or_else(|| state.remove_queued_prompt(raw_session_id, prompt_id));
     let Some((item, queue)) = removed else {
         return HttpResponse::json(404, json!({ "error": "queued prompt not found" }));
     };
 
     let is_busy = state.is_session_busy_released(&canonical_id);
+    let archived_queue = authority.is_owner().then(|| {
+        let key = if item.retained_as_draft {
+            &canonical_id
+        } else {
+            &item.session_id
+        };
+        state.session_prompt_queue_view(key, draft_persona.as_deref(), true)
+    });
     state.broadcast(
         "session",
         "queue_updated",
@@ -7239,7 +7313,8 @@ fn handle_delete_queued_prompt(
             "status": "cancelled",
             "prompt_id": prompt_id,
             "is_busy": is_busy,
-            "queue": queue,
+            "queue": archived_queue.unwrap_or(queue),
+            "queue_epoch": state.queue_epoch,
         }),
     )
 }
@@ -7279,7 +7354,7 @@ fn operator_prompt_queued(
         "session",
         "queue_updated",
         json!({
-            "session_id": item.session_id, "persona": item.persona, "is_busy": true, "queue": queue,
+            "session_id": item.session_id, "persona": item.persona, "is_busy": true, "queue": queue.iter().filter(|item| !item.retained_as_draft).collect::<Vec<_>>(),
         }),
     );
     HttpResponse::json(200, data)
@@ -7994,6 +8069,12 @@ fn reset_session(
     )
 }
 
+#[cfg(test)]
+thread_local! {
+    static RESET_DISPATCH_STUB: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 /// Prepare guidance only after the selected route passes the pure reset policy. Retain that
 /// route through dispatch: re-resolving it could send a reset to a different conversation.
 fn reset_session_with_prompt(
@@ -8085,7 +8166,17 @@ fn reset_session_with_prompt(
     };
     // A reset runs once: after its `/clear` or `/new` lands the session has changed, so a reset
     // that then fails is never run again on another route.
-    let reset = clear_or_reforge_session(&route, reset_mode, actor, prompt.as_deref());
+    #[cfg(test)]
+    let stubbed = RESET_DISPATCH_STUB
+        .with(|slot| slot.borrow_mut().take())
+        .map(|run| {
+            run();
+            Ok(())
+        });
+    #[cfg(not(test))]
+    let stubbed: Option<Result<(), String>> = None;
+    let reset = stubbed
+        .unwrap_or_else(|| clear_or_reforge_session(&route, reset_mode, actor, prompt.as_deref()));
     if let Some(claim) = reset_claim {
         claim.finish();
     }
@@ -9062,6 +9153,13 @@ fn checked_owned_target<'a>(
     Ok((store, target))
 }
 
+fn note_handshake_queue_refusal(data: &mut Value, session_id: &str) {
+    operator_prompt_log(session_id, "refused", "handshake_queue_limit");
+    const ERROR: &str = "The session is marked as decommissioning, but the handshake could not be queued. The queue is full or the prompt exceeds its size limit.";
+    data["handshake_queue_error"] = json!(ERROR);
+    data["error"] = json!(ERROR);
+}
+
 /// `POST /api/v1/sessions/:id/decommission` (`prepare` or `teardown`, see
 /// [`lifecycle::prepare_decommission`] and [`lifecycle::teardown_session`]). Owner only: 403 for
 /// a Peer, checked before the body is read and before any discovery, store access or side effect.
@@ -9151,10 +9249,27 @@ fn handle_post_session_decommission(
                             artifact_candidates,
                         );
                     }
-                    lifecycle::teardown_session(&*store, env, &target, by, caller, |key| {
-                        state.clear_session_prompt_queue(key);
-                        state.clear_session_model_override(key);
-                    })
+                    let watermark = state.queued_prompt_admission_watermark();
+                    lifecycle::teardown_session_with_queue_cleanup(
+                        &*store,
+                        env,
+                        &target,
+                        by,
+                        caller,
+                        |cleanup| match cleanup {
+                            lifecycle::TeardownQueueCleanup::Started {
+                                vendor: "claude",
+                                persona,
+                            } => {
+                                state.invalidate_restarted_claude_prompts(persona, watermark);
+                            }
+                            lifecycle::TeardownQueueCleanup::Started { .. } => {}
+                            lifecycle::TeardownQueueCleanup::Key(key) => {
+                                state.clear_session_prompt_queue(key);
+                                state.clear_session_model_override(key);
+                            }
+                        },
+                    )
                 }
             };
             let out = match result {
@@ -9183,13 +9298,18 @@ fn handle_post_session_decommission(
                         }),
                     );
                 } else {
-                    data["handshake_queue_error"] = json!(
-                        "The handshake exceeds the prompt queue limit. Review the prompt and resubmit it when the session is available."
-                    );
+                    note_handshake_queue_refusal(&mut data, &target.session_id);
                 }
             }
             state.broadcast("sessions", "session.decommission", data.clone());
-            HttpResponse::json(200, data)
+            HttpResponse::json(
+                if data["handshake_queue_error"].is_string() {
+                    409
+                } else {
+                    200
+                },
+                data,
+            )
         })())
     }) {
         Ok(response) => response,
@@ -9251,7 +9371,14 @@ fn handle_post_session_remodel(
                 by,
                 caller_of(authority),
             ) {
-                RemodelRun::Done { data, .. } => HttpResponse::json(200, data),
+                RemodelRun::Done { data, .. } => HttpResponse::json(
+                    if data["handshake_queue_error"].is_string() {
+                        409
+                    } else {
+                        200
+                    },
+                    data,
+                ),
                 RemodelRun::Failed { data, .. } => HttpResponse::json(502, data),
                 RemodelRun::Refused(e) => lifecycle_error_response(&e),
             },
@@ -9377,9 +9504,7 @@ pub(crate) fn run_remodel(
                         }),
                     );
                 } else {
-                    data["handshake_queue_error"] = json!(
-                        "The handshake exceeds the prompt queue limit. Review the prompt and resubmit it when the session is available."
-                    );
+                    note_handshake_queue_refusal(&mut data, &out.session_id);
                 }
             }
         }
@@ -14731,7 +14856,12 @@ mod claude_registration_binding_tests {
             hosted.vendor_session_id = Some("fbb4d293-6208-4370-875a-07da136f4f3d".into());
             lifecycle::persist_hosted_session(&*store, &hosted, "owner").unwrap();
         }
-        let _dispatch = stub_claude_dispatch(move |_, _| Err(busy_hold(&stream)));
+        let _dispatch = stub_claude_dispatch(move |_, _| {
+            Err(ClaudeBoundError::Held {
+            reason: "composer_occupied_by_non_wire_input: composer holds non-wire input; holding delivery without sending keys".into(),
+            stream: stream.clone(),
+        })
+        });
         let response = owner_post_with_attachment(state, owner);
         assert_eq!(response.status, 200, "{:?}", response.json_value());
         let receipt = response.json_value().unwrap();
@@ -14743,31 +14873,45 @@ mod claude_registration_binding_tests {
                 Some(index + 1)
             );
         }
-        state.mark_hold_retries_exhausted(native, id);
+        assert!(state.mark_hold_retries_exhausted(native, id));
         drain_ready_session_queues(state);
         assert!(state.session_queue(native)[0].retries_exhausted);
         id.to_owned()
     }
 
     #[test]
-    fn hosted_claude_restart_refuses_exhausted_hold_by_original_native_id() {
-        let (_tmp, state, native, stream) = parking_fixture();
-        let owner = HubAuthority::Owner {
-            login: "owner".into(),
-        };
-        let id = park_exhausted_hosted_claude_prompt(&state, &owner, &native, stream);
-        let response = handle_post_hosted_session_restart(&state, &owner, "claude:ada");
-        assert_eq!(response.status, 200, "{:?}", response.json_value());
-        let queue = state.session_queue(&native);
-        assert_eq!(queue.len(), 1);
-        assert_eq!(queue[0].id, id);
-        assert_eq!(queue[0].delivery_state, crate::QueuedDeliveryState::Refused);
-        assert_eq!(queue[0].refusal_reason.as_deref(), Some("session_replaced"));
-        assert_eq!(queue[0].prompt, "check this file");
-        assert_eq!(
-            std::fs::read(&queue[0].attachments[0].path).unwrap(),
-            b"hello"
-        );
+    fn hosted_claude_restart_and_teardown_refuse_exhausted_hold_by_original_native_id() {
+        for action in ["restart", "teardown"] {
+            let (_tmp, state, native, stream) = parking_fixture();
+            let owner = HubAuthority::Owner {
+                login: "owner".into(),
+            };
+            let id = park_exhausted_hosted_claude_prompt(&state, &owner, &native, stream);
+            let mut events = state.subscribe();
+            let response = match action {
+                "restart" => handle_post_hosted_session_restart(&state, &owner, "claude:ada"),
+                _ => {
+                    let req = HttpRequest::new("POST", "/unused")
+                        .with_json_body(&json!({"mode": "teardown"}));
+                    handle_post_session_decommission(&state, &owner, "claude:ada", &req)
+                }
+            };
+            assert_eq!(response.status, 200, "{:?}", response.json_value());
+            let event = events.try_recv().unwrap();
+            assert_eq!(event.event, "queue_updated");
+            assert!(event.data.get("queue").is_none());
+            assert!(state.session_queue(&native).is_empty());
+            let queue = state.session_prompt_queue_view(&native, Some("ada"), true);
+            assert_eq!(queue.len(), 1);
+            assert_eq!(queue[0].id, id);
+            assert_eq!(queue[0].delivery_state, crate::QueuedDeliveryState::Refused);
+            assert_eq!(queue[0].refusal_reason.as_deref(), Some("session_replaced"));
+            assert_eq!(queue[0].prompt, "check this file");
+            assert_eq!(
+                std::fs::read(&queue[0].attachments[0].path).unwrap(),
+                b"hello"
+            );
+        }
     }
 
     #[test]
@@ -14805,7 +14949,8 @@ mod claude_registration_binding_tests {
             if launch_fails {
                 assert_eq!(body["outcome"], "restored");
             }
-            let queue = state.session_queue(&native);
+            assert!(state.session_queue(&native).is_empty());
+            let queue = state.session_prompt_queue_view(&native, Some("ada"), true);
             assert_eq!(queue.len(), 1);
             assert_eq!(queue[0].id, id);
             assert_eq!(queue[0].delivery_state, crate::QueuedDeliveryState::Refused);
@@ -14861,23 +15006,66 @@ mod claude_registration_binding_tests {
         assert_eq!(repeated["queue"][2]["prompt"], "first");
         assert_ne!(repeated["queue"][0]["id"], repeated["queue"][2]["id"]);
 
-        let probes = stub_composer_probes(vec![Some(false)]);
-        drain_ready_session_queues(&state);
-        assert_eq!(composer_probe_calls(), 1);
-        drain_ready_session_queues(&state);
-        assert!(successful.borrow().is_empty());
-        assert_eq!(composer_probe_calls(), 1, "busy retry must honor backoff");
-        drop(probes);
-
-        let first = parked["queued_prompt"]["id"].as_str().unwrap();
-        state.reset_composer_hold_probe(first, 0);
-        let _probes = stub_composer_probes(vec![Some(true)]);
-        drain_ready_session_queues(&state);
+        let busy_probes = crate::COMPOSER_HELD_MAX_PROBES + 4;
+        let mut observations = vec![Some(false); busy_probes as usize];
+        observations.push(Some(true));
+        let _probes = stub_composer_probes(observations);
+        let start = stamp::now().unix_millis() as i64;
+        for i in 0..busy_probes {
+            let now = start + i64::from(i) * crate::COMPOSER_HELD_MAX_BACKOFF_MS;
+            drain_ready_session_queues_at(&state, now);
+            drain_ready_session_queues_at(&state, now);
+            assert_eq!(
+                composer_probe_calls(),
+                i as usize + 1,
+                "busy retry must honor backoff"
+            );
+            assert!(!state.session_queue(&native)[0].retries_exhausted);
+            assert!(successful.borrow().is_empty());
+        }
+        drain_ready_session_queues_at(
+            &state,
+            start + i64::from(busy_probes) * crate::COMPOSER_HELD_MAX_BACKOFF_MS,
+        );
+        assert_eq!(composer_probe_calls(), busy_probes as usize + 1);
         assert_eq!(&*successful.borrow(), &["first"]);
         assert_eq!(state.session_queue(&native)[0].prompt, "later");
         state.clear_session_in_flight(&native);
         drain_ready_session_queues(&state);
         assert_eq!(&*successful.borrow(), &["first", "later"]);
+    }
+
+    #[test]
+    fn composer_hold_observation_changes_keep_separate_retry_budgets() {
+        const OCCUPIED: &str =
+            "composer_occupied_by_non_wire_input: occupied; holding delivery without sending keys";
+        let (_tmp, state, native, stream) = parking_fixture();
+        let busy = match busy_hold(&stream) {
+            ClaudeBoundError::Held { reason, .. } => reason,
+            _ => unreachable!(),
+        };
+        let _dispatch = stub_claude_dispatch(move |_, _| {
+            Err(ClaudeBoundError::Held {
+                reason: OCCUPIED.into(),
+                stream: stream.clone(),
+            })
+        });
+        let receipt = owner_post(&state, "hold and retry").json_value().unwrap();
+        let id = receipt["queued_prompt"]["id"].as_str().unwrap();
+        let mut now = stamp::now().unix_millis() as i64;
+        for _ in 0..crate::COMPOSER_HELD_MAX_PROBES {
+            assert!(state.note_composer_hold_probe(id, now).is_some());
+            now += crate::COMPOSER_HELD_MAX_BACKOFF_MS;
+        }
+        assert!(state.update_bound_hold_reason(&native, id, busy));
+        for _ in 0..crate::COMPOSER_HELD_MAX_PROBES {
+            assert!(state.note_composer_hold_probe(id, now).is_some());
+            now += crate::COMPOSER_HELD_MAX_BACKOFF_MS;
+        }
+        assert!(!state.mark_hold_retries_exhausted(&native, id));
+        assert!(state.update_bound_hold_reason(&native, id, OCCUPIED.into()));
+        assert_eq!(state.note_composer_hold_probe(id, now), Some(2));
+        assert!(!state.mark_hold_retries_exhausted(&native, id));
     }
 
     #[test]
@@ -14907,6 +15095,11 @@ mod claude_registration_binding_tests {
         assert_eq!(after[0].delivery_state, crate::QueuedDeliveryState::Refused);
         assert_eq!(after[0].refusal_reason.as_deref(), Some("session_replaced"));
         assert_eq!(after[0].prompt, "keep this draft");
+        assert!(state.session_queue(&native).is_empty());
+        assert_eq!(
+            state.session_prompt_queue_view(&native, Some("ada"), true)[0].id,
+            first
+        );
         assert!(
             state
                 .claim_queued_for_dispatch(&native, &native, &first, false)
@@ -14961,6 +15154,260 @@ mod claude_registration_binding_tests {
         let queue = state.session_queue(&native);
         assert_eq!(queue.len(), crate::MAX_SESSION_QUEUED_PROMPTS);
         assert_eq!(queue[0].prompt, "first");
+    }
+
+    #[test]
+    fn real_probe_refusal_keeps_draft_in_current_seat_and_never_dispatches() {
+        let (tmp, state, native, stream) = parking_fixture();
+        let owner = HubAuthority::Owner {
+            login: "owner".into(),
+        };
+        let peer = HubAuthority::Peer {
+            agent: Some("peer".into()),
+        };
+        let mut first = true;
+        let _dispatch = stub_claude_dispatch(move |_, _| {
+            assert!(
+                std::mem::take(&mut first),
+                "refused probe must not dispatch"
+            );
+            Err(busy_hold(&stream))
+        });
+        let receipt = owner_post_with_attachment(&state, &owner)
+            .json_value()
+            .unwrap();
+        let id = receipt["queued_prompt"]["id"].as_str().unwrap();
+        let route_file = tmp.path().join(".cache/agent-bus/routes.json");
+        let mut entry = RouteTable::load(Some(&route_file))
+            .get("ada")
+            .unwrap()
+            .clone();
+        let VendorRoute::Claude { session_id, .. } = &mut entry.route else {
+            panic!("expected Claude");
+        };
+        let current_native = "481b7ceb-372a-437e-b5b6-f4d53f527f20";
+        *session_id = current_native.into();
+        write(&route_file, &changed(entry));
+
+        // The production probe validates the stored registration and refuses before Host I/O.
+        let mut events = state.subscribe();
+        drain_ready_session_queues(&state);
+        assert!(state.session_queue(&native).is_empty());
+        let event = events.try_recv().unwrap();
+        assert_eq!(event.event, "queue_updated");
+        assert!(event.data.get("queue").is_none());
+
+        let read = |authority, target, view| {
+            let req = HttpRequest::new("GET", &format!("/api/v1/sessions/{target}/{view}"));
+            handle_dynamic_api_routes(&state, authority, &req)
+                .json_value()
+                .unwrap()
+        };
+        let queue = read(&owner, "claude:ada", "queue");
+        assert_eq!(queue["queue"][0]["id"], id);
+        assert_eq!(queue["queue"][0]["session_id"], native);
+        assert_eq!(queue["queue"][0]["prompt"], "check this file");
+        assert_eq!(queue["queue"][0]["delivery_state"], "refused");
+        assert_eq!(queue["queue"][0]["refusal_reason"], "session_replaced");
+        assert_eq!(queue["queue"][0]["retained_as_draft"], true);
+        assert_eq!(queue["queue"][0]["attachments"][0]["name"], "evidence.txt");
+        assert_eq!(
+            read(&owner, "claude:ada", "transcript")["queue"][0]["id"],
+            id
+        );
+        assert_eq!(read(&owner, current_native, "queue")["queue"][0]["id"], id);
+        assert_eq!(
+            read(&owner, current_native, "transcript")["queue"][0]["id"],
+            id
+        );
+        assert_eq!(read(&owner, "claude:bea", "queue")["queue"], json!([]));
+        assert_eq!(read(&peer, "claude:ada", "queue")["queue"], json!([]));
+        assert_eq!(read(&peer, &native, "queue")["queue"], json!([]));
+        assert_eq!(
+            handle_delete_queued_prompt(&state, &peer, "claude:ada", id).status,
+            404
+        );
+        assert_eq!(
+            handle_delete_queued_prompt(&state, &owner, "claude:bea", id).status,
+            404
+        );
+        assert_eq!(
+            handle_delete_queued_prompt(&state, &owner, current_native, id).status,
+            200
+        );
+        assert_eq!(read(&owner, "claude:ada", "queue")["queue"], json!([]));
+    }
+
+    #[test]
+    fn clear_and_parked_prompt_dispatch_conflict_in_both_directions() {
+        let (_tmp, state, native, stream) = parking_fixture();
+        let owner = HubAuthority::Owner {
+            login: "owner".into(),
+        };
+        let _dispatch = stub_claude_dispatch(move |_, _| Err(busy_hold(&stream)));
+        let receipt = owner_post(&state, "retain this draft")
+            .json_value()
+            .unwrap();
+        let id = receipt["queued_prompt"]["id"].as_str().unwrap();
+        let clear = || {
+            let req = HttpRequest::new("POST", "/unused").with_json_body(&json!({"mode": "clear"}));
+            handle_post_session_clear(&state, &owner, &native, &req)
+        };
+        let (_, claim) = state
+            .claim_queued_for_dispatch(&native, &native, id, false)
+            .unwrap();
+        assert_eq!(clear().status, 409);
+        let ClaudeBoundError::Held { reason, stream } = busy_hold(
+            &state.session_queue(&native)[0]
+                .claude_stream
+                .clone()
+                .unwrap(),
+        ) else {
+            unreachable!()
+        };
+        state.finish_bound_claude_hold(&native, id, reason, stream);
+        claim.finish();
+
+        let mut events = state.subscribe();
+        let during_clear = state.clone();
+        let during_id = id.to_owned();
+        let during_native = native.clone();
+        let during_owner = owner.clone();
+        RESET_DISPATCH_STUB.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                let response = owner_post(&during_clear, "later");
+                assert_eq!(response.status, 409);
+                assert_eq!(
+                    response.json_value().unwrap()["refusal_reason"],
+                    "dispatch_busy"
+                );
+                assert_eq!(
+                    handle_post_queued_prompt_send_now(
+                        &during_clear,
+                        &during_owner,
+                        &during_native,
+                        &during_id
+                    )
+                    .status,
+                    409
+                );
+            }))
+        });
+        let response = clear();
+        assert_eq!(response.status, 200, "{:?}", response.json_value());
+        let first = events.try_recv().unwrap();
+        assert_eq!(first.event, "queue_updated");
+        assert!(first.data.get("queue").is_none());
+        let queue = state.session_prompt_queue_view(&native, Some("ada"), true);
+        assert_eq!(queue[0].refusal_reason.as_deref(), Some("session_replaced"));
+        assert_eq!(queue[0].prompt, "retain this draft");
+        assert!(state.session_queue(&native).is_empty());
+
+        // A retained draft cannot fence the active queue even if a native id is reused.
+        let response = owner_post(&state, "send this next");
+        assert_eq!(
+            response.json_value().unwrap()["hold_reason"],
+            "session_busy"
+        );
+        assert_eq!(state.session_queue(&native)[0].prompt, "send this next");
+    }
+
+    #[test]
+    fn retired_claude_drafts_age_out_and_release_the_hub_queue_limit() {
+        let (_tmp, state, native, stream) = parking_fixture();
+        let _dispatch = stub_claude_dispatch(move |_, _| Err(busy_hold(&stream)));
+        assert_eq!(owner_post(&state, "retire this prompt").status, 200);
+        state.clear_session_prompt_queue(&native);
+        for i in 0..crate::MAX_HUB_QUEUED_PROMPTS - 1 {
+            state.enqueue_session_prompt(
+                &format!("seat-{i}"),
+                None,
+                "queued".into(),
+                "queued".into(),
+                "owner".into(),
+                vec![],
+            );
+        }
+        let response = owner_post(&state, "at capacity");
+        assert_eq!(response.status, 409);
+        assert_eq!(
+            response.json_value().unwrap()["refusal_reason"],
+            "queue_full"
+        );
+        state
+            .prompt_queues
+            .lock()
+            .unwrap()
+            .expire_refused_claude_drafts(
+                std::time::Instant::now() + crate::REFUSED_PROMPT_RETENTION,
+            );
+        assert!(
+            state
+                .session_prompt_queue_view(&native, Some("ada"), true)
+                .is_empty()
+        );
+        assert_eq!(owner_post(&state, "room after expiration").status, 200);
+    }
+
+    #[test]
+    fn parked_claude_rejects_oversize_queued_requests_before_dispatch() {
+        let (_tmp, state, native, stream) = parking_fixture();
+        let mut first = true;
+        let _dispatch = stub_claude_dispatch(move |_, _| {
+            assert!(
+                std::mem::take(&mut first),
+                "oversized prompt cannot dispatch behind a hold"
+            );
+            Err(busy_hold(&stream))
+        });
+        assert_eq!(owner_post(&state, "first").status, 200);
+        let response = owner_post(&state, &"a".repeat(crate::MAX_QUEUED_PROMPT_BYTES + 1));
+        assert_eq!(response.status, 413);
+        assert_eq!(
+            response.json_value().unwrap()["refusal_reason"],
+            "queued_prompt_too_large"
+        );
+        assert_eq!(state.session_queue(&native).len(), 1);
+    }
+
+    #[test]
+    fn lifecycle_prepare_surfaces_handshake_queue_limit_after_marking_decommissioning() {
+        let (_tmp, state, _native, _stream) = parking_fixture();
+        let owner = HubAuthority::Owner {
+            login: "owner".into(),
+        };
+        let spin_up = HttpRequest::new("POST", "/unused").with_json_body(&json!({
+            "persona": "ada", "project": "FerroLoop", "role": "assistant", "vendor": "claude"
+        }));
+        assert_eq!(
+            handle_post_session_spin_up(&state, &owner, &spin_up).status,
+            200
+        );
+        for i in 0..crate::MAX_HUB_QUEUED_PROMPTS {
+            state.enqueue_session_prompt(
+                &format!("seat-{i}"),
+                None,
+                "queued".into(),
+                "queued".into(),
+                "owner".into(),
+                vec![],
+            );
+        }
+        let decommission =
+            HttpRequest::new("POST", "/unused").with_json_body(&json!({"mode": "prepare"}));
+        let remodel = HttpRequest::new("POST", "/unused")
+            .with_json_body(&json!({"mode": "prepare", "vendor": "codex"}));
+        for response in [
+            handle_post_session_decommission(&state, &owner, "claude:ada", &decommission),
+            handle_post_session_remodel(&state, &owner, "claude:ada", &remodel),
+        ] {
+            let body = response.json_value().unwrap();
+            assert_eq!(response.status, 409, "{body}");
+            assert_eq!(body["status"], "decommissioning");
+            assert_eq!(body["handshake_dispatched"], false);
+            assert!(body["prompt"].is_string());
+            assert_eq!(body["error"], body["handshake_queue_error"]);
+        }
     }
 
     #[test]
@@ -15310,16 +15757,12 @@ mod claude_registration_binding_tests {
             handle_post_queued_prompt_send_now(&state, &owner, &item.session_id, &item.id)
         });
         assert_eq!(costs.route_scans, 0);
-        let queue = state.session_queue(&item.session_id);
+        assert!(state.session_queue(&item.session_id).is_empty());
+        let queue = state.session_prompt_queue_view(&item.session_id, Some("ada"), true);
         assert_eq!(queue.len(), 1);
         assert_eq!(queue[0].delivery_state, crate::QueuedDeliveryState::Refused);
-        assert!(
-            queue[0]
-                .delivery_error
-                .as_deref()
-                .unwrap()
-                .contains("re-register and resubmit")
-        );
+        let error = queue[0].delivery_error.as_deref().unwrap();
+        assert_eq!(error.matches("re-register and resubmit").count(), 1);
     }
 
     // This fixture uses a store under its private temp home; no host or vendor is started.
@@ -15332,7 +15775,8 @@ mod claude_registration_binding_tests {
         let (_, costs) =
             crate::discovery::cost_counters::measure(|| drain_ready_session_queues(&state));
         assert_eq!(costs.route_scans, 0);
-        let queue = state.session_queue(&item.session_id);
+        assert!(state.session_queue(&item.session_id).is_empty());
+        let queue = state.session_prompt_queue_view(&item.session_id, Some("ada"), true);
         assert_eq!(queue.len(), 1);
         assert_eq!(queue[0].delivery_state, crate::QueuedDeliveryState::Refused);
     }
