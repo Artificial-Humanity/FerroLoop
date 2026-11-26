@@ -16,7 +16,6 @@ fn env(home: &TempDir) -> LifecycleEnv<'_> {
         workspace_root: None,
         log_hydration_warnings: true,
         lifecycle_fence: None,
-        skip_launch_auth_probe: false,
     }
 }
 
@@ -904,7 +903,7 @@ fn an_old_runtime_the_teardown_cannot_stop_is_refused_before_anything_changes() 
 }
 
 #[test]
-fn confirmed_codex_auth_rejection_preserves_the_source_seat() {
+fn confirmed_codex_auth_warning_is_reported_once_and_remodel_continues() {
     let home = TempDir::new().unwrap();
     let _trusted = trusted_codex_home(home.path(), home.path());
     let fake = FakeRuntime::default();
@@ -919,24 +918,28 @@ fn confirmed_codex_auth_rejection_preserves_the_source_seat() {
         None,
         Some(home.path()),
     );
-    let before = record(&store, "claude:ada");
-    fake.calls.borrow_mut().clear();
 
-    let code = fl_core::LaunchPrerequisiteRefusal::VENDOR_SIGN_IN;
-    TEST_LAUNCH_PREREQUISITE.with(|slot| {
-        *slot.borrow_mut() = Some(Err(fl_core::LaunchPrerequisiteRefusal {
-            code: code.into(),
-            detail: "Codex sign-in rejected".into(),
-        }));
-    });
-    assert!(matches!(
-        remodel(&store, &env, "claude:ada", &remodel_req("codex"), Caller::Owner),
-        Err(LifecycleError::PrerequisiteUnavailable { code: actual, .. }) if actual == code
-    ));
-    assert_eq!(list_hosted_sessions(&store).unwrap(), vec![before]);
-    assert!(handoff(&store, "ada").is_none());
-    assert!(fake.calls.borrow().is_empty());
-    assert!(fake.is_live("Ada"));
+    TEST_LAUNCH_PREREQUISITE
+        .with(|slot| *slot.borrow_mut() = Some(Ok(Some(TEST_CODEX_AUTH_WARNING))));
+    let out = remodel(
+        &store,
+        &env,
+        "claude:ada",
+        &remodel_req("codex"),
+        Caller::Owner,
+    )
+    .unwrap();
+    assert_eq!(out.session_id, "codex:ada");
+    assert!(out.runtime_stopped);
+    assert_eq!(record(&store, "codex:ada").status, STATUS_RUNNING);
+    assert_eq!(record(&store, "claude:ada").status, STATUS_DECOMMISSIONED);
+    assert_eq!(
+        out.warnings
+            .iter()
+            .filter(|warning| warning.as_str() == TEST_CODEX_AUTH_WARNING)
+            .count(),
+        1
+    );
 }
 
 #[test]
@@ -1926,6 +1929,7 @@ fn recast_remodel_uses_bound_current_registration_over_hosted_assignment() {
         &target,
         &remodel_req("codex"),
         Caller::Owner,
+        true,
     )
     .unwrap();
     assert_eq!(plan.to.project, "sonora");
@@ -2053,6 +2057,7 @@ fn remodel_resolves_project_cwd_from_workspace_root_when_old_cwd_is_none_or_work
         &target(&store, "antigravity:kayla"),
         &remodel_req("claude"),
         Caller::Owner,
+        true,
     )
     .unwrap();
     let want_proj = proj_dir.display().to_string();
@@ -2105,6 +2110,7 @@ fn remodel_resolves_project_cwd_from_workspace_root_when_old_cwd_is_none_or_work
         &target(&store, "codex:kayla"),
         &remodel_req("claude"),
         Caller::Owner,
+        true,
     )
     .unwrap();
     assert_eq!(plan3.to.cwd.as_deref(), Some(wt_str.as_str()));

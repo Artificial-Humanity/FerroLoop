@@ -61,6 +61,8 @@ pub const CODEX_CONTROL_SOCKET_REL: &str = "app-server-control/app-server-contro
 #[cfg(unix)]
 const LAUNCH_AUTH_PROBE_TIMEOUT: Duration = Duration::from_millis(750);
 #[cfg(unix)]
+const LAUNCH_AUTH_WARNING: &str = "The managed Codex app-server's account check returned HTTP 401.";
+#[cfg(unix)]
 const ACCOUNT_RATE_LIMITS_READ: &str = "account/rateLimits/read";
 #[cfg(unix)]
 const CODEX_DEFAULT_CHATGPT_BASE_URL: &str = "https://chatgpt.com/backend-api";
@@ -256,7 +258,7 @@ impl VendorHostAdapter for CodexHostAdapter {
         &self,
         config_home: Option<&Path>,
         launch_cwd: Option<&Path>,
-    ) -> Result<(), LaunchPrerequisiteRefusal> {
+    ) -> Result<Option<&'static str>, LaunchPrerequisiteRefusal> {
         let config_home = config_home.ok_or_else(|| {
             codex_prerequisite_refusal(
                 Path::new("<unresolved CODEX_HOME>"),
@@ -269,16 +271,12 @@ impl VendorHostAdapter for CodexHostAdapter {
             let stream =
                 connect_unix_with_deadline(&socket, Instant::now() + Duration::from_millis(250))
                     .map_err(|e| codex_prerequisite_refusal(&socket, &format!("{:?}", e.kind())))?;
-            if launch_cwd
+            // Model requests can recover from a 401 by reloading or refreshing auth.
+            // The account check reports its own rejection without blocking the launch.
+            Ok(launch_cwd
                 .and_then(Path::to_str)
                 .is_some_and(|cwd| launch_account_auth_rejected(stream, cwd))
-            {
-                return Err(LaunchPrerequisiteRefusal {
-                    code: LaunchPrerequisiteRefusal::VENDOR_SIGN_IN.into(),
-                    detail: "The Codex app-server's sign-in was rejected. Sign in again, then restart the managed app-server.".into(),
-                });
-            }
-            Ok(())
+                .then_some(LAUNCH_AUTH_WARNING))
         }
         #[cfg(not(unix))]
         {
@@ -2501,7 +2499,7 @@ mod tests {
     }
 
     #[test]
-    fn launch_prerequisite_refuses_only_correlated_backend_auth_rejection() {
+    fn launch_prerequisite_warns_only_on_correlated_backend_auth_rejection() {
         const AUTH_REJECTION: &str = "failed to fetch codex rate limits: GET https://chatgpt.com/backend-api/wham/usage failed: 401 Unauthorized; content-type=application/json; body=private detail";
         let responses = [
             (
@@ -2538,7 +2536,7 @@ mod tests {
                 false,
             ),
         ];
-        for (response, expected_refusal) in responses {
+        for (response, expected_warning) in responses {
             let home = tempfile::tempdir().unwrap();
             let socket = codex_launch_control_socket(home.path());
             std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
@@ -2569,15 +2567,14 @@ mod tests {
                 conn.send_text(&response.to_string());
                 conn.drain_until_eof();
             });
-            let result =
-                CodexHostAdapter::default().preflight_launch(Some(home.path()), Some(&project));
-            if expected_refusal {
-                let refusal = result.unwrap_err();
-                assert_eq!(refusal.code, LaunchPrerequisiteRefusal::VENDOR_SIGN_IN);
-                assert!(!refusal.detail.contains("private detail"));
-            } else {
-                result.unwrap();
-            }
+            let warning = CodexHostAdapter::default()
+                .preflight_launch(Some(home.path()), Some(&project))
+                .unwrap();
+            assert_eq!(
+                warning,
+                expected_warning
+                    .then_some("The managed Codex app-server's account check returned HTTP 401.")
+            );
             let frames = server.join().unwrap();
             assert_eq!(
                 frames
@@ -2631,9 +2628,12 @@ mod tests {
                 }
                 conn.drain_until_eof();
             });
-            CodexHostAdapter::default()
-                .preflight_launch(Some(home.path()), Some(home.path()))
-                .unwrap();
+            assert_eq!(
+                CodexHostAdapter::default()
+                    .preflight_launch(Some(home.path()), Some(home.path()))
+                    .unwrap(),
+                None
+            );
             let frames = server.join().unwrap();
             let expected = if account.is_some() { 4 } else { 3 };
             assert_eq!(
@@ -2667,9 +2667,12 @@ mod tests {
             .unwrap_err();
         assert_eq!(missing.code, "codex_app_server_unavailable");
         let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
-        adapter
-            .preflight_launch(Some(home.path()), Some(home.path()))
-            .unwrap();
+        assert_eq!(
+            adapter
+                .preflight_launch(Some(home.path()), Some(home.path()))
+                .unwrap(),
+            None
+        );
         drop(listener);
         // A sibling test forks a child that briefly holds the listener
         // (fork inherits fds), so a connect can succeed briefly after the

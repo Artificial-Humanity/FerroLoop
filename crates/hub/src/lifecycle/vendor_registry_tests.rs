@@ -455,6 +455,7 @@ fn remodel_accepts_a_custom_vendor_as_target_and_as_source() {
             ..RemodelRequest::default()
         },
         Caller::Peer,
+        true,
     )
     .unwrap();
     assert_eq!(plan.from_vendor, custom);

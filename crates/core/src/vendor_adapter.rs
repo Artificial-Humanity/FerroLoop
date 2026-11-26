@@ -381,10 +381,6 @@ pub struct LaunchPrerequisiteRefusal {
     pub detail: String,
 }
 
-impl LaunchPrerequisiteRefusal {
-    pub const VENDOR_SIGN_IN: &str = "vendor_sign_in";
-}
-
 /// Dependency-inverted contract implemented by each concrete vendor host adapter
 /// (`CodexHostAdapter`, `AntigravityHostAdapter`, `ClaudeHostAdapter`, `MuseGrokPtyAdapter`, etc.).
 pub trait VendorHostAdapter: fmt::Debug + Send + Sync {
@@ -404,13 +400,14 @@ pub trait VendorHostAdapter: fmt::Debug + Send + Sync {
     /// Read-only prerequisite check immediately before a hosted launch. `config_home` is
     /// the effective configuration directory pinned into the child, not a delivery endpoint.
     /// `cwd` selects the launch workspace for credential checks. `None` checks connectivity
-    /// only. Launch-plan preparation remains deterministic and performs no availability probes.
+    /// only. A warning describes an observed problem that need not prevent launch.
+    /// Launch-plan preparation remains deterministic and performs no availability probes.
     fn preflight_launch(
         &self,
         _config_home: Option<&Path>,
         _cwd: Option<&Path>,
-    ) -> Result<(), LaunchPrerequisiteRefusal> {
-        Ok(())
+    ) -> Result<Option<&'static str>, LaunchPrerequisiteRefusal> {
+        Ok(None)
     }
 
     /// Build a deterministic launch plan (`argv`, `env`, `cwd`, `remote_control`) for starting a

@@ -201,8 +201,6 @@ pub struct LifecycleEnv<'a> {
     pub log_hydration_warnings: bool,
     /// Borrowed proof for nested helpers; never a bypass for a different persona.
     pub(crate) lifecycle_fence: Option<&'a lock::LifecycleFence>,
-    /// Remodel checks destination credentials before teardown and restores the old seat on failure.
-    pub(crate) skip_launch_auth_probe: bool,
 }
 
 /// Process-wide [`fl_core::VendorHostAdapterRegistry`] slot injected at startup by `fl-cli`.
@@ -235,7 +233,6 @@ impl<'a> LifecycleEnv<'a> {
             workspace_root: None,
             log_hydration_warnings: true,
             lifecycle_fence: None,
-            skip_launch_auth_probe: false,
         }
     }
 
@@ -949,6 +946,8 @@ fn preflight_vendor_launch(
     vendor: &str,
     hosted: bool,
     cwd: &mut Option<String>,
+    probe_auth: bool,
+    warnings: &mut Vec<String>,
 ) -> Result<Option<PathBuf>, LifecycleError> {
     if vendor != "codex" || !hosted || !env.spawn_runtime {
         return Ok(None);
@@ -984,9 +983,14 @@ fn preflight_vendor_launch(
     if env
         .vendor_launch_options_for_vendor(vendor, fl_core::permissions::Posture::Auto)
         .remote_control
+        && let Some(warning) = check_vendor_launch_prerequisite(
+            env,
+            vendor,
+            Some(&config_home),
+            probe_auth.then_some(checked.cwd.as_path()),
+        )?
     {
-        let launch_cwd = (!env.skip_launch_auth_probe).then_some(checked.cwd.as_path());
-        check_vendor_launch_prerequisite(env, vendor, Some(&config_home), launch_cwd)?;
+        warnings.push(warning.into());
     }
     Ok(Some(config_home))
 }
@@ -996,24 +1000,20 @@ fn check_vendor_launch_prerequisite(
     vendor: &str,
     config_home: Option<&Path>,
     cwd: Option<&Path>,
-) -> Result<(), LifecycleError> {
+) -> Result<Option<&'static str>, LifecycleError> {
     #[cfg(test)]
     TEST_LAUNCH_PREREQUISITE_CALLS.with(|calls| calls.set(calls.get() + 1));
     #[cfg(test)]
-    if let Some(result) =
-        TEST_LAUNCH_PREREQUISITE_SEQUENCE.with(|slot| slot.borrow_mut().pop_front())
+    if let Some(result) = TEST_LAUNCH_PREREQUISITE_SEQUENCE
+        .with(|slot| slot.borrow_mut().pop_front())
+        .or_else(|| TEST_LAUNCH_PREREQUISITE.with(|slot| slot.borrow().clone()))
     {
-        return result.map_err(|r| LifecycleError::PrerequisiteUnavailable {
-            code: r.code,
-            detail: r.detail,
-        });
-    }
-    #[cfg(test)]
-    if let Some(result) = TEST_LAUNCH_PREREQUISITE.with(|slot| slot.borrow().clone()) {
-        return result.map_err(|r| LifecycleError::PrerequisiteUnavailable {
-            code: r.code,
-            detail: r.detail,
-        });
+        return result
+            .map(|warning| warning.filter(|_| cwd.is_some()))
+            .map_err(|r| LifecycleError::PrerequisiteUnavailable {
+                code: r.code,
+                detail: r.detail,
+            });
     }
     // Production hosted Codex launch must never silently fall back around its prerequisite.
     let adapter =
@@ -1064,10 +1064,17 @@ fn codex_config_home(
 }
 
 #[cfg(test)]
+type LaunchPrerequisiteCheck = Result<Option<&'static str>, fl_core::LaunchPrerequisiteRefusal>;
+
+#[cfg(test)]
+const TEST_CODEX_AUTH_WARNING: &str =
+    "The managed Codex app-server's account check returned HTTP 401.";
+
+#[cfg(test)]
 thread_local! {
     // Scoped ambient input replacement, not a trust bypass or process environment edit.
-    static TEST_LAUNCH_PREREQUISITE: std::cell::RefCell<Option<Result<(), fl_core::LaunchPrerequisiteRefusal>>> = const { std::cell::RefCell::new(None) };
-    static TEST_LAUNCH_PREREQUISITE_SEQUENCE: std::cell::RefCell<std::collections::VecDeque<Result<(), fl_core::LaunchPrerequisiteRefusal>>> = const { std::cell::RefCell::new(std::collections::VecDeque::new()) };
+    static TEST_LAUNCH_PREREQUISITE: std::cell::RefCell<Option<LaunchPrerequisiteCheck>> = const { std::cell::RefCell::new(None) };
+    static TEST_LAUNCH_PREREQUISITE_SEQUENCE: std::cell::RefCell<std::collections::VecDeque<LaunchPrerequisiteCheck>> = const { std::cell::RefCell::new(std::collections::VecDeque::new()) };
     static TEST_LAUNCH_PREREQUISITE_CALLS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
     static TEST_RESPAWN_LOAD_FAILURE_SESSION: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
     static TEST_RESPAWN_SAVE_FAILURE_SESSION: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
@@ -1079,14 +1086,14 @@ thread_local! {
 #[cfg(test)]
 pub(crate) struct IsolatedCodexHome(
     Option<Option<std::ffi::OsString>>,
-    Option<Result<(), fl_core::LaunchPrerequisiteRefusal>>,
+    Option<LaunchPrerequisiteCheck>,
 );
 #[cfg(test)]
 impl IsolatedCodexHome {
     pub(crate) fn new() -> Self {
         Self(
             TEST_CODEX_HOME.with(|slot| slot.replace(Some(None))),
-            TEST_LAUNCH_PREREQUISITE.with(|slot| slot.replace(Some(Ok(())))),
+            TEST_LAUNCH_PREREQUISITE.with(|slot| slot.replace(Some(Ok(None)))),
         )
     }
 }
@@ -2546,7 +2553,6 @@ impl FakeRuntime {
             workspace_root: None,
             log_hydration_warnings: true,
             lifecycle_fence: None,
-            skip_launch_auth_probe: false,
         }
     }
 
@@ -6047,12 +6053,12 @@ where
 {
     let persona = req.validate()?.persona;
     if env.lifecycle_fence.is_some_and(|f| f.covers(&persona)) {
-        return spin_up_fenced(store_guard, &mut reopen_store, env, req, by, caller);
+        return spin_up_fenced(store_guard, &mut reopen_store, env, req, by, caller, true);
     }
     drop(store_guard);
     with_lifecycle_fence(env, &persona, "spin-up", |env| {
         let store_guard = reopen_store()?;
-        spin_up_fenced(store_guard, &mut reopen_store, env, req, by, caller)
+        spin_up_fenced(store_guard, &mut reopen_store, env, req, by, caller, true)
     })
 }
 
@@ -6063,6 +6069,7 @@ fn spin_up_fenced<S, G, F>(
     req: &SpinUpRequest,
     by: &str,
     caller: Caller,
+    probe_auth: bool,
 ) -> Result<SpinUpResponse, LifecycleError>
 where
     S: AgentRegistry + StateStore + Catalog + MessageStore,
@@ -6134,7 +6141,15 @@ where
     if let Some(record) = &previous {
         load_hosted_respawn_state_policy(store, &record.session_id, true)?;
     }
-    let config_home = preflight_vendor_launch(env, &v.vendor, v.hosted, &mut v.cwd)?;
+    let mut warnings = Vec::new();
+    let config_home = preflight_vendor_launch(
+        env,
+        &v.vendor,
+        v.hosted,
+        &mut v.cwd,
+        probe_auth,
+        &mut warnings,
+    )?;
     let tmux_target = has_runtime.then(|| hosted_tmux_target(&v.vendor, &v.persona));
     let host_session_id = host_session_id_for_target(tmux_target.as_deref());
     let unit = tmux_target
@@ -6209,7 +6224,7 @@ where
     if env.log_hydration_warnings {
         crate::hydration::log_warnings(&v.persona, &session_id, &guidance.warnings);
     }
-    let mut warnings = guidance.warnings;
+    warnings.extend(guidance.warnings);
     let mut prompt = guidance.text;
 
     let mut is_claude_resume = false;
@@ -8473,6 +8488,7 @@ where
     let prior_stop_reason = record.stop_reason.clone();
     let retry_prerequisite = prerequisite_retry_allowed(by, prior_stop_reason.as_deref());
     let mut recast_staged = false;
+    let mut warnings = Vec::new();
     // Classify every preparation error under the same lock as its attempt reservation.
     let preparation = (|| {
         let recast_assignment = current_recast_assignment(store, &record.persona)?;
@@ -8489,8 +8505,14 @@ where
                 env.home_override,
             )?;
         }
-        let config_home =
-            preflight_vendor_launch(env, &record.vendor, record.hosted, &mut record.cwd)?;
+        let config_home = preflight_vendor_launch(
+            env,
+            &record.vendor,
+            record.hosted,
+            &mut record.cwd,
+            true,
+            &mut warnings,
+        )?;
         if record.hosted && vendor_has_runtime(&record.vendor) && env.spawn_runtime {
             env.runtime.preflight_spawn(&record.session_id)?;
         }
@@ -8641,7 +8663,7 @@ where
     if env.log_hydration_warnings {
         crate::hydration::log_warnings(&record.persona, &record.session_id, &guidance.warnings);
     }
-    let mut warnings = guidance.warnings;
+    warnings.extend(guidance.warnings);
     let mut prompt = guidance.text;
 
     let mut is_claude_resume = false;
@@ -9756,6 +9778,7 @@ struct RemodelPlan {
     from_model: Option<String>,
     /// The new session, validated.
     to: ValidSpinUp,
+    warnings: Vec<String>,
     /// The spin-up that puts the old session back, when its vendor is one spin-up can start.
     restore: Option<SpinUpRequest>,
 }
@@ -9874,6 +9897,7 @@ fn check_old_runtime_stoppable<S: StateStore>(
 /// nothing done: the same checks, error texts and statuses (see `plan_remodel`, whose result this
 /// drops, so the two cannot drift). It only reads: the store, the runtime directory, the key
 /// probe and, when runtime calls are on, whether a tmux session of the persona's name runs.
+/// The connectivity check still runs. Sign-in observations are reported by the remodel itself.
 pub(crate) fn remodel_precheck<S: AgentRegistry + StateStore + Catalog>(
     store: &S,
     env: &LifecycleEnv<'_>,
@@ -9881,7 +9905,7 @@ pub(crate) fn remodel_precheck<S: AgentRegistry + StateStore + Catalog>(
     req: &RemodelRequest,
     caller: Caller,
 ) -> Result<(), LifecycleError> {
-    plan_remodel(store, env, target, req, caller).map(drop)
+    plan_remodel(store, env, target, req, caller, false).map(drop)
 }
 
 /// Every check a remodel can make before its first side effect, in the order the siblings make
@@ -9896,6 +9920,7 @@ fn plan_remodel<S: AgentRegistry + StateStore + Catalog>(
     target: &SessionTarget,
     req: &RemodelRequest,
     caller: Caller,
+    probe_auth: bool,
 ) -> Result<RemodelPlan, LifecycleError> {
     let mode = RemodelMode::parse(req.mode.as_deref())?;
     authorize_teardown(store, target, caller)?;
@@ -10031,7 +10056,15 @@ fn plan_remodel<S: AgentRegistry + StateStore + Catalog>(
         preflight_teardown_runtime(store, env, target, caller)?;
         check_old_runtime_stoppable(store, env, target, &to)?;
     }
-    preflight_vendor_launch(env, &to.vendor, to.hosted, &mut to.cwd)?;
+    let mut warnings = Vec::new();
+    preflight_vendor_launch(
+        env,
+        &to.vendor,
+        to.hosted,
+        &mut to.cwd,
+        probe_auth,
+        &mut warnings,
+    )?;
     Ok(RemodelPlan {
         mode,
         persona: target.persona.clone(),
@@ -10039,6 +10072,7 @@ fn plan_remodel<S: AgentRegistry + StateStore + Catalog>(
         from_vendor,
         from_model,
         to,
+        warnings,
         restore,
     })
 }
@@ -10228,7 +10262,9 @@ pub fn remodel_session<S: AgentRegistry + StateStore + Catalog + MessageStore>(
                     req.vendor
                 )));
             }
-            spin_up(store, env, req, by, caller)
+            // The remodel already holds the persona fence and probed the destination.
+            // Activation and rollback still need to verify socket availability.
+            spin_up_fenced(store, || Ok(store), env, req, by, caller, false)
         },
     )
 }
@@ -10269,7 +10305,7 @@ fn remodel_fenced<S: AgentRegistry + StateStore + Catalog + MessageStore>(
     clear_queue: impl FnMut(&str),
     spin: &mut SpinUpFn<'_, S>,
 ) -> Result<RemodelResponse, LifecycleError> {
-    let plan = plan_remodel(store, env, target, req, caller)?;
+    let plan = plan_remodel(store, env, target, req, caller, true)?;
     let to = &plan.to;
     if plan.mode == RemodelMode::Prepare {
         let out = prepare_decommission(store, env, target, by, caller)?;
@@ -10302,7 +10338,7 @@ fn remodel_fenced<S: AgentRegistry + StateStore + Catalog + MessageStore>(
             host_session_id,
             prompt: out.prompt,
             handoff: None,
-            warnings: Vec::new(),
+            warnings: plan.warnings,
             posture: to.posture,
             permission_receipts: to.permission_receipts.clone(),
         });
@@ -10326,11 +10362,7 @@ fn remodel_fenced<S: AgentRegistry + StateStore + Catalog + MessageStore>(
     let spun = teardown_session(store, env, target, by, caller, clear_queue)
         .map_err(|e| format!("teardown of `{}` failed: {e}", plan.from_session_id))
         .and_then(|torn| {
-            let spin_env = LifecycleEnv {
-                skip_launch_auth_probe: true,
-                ..*env
-            };
-            spin(store, &spin_env, &plan.spin_up_request(), by, caller)
+            spin(store, env, &plan.spin_up_request(), by, caller)
                 .and_then(|out| require_runtime(env, out))
                 .map(|out| (torn, out))
                 .map_err(|e| format!("spin-up on {} failed: {e}", to.vendor))
@@ -10340,7 +10372,7 @@ fn remodel_fenced<S: AgentRegistry + StateStore + Catalog + MessageStore>(
 
     let error = match spun {
         Ok((torn, out)) => {
-            let mut warnings = Vec::new();
+            let mut warnings = plan.warnings.clone();
             if plan.restore.is_none() {
                 warnings.push(format!(
                     "no restore was possible: spin-up cannot start vendor `{}`, so a failure \
@@ -10409,7 +10441,6 @@ fn remodel_fenced<S: AgentRegistry + StateStore + Catalog + MessageStore>(
     // vanished since the session first ran, which would leave the persona down for nothing.
     let restore_env = LifecycleEnv {
         key_probe: &RestoreKeys,
-        skip_launch_auth_probe: true,
         ..*env
     };
     let restored = match &plan.restore {
@@ -11036,7 +11067,6 @@ mod tests {
             workspace_root: None,
             log_hydration_warnings: true,
             lifecycle_fence: None,
-            skip_launch_auth_probe: false,
         }
     }
 
@@ -21915,7 +21945,7 @@ mod tests {
                 .next_allowed_at_ms,
             Some(61_000)
         );
-        TEST_LAUNCH_PREREQUISITE.with(|slot| *slot.borrow_mut() = Some(Ok(())));
+        TEST_LAUNCH_PREREQUISITE.with(|slot| *slot.borrow_mut() = Some(Ok(None)));
         TEST_RESPAWN_NOW_MS.with(|clock| clock.set(Some(61_000)));
         let out = reconcile_and_respawn_hosted_sessions(&store, &env).unwrap();
         assert_eq!(out.len(), 1);
@@ -22270,7 +22300,7 @@ mod tests {
             .is_empty()
         );
         assert_eq!(TEST_LAUNCH_PREREQUISITE_CALLS.with(|calls| calls.get()), 0);
-        TEST_LAUNCH_PREREQUISITE.with(|slot| *slot.borrow_mut() = Some(Ok(())));
+        TEST_LAUNCH_PREREQUISITE.with(|slot| *slot.borrow_mut() = Some(Ok(None)));
         TEST_RESPAWN_NOW_MS.with(|clock| clock.set(Some(661_000)));
         assert_eq!(
             reconcile_and_respawn_hosted_sessions_with_store(
@@ -22323,7 +22353,7 @@ mod tests {
             load_hosted_respawn_state(&store, &record.session_id).unwrap(),
             incident
         );
-        TEST_LAUNCH_PREREQUISITE.with(|slot| *slot.borrow_mut() = Some(Ok(())));
+        TEST_LAUNCH_PREREQUISITE.with(|slot| *slot.borrow_mut() = Some(Ok(None)));
         fake.fail_windows.borrow_mut().push("codex".into());
         let failed = restart_hosted_session(&store, &env, &record.session_id, "owner").unwrap();
         assert!(!failed.record.runtime_spawned);
@@ -22380,7 +22410,7 @@ mod tests {
         };
         save_hosted_respawn_state(&store, &record.session_id, &incident, "owner").unwrap();
         TEST_RESPAWN_NOW_MS.with(|clock| clock.set(Some(1_000)));
-        TEST_LAUNCH_PREREQUISITE.with(|slot| *slot.borrow_mut() = Some(Ok(())));
+        TEST_LAUNCH_PREREQUISITE.with(|slot| *slot.borrow_mut() = Some(Ok(None)));
         fake.fail_windows.borrow_mut().push("codex".into());
 
         restart_hosted_session(&store, &env, &record.session_id, "owner").unwrap();
@@ -22617,13 +22647,7 @@ mod tests {
         let store = MemStore::default();
         let fake = FakeRuntime::default();
         let env = fake.env(home.path());
-        for (reason, code) in [
-            (STOP_REASON_CLEAN_EXIT, "codex_app_server_unavailable"),
-            (
-                STOP_REASON_CRASH_LOOP,
-                fl_core::LaunchPrerequisiteRefusal::VENDOR_SIGN_IN,
-            ),
-        ] {
+        for reason in [STOP_REASON_CLEAN_EXIT, STOP_REASON_CRASH_LOOP] {
             let mut record = hosted_record("codex", "manual-stop", STATUS_STOPPED, false);
             record.cwd = Some(home.path().display().to_string());
             record.stop_reason = Some(reason.into());
@@ -22639,13 +22663,13 @@ mod tests {
             save_hosted_respawn_state(&store, &record.session_id, &state, "owner").unwrap();
             TEST_LAUNCH_PREREQUISITE.with(|slot| {
                 *slot.borrow_mut() = Some(Err(fl_core::LaunchPrerequisiteRefusal {
-                    code: code.into(),
-                    detail: "Codex launch prerequisite unavailable".into(),
+                    code: "codex_app_server_unavailable".into(),
+                    detail: "/private/control.sock: NotFound".into(),
                 }))
             });
             assert!(matches!(
                 restart_hosted_session(&store, &env, &record.session_id, "owner"),
-                Err(LifecycleError::PrerequisiteUnavailable { code: actual, .. }) if actual == code
+                Err(LifecycleError::PrerequisiteUnavailable { .. })
             ));
             assert_eq!(
                 get_hosted_session_by_id(&store, &record.session_id)
@@ -22659,6 +22683,67 @@ mod tests {
             );
         }
         assert!(fake.calls.borrow().is_empty());
+    }
+
+    #[test]
+    fn codex_auth_warning_allows_spin_up_and_manual_restart() {
+        let home = TempDir::new().unwrap();
+        let _trusted = trusted_codex_home(home.path(), home.path());
+        let fake = FakeRuntime::default();
+        let env = fake.env(home.path());
+        let store = MemStore::default();
+        TEST_LAUNCH_PREREQUISITE.with(|slot| {
+            *slot.borrow_mut() = Some(Ok(Some(TEST_CODEX_AUTH_WARNING)));
+        });
+        let req = SpinUpRequest {
+            persona: "warned".into(),
+            vendor: "codex".into(),
+            project: "ferroloop".into(),
+            role: "assistant".into(),
+            cwd: Some(home.path().display().to_string()),
+            ..SpinUpRequest::default()
+        };
+        let spun = spin_up(&store, &env, &req, "owner", Caller::Owner).unwrap();
+        assert!(spun.runtime_spawned);
+        assert!(
+            spun.warnings
+                .iter()
+                .any(|warning| warning == TEST_CODEX_AUTH_WARNING)
+        );
+
+        let mut stopped = get_hosted_session_by_id(&store, &spun.session_id)
+            .unwrap()
+            .unwrap();
+        fake.clear();
+        stopped.status = STATUS_STOPPED.into();
+        stopped.stop_reason = Some(STOP_REASON_CRASH_LOOP.into());
+        persist_hosted_session(&store, &stopped, "owner").unwrap();
+        save_hosted_respawn_state(
+            &store,
+            &spun.session_id,
+            &HostedRespawnState {
+                respawn_timestamps_ms: vec![900],
+                recovery_attempts: 2,
+                ..Default::default()
+            },
+            "owner",
+        )
+        .unwrap();
+
+        let restarted = restart_hosted_session(&store, &env, &spun.session_id, "owner").unwrap();
+        assert!(restarted.runtime_live);
+        assert_eq!(restarted.record.status, STATUS_RUNNING);
+        assert_eq!(restarted.record.launch_prerequisite_detail, None);
+        assert!(
+            restarted
+                .warnings
+                .iter()
+                .any(|warning| warning == TEST_CODEX_AUTH_WARNING)
+        );
+        assert_eq!(
+            load_hosted_respawn_state(&store, &spun.session_id).unwrap(),
+            HostedRespawnState::default()
+        );
     }
 
     // CI only: a lost trust entry must spend the ordinary bounded automatic budget.
@@ -22746,14 +22831,14 @@ mod tests {
             TEST_RESPAWN_NOW_MS.with(|clock| clock.set(Some(1_000)));
             TEST_LAUNCH_PREREQUISITE_SEQUENCE.with(|slot| {
                 *slot.borrow_mut() = [
-                    Ok(()),
+                    Ok(None),
                     if daemon_disappears {
                         Err(fl_core::LaunchPrerequisiteRefusal {
                             code: "codex_app_server_unavailable".into(),
                             detail: "/private/control.sock: ConnectionRefused".into(),
                         })
                     } else {
-                        Ok(())
+                        Ok(None)
                     },
                 ]
                 .into_iter()
@@ -22977,7 +23062,7 @@ mod tests {
                 TEST_RESPAWN_NOW_MS.with(|clock| clock.set(Some(1_000)));
                 TEST_LAUNCH_PREREQUISITE_SEQUENCE.with(|slot| {
                     *slot.borrow_mut() = [
-                        Ok(()),
+                        Ok(None),
                         Err(fl_core::LaunchPrerequisiteRefusal {
                             code: "codex_app_server_unavailable".into(),
                             detail: "/private/control.sock: NotFound".into(),
@@ -23096,7 +23181,7 @@ mod tests {
             TEST_RESPAWN_NOW_MS.with(|clock| clock.set(Some(601_000)));
             TEST_LAUNCH_PREREQUISITE_SEQUENCE.with(|slot| {
                 *slot.borrow_mut() = [
-                    Ok(()),
+                    Ok(None),
                     Err(fl_core::LaunchPrerequisiteRefusal {
                         code: "codex_app_server_unavailable".into(),
                         detail: "/private/control.sock: ConnectionRefused".into(),
