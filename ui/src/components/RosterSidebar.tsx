@@ -5,6 +5,7 @@ import {
   type AgentRecord,
   type AreaRecord,
   type DiscoveredSessionSummary,
+  type HostedRecoveryAttention,
   type SessionContextUsage,
   type SessionQuotaUsage,
   type TranscriptTurn,
@@ -426,6 +427,7 @@ export interface RosterSidebarProps {
   liveness: AgentLivenessItem[];
   unreadByAgent: Record<string, number | AgentUnreadSummary>;
   unreadSeverityByAgent?: Record<string, UnreadSeverity>;
+  recoveryAttentionByAgent?: Record<string, HostedRecoveryAttention>;
   busyByAgent?: Record<string, boolean>;
   transcriptsByAgent?: Record<string, TranscriptTurn[]>;
   contextUsageByAgent?: Record<string, SessionContextUsage | null>;
@@ -724,6 +726,7 @@ export const RosterSidebar: React.FC<RosterSidebarProps> = ({
   liveness = [],
   unreadByAgent = {},
   unreadSeverityByAgent,
+  recoveryAttentionByAgent,
   busyByAgent,
   transcriptsByAgent,
   contextUsageByAgent,
@@ -1441,6 +1444,10 @@ export const RosterSidebar: React.FC<RosterSidebarProps> = ({
                       const key = record.name_key.toLowerCase();
                       const isSelected = key === selectedKey;
                       const isAgentPinned = pinnedAgents.has(key);
+                      const recoveryAttention = recoveryAttentionByAgent?.[key];
+                      const recoveryLabel = recoveryAttention === "exhausted"
+                        ? "Hosted session recovery exhausted"
+                        : "Hosted session recovery in progress";
                       const quotaEval = evaluateQuotaStatus({
                         quotaUsage,
                         vendor: adapter,
@@ -1570,6 +1577,17 @@ export const RosterSidebar: React.FC<RosterSidebarProps> = ({
                             </div>
 
                             <div style={{ display: "flex", alignItems: "center", gap: "4px" }}>
+                              {recoveryAttention && (
+                                <span
+                                  role="img"
+                                  aria-label={recoveryLabel}
+                                  title={recoveryLabel}
+                                  className="fd-badge"
+                                  style={getUnreadBadgeStyle(recoveryAttention === "exhausted" ? "important" : "question")}
+                                >
+                                  !
+                                </span>
+                              )}
                               {unreadCount > 0 && (
                                 <span
                                   data-testid={`unread-badge-${key}`}

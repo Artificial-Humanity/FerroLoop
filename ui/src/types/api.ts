@@ -755,6 +755,8 @@ export function normalizeHydrationWarnings(raw: unknown): string[] {
   return raw.filter((item): item is string => typeof item === "string");
 }
 
+export type HostedRecoveryAttention = "recovery" | "exhausted";
+
 export interface HostedSessionSummary {
   session_id: string;
   persona: string;
@@ -771,6 +773,7 @@ export interface HostedSessionSummary {
   launch_prerequisite_detail?: string | null;
   restart_count?: number;
   updated_at_ms?: number;
+  recovery_attention?: HostedRecoveryAttention;
 }
 
 export interface SpinUpSessionRequest {

@@ -96,6 +96,7 @@ import {
   type DecommissionMode,
   type DiscoveredSessionSummary,
   type EnrolledNode,
+  type HostedRecoveryAttention,
   type HostedSessionSummary,
   type HubAuthority,
   type HubStatsResponse,
@@ -1295,7 +1296,13 @@ export const App: React.FC<AppProps> = ({
     Record<string, SessionQuotaUsage | null>
   >({});
 
+  const [recoveryAttentionByAgent, setRecoveryAttentionByAgent] = useState<
+    Record<string, HostedRecoveryAttention>
+  >({});
+  const hostedRefreshRef = useRef({ requested: 0, applied: 0 });
+
   const advanceTranscriptAuth = () => {
+    setRecoveryAttentionByAgent({});
     authIdentityRef.current = { apiClient, token: apiClient.getToken() };
     ownerRef.current = { ...ownerRef.current, authEpoch: ownerRef.current.authEpoch + 1 };
     transcriptGuard.invalidate();
@@ -1761,11 +1768,26 @@ export const App: React.FC<AppProps> = ({
   >(async () => {});
 
   const refreshHostedSessions = useCallback(async () => {
+    const authEpoch = ownerRef.current.authEpoch;
+    const refreshId = ++hostedRefreshRef.current.requested;
     try {
       const hostedRes = await apiClient.getHostedSessions?.();
-      if (!mountedRef.current || loggedOutRef.current || !hostedRes?.sessions) {
+      if (
+        !mountedRef.current || loggedOutRef.current || !hostedRes?.sessions ||
+        authEpoch !== ownerRef.current.authEpoch || refreshId < hostedRefreshRef.current.applied
+      ) {
         return;
       }
+      hostedRefreshRef.current.applied = refreshId;
+      const attention: Record<string, HostedRecoveryAttention> = Object.create(null);
+      for (const session of hostedRes.sessions) {
+        const key = session.persona?.trim().toLowerCase();
+        const phase = session.recovery_attention;
+        if (key && (phase === "recovery" || phase === "exhausted") && attention[key] !== "exhausted") {
+          attention[key] = phase;
+        }
+      }
+      setRecoveryAttentionByAgent(attention);
       setHostedSessionsByAgent(
         selectPreferredHostedSessions(
           hostedRes.sessions,
@@ -2742,6 +2764,7 @@ export const App: React.FC<AppProps> = ({
     setSessionQuotaUsage(null);
     setAgents([]);
     setAreas([]);
+    setRecoveryAttentionByAgent({});
     setSessions([]);
     setRoutes([]);
     setLiveness([]);
@@ -3794,6 +3817,7 @@ export const App: React.FC<AppProps> = ({
       liveness={liveness}
       unreadByAgent={unreadByAgent}
       unreadSeverityByAgent={unreadSeverityByAgent}
+      recoveryAttentionByAgent={authority?.tier === "owner" ? recoveryAttentionByAgent : undefined}
       busyByAgent={effectiveBusyByAgent}
       contextUsageByAgent={effectiveContextUsageByAgent}
       quotaUsageByAgent={effectiveQuotaUsageByAgent}

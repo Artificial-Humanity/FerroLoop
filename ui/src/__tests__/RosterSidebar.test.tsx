@@ -14,6 +14,7 @@ import {
   PINNED_PROJECT_OVERRIDES_KEY,
   PINNED_PROJECTS_STORAGE_KEY,
   RosterSidebar,
+  type RosterSidebarProps,
   classifyTextUnreadSeverity,
   classifyTurnUnreadSeverity,
   classifyWireUnreadSeverity,
@@ -554,6 +555,33 @@ describe("RosterSidebar", () => {
     fireEvent.change(searchInput, { target: { value: "Website" } });
     expect(screen.getByText("Wesley")).toBeInTheDocument();
     expect(screen.queryByText("Kayla")).toBeNull();
+  });
+
+  it("shows recovery attention beside unread messages and clears it when absent", () => {
+    const roster = (recoveryAttentionByAgent?: RosterSidebarProps["recoveryAttentionByAgent"]) => (
+      <RosterSidebar
+        agents={[nestedAgent("ferris", "FerroLoop"), nestedAgent("felix", "FerroLoop")]}
+        routes={[]}
+        liveness={[]}
+        unreadByAgent={{ ferris: 2 }}
+        unreadSeverityByAgent={{ ferris: "question" }}
+        recoveryAttentionByAgent={recoveryAttentionByAgent}
+        selectedAgentName={null}
+        onSelectAgent={vi.fn()}
+      />
+    );
+    const { rerender } = render(roster({ ferris: "recovery", felix: "exhausted" }));
+    const ferris = within(screen.getByTestId("agent-row-ferris"));
+    const felix = within(screen.getByTestId("agent-row-felix"));
+
+    expect(ferris.getByRole("img", { name: /recovery in progress/i })).toHaveTextContent("!");
+    expect(felix.getByRole("img", { name: /recovery exhausted/i })).toHaveTextContent("!");
+    expect(ferris.getByTestId("unread-badge-ferris")).toHaveTextContent("2?");
+    expect(felix.queryByTestId("unread-badge-felix")).toBeNull();
+
+    rerender(roster());
+    expect(screen.queryByRole("img", { name: /session recovery/i })).toBeNull();
+    expect(ferris.getByTestId("unread-badge-ferris")).toHaveTextContent("2?");
   });
 
   it("supports collapsible project groups persisted in localStorage, project unread badge sum, and project settings cog", () => {
@@ -1488,10 +1516,11 @@ describe("Mobile responsive sidebar drawer (Record 55)", () => {
     unmount();
   });
 
-  it("periodically polls /api/v1/agents and /api/v1/agents/liveness while authenticated", async () => {
+  it("refreshes roster membership, liveness and hosted recovery attention while authenticated", async () => {
     vi.useFakeTimers();
     try {
       let pollWave = 0;
+      let hasRecoveryAttention = true;
       const fetchImpl = vi.fn(async (input: RequestInfo | URL) => {
         const url = String(input);
         if (url.includes("/api/v1/auth/session")) {
@@ -1502,6 +1531,29 @@ describe("Mobile responsive sidebar drawer (Record 55)", () => {
             }),
             { status: 200, headers: { "Content-Type": "application/json" } },
           );
+        }
+        if (url.endsWith("/api/v1/hosted-sessions")) {
+          const session = {
+            persona: "Ferris",
+            project: "FerroLoop",
+            role: "lead",
+            vendor: "claude",
+            node_id: "local",
+            hydration_dispatched: true,
+          };
+          return Response.json({
+            sessions: [
+              { ...session, session_id: "ferris-current", status: "running", updated_at_ms: 3000 },
+              {
+                ...session, session_id: "ferris-older", status: "crashed", updated_at_ms: 1000,
+                recovery_attention: hasRecoveryAttention ? "exhausted" : undefined,
+              },
+              {
+                ...session, session_id: "ferris-recent", status: "crashed", updated_at_ms: 2000,
+                recovery_attention: hasRecoveryAttention ? "recovery" : undefined,
+              },
+            ],
+          });
         }
         if (url.endsWith("/api/v1/agents")) {
           pollWave += 1;
@@ -1601,8 +1653,11 @@ describe("Mobile responsive sidebar drawer (Record 55)", () => {
       await act(async () => {
         await Promise.resolve();
       });
-      expect(screen.getByTestId("agent-row-ferris")).toBeInTheDocument();
+      const ferris = within(screen.getByTestId("agent-row-ferris"));
+      expect(ferris.getByRole("img", { name: /recovery exhausted/i })).toBeInTheDocument();
       expect(screen.queryByTestId("agent-row-athena")).toBeNull();
+
+      hasRecoveryAttention = false;
 
       await act(async () => {
         await vi.advanceTimersByTimeAsync(ROSTER_POLL_INTERVAL_MS + 100);
@@ -1610,6 +1665,7 @@ describe("Mobile responsive sidebar drawer (Record 55)", () => {
 
       expect(screen.getByTestId("agent-row-athena")).toBeInTheDocument();
       expect(screen.getByTestId("liveness-dot-athena")).toHaveClass("fd-dot-alive");
+      expect(ferris.queryByRole("img", { name: /session recovery/i })).toBeNull();
 
       unmount();
     } finally {
