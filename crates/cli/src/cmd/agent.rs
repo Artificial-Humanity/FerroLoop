@@ -1242,6 +1242,8 @@ mod tests {
 
     #[test]
     fn remodel_blocked_sign_in_override_defaults_to_false() {
+        use clap::Parser;
+
         for explicit in [false, true] {
             let mut args = vec!["fl", "remodel", "ada", "--vendor", "codex"];
             if explicit {
