@@ -254,8 +254,8 @@ impl<'a> LifecycleEnv<'a> {
         }
     }
 
-    /// Run a direct CLI operation, then record passive evidence from exactly its launches.
-    /// The operation's persona fence has dropped before any version evidence is read.
+    /// Run a direct CLI operation, then record passive evidence from its exact launches
+    /// and recover outstanding direct receipts. The persona fence has already dropped.
     pub fn with_direct_launch_versions<S: StateStore, T>(
         &self,
         store: &S,

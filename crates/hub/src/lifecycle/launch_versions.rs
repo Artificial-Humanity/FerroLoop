@@ -2,6 +2,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 
 use fl_core::state::{
     HOSTED_VERSION_BASELINE_PREFIX, HOSTED_VERSION_GENERATION_PREFIX, HOSTED_VERSION_LAUNCH_PREFIX,
@@ -21,6 +22,7 @@ const MAX_PENDING_LAUNCHES: usize = 64;
 const STATE_UPDATE_ATTEMPTS: usize = 4;
 const SETTLE_MS: u64 = 250;
 const MAX_WRAPPER_CHILDREN: usize = 8;
+const DIRECT_COMMIT_WAIT: Duration = Duration::from_millis(100);
 
 static ADAPTERS: OnceLock<VendorVersionRegistry> = OnceLock::new();
 
@@ -245,6 +247,8 @@ struct LaunchEvidence {
     leader: Option<ProcessIdentity>,
     daemon: Option<DaemonEvidence>,
     automatic: bool,
+    #[serde(default)]
+    direct: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -509,15 +513,16 @@ pub(super) fn remember_launch<S: StateStore>(
             leader,
             daemon: config.and_then(|config| config.daemon.clone()),
             automatic: by == AUTO_RESPAWN_ACTOR,
+            direct: env.direct_version_receipts.is_some(),
         }),
         versions: None,
     };
     let queued = queue_launch(store, &receipt);
-    if matches!(queued, Ok(true)) {
-        if let Some(receipts) = env.direct_version_receipts {
-            receipts.lock().unwrap_or_else(|e| e.into_inner()).push(id);
-        }
-    } else {
+    if let Some(receipts) = env.direct_version_receipts {
+        // Even a saturated queue needs a direct pass to recover older skipped receipts.
+        receipts.lock().unwrap_or_else(|e| e.into_inner()).push(id);
+    }
+    if !matches!(queued, Ok(true)) {
         // Keep the exact launch visible as an unknown observation when the queue cannot accept it.
         let versions = HostedVendorVersions {
             daemon_expected: receipt.daemon_expected,
@@ -777,31 +782,73 @@ pub(super) fn observe_direct_launches<S: StateStore>(
     ferro_file: Option<&Path>,
     receipts: &[uuid::Uuid],
 ) -> Result<(), LifecycleError> {
-    let Some(adapters) = ADAPTERS.get().filter(|_| !receipts.is_empty()) else {
+    let Some(adapters) = ADAPTERS.get() else {
         return Ok(());
     };
-    let _worker = if let Some(file) = ferro_file {
-        let file = file
-            .canonicalize()
-            .map_err(|err| LifecycleError::Store(err.to_string()))?;
-        let Some(worker) = lock::try_version_observer(&file)? else {
-            return Ok(());
-        };
-        Some(worker)
-    } else {
-        // The direct CLI's redb handle already owns the file exclusively.
-        None
+    observe_direct_with_adapters(store, ferro_file, receipts, adapters)
+}
+
+fn observe_direct_with_adapters<S: StateStore>(
+    store: &S,
+    ferro_file: Option<&Path>,
+    receipts: &[uuid::Uuid],
+    adapters: &VendorVersionRegistry,
+) -> Result<(), LifecycleError> {
+    let Some(latest) = receipts.iter().max() else {
+        return Ok(());
     };
+    let file = ferro_file
+        .map(Path::canonicalize)
+        .transpose()
+        .map_err(|err| LifecycleError::Store(err.to_string()))?;
     let (mut pending, _): (Vec<LaunchReceipt>, _) = load_revision(store, &queue_slug())?;
     pending.sort_unstable_by_key(|receipt| receipt.id);
-    for receipt in pending
+    // Recover older direct receipts whose CLI exited before it could settle. When both
+    // launches are already queued, settle the older one first for drift comparison.
+    let mut recover = OBSERVATIONS_PER_PASS;
+    let sampled: Vec<_> = pending
         .into_iter()
-        .filter(|receipt| receipts.contains(&receipt.id))
-    {
-        let versions = observe(&receipt, adapters, false);
+        .filter(|receipt| {
+            if receipts.contains(&receipt.id) {
+                return true;
+            }
+            if recover > 0
+                && receipt.id < *latest
+                && receipt.versions.is_none()
+                && receipt
+                    .evidence
+                    .as_ref()
+                    .is_some_and(|evidence| evidence.direct)
+            {
+                recover -= 1;
+                return true;
+            }
+            false
+        })
+        .map(|receipt| {
+            let versions = observe(&receipt, adapters, false);
+            (receipt, versions)
+        })
+        .collect();
+    let started = Instant::now();
+    for (receipt, versions) in sampled {
         let session_id = receipt.session_id.clone();
         let vendor = receipt.vendor.clone();
-        if let Some(applied) = commit(store, receipt, versions, false)? {
+        let applied = {
+            let _commit = if let Some(file) = &file {
+                let wait = DIRECT_COMMIT_WAIT.saturating_sub(started.elapsed());
+                let Some(guard) = lock::try_version_commit(file, wait)? else {
+                    // A subsequent direct invocation or the Hub can settle the queued receipt.
+                    return Ok(());
+                };
+                Some(guard)
+            } else {
+                // The direct CLI's redb handle already owns the file exclusively.
+                None
+            };
+            commit(store, receipt, versions, false)?
+        };
+        if let Some(applied) = applied {
             applied.warn_about_drift("", &session_id, &vendor);
         }
     }
@@ -949,21 +996,32 @@ impl VersionObserver {
                 .collect::<Vec<_>>())
         })?;
         for receipt in batch {
-            // The observer lock is private to this worker. Process and daemon reads hold no
-            // workspace transaction, redb handle or persona fence.
+            // Only Hub sampling uses the observer lock. Process and daemon reads hold
+            // no commit lock, workspace transaction, redb handle or persona fence.
             let versions = observe(&receipt, adapters, true);
-            if !target.is_current(state)? {
-                // A different file means a different worker lock. Let that worker settle the
-                // persisted queue instead of applying an old observation under this lock.
-                return Ok(());
-            }
             let session_id = receipt.session_id.clone();
             let stream = receipt.stream.clone();
             let generation = receipt.generation.clone();
             let vendor = receipt.vendor.clone();
-            let applied = self.with_store(state, &target, |store| {
-                commit(store, receipt, versions, true)
-            })?;
+            let applied = {
+                let _commit = if target.engine == BackendKind::Ferro {
+                    let Some(guard) = lock::try_version_commit(&target.file, Duration::ZERO)?
+                    else {
+                        return Ok(());
+                    };
+                    Some(guard)
+                } else {
+                    None
+                };
+                if !target.is_current(state)? {
+                    // A different file means a different worker lock. Let that worker settle the
+                    // persisted queue instead of applying an old observation under this lock.
+                    return Ok(());
+                }
+                self.with_store(state, &target, |store| {
+                    commit(store, receipt, versions, true)
+                })?
+            };
             if let Some(applied) = applied {
                 applied.warn_about_drift("hub: ", &session_id, &vendor);
                 let versions = applied.versions;
@@ -1026,6 +1084,7 @@ mod tests {
                 leader: None,
                 daemon: None,
                 automatic: false,
+                direct: false,
             }),
             versions: None,
         }
@@ -1174,26 +1233,30 @@ mod tests {
     }
 
     #[test]
-    fn versions_at_capacity_reclaim_already_recorded_direct_observations() {
+    fn versions_at_capacity_recover_and_reclaim_direct_observations() {
         let store = MemStore::default();
         let unresolved = receipt(1);
-        let already_recorded = receipt(2);
+        let mut recoverable = receipt(2);
+        recoverable.evidence.as_mut().unwrap().direct = true;
         let limit = u8::try_from(MAX_PENDING_LAUNCHES).unwrap();
-        for index in 1..=limit {
+        seed(&store, &unresolved);
+        seed(&store, &recoverable);
+        for index in 3..=limit {
             seed(&store, &receipt(index));
         }
         let next = receipt(limit + 1);
         assert!(!queue_launch(&store, &next).unwrap());
 
-        commit(&store, already_recorded.clone(), sample(None, None), false).unwrap();
+        let adapters = VendorVersionRegistry::default();
+        observe_direct_with_adapters(&store, None, &[next.id], &adapters).unwrap();
         assert!(queue_launch(&store, &next).unwrap());
         let (pending, _): (Vec<LaunchReceipt>, _) = load_revision(&store, &queue_slug()).unwrap();
         assert_eq!(pending.len(), MAX_PENDING_LAUNCHES);
         assert!(pending.iter().any(|item| item.id == unresolved.id));
         assert!(pending.iter().any(|item| item.id == next.id));
-        assert!(!pending.iter().any(|item| item.id == already_recorded.id));
+        assert!(!pending.iter().any(|item| item.id == recoverable.id));
         assert_eq!(
-            hosted_vendor_versions_for_stream(&store, &already_recorded.stream.unwrap()).unwrap(),
+            hosted_vendor_versions_for_stream(&store, &recoverable.stream.unwrap()).unwrap(),
             Some(sample(None, None)),
         );
     }
@@ -1231,6 +1294,98 @@ mod tests {
         );
         observer.observe_with_adapters(&state, &adapters).unwrap();
         assert!(events.try_recv().is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn versions_competing_direct_observers_settle_without_the_hub_sampler_lock() {
+        use std::sync::mpsc;
+
+        #[derive(Debug)]
+        struct DirectAdapter {
+            observer: u8,
+            sampled: mpsc::Sender<u8>,
+        }
+
+        impl fl_core::VendorVersionAdapter for DirectAdapter {
+            fn vendor_id(&self) -> &'static str {
+                "codex"
+            }
+
+            fn version_from_executable(&self, executable: &Path) -> Option<String> {
+                assert_eq!(executable, std::env::current_exe().unwrap());
+                self.sampled.send(self.observer).unwrap();
+                Some("2.0.0".into())
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("workspace.fls");
+        let options = StoreOptions {
+            backend: Some(BackendKind::Ferro),
+            ..StoreOptions::default()
+        };
+        let writer = fl_store::open_store_with(&path, &options).unwrap();
+        let first_store = fl_store::open_store_with(&path, &options).unwrap();
+        let second_store = fl_store::open_store_with(&path, &options).unwrap();
+        let path = path.canonicalize().unwrap();
+
+        let before = receipt(1);
+        seed(&writer, &before);
+        commit(&writer, before, sample(Some("1.0.0"), None), true).unwrap();
+        let mut abandoned = receipt(2);
+        let mut first = receipt(3);
+        let mut second = receipt(4);
+        second.session_id = "codex:bea".into();
+        second.stream.as_mut().unwrap().session = SessionId::new("Bea.codex").unwrap();
+        for receipt in [&mut abandoned, &mut first, &mut second] {
+            let evidence = receipt.evidence.as_mut().unwrap();
+            evidence.direct = true;
+            evidence.leader = ProcessIdentity::capture(std::process::id());
+            seed(&writer, receipt);
+        }
+        let _sampler = lock::try_version_observer(&path).unwrap().unwrap();
+        let commit_guard = lock::try_version_commit(&path, Duration::ZERO)
+            .unwrap()
+            .unwrap();
+        let (sampled, on_sampled) = mpsc::channel();
+        let observe = |store: &AnyStore, receipt: &LaunchReceipt, observer| {
+            let mut adapters = VendorVersionRegistry::default();
+            adapters.register(DirectAdapter {
+                observer,
+                sampled: sampled.clone(),
+            });
+            observe_direct_with_adapters(store, Some(&path), &[receipt.id], &adapters).unwrap();
+        };
+        std::thread::scope(|threads| {
+            let left = threads.spawn(|| observe(&first_store, &first, 1));
+            let right = threads.spawn(|| observe(&second_store, &second, 2));
+            // Both CLI observers sample while the Hub sampler and the commit lock are held.
+            // The older abandoned receipt is also sampled on the next direct invocation.
+            let mut observed = Vec::new();
+            for _ in 0..5 {
+                observed.push(on_sampled.recv_timeout(Duration::from_secs(2)).unwrap());
+            }
+            observed.sort_unstable();
+            assert_eq!(observed, [1, 1, 2, 2, 2]);
+            drop(commit_guard);
+            left.join().unwrap();
+            right.join().unwrap();
+        });
+
+        let versions = [abandoned, first, second].map(|receipt| {
+            hosted_vendor_versions_for_stream(&writer, &receipt.stream.unwrap())
+                .unwrap()
+                .unwrap()
+        });
+        assert!(versions.iter().all(|v| v.cli.as_deref() == Some("2.0.0")));
+        assert_eq!(versions[0].changes.len(), 1);
+        assert_eq!(versions[0].changes[0].previous, "1.0.0");
+        assert!(versions[1].changes.is_empty());
+        assert!(versions[2].changes.is_empty());
+        let (baseline, _): (VendorBaseline, _) =
+            load_revision(&writer, &baseline_slug(&receipt(4))).unwrap();
+        assert_eq!(baseline.cli.unwrap().launch, launch(4));
     }
 
     #[test]
@@ -1526,6 +1681,16 @@ mod tests {
                     .observe_with_adapters(&competitor, &adapters)
                     .unwrap();
                 assert!(on_probe.try_recv().is_err());
+
+                // A direct CLI can settle passive evidence while the Hub's sample is paused.
+                let mut ready = VendorVersionRegistry::default();
+                ready.register(ReadyAdapter);
+                let store = writer.open_store().unwrap();
+                observe_direct_with_adapters(&*store, Some(&path), &[second.id], &ready).unwrap();
+                let versions = hosted_vendor_versions_for_stream(&*store, &stream)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(versions.cli.as_deref(), Some("2.0.0"));
             }
             resume_probe.send(()).unwrap();
             first_worker.join().unwrap()
