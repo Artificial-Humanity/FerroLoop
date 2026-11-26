@@ -8246,10 +8246,8 @@ fn dispatch_message_selected_with_status<S: MessageStore>(
     if let Some(recipient) = recipient {
         receipts.retain(|receipt| receipt.recipient_name.eq_ignore_ascii_case(recipient));
     }
-    if receipts.is_empty()
-        && let Some(recovery) = &mut recovery
-    {
-        *recovery.refusal = Some(FenceRecoveryOutcome::InboxUnavailable);
+    if receipts.is_empty() && recovery.is_some() {
+        report.record_failure(FailureStage::InitialReceiptReadMissing);
         return (Vec::new(), None);
     }
     let deliverable = |rcpt: &DeliveryReceipt| {

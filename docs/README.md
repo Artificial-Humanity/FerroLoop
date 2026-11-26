@@ -78,7 +78,9 @@ In addition to the guides above, `fl --help` documents the full command surface:
   view show the reason, including while recovery waits for the delay or a delivery worker.
   Timed recovery supports hosted Claude, Codex, and Muse routes. Non-hosted, Antigravity, Grok,
   and webhook routes stay fenced and report the reason. Fences caused by queue overflow,
-  receipt bookkeeping errors, or global capacity limits do not start timed recovery.
+  receipt bookkeeping errors, or global capacity limits do not start timed recovery. If a replay
+  encounters a bookkeeping fault or cannot confirm a successful submission in the store, timed
+  recovery stops and the fence remains held with the failure reason.
 * `fl github pr` — pull-request review and merge policy evaluation, structured review markers, and gated merges.
 * `fl flow` — DAG workflow validation, import, step execution, review loops, and human approval sign-off.
 * `fl arch` — `.fl/architecture.toml` validation, Cargo workspace dependency/source conformance checks, and LikeC4 export.

@@ -69,6 +69,9 @@ pub enum FenceRecoveryOutcome {
     FenceSuperseded,
     InboxUnavailable,
     ReplayFailed,
+    Resolved,
+    ReceiptBookkeepingFailed,
+    ReplayWorkerFailed,
     PrefixOverflow,
     #[serde(other)]
     Unsupported,
@@ -99,6 +102,9 @@ impl FenceRecoveryOutcome {
             Self::FenceSuperseded => "fence superseded during recovery",
             Self::InboxUnavailable => "inbox unavailable",
             Self::ReplayFailed => "replay failed",
+            Self::Resolved => "held receipts already resolved",
+            Self::ReceiptBookkeepingFailed => "receipt bookkeeping failed, timed replay stopped",
+            Self::ReplayWorkerFailed => "replay worker failed, timed replay stopped",
             Self::PrefixOverflow => "backlog exceeded the admitted delivery queue",
             Self::Unsupported => "unrecognized recovery outcome",
         }
@@ -135,6 +141,7 @@ pub enum FailureStage {
     MessageLookupMissing,
     MessageLookupError,
     InitialReceiptReadError,
+    InitialReceiptReadMissing,
     TransportError,
     DeadExplicitRoute,
     ComposerOccupiedByNonWireInput,
@@ -143,6 +150,7 @@ pub enum FailureStage {
     FinalReceiptReadError,
     FinalReceiptReadMissing,
     UnresolvedReceiptStatus,
+    UnconfirmedReceiptAfterSubmit,
     WorkerPanic,
     #[serde(other)]
     Unsupported,
@@ -155,6 +163,7 @@ pub enum FenceReason {
     MessageLookupMissing,
     MessageLookupError,
     InitialReceiptReadError,
+    InitialReceiptReadMissing,
     TransportError,
     DeadExplicitRoute,
     ComposerOccupiedByNonWireInput,
@@ -163,9 +172,11 @@ pub enum FenceReason {
     FinalReceiptReadError,
     FinalReceiptReadMissing,
     UnresolvedReceiptStatus,
+    UnconfirmedReceiptAfterSubmit,
     WorkerPanic,
     QueueOverflow,
     WorkerSpawnFailure,
+    ReplayStateUnavailable,
     GlobalMetadataCap,
     #[serde(other)]
     Unsupported,
@@ -605,9 +616,21 @@ impl DiagnosticsState {
     /// Called with the diagnostics lock paired with the authoritative marker.
     /// Return only the first retained hold, for logging after all guards drop.
     pub(crate) fn retain(&mut self, row: FenceDiagnostic) -> Option<FenceDiagnostic> {
+        self.retain_with_replacement(row, false)
+    }
+
+    pub(crate) fn retain_with_replacement(
+        &mut self,
+        row: FenceDiagnostic,
+        replace: bool,
+    ) -> Option<FenceDiagnostic> {
         if let Some(first) = self.snapshot.records.iter_mut().find(|first| {
             first.recipient == row.recipient && first.recipient_digest == row.recipient_digest
         }) {
+            if replace {
+                *first = row.clone();
+                return Some(row);
+            }
             if first.phase == SuppressionPhase::PrefixDraining
                 && row.phase == SuppressionPhase::RetainedFence
             {
