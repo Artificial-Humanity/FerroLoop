@@ -20925,6 +20925,55 @@ mod tests {
     }
 
     #[test]
+    fn overdue_hydration_without_prompt_evidence_allows_crash_recovery() {
+        let home = TempDir::new().unwrap();
+        let cwd = TempDir::new().unwrap();
+        let _trusted_codex = trusted_codex_home(home.path(), cwd.path());
+        let store = MemStore::default();
+        let fake = FakeRuntime::default();
+        let env = fake.env(home.path());
+        let mut record = hosted_record("codex", "overdue", STATUS_RUNNING, true);
+        record.cwd = Some(cwd.path().to_str().unwrap().into());
+        record.hydration_dispatched = true;
+        record.hydration_generation = Some("00000000-03e8-7000-8000-000000000001".into());
+        record.block = Some(fl_watch::HostedBlock {
+            reason: fl_watch::HostedBlockReason::HydrationOverdue,
+            observed_at_ms: 181_000,
+        });
+        let unit = record.tmux_target.as_ref().unwrap().clone();
+        fake.presence_of
+            .borrow_mut()
+            .insert(unit.clone(), RuntimePresence::Gone);
+        fake.exit_codes.borrow_mut().insert(unit, 1);
+        persist_hosted_session(&store, &record, "test").unwrap();
+
+        for _ in 0..2 {
+            reconcile_dead_hosted_sessions(&store, &env, "test").unwrap();
+        }
+        let stopped = get_hosted_session_by_id(&store, &record.session_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stopped.status, STATUS_STOPPED);
+        assert_eq!(
+            stopped.stop_reason.as_deref(),
+            Some(STOP_REASON_RUNTIME_GONE)
+        );
+
+        let respawned = reconcile_and_respawn_hosted_sessions(&store, &env).unwrap();
+        assert_eq!(respawned.len(), 1);
+        assert_eq!(respawned[0].record.status, STATUS_RUNNING);
+        assert_eq!(respawned[0].record.block, None);
+        assert_eq!(fake.launches.borrow().len(), 1);
+        assert_eq!(
+            load_hosted_respawn_state(&store, &record.session_id)
+                .unwrap()
+                .respawn_timestamps_ms
+                .len(),
+            1
+        );
+    }
+
+    #[test]
     fn crash_loop_guard_enforces_backoff_trips_on_fourth_stop_notifies_ferris_and_resets_on_manual_restart()
      {
         let tmp = TempDir::new().unwrap();

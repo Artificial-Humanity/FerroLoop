@@ -162,8 +162,11 @@ pub(super) fn blocked_at_exit(
     evidence: Option<&ExitEvidence>,
 ) -> bool {
     record.active_block().is_some_and(|block| {
-        block.reason == HostedBlockReason::HydrationOverdue
-            || evidence.is_some_and(|evidence| evidence.matches(record, block, Instant::now()))
+        // A missing hydration receipt leaves the seat's ability to run unknown.
+        matches!(
+            block.reason,
+            HostedBlockReason::VendorSignIn | HostedBlockReason::BlockingDialog
+        ) && evidence.is_some_and(|evidence| evidence.matches(record, block, Instant::now()))
     })
 }
 
