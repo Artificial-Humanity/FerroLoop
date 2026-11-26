@@ -2020,6 +2020,12 @@ where
                             let (first_hold, since) =
                                 self.retain_overflow_fence_at(&name, evidence.clone(), None, false);
                             if lock(&self.overflow_recipients).contains(&name) {
+                                // Route capture is best effort while holding dispatch_queues.
+                                // Preserve the captured identity or fall back to the released
+                                // route so a later registration can clear this fence.
+                                lock(&self.fence_routes)
+                                    .entry(name.clone())
+                                    .or_insert_with(|| route.route.clone());
                                 lock(&self.fence_recoveries).insert(
                                     name.clone(),
                                     RetainedFenceRecovery::new(
@@ -6131,7 +6137,11 @@ mod tests {
                 tail_write.recv_timeout(Duration::from_secs(5)).unwrap();
                 send_to_held_recipient(&inner, "queued behind in-flight tail");
             }
-            let overflow = send_to_held_recipient(&inner, "stored beyond the prefix");
+            let overflow = {
+                // Force the late overflow to retain its fence while routes is locked.
+                let _routes = overflow_during_tail.then(|| lock(&inner.routes));
+                send_to_held_recipient(&inner, "stored beyond the prefix")
+            };
             assert!(lock(&inner.dispatch_queues)["held"].overflowed);
             if overflow_during_tail {
                 // Resolve the receipt while its ordinary delivery write is failing.
