@@ -25,10 +25,10 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use fl_core::vendor_adapter::{
     AdapterIdentityBinding, AdapterReadiness, AttachOrResumeOutcome, AttachOrResumeRequest,
-    ConfigEffectiveScope, LaunchPrerequisiteRefusal, NormalizedSessionTurn, TeardownOutcome,
-    TeardownTarget, TranscriptNormalizeReport, TurnDeliveryOutcome, TurnDeliveryRequest,
-    VendorAdapterError, VendorConfigSpec, VendorHostAdapter, VendorLaunchPlan, VendorLaunchRequest,
-    VendorStartupPromptRule,
+    ConfigEffectiveScope, LaunchPrerequisiteRefusal, LaunchSignInIssue, NormalizedSessionTurn,
+    TeardownOutcome, TeardownTarget, TranscriptNormalizeReport, TurnDeliveryOutcome,
+    TurnDeliveryRequest, VendorAdapterError, VendorConfigSpec, VendorHostAdapter, VendorLaunchPlan,
+    VendorLaunchRequest, VendorStartupPromptRule,
 };
 #[cfg(unix)]
 use ring::rand::{SecureRandom, SystemRandom};
@@ -57,11 +57,14 @@ const MAX_RPC_REQUEST: usize = 1024 * 1024;
 const MAX_ERROR_TEXT: usize = 300;
 /// Control socket relative to `CODEX_HOME` or `~/.codex`.
 pub const CODEX_CONTROL_SOCKET_REL: &str = "app-server-control/app-server-control.sock";
-/// Overall deadline for the best-effort backend auth check after connecting.
+/// Deadline for connecting to the hosted client's managed daemon.
+#[cfg(unix)]
+const LAUNCH_CONNECT_TIMEOUT: Duration = Duration::from_millis(250);
+/// Shared deadline for the sign-in RPCs after connecting.
 #[cfg(unix)]
 const LAUNCH_AUTH_PROBE_TIMEOUT: Duration = Duration::from_millis(750);
 #[cfg(unix)]
-const LAUNCH_AUTH_WARNING: &str = "The managed Codex app-server's account check returned HTTP 401.";
+const LAUNCH_AUTH_DAEMON_VERSION: &str = "0.172.0";
 #[cfg(unix)]
 const ACCOUNT_RATE_LIMITS_READ: &str = "account/rateLimits/read";
 #[cfg(unix)]
@@ -257,8 +260,7 @@ impl VendorHostAdapter for CodexHostAdapter {
     fn preflight_launch(
         &self,
         config_home: Option<&Path>,
-        launch_cwd: Option<&Path>,
-    ) -> Result<Option<&'static str>, LaunchPrerequisiteRefusal> {
+    ) -> Result<(), LaunchPrerequisiteRefusal> {
         let config_home = config_home.ok_or_else(|| {
             codex_prerequisite_refusal(
                 Path::new("<unresolved CODEX_HOME>"),
@@ -268,25 +270,33 @@ impl VendorHostAdapter for CodexHostAdapter {
         let socket = codex_launch_control_socket(config_home);
         #[cfg(unix)]
         {
-            let stream =
-                connect_unix_with_deadline(&socket, Instant::now() + Duration::from_millis(250))
-                    .map_err(|e| codex_prerequisite_refusal(&socket, &format!("{:?}", e.kind())))?;
-            // Model requests can recover from a 401 by reloading or refreshing auth.
-            // The account check reports its own rejection without blocking the launch.
-            Ok(launch_cwd
-                .and_then(Path::to_str)
-                .is_some_and(|cwd| launch_account_auth_rejected(stream, cwd))
-                .then_some(LAUNCH_AUTH_WARNING))
+            connect_unix_with_deadline(&socket, Instant::now() + LAUNCH_CONNECT_TIMEOUT)
+                .map(|_| ())
+                .map_err(|e| codex_prerequisite_refusal(&socket, &format!("{:?}", e.kind())))
         }
         #[cfg(not(unix))]
         {
-            let _ = launch_cwd;
             Err(codex_prerequisite_refusal(
                 &socket,
                 "unix remote sockets unsupported on this platform",
             ))
         }
     }
+
+    fn probe_launch_auth(&self, config_home: &Path, cwd: &Path) -> Option<LaunchSignInIssue> {
+        #[cfg(unix)]
+        if let Some(cwd) = cwd.to_str() {
+            let socket = codex_launch_control_socket(config_home);
+            let connect_deadline = Instant::now() + LAUNCH_CONNECT_TIMEOUT;
+            if let Ok(stream) = connect_unix_with_deadline(&socket, connect_deadline) {
+                return launch_account_sign_in_issue(stream, cwd);
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = (config_home, cwd);
+        Some(LaunchSignInIssue::Inconclusive)
+    }
+
     fn vendor_id(&self) -> &str {
         "codex"
     }
@@ -750,37 +760,56 @@ impl RpcStage {
 }
 
 /// Verify managed ChatGPT sign-in through the daemon's authenticated backend usage request.
-/// Every RPC shares one deadline. Without positive evidence, the existing socket check suffices.
 #[cfg(unix)]
-fn launch_account_auth_rejected(stream: UnixStream, cwd: &str) -> bool {
+fn launch_account_sign_in_issue(stream: UnixStream, cwd: &str) -> Option<LaunchSignInIssue> {
     let deadline = Instant::now() + LAUNCH_AUTH_PROBE_TIMEOUT;
-    let Ok(mut conn) = Conn::initialize_stream(stream, deadline) else {
-        return false;
+    let Ok((mut conn, initialize)) = Conn::initialize_stream(stream, deadline) else {
+        return Some(LaunchSignInIssue::Inconclusive);
     };
+    // The first initialize can latch the originator for the daemon's lifetime. Allow any
+    // existing originator and check the version in the first userAgent product token.
+    let product_and_version = initialize["userAgent"]
+        .as_str()
+        .and_then(|ua| ua.split_whitespace().next())
+        .and_then(|token| token.split_once('/'));
+    let issue = match product_and_version {
+        Some((originator, LAUNCH_AUTH_DAEMON_VERSION)) if !originator.is_empty() => {
+            check_default_route_sign_in(&mut conn, cwd)
+        }
+        _ => Some(LaunchSignInIssue::Inconclusive),
+    };
+    let _ = conn.send(OP_CLOSE, &1000u16.to_be_bytes());
+    issue
+}
+
+#[cfg(unix)]
+fn check_default_route_sign_in(conn: &mut Conn, cwd: &str) -> Option<LaunchSignInIssue> {
+    use LaunchSignInIssue::{Inconclusive, NotSignedIn};
+
     let Ok(config) = conn.rpc_reply(2, "config/read", json!({ "cwd": cwd })) else {
-        return false;
+        return Some(Inconclusive);
     };
-    // An explicit null uses the built-in OpenAI default. A custom provider can
-    // launch independently of the daemon's cached ChatGPT sign-in.
-    match config.pointer("/config/model_provider") {
+    let config = &config["config"];
+    // A custom provider or backend can launch independently of the managed ChatGPT account.
+    match config.get("model_provider") {
         Some(Value::Null) => {}
         Some(Value::String(provider)) if provider == "openai" => {}
-        _ => return false,
+        Some(Value::String(provider)) if !provider.is_empty() => return None,
+        _ => return Some(Inconclusive),
     }
-    // The usage RPC selects its route from daemon-wide config. A workspace can
-    // use a different route even with the built-in OpenAI provider.
-    match config.pointer("/config/chatgpt_base_url") {
-        None | Some(Value::Null) => {}
+    match config.get("chatgpt_base_url") {
+        Some(Value::Null) => {}
         Some(Value::String(url)) if url.trim_end_matches('/') == CODEX_DEFAULT_CHATGPT_BASE_URL => {
         }
-        _ => return false,
+        Some(Value::String(url)) if !url.is_empty() => return None,
+        _ => return Some(Inconclusive),
     }
-    if config
-        .pointer("/config/openai_base_url")
-        .is_some_and(|url| !url.is_null())
-    {
-        return false;
+    match config.get("openai_base_url") {
+        Some(Value::Null) => {}
+        Some(Value::String(url)) if !url.is_empty() => return None,
+        _ => return Some(Inconclusive),
     }
+
     // The legacy status response exposes the exact auth mode. Account summaries
     // can group agent identity and programmatic tokens under "chatgpt".
     let Ok(auth) = conn.rpc_reply(
@@ -788,36 +817,78 @@ fn launch_account_auth_rejected(stream: UnixStream, cwd: &str) -> bool {
         "getAuthStatus",
         json!({ "includeToken": false, "refreshToken": false }),
     ) else {
-        return false;
+        return Some(Inconclusive);
     };
-    if auth.get("authMethod").and_then(Value::as_str) != Some("chatgpt")
-        || auth.get("requiresOpenaiAuth").and_then(Value::as_bool) != Some(true)
-    {
-        return false;
+    let Some(requires_auth) = auth["requiresOpenaiAuth"].as_bool() else {
+        return Some(Inconclusive);
+    };
+    match auth.get("authMethod") {
+        Some(Value::Null) if requires_auth => return Some(NotSignedIn),
+        Some(Value::Null) => return None,
+        Some(Value::String(method)) => match method.as_str() {
+            "chatgpt" if requires_auth => {}
+            "chatgpt"
+            | "apikey"
+            | "agentIdentity"
+            | "personalAccessToken"
+            | "chatgptAuthTokens"
+            | "headers"
+            | "bedrockApiKey"
+            | "bedrockAccessKeys" => {
+                return None;
+            }
+            _ => return Some(Inconclusive),
+        },
+        _ => return Some(Inconclusive),
     }
-    let reply = conn.rpc_reply(
+
+    match conn.rpc_reply(
         4,
         ACCOUNT_RATE_LIMITS_READ,
         json!({ "excludeResetCreditDetails": true }),
-    );
-    let _ = conn.send(OP_CLOSE, &1000u16.to_be_bytes());
-    let Err(RpcReplyError::Rejected(error)) = reply else {
-        return false;
-    };
-    if error.get("code").and_then(Value::as_i64) != Some(-32603) {
-        return false;
+    ) {
+        Ok(reply)
+            if reply["rateLimits"]
+                .as_object()
+                .is_some_and(|limits| !limits.is_empty())
+                && reply["rateLimitsByLimitId"]
+                    .as_object()
+                    .is_some_and(|limits| !limits.is_empty()) =>
+        {
+            None
+        }
+        Err(RpcReplyError::Rejected(error)) => Some(classify_launch_auth_error(&error)),
+        _ => Some(Inconclusive),
     }
-    // Codex 0.172.0's rate-limits handler wraps the backend GET error in a
-    // JSON-RPC internal error. Match the HTTP status before the untrusted body.
-    error
-        .get("message")
-        .and_then(Value::as_str)
-        .and_then(|message| message.strip_prefix("failed to fetch codex rate limits: GET "))
-        .and_then(|request| request.split_once(' '))
-        .is_some_and(|(url, status)| {
-            url == CODEX_DEFAULT_CHATGPT_USAGE_URL
-                && status.starts_with("failed: 401 Unauthorized; content-type=")
-        })
+}
+
+#[cfg(unix)]
+fn classify_launch_auth_error(error: &Value) -> LaunchSignInIssue {
+    use LaunchSignInIssue::{Inconclusive, NotSignedIn, Rejected};
+
+    match (error["code"].as_i64(), error["message"].as_str()) {
+        (
+            Some(-32600),
+            Some(
+                "codex account authentication required to read rate limits"
+                | "chatgpt authentication required to read rate limits",
+            ),
+        ) => NotSignedIn,
+        // Codex 0.172.0 wraps the backend GET error in a JSON-RPC internal error.
+        // Match the endpoint and HTTP status before the untrusted body.
+        (Some(-32603), Some(message))
+            if message
+                .strip_prefix("failed to fetch codex rate limits: GET ")
+                .and_then(|request| request.split_once(' '))
+                .is_some_and(|(url, status)| {
+                    url == CODEX_DEFAULT_CHATGPT_USAGE_URL
+                        && status.starts_with("failed: 401 Unauthorized; content-type=")
+                }) =>
+        {
+            Rejected
+        }
+        _ => Inconclusive,
+    }
 }
 
 /// Probe `thread/read` over the Codex app-server control socket and map `thread.status.type`
@@ -1500,13 +1571,13 @@ impl Conn {
                 ),
             )
         })?;
-        Self::initialize_stream(stream, deadline)
+        Self::initialize_stream(stream, deadline).map(|(conn, _)| conn)
     }
 
     fn initialize_stream(
         stream: UnixStream,
         deadline: Instant,
-    ) -> Result<Self, (RpcStage, String)> {
+    ) -> Result<(Self, Value), (RpcStage, String)> {
         let mut conn = Self {
             stream,
             rbuf: Vec::new(),
@@ -1514,17 +1585,19 @@ impl Conn {
             deadline,
         };
         conn.handshake().map_err(|msg| (RpcStage::Handshake, msg))?;
+        // Keep the same client identity as Wire's managed-daemon control connection.
         conn.send_json(&json!({
             "id": 1,
             "method": "initialize",
             "params": { "clientInfo": { "name": "ferroloop", "version": "0.1.0" } },
         }))
         .map_err(|msg| (RpcStage::Initialize, msg))?;
-        conn.await_rpc_result(1, "initialize", RpcStage::Initialize)
+        let initialize = conn
+            .await_rpc_result(1, "initialize", RpcStage::Initialize)
             .map_err(|(_, msg)| (RpcStage::Initialize, msg))?;
         conn.send_json(&json!({ "method": "initialized", "params": {} }))
             .map_err(|msg| (RpcStage::Initialize, msg))?;
-        Ok(conn)
+        Ok((conn, initialize))
     }
 
     fn io_budget(&self) -> Result<Duration, String> {
@@ -2462,7 +2535,7 @@ mod tests {
             assert!(UnixStream::connect(Path::new(&delivery)).is_ok());
             let pinned = Path::new(&pinned);
             let refusal = CodexHostAdapter::default()
-                .preflight_launch(Some(pinned), None)
+                .preflight_launch(Some(pinned))
                 .unwrap_err();
             assert_eq!(refusal.code, "codex_app_server_unavailable");
             assert_eq!(
@@ -2498,152 +2571,241 @@ mod tests {
         assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"));
     }
 
+    fn captured_launch_auth() -> Value {
+        serde_json::from_str(include_str!(
+            "../tests/fixtures/codex-0.172.0-launch-sign-in.json"
+        ))
+        .unwrap()
+    }
+
+    fn replay_launch_auth(replies: Vec<Value>) -> Option<LaunchSignInIssue> {
+        let home = tempfile::tempdir().unwrap();
+        let socket = codex_launch_control_socket(home.path());
+        std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+        let project = home.path().join("project");
+        let cwd = project.clone();
+        let replies_count = replies.len();
+        let server = spawn_fake_server_at(&socket, move |conn| {
+            conn.handshake();
+            assert_eq!(
+                conn.expect_json(),
+                json!({
+                    "id": 1,
+                    "method": "initialize",
+                    "params": {"clientInfo": {"name": "ferroloop", "version": "0.1.0"}},
+                })
+            );
+            let mut replies = replies.into_iter();
+            conn.send_text(&replies.next().unwrap().to_string());
+            assert_eq!(conn.expect_json()["method"], "initialized");
+            let expected_requests = [
+                json!({"id": 2, "method": "config/read", "params": {"cwd": cwd}}),
+                json!({
+                    "id": 3,
+                    "method": "getAuthStatus",
+                    "params": {"includeToken": false, "refreshToken": false},
+                }),
+                json!({
+                    "id": 4,
+                    "method": "account/rateLimits/read",
+                    "params": {"excludeResetCreditDetails": true},
+                }),
+            ];
+            for (reply, expected_request) in replies.zip(expected_requests) {
+                assert_eq!(conn.expect_json(), expected_request);
+                conn.send_text(&reply.to_string());
+            }
+            conn.drain_until_eof();
+        });
+        let issue = CodexHostAdapter::default().probe_launch_auth(home.path(), &project);
+        let frames = server.join().unwrap();
+        // One initialize notification in addition to the correlated request/reply pairs.
+        assert_eq!(
+            frames
+                .iter()
+                .filter(|frame| frame.opcode == OP_TEXT)
+                .count(),
+            replies_count + 1
+        );
+        issue
+    }
+
     #[test]
-    fn launch_prerequisite_warns_only_on_correlated_backend_auth_rejection() {
+    fn launch_auth_accepts_redacted_replies_from_the_live_codex_daemon() {
+        let capture = captured_launch_auth();
+        assert_eq!(
+            replay_launch_auth(vec![
+                capture["initialize"].clone(),
+                capture["config_read"].clone(),
+                capture["get_auth_status"].clone(),
+                capture["account_rate_limits_read"].clone(),
+            ]),
+            None
+        );
+    }
+
+    #[test]
+    fn launch_auth_classifies_only_correlated_rate_limit_results() {
+        use LaunchSignInIssue::{Inconclusive, NotSignedIn, Rejected};
+
         const AUTH_REJECTION: &str = "failed to fetch codex rate limits: GET https://chatgpt.com/backend-api/wham/usage failed: 401 Unauthorized; content-type=application/json; body=private detail";
         let responses = [
             (
                 json!({"id": 4, "error": {"code": -32603, "message": AUTH_REJECTION}}),
-                true,
-            ),
-            (json!({"id": 4, "result": {"rateLimits": {}}}), false),
-            (
-                json!({"id": 4, "error": {"code": -32603, "message": AUTH_REJECTION.replace("chatgpt.com", "other.example")}}),
-                false,
-            ),
-            (
-                json!({"id": 4, "error": {"code": -32601, "message": "method not found"}}),
-                false,
+                Rejected,
             ),
             (
                 json!({"id": 4, "error": {"code": -32600, "message": "chatgpt authentication required to read rate limits"}}),
-                false,
+                NotSignedIn,
             ),
             (
                 json!({"id": 4, "error": {"code": -32600, "message": "codex account authentication required to read rate limits"}}),
-                false,
+                NotSignedIn,
+            ),
+            (
+                json!({"id": 4, "error": {"code": -32600, "message": "chatgpt authentication required to read rate limits: additional text"}}),
+                Inconclusive,
+            ),
+            (
+                json!({"id": 4, "error": {"code": -32603, "message": AUTH_REJECTION.replace("chatgpt.com", "other.example")}}),
+                Inconclusive,
+            ),
+            (
+                json!({"id": 4, "error": {"code": -32601, "message": "method not found"}}),
+                Inconclusive,
             ),
             (
                 json!({"id": 4, "error": {"code": -32603, "message": "failed to fetch codex rate limits: GET https://chatgpt.com/backend-api/wham/usage failed: 503 Service Unavailable; content-type=application/json; body=failed: 401 Unauthorized; content-type=application/json"}}),
-                false,
+                Inconclusive,
             ),
             (
                 json!({"id": 5, "error": {"code": -32603, "message": AUTH_REJECTION}}),
-                false,
+                Inconclusive,
             ),
             (
                 json!({"id": 4, "error": {"code": -32603, "message": AUTH_REJECTION}, "result": {}}),
-                false,
+                Inconclusive,
             ),
+            (json!({"id": 4, "result": {"rateLimits": {}}}), Inconclusive),
         ];
-        for (response, expected_warning) in responses {
-            let home = tempfile::tempdir().unwrap();
-            let socket = codex_launch_control_socket(home.path());
-            std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
-            let project = home.path().join("project");
-            let cwd = project.clone();
-            let server = spawn_fake_server_at(&socket, move |conn| {
-                conn.handshake();
-                assert_eq!(conn.expect_json()["method"], "initialize");
-                conn.send_text(r#"{"id":1,"result":{}}"#);
-                assert_eq!(conn.expect_json()["method"], "initialized");
-                let config = conn.expect_json();
-                assert_eq!(config["method"], "config/read");
-                assert_eq!(config["params"]["cwd"], cwd.to_str().unwrap());
-                conn.send_text(r#"{"id":2,"result":{"config":{"model_provider":null}}}"#);
-                let auth = conn.expect_json();
-                assert_eq!(auth["method"], "getAuthStatus");
-                assert_eq!(
-                    auth["params"],
-                    json!({"includeToken": false, "refreshToken": false})
-                );
-                conn.send_text(
-                    r#"{"id":3,"result":{"authMethod":"chatgpt","requiresOpenaiAuth":true}}"#,
-                );
-                let request = conn.expect_json();
-                assert_eq!(request["id"], 4);
-                assert_eq!(request["method"], "account/rateLimits/read");
-                assert_eq!(request["params"]["excludeResetCreditDetails"], true);
-                conn.send_text(&response.to_string());
-                conn.drain_until_eof();
-            });
-            let warning = CodexHostAdapter::default()
-                .preflight_launch(Some(home.path()), Some(&project))
-                .unwrap();
+        let capture = captured_launch_auth();
+        for (response, expected) in responses {
             assert_eq!(
-                warning,
-                expected_warning
-                    .then_some("The managed Codex app-server's account check returned HTTP 401.")
-            );
-            let frames = server.join().unwrap();
-            assert_eq!(
-                frames
-                    .iter()
-                    .filter(|frame| frame.opcode == OP_TEXT)
-                    .count(),
-                5
+                replay_launch_auth(vec![
+                    capture["initialize"].clone(),
+                    capture["config_read"].clone(),
+                    capture["get_auth_status"].clone(),
+                    response,
+                ]),
+                Some(expected)
             );
         }
     }
 
     #[test]
-    fn launch_prerequisite_skips_usage_for_other_providers_or_auth_modes() {
-        for (config, account) in [
-            (json!({"model_provider": "custom"}), None),
-            (json!({}), None),
-            (
-                json!({"model_provider": "openai", "chatgpt_base_url": "https://other.example"}),
-                None,
-            ),
-            (
-                json!({"model_provider": "openai", "openai_base_url": "https://other.example"}),
-                None,
-            ),
-            (json!({"model_provider": "openai"}), Some("apikey")),
-            (json!({"model_provider": null}), Some("agentIdentity")),
-            (
-                json!({"model_provider": "openai"}),
-                Some("personalAccessToken"),
-            ),
-            (
-                json!({"model_provider": "openai"}),
-                Some("chatgptAuthTokens"),
-            ),
+    fn launch_auth_skips_usage_for_other_providers_or_auth_modes() {
+        let capture = captured_launch_auth();
+        for (field, value) in [
+            ("model_provider", "custom"),
+            ("chatgpt_base_url", "https://other.example"),
+            ("openai_base_url", "https://other.example"),
         ] {
-            let home = tempfile::tempdir().unwrap();
-            let socket = codex_launch_control_socket(home.path());
-            std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
-            let server = spawn_fake_server_at(&socket, move |conn| {
-                conn.handshake();
-                assert_eq!(conn.expect_json()["method"], "initialize");
-                conn.send_text(r#"{"id":1,"result":{}}"#);
-                assert_eq!(conn.expect_json()["method"], "initialized");
-                assert_eq!(conn.expect_json()["method"], "config/read");
-                conn.send_text(&json!({"id": 2, "result": {"config": config}}).to_string());
-                if let Some(account) = account {
-                    assert_eq!(conn.expect_json()["method"], "getAuthStatus");
-                    conn.send_text(
-                        &json!({"id": 3, "result": {"authMethod": account, "requiresOpenaiAuth": true}}).to_string(),
-                    );
-                }
-                conn.drain_until_eof();
-            });
+            let mut config = capture["config_read"].clone();
+            config["result"]["config"][field] = json!(value);
             assert_eq!(
-                CodexHostAdapter::default()
-                    .preflight_launch(Some(home.path()), Some(home.path()))
-                    .unwrap(),
+                replay_launch_auth(vec![capture["initialize"].clone(), config]),
                 None
             );
-            let frames = server.join().unwrap();
-            let expected = if account.is_some() { 4 } else { 3 };
+        }
+        for method in [
+            "apikey",
+            "agentIdentity",
+            "personalAccessToken",
+            "chatgptAuthTokens",
+            "headers",
+            "bedrockApiKey",
+            "bedrockAccessKeys",
+        ] {
+            let mut auth = capture["get_auth_status"].clone();
+            auth["result"]["authMethod"] = json!(method);
             assert_eq!(
-                frames
-                    .iter()
-                    .filter(|frame| frame.opcode == OP_TEXT)
-                    .count(),
+                replay_launch_auth(vec![
+                    capture["initialize"].clone(),
+                    capture["config_read"].clone(),
+                    auth,
+                ]),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn launch_auth_reports_daemon_sign_in_status_before_checking_rate_limits() {
+        use LaunchSignInIssue::{Inconclusive, NotSignedIn};
+
+        let capture = captured_launch_auth();
+        for (status, expected) in [
+            (
+                json!({"authMethod": null, "authToken": null, "requiresOpenaiAuth": true}),
+                Some(NotSignedIn),
+            ),
+            (
+                json!({"authMethod": null, "authToken": null, "requiresOpenaiAuth": false}),
+                None,
+            ),
+            (json!({"requiresOpenaiAuth": true}), Some(Inconclusive)),
+            (json!({"authMethod": null}), Some(Inconclusive)),
+            (
+                json!({"authMethod": "unknown-mode", "requiresOpenaiAuth": true}),
+                Some(Inconclusive),
+            ),
+        ] {
+            assert_eq!(
+                replay_launch_auth(vec![
+                    capture["initialize"].clone(),
+                    capture["config_read"].clone(),
+                    json!({"id": 3, "result": status}),
+                ]),
                 expected
             );
         }
+    }
+
+    #[test]
+    fn launch_auth_does_not_query_unknown_daemon_versions_or_config_shapes() {
+        let capture = captured_launch_auth();
+        for user_agent in ["codex-tui/0.173.0", "codex-tui/0.172.0-beta.1", "unknown"] {
+            assert_eq!(
+                replay_launch_auth(vec![json!({"id": 1, "result": {"userAgent": user_agent}})]),
+                Some(LaunchSignInIssue::Inconclusive)
+            );
+        }
+        for config in [json!({}), json!({"model_provider": 0}), Value::Null] {
+            assert_eq!(
+                replay_launch_auth(vec![
+                    capture["initialize"].clone(),
+                    json!({"id": 2, "result": {"config": config}}),
+                ]),
+                Some(LaunchSignInIssue::Inconclusive)
+            );
+        }
+    }
+
+    #[test]
+    fn launch_auth_reports_an_unresponsive_daemon_as_inconclusive() {
+        let home = tempfile::tempdir().unwrap();
+        let socket = codex_launch_control_socket(home.path());
+        std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+        let server = spawn_fake_server_at(&socket, |conn| {
+            conn.handshake();
+            assert_eq!(conn.expect_json()["method"], "initialize");
+            conn.drain_until_eof();
+        });
+        assert_eq!(
+            CodexHostAdapter::default().probe_launch_auth(home.path(), home.path()),
+            Some(LaunchSignInIssue::Inconclusive)
+        );
+        server.join().unwrap();
     }
 
     #[test]
@@ -2662,17 +2824,10 @@ mod tests {
         let adapter = CodexHostAdapter::default();
         let socket = codex_launch_control_socket(home.path());
         std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
-        let missing = adapter
-            .preflight_launch(Some(home.path()), None)
-            .unwrap_err();
+        let missing = adapter.preflight_launch(Some(home.path())).unwrap_err();
         assert_eq!(missing.code, "codex_app_server_unavailable");
         let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
-        assert_eq!(
-            adapter
-                .preflight_launch(Some(home.path()), Some(home.path()))
-                .unwrap(),
-            None
-        );
+        adapter.preflight_launch(Some(home.path())).unwrap();
         drop(listener);
         // A sibling test forks a child that briefly holds the listener
         // (fork inherits fds), so a connect can succeed briefly after the
@@ -2681,7 +2836,7 @@ mod tests {
         // 10/10 passes for this test alone.
         let deadline = Instant::now() + Duration::from_secs(5);
         let stale = loop {
-            if let Err(refusal) = adapter.preflight_launch(Some(home.path()), None)
+            if let Err(refusal) = adapter.preflight_launch(Some(home.path()))
                 && refusal.detail.ends_with("ConnectionRefused")
             {
                 break refusal;
@@ -2717,7 +2872,7 @@ mod tests {
         let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
         std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o000)).unwrap();
         let refusal = CodexHostAdapter::default()
-            .preflight_launch(Some(home.path()), None)
+            .preflight_launch(Some(home.path()))
             .unwrap_err();
         assert!(refusal.detail.ends_with("PermissionDenied"));
     }
@@ -2737,7 +2892,7 @@ mod tests {
         let start = Instant::now();
         assert!(
             CodexHostAdapter::default()
-                .preflight_launch(Some(home.path()), None)
+                .preflight_launch(Some(home.path()))
                 .is_err()
         );
         assert!(start.elapsed() < Duration::from_secs(2));

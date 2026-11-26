@@ -381,6 +381,35 @@ pub struct LaunchPrerequisiteRefusal {
     pub detail: String,
 }
 
+/// A managed vendor sign-in problem observed before a hosted seat is launched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LaunchSignInIssue {
+    /// The sign-in cached by the daemon was rejected.
+    Rejected,
+    /// The daemon reports no usable sign-in.
+    NotSignedIn,
+    /// The probe did not establish the daemon's sign-in status.
+    Inconclusive,
+}
+
+impl LaunchSignInIssue {
+    pub const fn message(self) -> &'static str {
+        match self {
+            Self::Rejected => {
+                "The managed Codex daemon rejected its sign-in. A hosted seat will wait at the sign-in screen until the daemon has a usable sign-in. Run `codex login`, then restart `codex-app-server-daemon.service` to clear the rejected token from memory."
+            }
+            Self::NotSignedIn => {
+                "The managed Codex daemon has no usable sign-in. A hosted seat will wait at the sign-in screen until the daemon has a usable sign-in. Run `codex login`, then restart `codex-app-server-daemon.service` so the daemon loads the sign-in."
+            }
+            Self::Inconclusive => "Codex sign-in not verified.",
+        }
+    }
+
+    pub const fn blocks_remodel(self) -> bool {
+        matches!(self, Self::Rejected | Self::NotSignedIn)
+    }
+}
+
 /// Dependency-inverted contract implemented by each concrete vendor host adapter
 /// (`CodexHostAdapter`, `AntigravityHostAdapter`, `ClaudeHostAdapter`, `MuseGrokPtyAdapter`, etc.).
 pub trait VendorHostAdapter: fmt::Debug + Send + Sync {
@@ -397,17 +426,19 @@ pub trait VendorHostAdapter: fmt::Debug + Send + Sync {
 
     // --- 1. Identity & Lifecycle -------------------------------------------
 
-    /// Read-only prerequisite check immediately before a hosted launch. `config_home` is
-    /// the effective configuration directory pinned into the child, not a delivery endpoint.
-    /// `cwd` selects the launch workspace for credential checks. `None` checks connectivity
-    /// only. A warning describes an observed problem that need not prevent launch.
-    /// Launch-plan preparation remains deterministic and performs no availability probes.
+    /// Read-only connectivity check immediately before a hosted launch. The configuration
+    /// home is the effective directory pinned into the child.
     fn preflight_launch(
         &self,
         _config_home: Option<&Path>,
-        _cwd: Option<&Path>,
-    ) -> Result<Option<&'static str>, LaunchPrerequisiteRefusal> {
-        Ok(None)
+    ) -> Result<(), LaunchPrerequisiteRefusal> {
+        Ok(())
+    }
+
+    /// Check sign-in on the managed daemon for an explicit hosted launch. The configuration
+    /// home and working directory match the launch plan. `None` means verified or inapplicable.
+    fn probe_launch_auth(&self, _config_home: &Path, _cwd: &Path) -> Option<LaunchSignInIssue> {
+        None
     }
 
     /// Build a deterministic launch plan (`argv`, `env`, `cwd`, `remote_control`) for starting a
