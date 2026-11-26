@@ -7404,22 +7404,30 @@ pub fn classify_hosted_screen_blocker(vendor: &str, contents: &str) -> Option<Ho
     if !supports_hosted_screen_blockers(vendor) {
         return None;
     }
-    classify_normalized_screen_blocker(vendor, &normalize_terminal_screen(contents))
+    classify_normalized_screen_blocker(vendor, &normalize_terminal_screen(contents), false)
 }
 
 fn supports_hosted_screen_blockers(vendor: &str) -> bool {
     matches!(vendor, "codex" | "claude" | "muse" | "grok")
 }
 
-fn classify_normalized_screen_blocker(vendor: &str, cleaned: &str) -> Option<HostedScreenBlocker> {
+fn classify_normalized_screen_blocker(
+    vendor: &str,
+    cleaned: &str,
+    include_ambiguous_markers: bool,
+) -> Option<HostedScreenBlocker> {
+    // Wire must withhold input on ambiguity. A hosted status needs corroborating UI rows.
     if (vendor == "codex" && codex_screen_is_onboarding(cleaned))
-        || cleaned
-            .lines()
-            .any(|line| line.trim().eq_ignore_ascii_case("Sign in to continue"))
+        || (include_ambiguous_markers
+            && cleaned
+                .lines()
+                .any(|line| line.trim().eq_ignore_ascii_case("Sign in to continue")))
     {
         return Some(HostedScreenBlocker::VendorSignIn);
     }
-    if normalized_screen_has_dialog_or_menu_markers(cleaned, None, None, &[])
+    if ((include_ambiguous_markers
+        || (vendor == "claude" && claude_screen_is_workspace_trust_dialog(cleaned)))
+        && normalized_screen_has_dialog_or_menu_markers(cleaned, None, None, &[]))
         || (vendor == "muse" && muse_screen_is_hook_trust_dialog(cleaned))
     {
         return Some(HostedScreenBlocker::BlockingDialog);
@@ -7443,7 +7451,7 @@ fn retained_fence_screen_gate(
     if cleaned.trim().is_empty() {
         return Err(BlankScreen);
     }
-    match classify_normalized_screen_blocker(vendor, &cleaned) {
+    match classify_normalized_screen_blocker(vendor, &cleaned, true) {
         Some(HostedScreenBlocker::VendorSignIn) => return Err(VendorSignIn),
         Some(HostedScreenBlocker::BlockingDialog) => return Err(DialogWaiting),
         None => {}
@@ -7483,6 +7491,27 @@ fn codex_screen_is_onboarding(cleaned: &str) -> bool {
                         == "1. Sign in with ChatGPT"
                 })
             })
+}
+
+fn claude_screen_is_workspace_trust_dialog(cleaned: &str) -> bool {
+    let mut lines = cleaned
+        .lines()
+        .rev()
+        .map(|line| {
+            strip_dialog_box_prefix(line)
+                .trim_end()
+                .trim_end_matches(['│', '┃'])
+                .trim_end()
+        })
+        .filter(|line| !line.is_empty())
+        .take(12);
+    lines.next() == Some("Enter to confirm · Esc to cancel")
+        && lines
+            .by_ref()
+            .take(2)
+            .map(|line| line.trim_start_matches('❯').trim_start())
+            .eq(["Yes, I trust this folder", "No, exit"])
+        && lines.any(|line| line.starts_with("Quick safety check:"))
 }
 
 fn muse_screen_is_hook_trust_dialog(cleaned: &str) -> bool {
@@ -21422,6 +21451,33 @@ exit 1"#,
     }
 
     #[test]
+    fn hosted_screen_blocker_does_not_treat_reply_prose_as_a_prompt() {
+        let codex = VendorRoute::Codex {
+            thread_id: "thread".into(),
+            cwd: None,
+        };
+        for (prose, wire_outcome) in [
+            (
+                "• The page reads:\nSign in to continue",
+                FenceRecoveryOutcome::VendorSignIn,
+            ),
+            (
+                "• The menu says Esc to cancel.",
+                FenceRecoveryOutcome::DialogWaiting,
+            ),
+        ] {
+            let screen = format!(
+                "{prose}\n\n› Ask Codex to do anything\n\n  GPT-6.1-Sol medium · ~/project"
+            );
+            assert_eq!(
+                retained_fence_screen_gate(&codex, &screen),
+                Err(wire_outcome)
+            );
+            assert_eq!(classify_hosted_screen_blocker("codex", &screen), None);
+        }
+    }
+
+    #[test]
     fn hosted_screen_blocker_ignores_blank_unsupported_and_busy_screens() {
         let busy = "• Working (4s · esc to interrupt)\n› Ask Codex to do anything\n  GPT-6.1-Sol medium · ~/project";
 
@@ -21456,6 +21512,9 @@ exit 1"#,
             classify_hosted_screen_blocker("claude", claude_trust),
             Some(HostedScreenBlocker::BlockingDialog)
         );
+
+        let claude_idle = format!("{claude_trust}\n❯ \n  ? for shortcuts");
+        assert_eq!(classify_hosted_screen_blocker("claude", &claude_idle), None);
 
         let muse = VendorRoute::Muse {
             session_id: "session".into(),
