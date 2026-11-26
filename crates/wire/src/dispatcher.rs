@@ -7423,68 +7423,20 @@ fn retained_fence_codex_gate(cleaned: &str) -> Result<(), FenceRecoveryOutcome> 
     use FenceRecoveryOutcome::{Inconclusive, SeatBusy};
 
     let lines: Vec<_> = cleaned.lines().collect();
-    let Some(composer) = codex_composer_range(&lines) else {
-        return if lines.iter().copied().any(retained_fence_codex_working) {
-            Err(SeatBusy)
-        } else {
-            Err(Inconclusive)
-        };
-    };
-
-    // The rendered status, detail rows and previews can be separated from
-    // each other or the composer by blank rows. An ordinary transcript row
-    // ends this scan, so older Working text does not hold an idle seat.
-    let mut saw_preview = false;
-    let mut unanchored_continuation = false;
-    for &row in lines[..composer.start].iter().rev() {
-        // Indented preview text can repeat the status wording.
-        if !row.starts_with("  ") && retained_fence_codex_working(row) {
-            if !unanchored_continuation {
-                return Err(SeatBusy);
-            }
-            break;
-        }
-        let preview = retained_fence_codex_preview_row(row);
-        saw_preview |= preview;
-        if preview || row.starts_with(" └ ") || row.starts_with("  └ ") {
-            unanchored_continuation = false;
-        } else if row.trim().is_empty() {
-            continue;
-        } else if row.starts_with("  ") {
-            // A wrapped status detail or preview must lead back to one of
-            // its recognized rows before we treat it as part of the widget.
-            unanchored_continuation = true;
-        } else {
-            break;
-        }
+    let composer = codex_composer_range(&lines);
+    // Scan the whole screen when the composer cannot be located. A located
+    // composer bounds the scan so text in an owner's draft is excluded.
+    let status_rows = &lines[..composer.as_ref().map_or(lines.len(), |range| range.start)];
+    if status_rows.iter().any(|row| {
+        let status = row.trim();
+        status.starts_with("• Working (")
+            || status.starts_with("• Working...")
+            || status.starts_with("• Working…")
+            || (row.starts_with("• ") && row.trim_end().ends_with("esc to interrupt)"))
+    }) {
+        return Err(SeatBusy);
     }
-    if saw_preview {
-        return Err(Inconclusive);
-    }
-    Ok(())
-}
-
-fn retained_fence_codex_working(row: &str) -> bool {
-    let trimmed = row.trim();
-    trimmed.starts_with("• Working (") || matches!(trimmed, "• Working..." | "• Working…")
-}
-
-fn retained_fence_codex_preview_row(row: &str) -> bool {
-    let trimmed = row.trim();
-    let title = row
-        .strip_prefix("• ")
-        .or_else(|| row.strip_prefix("  "))
-        .unwrap_or_default()
-        .trim_end();
-    matches!(
-        title,
-        "Queued follow-up inputs" | "Messages to be submitted at end of turn"
-    ) || title.starts_with("Messages to be submitted after next tool call")
-        || row.starts_with("  ↳ ")
-        || row.starts_with("  ! Approval needed in ")
-        || (row.starts_with("    ")
-            && (trimmed.ends_with(" edit last queued message")
-                || trimmed == "/subagents to review requests"))
+    composer.map(|_| ()).ok_or(Inconclusive)
 }
 
 fn retained_fence_codex_onboarding(cleaned: &str) -> bool {
@@ -21322,6 +21274,11 @@ exit 1"#,
     const CODEX_BUSY_WARNING_CAPTURE: &str =
         include_str!("../tests/fixtures/codex-0.172.0-busy-warning.txt");
 
+    // The same standard capture with all 40 terminal rows, including the transcript
+    // layout with its content and identifiers replaced.
+    const CODEX_BUSY_FULL_CAPTURE: &str =
+        include_str!("../tests/fixtures/codex-0.172.0-busy-full.txt");
+
     #[test]
     fn retained_fence_recovery_requires_a_located_ready_composer() {
         let codex = VendorRoute::Codex {
@@ -21338,12 +21295,15 @@ exit 1"#,
         let busy_with_tip = format!(
             "• Working (4s · esc to interrupt)\n  └ Tip: Try /help.\n                                          Copying 5 chars…\n\n{idle}"
         );
+        let busy_with_toast = format!(
+            "• Working (4s · esc to interrupt)\n                                          Copying 5 chars…\n\n{idle}"
+        );
+        let busy_with_different_header =
+            format!("• Compacting context (4s · esc to interrupt)\n\n{idle}");
         let queued = "• Queued follow-up inputs\n  ↳ later\n    a wrapped input\n    shift+← edit last queued message";
         let busy_with_approval_and_queue = format!(
             "• Working (4s · esc to interrupt)\n └ Checking policy\n  └ Tip text\n\n  ! Approval needed in Robie [explorer]\n    /subagents to review requests\n\n{queued}\n\n{idle}"
         );
-        let queue_without_status = format!("{queued}\n\n{idle}");
-        let clipped_queue = format!("  ↳ later\n\n{idle}");
         let old_busy = format!("• Working…\nPrevious turn completed.\n\n{idle}");
         let old_busy_with_indented_output =
             format!("• Working…\n    Previous turn completed.\n\n{idle}");
@@ -21355,6 +21315,7 @@ exit 1"#,
         let unlocated_busy = format!("• Working...\n\n{footer}");
         let sign_in =
             "\x1b[1mWelcome to Codex\x1b[0m\n\n  › 1. Sign in with ChatGPT\n    2. Use an API key";
+        assert_eq!(CODEX_BUSY_FULL_CAPTURE.lines().count(), 40);
         for (screen, expected) in [
             (idle.as_str(), Ok(())),
             (draft.as_str(), Err(FenceRecoveryOutcome::ComposerDraft)),
@@ -21365,29 +21326,33 @@ exit 1"#,
             ),
             (busy_with_tip.as_str(), Err(FenceRecoveryOutcome::SeatBusy)),
             (
-                busy_with_approval_and_queue.as_str(),
+                busy_with_toast.as_str(),
                 Err(FenceRecoveryOutcome::SeatBusy),
             ),
             (
-                queue_without_status.as_str(),
-                Err(FenceRecoveryOutcome::Inconclusive),
+                busy_with_different_header.as_str(),
+                Err(FenceRecoveryOutcome::SeatBusy),
             ),
             (
-                clipped_queue.as_str(),
-                Err(FenceRecoveryOutcome::Inconclusive),
+                busy_with_approval_and_queue.as_str(),
+                Err(FenceRecoveryOutcome::SeatBusy),
             ),
-            (old_busy.as_str(), Ok(())),
-            (old_busy_with_indented_output.as_str(), Ok(())),
+            (old_busy.as_str(), Err(FenceRecoveryOutcome::SeatBusy)),
+            (
+                old_busy_with_indented_output.as_str(),
+                Err(FenceRecoveryOutcome::SeatBusy),
+            ),
             (
                 busy_with_separated_branches.as_str(),
                 Err(FenceRecoveryOutcome::SeatBusy),
             ),
-            (old_queue.as_str(), Ok(())),
+            (old_queue.as_str(), Err(FenceRecoveryOutcome::SeatBusy)),
             (
                 busy_with_blank_rows.as_str(),
                 Err(FenceRecoveryOutcome::SeatBusy),
             ),
             (CODEX_BUSY_CAPTURE, Err(FenceRecoveryOutcome::SeatBusy)),
+            (CODEX_BUSY_FULL_CAPTURE, Err(FenceRecoveryOutcome::SeatBusy)),
             (
                 CODEX_BUSY_WARNING_CAPTURE,
                 Err(FenceRecoveryOutcome::SeatBusy),
@@ -21403,7 +21368,8 @@ exit 1"#,
         ] {
             assert_eq!(
                 retained_fence_screen_readiness(&codex, screen, None),
-                expected
+                expected,
+                "{screen:?}"
             );
         }
 

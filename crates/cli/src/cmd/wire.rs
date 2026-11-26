@@ -2862,21 +2862,21 @@ fn dispatch_diagnostics_summary(
     };
     let mut waiting = Vec::new();
     let mut needs_attention = Vec::new();
+    let mut busy_since = Vec::new();
     for row in &diagnostics.fence_recovery_attention {
         let Some(recipient) = fl_wire::identity::normalize_persona(&row.recipient) else {
             continue;
         };
         let reason = row.reason_label();
-        let since = row
-            .busy_since
-            .as_ref()
-            .map_or_else(String::new, |at| format!(" busy_since={at}"));
+        if let Some(at) = row.busy_since.as_ref() {
+            busy_since.push(format!("{recipient}={at}"));
+        }
         let exhausted = if row.exhausted { ":exhausted" } else { "" };
         let group = match row.outcome {
             WaitingForDelay | WaitingForWorker | SeatBusy => &mut waiting,
             _ => &mut needs_attention,
         };
-        group.push(format!("{recipient}:{reason}{exhausted}{since}"));
+        group.push(format!("{recipient}:{reason}{exhausted}"));
     }
     // Ring insertion order defines the latest observed streak for each recipient.
     let mut last_busy_probe_counts = std::collections::BTreeMap::new();
@@ -2894,6 +2894,7 @@ fn dispatch_diagnostics_summary(
     let recovery_status = [
         ("fence_recovery_needs_attention", needs_attention),
         ("fence_recovery_waiting", waiting),
+        ("fence_recovery_busy_since", busy_since),
         (
             "fence_recovery_last_busy_probe_counts",
             last_busy_probe_counts,
@@ -3102,17 +3103,22 @@ pub(crate) mod tests {
         ));
         let (attention, waiting_and_history) =
             summary.split_once("\tfence_recovery_waiting=").unwrap();
-        let (waiting, last_busy_probe_counts) = waiting_and_history
+        let (waiting, busy_since_and_history) = waiting_and_history
+            .split_once("\tfence_recovery_busy_since=")
+            .unwrap();
+        let (busy_since, last_busy_probe_counts) = busy_since_and_history
             .split_once("\tfence_recovery_last_busy_probe_counts=")
             .unwrap();
         assert_eq!(
             waiting,
-            "ari:waiting for the recovery delay,bea:waiting for a delivery worker slot,den:seat is in a turn:exhausted busy_since=2026-11-26T00:12:34.567Z"
+            "ari:waiting for the recovery delay,bea:waiting for a delivery worker slot,den:seat is in a turn:exhausted"
+        );
+        assert_eq!(
+            busy_since,
+            "den=2026-11-26T00:12:34.567Z,eve=2026-11-26T01:00:00.000Z"
         );
         assert_eq!(last_busy_probe_counts, "den:2,eve:12,sera:5");
-        assert!(attention.contains(
-            "eve:seat has been in a turn for 5m 41s busy_since=2026-11-26T01:00:00.000Z"
-        ));
+        assert!(attention.contains("eve:seat has been in a turn for 5m 41s"));
         assert!(attention.contains("max:seat is still in a turn"));
         for entry in [
             "cal:timed recovery is disabled",
