@@ -428,13 +428,14 @@ impl HostedLivenessBlock {
 }
 
 fn blocked_seat_for<'a>(
-    seats: &'a [WatchHostedSession],
+    seats: &[&'a WatchHostedSession],
     target: &str,
     vendor: Option<&str>,
 ) -> Option<&'a WatchHostedSession> {
     let target = target.trim();
     seats
         .iter()
+        .copied()
         .filter(|seat| {
             seat.session_id.eq_ignore_ascii_case(target)
                 || (seat.persona.eq_ignore_ascii_case(target)
@@ -476,10 +477,12 @@ fn format_liveness_line(
 }
 
 /// Evaluate live `fl-host` session or active `RouteTable` liveness for `target` when no
-/// wrapper `AttemptHeartbeat` exists in the store.
+/// wrapper `AttemptHeartbeat` exists in the store. Canonical stored session IDs
+/// may only resolve to their own live Host seat.
 pub fn hosted_session_liveness<F>(
     target: &str,
     sessions: &[fl_host_proto::SessionSummary],
+    hosted_seats: &[WatchHostedSession],
     routes: Option<&fl_wire::identity::RouteTable>,
     now: &At,
     local_host: &str,
@@ -488,46 +491,62 @@ pub fn hosted_session_liveness<F>(
 where
     F: Fn(u32) -> bool,
 {
-    let target_trimmed = target.trim();
+    let target = target.trim();
+    let colon_parts = target.split_once(':');
+    let canonical_only = colon_parts.is_some()
+        && hosted_seats
+            .iter()
+            .any(|seat| seat.session_id.eq_ignore_ascii_case(target));
+    let mut selected = None;
     for summary in sessions {
         let fl_host_proto::ChildState::Running(rec) = &summary.state else {
             continue;
         };
-        if !pid_alive(rec.pid) {
-            continue;
-        }
         let sid = summary.stream.session.as_str();
-        let matched = match sid.split_once('.') {
-            Some((s, w)) if s.eq_ignore_ascii_case("muse") => (w
-                .eq_ignore_ascii_case(target_trimmed)
-                || sid.eq_ignore_ascii_case(target_trimmed)
-                || format!("{s}:{w}").eq_ignore_ascii_case(target_trimmed))
-            .then(|| (w.trim().to_ascii_lowercase(), "muse".to_string())),
-            Some((s, w)) => (s.eq_ignore_ascii_case(target_trimmed)
-                || sid.eq_ignore_ascii_case(target_trimmed)
-                || format!("{s}:{w}").eq_ignore_ascii_case(target_trimmed)
-                || format!("{w}:{s}").eq_ignore_ascii_case(target_trimmed))
-            .then(|| (s.trim().to_ascii_lowercase(), w.trim().to_ascii_lowercase())),
-            None => sid
-                .eq_ignore_ascii_case(target_trimmed)
-                .then(|| (sid.trim().to_ascii_lowercase(), "unknown".to_string())),
+        let host_parts = sid.split_once('.');
+        let (persona, adapter) = match host_parts {
+            Some((prefix, persona)) if prefix.eq_ignore_ascii_case("muse") => (persona, "muse"),
+            Some((persona, adapter)) => (persona, adapter),
+            None => (sid, "unknown"),
         };
-        if let Some((persona, adapter)) = matched {
-            let duration_ms = now.unix_millis().saturating_sub(rec.started_at_ms);
-            return Some((
-                adapter,
-                persona,
-                LivenessVerdict::Live {
-                    pid: rec.pid,
-                    host: local_host.to_string(),
-                    heartbeat_at: now.clone(),
-                    duration_ms,
-                    tokens_in: 0,
-                    tokens_out: 0,
-                    cost_usd_micros: 0,
-                },
-            ));
+        let canonical = host_parts.is_some()
+            && colon_parts.is_some_and(|(vendor, name)| {
+                vendor.eq_ignore_ascii_case(adapter) && name.eq_ignore_ascii_case(persona)
+            });
+        let alias = !canonical_only
+            && selected.is_none()
+            && (sid.eq_ignore_ascii_case(target)
+                || host_parts.is_some_and(|(prefix, suffix)| {
+                    persona.eq_ignore_ascii_case(target)
+                        || colon_parts.is_some_and(|(first, last)| {
+                            prefix.eq_ignore_ascii_case(first) && suffix.eq_ignore_ascii_case(last)
+                        })
+                }));
+        if (canonical || alias) && pid_alive(rec.pid) {
+            selected = Some((rec, persona, adapter));
+            if canonical || colon_parts.is_none() {
+                break;
+            }
         }
+    }
+    if let Some((rec, persona, adapter)) = selected {
+        let duration_ms = now.unix_millis().saturating_sub(rec.started_at_ms);
+        return Some((
+            adapter.trim().to_ascii_lowercase(),
+            persona.trim().to_ascii_lowercase(),
+            LivenessVerdict::Live {
+                pid: rec.pid,
+                host: local_host.to_string(),
+                heartbeat_at: now.clone(),
+                duration_ms,
+                tokens_in: 0,
+                tokens_out: 0,
+                cost_usd_micros: 0,
+            },
+        ));
+    }
+    if canonical_only {
+        return None;
     }
 
     if let Some(table) = routes
@@ -1103,7 +1122,7 @@ pub fn run<S: AgentRegistry + Handles + StateStore + Catalog + fl_core::MessageS
             let heartbeats = runtime.heartbeats;
             let blocked_seats: Vec<_> = runtime
                 .hosted_sessions
-                .into_iter()
+                .iter()
                 .filter(|seat| {
                     (seat.is_running() && seat.block.is_some()) || seat.is_stopped_while_blocked()
                 })
@@ -1156,6 +1175,7 @@ pub fn run<S: AgentRegistry + Handles + StateStore + Catalog + fl_core::MessageS
                     if let Some((adapter, agent, v)) = hosted_session_liveness(
                         &t,
                         &host_sessions,
+                        &runtime.hosted_sessions,
                         routes.as_ref(),
                         &now,
                         &host,
@@ -1248,6 +1268,7 @@ pub fn run<S: AgentRegistry + Handles + StateStore + Catalog + fl_core::MessageS
                     if let Some((adapter, agent, verdict)) = hosted_session_liveness(
                         sess_name,
                         &host_sessions,
+                        &[],
                         None,
                         &now,
                         &host,
@@ -1637,6 +1658,86 @@ mod tests {
     }
 
     #[test]
+    fn hosted_session_liveness_prefers_canonical_id_over_reversed_alias() {
+        use fl_host_proto::{
+            ChildRecord, ChildState, HostInstance, InputState, SessionEpoch, SessionId,
+            SessionMode, SessionSummary, SpawnKind, StreamId,
+        };
+
+        let running = |name, pid| {
+            let session = SessionId::new(name).unwrap();
+            SessionSummary {
+                stream: StreamId {
+                    host: HostInstance::new([1u8; 16]),
+                    session: session.clone(),
+                    epoch: SessionEpoch(2),
+                },
+                mode: SessionMode::Pty,
+                state: ChildState::Running(ChildRecord {
+                    pid,
+                    session,
+                    session_epoch: SessionEpoch(2),
+                    kind: SpawnKind::Pty,
+                    input: InputState::Writable,
+                    started_at_ms: 1_000,
+                    exit: None,
+                    consumer_stalled: false,
+                }),
+                acked: 0,
+                latest: 0,
+                input: InputState::Writable,
+            }
+        };
+        let legacy = running("Codex.claude", 22);
+        let canonical = running("Claude.codex", 33);
+        let now = At::from_unix_millis(6_000);
+        for seats in [
+            [legacy.clone(), canonical.clone()],
+            [canonical, legacy.clone()],
+        ] {
+            let (adapter, persona, verdict) =
+                hosted_session_liveness("codex:claude", &seats, &[], None, &now, "host", |_| true)
+                    .expect("canonical Host session is live");
+            assert_eq!((adapter.as_str(), persona.as_str()), ("codex", "claude"));
+            assert!(matches!(verdict, LivenessVerdict::Live { pid: 33, .. }));
+        }
+
+        let legacy_only = [legacy];
+        let stopped = WatchHostedSession {
+            session_id: "codex:claude".into(),
+            persona: "claude".into(),
+            vendor: "codex".into(),
+            status: "stopped".into(),
+            stop_reason: Some(lifecycle::STOP_REASON_STARTUP_BLOCKED.into()),
+            ..WatchHostedSession::default()
+        };
+        assert!(
+            hosted_session_liveness(
+                "codex:claude",
+                &legacy_only,
+                &[stopped],
+                None,
+                &now,
+                "host",
+                |_| true,
+            )
+            .is_none()
+        );
+        let (adapter, persona, verdict) = hosted_session_liveness(
+            "codex:claude",
+            &legacy_only,
+            &[],
+            None,
+            &now,
+            "host",
+            |_| true,
+        )
+        .expect("legacy alias remains available without a canonical seat");
+        assert_eq!((adapter.as_str(), persona.as_str()), ("claude", "codex"));
+        assert!(matches!(verdict, LivenessVerdict::Live { pid: 22, .. }));
+    }
+
+    #[test]
     fn hosted_session_liveness_resolves_running_fl_host_session_and_active_route() {
         use fl_host_proto::{
             ChildRecord, ChildState, HostInstance, InputState, SessionEpoch, SessionId,
@@ -1668,7 +1769,7 @@ mod tests {
         }];
         let now = At::from_unix_millis(6_000);
         let (adapter, agent, verdict) =
-            hosted_session_liveness("feira", &sessions, None, &now, "ai-lab-0", |pid| {
+            hosted_session_liveness("feira", &sessions, &[], None, &now, "ai-lab-0", |pid| {
                 pid == 2270049
             })
             .expect("live fl-host session must report live");
@@ -1695,7 +1796,7 @@ mod tests {
             "Antigravity:Feira",
         ] {
             let resolved =
-                hosted_session_liveness(target, &sessions, None, &now, "ai-lab-0", |pid| {
+                hosted_session_liveness(target, &sessions, &[], None, &now, "ai-lab-0", |pid| {
                     pid == 2270049
                 });
             assert_eq!(
@@ -1719,7 +1820,7 @@ mod tests {
             At::from_unix_millis(2_000),
         );
         let (adapter2, agent2, verdict2) =
-            hosted_session_liveness("felix", &[], Some(&routes), &now, "ai-lab-0", |pid| {
+            hosted_session_liveness("felix", &[], &[], Some(&routes), &now, "ai-lab-0", |pid| {
                 pid == 2667475
             })
             .expect("live route pid must report live");
@@ -1749,8 +1850,10 @@ mod tests {
             At::from_unix_millis(2_000),
         );
         assert!(
-            hosted_session_liveness("pidless", &[], Some(&routes), &now, "ai-lab-0", |_| true)
-                .is_none(),
+            hosted_session_liveness("pidless", &[], &[], Some(&routes), &now, "ai-lab-0", |_| {
+                true
+            })
+            .is_none(),
             "Agy route without live ls_pid must not report Live (pid 0)"
         );
     }
