@@ -418,7 +418,8 @@ mod tests {
         let root = tempfile::TempDir::new().unwrap();
         let endpoint = HostEndpoint::unix(root.path().join("host.sock")).unwrap();
         let tmux = root.path().join("tmux.sock");
-        let tmux_lock = safe_open(&lock_path(&tmux, "fiona", "tmux").unwrap()).unwrap();
+        let canonical_tmux = canonical_socket(&tmux).unwrap();
+        let tmux_lock = safe_open(&lock_path(&canonical_tmux, "fiona", "tmux").unwrap()).unwrap();
         tmux_lock.try_lock().unwrap();
 
         // A fork can retain the same open description until exec despite FD_CLOEXEC.
