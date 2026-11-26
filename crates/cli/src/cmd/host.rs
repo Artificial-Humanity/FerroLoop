@@ -7,6 +7,9 @@ use clap::Subcommand;
 use fl_host_proto::{
     BlockingHostClient, ChildState, HostConfig, HostEndpoint, SendOutcome, SessionSummary,
 };
+use fl_hub::lifecycle::{
+    HostedVendorVersionComponent, HostedVendorVersions, hosted_vendor_versions_for_stream,
+};
 use fl_wire::vendor_adapter::{
     host_session_id_to_unit, lifecycle_id_to_host_session_id, matching_live_host_sessions,
     split_lifecycle_session_id, unit_to_host_session_id,
@@ -241,8 +244,8 @@ fn resolve_target_session_with_agents<'a>(
         .ok_or_else(|| anyhow::anyhow!("no fl-host session matching `{target}`"))
 }
 
-fn load_registry_agents(db: Option<&Path>) -> Result<Vec<fl_core::AgentRecord>> {
-    let store_path = match crate::explicit_db(db.map(Path::to_path_buf)) {
+fn host_workspace_store_path(db: Option<&Path>) -> Option<PathBuf> {
+    match crate::explicit_db(db.map(Path::to_path_buf)) {
         Some(p) => Some(p),
         None => {
             let default = crate::default_state_store_path().ok();
@@ -264,8 +267,11 @@ fn load_registry_agents(db: Option<&Path>) -> Result<Vec<fl_core::AgentRecord>> 
                 }
             }
         }
-    };
-    let Some(path) = store_path else {
+    }
+}
+
+fn load_registry_agents(db: Option<&Path>) -> Result<Vec<fl_core::AgentRecord>> {
+    let Some(path) = host_workspace_store_path(db) else {
         return Ok(Vec::new());
     };
     if !fl_store::store_exists(&path) {
@@ -277,6 +283,100 @@ fn load_registry_agents(db: Option<&Path>) -> Result<Vec<fl_core::AgentRecord>> 
     store
         .list_agents(None, true)
         .with_context(|| format!("could not list agents from {}", path.display()))
+}
+
+fn open_host_version_store(path: &Path) -> Option<fl_store::AnyStore> {
+    use fl_store::{BackendKind, StoreOptions, Unmigrated};
+
+    let configured = std::env::var(fl_store::BACKEND_ENV).ok();
+    let backend = fl_store::choose_backend(path, configured.as_deref()).ok()?;
+    let physical = fl_store::physical_path(path, backend);
+    if backend == BackendKind::Ferro && physical.is_file() {
+        return fl_store::open_store_with(
+            path,
+            &StoreOptions {
+                backend: Some(backend),
+                retries: 0,
+                unmigrated: Unmigrated::Refuse,
+            },
+        )
+        .ok();
+    }
+    // Read a lone redb in place, without migration or recovery. A present but
+    // unusable .fls still owns the store identity, so don't show its old backup.
+    if (backend == BackendKind::Redb
+        || (path != physical
+            && std::fs::symlink_metadata(&physical)
+                .is_err_and(|err| err.kind() == std::io::ErrorKind::NotFound)))
+        && path.is_file()
+    {
+        return fl_store::RedbStore::open_read_only(path, 0)
+            .ok()
+            .map(Into::into);
+    }
+    None
+}
+
+#[derive(serde::Serialize)]
+struct HostListRow<'a> {
+    id: &'a str,
+    unit: String,
+    vendor: String,
+    state: &'static str,
+    pid: Option<u32>,
+    vendor_versions: Option<HostedVendorVersions>,
+}
+
+impl<'a> HostListRow<'a> {
+    fn from_session(summary: &'a SessionSummary, store: Option<&impl fl_core::StateStore>) -> Self {
+        let (vendor, state, pid) = session_vendor_and_state(summary);
+        let vendor_versions = store.and_then(|store| {
+            hosted_vendor_versions_for_stream(store, &summary.stream)
+                .ok()
+                .flatten()
+        });
+        Self {
+            id: summary.stream.session.as_str(),
+            unit: host_session_id_to_unit(&summary.stream.session),
+            vendor,
+            state,
+            pid,
+            vendor_versions,
+        }
+    }
+
+    fn render_text(&self) -> String {
+        use std::fmt::Write as _;
+
+        let pid = self.pid.map_or_else(|| "-".into(), |pid| pid.to_string());
+        let versions = self.vendor_versions.as_ref();
+        let cli = versions
+            .and_then(|versions| versions.cli.as_deref())
+            .unwrap_or("unknown");
+        let daemon = versions
+            .filter(|versions| versions.daemon_expected)
+            .map_or("-", |versions| {
+                versions.daemon.as_deref().unwrap_or("unknown")
+            });
+        let mut row = format!(
+            "{:<24} {:<14} {:<18} {:<8} {:<16} {}",
+            self.id, self.vendor, self.state, pid, cli, daemon
+        );
+        if let Some(versions) = versions {
+            for change in &versions.changes {
+                let component = match change.component {
+                    HostedVendorVersionComponent::Cli => "CLI",
+                    HostedVendorVersionComponent::Daemon => "daemon",
+                };
+                let _ = write!(
+                    row,
+                    "  ! {component} changed: {} -> {}",
+                    change.previous, change.current,
+                );
+            }
+        }
+        row
+    }
 }
 
 fn resolve_target_session_from_store<'a>(
@@ -426,35 +526,26 @@ pub fn execute_with_db(cmd: HostCmd, db: Option<&Path>) -> Result<()> {
                     .list_sessions()
                     .context("failed to list fl-host sessions")?,
             );
+            let store = if sessions.is_empty() {
+                None
+            } else {
+                host_workspace_store_path(db).and_then(|path| open_host_version_store(&path))
+            };
+            let rows: Vec<_> = sessions
+                .iter()
+                .map(|session| HostListRow::from_session(session, store.as_ref()))
+                .collect();
             if json {
-                let rows: Vec<_> = sessions
-                    .iter()
-                    .map(|s| {
-                        let (vendor, state, pid) = session_vendor_and_state(s);
-                        serde_json::json!({
-                            "id": s.stream.session.as_str(),
-                            "unit": host_session_id_to_unit(&s.stream.session),
-                            "vendor": vendor,
-                            "state": state,
-                            "pid": pid,
-                        })
-                    })
-                    .collect();
                 println!("{}", serde_json::to_string_pretty(&rows)?);
-            } else if sessions.is_empty() {
+            } else if rows.is_empty() {
                 println!("No sessions in fl-host.");
             } else {
-                println!("{:<24} {:<14} {:<18} PID", "ID", "VENDOR", "STATE");
-                for s in &sessions {
-                    let (vendor, state, pid) = session_vendor_and_state(s);
-                    let pid_str = pid.map_or_else(|| "-".to_string(), |p| p.to_string());
-                    println!(
-                        "{:<24} {:<14} {:<18} {}",
-                        s.stream.session.as_str(),
-                        vendor,
-                        state,
-                        pid_str
-                    );
+                println!(
+                    "{:<24} {:<14} {:<18} {:<8} {:<16} DAEMON VERSION",
+                    "ID", "VENDOR", "STATE", "PID", "CLI VERSION"
+                );
+                for row in rows {
+                    println!("{}", row.render_text());
                 }
             }
             Ok(())
@@ -605,6 +696,54 @@ mod tests {
             latest: 0,
             input: InputState::Writable,
         }
+    }
+
+    #[test]
+    fn host_list_shows_unknown_versions_and_component_changes() {
+        use fl_hub::lifecycle::HostedVendorVersionChange;
+
+        let session = make_summary("Bea.codex", 102);
+        let mut row = HostListRow::from_session(&session, None::<&fl_store::AnyStore>);
+        let json = serde_json::to_value(&row).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "id": "Bea.codex",
+                "unit": "Bea:codex",
+                "vendor": "codex",
+                "state": "running",
+                "pid": 102,
+                "vendor_versions": null,
+            })
+        );
+        assert!(row.render_text().contains("unknown"));
+
+        row.vendor_versions = Some(HostedVendorVersions {
+            cli: Some("0.172.0".into()),
+            daemon: None,
+            daemon_expected: true,
+            changes: vec![HostedVendorVersionChange {
+                component: HostedVendorVersionComponent::Cli,
+                previous: "0.167.0".into(),
+                current: "0.172.0".into(),
+            }],
+        });
+        let json = serde_json::to_value(&row).unwrap();
+        assert_eq!(
+            json["vendor_versions"],
+            serde_json::json!({
+                "cli": "0.172.0",
+                "daemon": null,
+                "daemon_expected": true,
+                "changes": [{
+                    "component": "cli",
+                    "previous": "0.167.0",
+                    "current": "0.172.0",
+                }],
+            }),
+        );
+        let text = row.render_text();
+        assert!(text.contains("unknown  ! CLI changed: 0.167.0 -> 0.172.0"));
     }
 
     #[test]

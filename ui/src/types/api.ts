@@ -774,6 +774,13 @@ export interface HostedRecoveryEvidenceResponse {
   } | null;
 }
 
+export interface HostedVendorVersions {
+  cli: string | null;
+  daemon: string | null;
+  daemon_expected: boolean;
+  changes: Array<{ component: "cli" | "daemon"; previous: string; current: string }>;
+}
+
 export interface HostedSessionSummary {
   session_id: string;
   persona: string;
@@ -791,6 +798,7 @@ export interface HostedSessionSummary {
   restart_count?: number;
   updated_at_ms?: number;
   recovery_attention?: HostedRecoveryAttention;
+  vendor_versions?: HostedVendorVersions | null;
 }
 
 export interface SpinUpSessionRequest {

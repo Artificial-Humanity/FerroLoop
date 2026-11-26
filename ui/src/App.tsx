@@ -2508,6 +2508,12 @@ export const App: React.FC<AppProps> = ({
   const activeHostedSession = activeAgentKey
     ? hostedSessionsByAgent[activeAgentKey]
     : undefined;
+  const vendorVersionChangedAgents = useMemo(
+    () => new Set(Object.entries(hostedSessionsByAgent)
+      .filter(([, session]) => session.vendor_versions?.changes.length)
+      .map(([key]) => key)),
+    [hostedSessionsByAgent],
+  );
   const activeHydrationStatus = useMemo<HydrationStatus | null>(() => {
     const raw =
       activeSession?.hydration_status ??
@@ -3761,6 +3767,9 @@ export const App: React.FC<AppProps> = ({
       hydrationStatus={activeHydrationStatus}
       hydrationDispatched={activeHydrationDispatched}
       hydrationWarnings={activeHydrationWarnings}
+      hostedVendorVersions={
+        activeHostedSession ? activeHostedSession.vendor_versions ?? null : undefined
+      }
       sessionId={activeSession?.id ?? activeSpunUp?.sessionId ?? null}
       turns={transcriptTurns}
       transcriptRefreshState={transcriptRefreshState}
@@ -3835,6 +3844,7 @@ export const App: React.FC<AppProps> = ({
       unreadByAgent={unreadByAgent}
       unreadSeverityByAgent={unreadSeverityByAgent}
       recoveryAttentionByAgent={authority?.tier === "owner" ? recoveryAttentionByAgent : undefined}
+      vendorVersionChangedAgents={vendorVersionChangedAgents}
       onOpenRecoveryEvidence={(agentKey, sessionId, opener) => {
         if (authority?.tier !== "owner" || loggedOutRef.current) return;
         recoveryEvidenceOpener.current = opener;
