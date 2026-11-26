@@ -45,7 +45,8 @@ mod recovery;
 pub(crate) mod vendor_versions;
 pub use vendor_versions::{
     HostedVendorVersionChange, HostedVendorVersionComponent, HostedVendorVersions,
-    hosted_vendor_versions_for_stream, set_global_vendor_version_adapters,
+    hosted_vendor_versions_for_stream, read_hosted_vendor_versions,
+    set_global_vendor_version_adapters,
 };
 
 #[cfg(test)]

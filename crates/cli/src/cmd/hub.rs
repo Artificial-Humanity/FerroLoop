@@ -191,16 +191,25 @@ pub fn run(env: &StateEnv<'_>, cmd: HubCmd) -> Result<i32, (i32, String)> {
 }
 
 pub(super) fn resolve_hub_store_path(env: &StateEnv<'_>) -> PathBuf {
-    if let Some(db) = env.explicit_db {
-        return db.to_path_buf();
+    env.explicit_db
+        .map(Path::to_path_buf)
+        .or_else(|| configured_hub_store_path(env.cfg, Some(env.cwd)))
+        .unwrap_or_else(|| env.default_store.to_path_buf())
+}
+
+pub(super) fn configured_hub_store_path(
+    cfg: &crate::config::Config,
+    cwd: Option<&Path>,
+) -> Option<PathBuf> {
+    if let Some(st) = cfg.state.as_ref().and_then(|s| s.store.clone()) {
+        return Some(st);
     }
-    if let Some(st) = env.cfg.state.as_ref().and_then(|s| s.store.clone()) {
-        return st;
-    }
-    if let Ok(Some(entry)) = crate::config::bound_entry(&env.cfg.projects, env.cwd) {
-        return entry.store;
-    }
-    env.cfg.workspace_state_store(env.default_store)
+    cwd.and_then(|cwd| {
+        crate::config::bound_entry(&cfg.projects, cwd)
+            .ok()
+            .flatten()
+    })
+    .map(|entry| entry.store)
 }
 
 /// Open the hub's store on whichever engine the path and `FL_STORE_BACKEND` select.

@@ -10,6 +10,7 @@ import {
   type ClearSessionMode,
   type DecommissionMode,
   type HubAuthority,
+  type HostedVendorVersions,
   type HydrationStatus,
   type DecommissionSessionResponse,
   type InterruptSessionResponse,
@@ -1133,6 +1134,8 @@ export interface ChatPaneProps {
   hydrationDispatched?: boolean;
   /** Ephemeral hydration guidance warnings from the most recent spin-up, restart, or remodel response. */
   hydrationWarnings?: string[];
+  /** A null observation means the hosted launch version is unknown. */
+  hostedVendorVersions?: HostedVendorVersions | null;
   sessionId?: string | null;
   turns?: TranscriptTurn[];
   /** Server-measured context usage; estimates apply when absent. */
@@ -1229,6 +1232,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
   hydrationStatus,
   hydrationDispatched,
   hydrationWarnings,
+  hostedVendorVersions,
   sessionId,
   turns,
   contextUsage = null,
@@ -3087,6 +3091,25 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
           </button>
         </div>
       </div>
+
+      {hostedVendorVersions !== undefined && (
+        <div className="fd-hosted-vendor-versions fd-mono">
+          <span>CLI version {hostedVendorVersions?.cli ?? "unknown"}</span>
+          {hostedVendorVersions?.daemon_expected && (
+            <span>Daemon version {hostedVendorVersions.daemon ?? "unknown"}</span>
+          )}
+          {Boolean(hostedVendorVersions?.changes.length) && (
+            <span role="status" className="fd-hosted-vendor-version-warning">
+              <span aria-hidden="true">⚠ </span>
+              {hostedVendorVersions?.changes
+                .map(({ component, previous, current }) =>
+                  `${component === "cli" ? "CLI" : "Daemon"} version changed from ${previous} to ${current}`,
+                )
+                .join(" · ")}
+            </span>
+          )}
+        </div>
+      )}
 
       {(() => {
         const normalizedHydrationWarnings =

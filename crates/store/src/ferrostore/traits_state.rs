@@ -1,6 +1,7 @@
 //! Agent registry and state store.
 
 use std::collections::BTreeMap;
+use std::path::Path;
 
 use super::FerroStore;
 use super::doc::{
@@ -36,6 +37,27 @@ fn append_state_revision(txn: &mut super::Txn, rev: &StateRevision) -> Result<u6
     doc::put_json(txn, STATE_REVISIONS, &doc::key_u64(seq), rev)?;
     doc::put_json(txn, STATE_REVISION_IDS, rev.revision_id.as_str(), &seq)?;
     Ok(seq)
+}
+
+fn state_key(scope: &StateScope, concern: StateConcern, slug: &str) -> Result<String, StoreError> {
+    let slug = validate_slug(slug).map_err(|err| StoreError::InvalidState(err.to_string()))?;
+    Ok(doc::triple(&scope.as_wire(), concern.as_wire(), &slug))
+}
+
+fn state_by_key(
+    txn: &super::Txn,
+    label: &str,
+    key: &str,
+) -> Result<Option<StateEntry>, StoreError> {
+    let Some(id_str) = doc::get_json::<String>(txn, STATE_KEYS, key)? else {
+        return Ok(None);
+    };
+    let id_iri = Iri::parse(&id_str).map_err(decode)?;
+    let (target, kind) = doc::locate(txn, label, &id_iri)?;
+    if kind != Kind::State {
+        return Ok(None);
+    }
+    doc::get_json(txn, STATE_ENTRIES, target.as_str())
 }
 
 fn load_revisions(
@@ -659,6 +681,23 @@ impl AgentRegistry for FerroStore {
 }
 
 impl FerroStore {
+    pub(crate) fn read_state_keys_at(
+        path: &Path,
+        scope: &StateScope,
+        concern: StateConcern,
+        slugs: &[String],
+    ) -> Result<Vec<Option<StateEntry>>, StoreError> {
+        let keys = slugs
+            .iter()
+            .map(|slug| state_key(scope, concern, slug))
+            .collect::<Result<Vec<_>, _>>()?;
+        Self::read_existing_snapshot(path, |txn, label| {
+            keys.iter()
+                .map(|key| state_by_key(txn, label, key))
+                .collect()
+        })
+    }
+
     fn upsert_state_when(
         &self,
         args: UpsertStateArgs,
@@ -834,19 +873,8 @@ impl StateStore for FerroStore {
         concern: StateConcern,
         slug: &str,
     ) -> Result<Option<StateEntry>, StoreError> {
-        let slug = validate_slug(slug).map_err(|err| StoreError::InvalidState(err.to_string()))?;
-        let key = doc::triple(&scope.as_wire(), concern.as_wire(), &slug);
-        self.with_read(|txn| {
-            let Some(id_str) = doc::get_json::<String>(txn, STATE_KEYS, &key)? else {
-                return Ok(None);
-            };
-            let id_iri = Iri::parse(&id_str).map_err(decode)?;
-            let (target, kind) = doc::locate(txn, &self.label, &id_iri)?;
-            if kind != Kind::State {
-                return Ok(None);
-            }
-            doc::get_json(txn, STATE_ENTRIES, target.as_str())
-        })
+        let key = state_key(scope, concern, slug)?;
+        self.with_read(|txn| state_by_key(txn, &self.label, &key))
     }
 
     fn delete_state_by_key(

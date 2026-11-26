@@ -503,9 +503,43 @@ pub fn hosted_vendor_versions_for_stream<S: StateStore>(
     store: &S,
     stream: &StreamId,
 ) -> Result<Option<HostedVendorVersions>, LifecycleError> {
-    Ok(read::<_, LaunchReceipt>(store, &stream_slug(stream))?
+    Ok(versions_for_stream(
+        read(store, &stream_slug(stream))?,
+        stream,
+    ))
+}
+
+/// Read versions for Host inventory from one local read-only store snapshot.
+pub fn read_hosted_vendor_versions(
+    path: &Path,
+    streams: &[&StreamId],
+) -> Result<Vec<Option<HostedVendorVersions>>, LifecycleError> {
+    let keys = streams
+        .iter()
+        .map(|stream| stream_slug(stream))
+        .collect::<Vec<_>>();
+    let entries = fl_store::health::read_state_keys(
+        path,
+        None,
+        &StateScope::Workspace,
+        StateConcern::Runtime,
+        &keys,
+        0,
+    )?;
+    Ok(entries
+        .into_iter()
+        .zip(streams)
+        .map(|(entry, stream)| versions_for_stream(entry.and_then(decode), stream))
+        .collect())
+}
+
+fn versions_for_stream(
+    receipt: Option<LaunchReceipt>,
+    stream: &StreamId,
+) -> Option<HostedVendorVersions> {
+    receipt
         .filter(|receipt| receipt.stream.as_ref() == Some(stream))
-        .and_then(|receipt| receipt.versions))
+        .and_then(|receipt| receipt.versions)
 }
 
 pub(crate) fn hosted_vendor_versions_for_record<S: StateStore>(
@@ -976,6 +1010,24 @@ mod tests {
             hosted_vendor_versions_for_stream(&store, &replacement)
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn host_inventory_reads_exact_streams_from_a_local_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("workspace.fls");
+        let store = fl_store::FerroStore::open(&path).unwrap();
+        let receipt = receipt(1);
+        let stream = receipt.stream.clone().unwrap();
+        let mut unmatched = stream.clone();
+        unmatched.host = HostInstance::new([2; 16]);
+        let observed = sample(Some("1.0.0"), None);
+        save_versions(&store, receipt, observed.clone()).unwrap();
+
+        assert_eq!(
+            read_hosted_vendor_versions(&path, &[&unmatched, &stream]).unwrap(),
+            vec![None, Some(observed)]
         );
     }
 

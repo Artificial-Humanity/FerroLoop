@@ -51,6 +51,9 @@ impl Fixture {
         BlockingHostClient::connect(&self.endpoint).unwrap()
     }
     fn command(&self) -> Command {
+        self.command_with_db(&self.root.path().join("fl.fls"))
+    }
+    fn command_with_db(&self, db: &std::path::Path) -> Command {
         let mut c = Command::new(env!("CARGO_BIN_EXE_fl"));
         c.env_clear()
             .current_dir(self.root.path())
@@ -64,7 +67,7 @@ impl Fixture {
             .env("FL_WIRE_CLAUDE_BIN", self.root.path().join("vendor"))
             .env("FL_WIRE_AGY_BIN", self.root.path().join("vendor"))
             .args(["--db"])
-            .arg(self.root.path().join("fl.fls"));
+            .arg(db);
         c
     }
     fn json(&self, args: &[&str], no_spawn: bool) -> Value {
@@ -163,6 +166,46 @@ impl Drop for Fixture {
         let _ = self.daemon.kill();
         let _ = self.daemon.wait();
     }
+}
+
+#[test]
+fn host_list_preserves_live_rows_without_migrating_a_store() {
+    let f = Fixture::new();
+    f.raw_spawn("Ada.claude", Some("claude:ada"));
+    let rows = f.json(&["host", "list", "--json"], false);
+    let row = &rows[0];
+    assert_eq!(row["id"], "Ada.claude");
+    assert_eq!(row["unit"], "Ada:claude");
+    assert_eq!(row["vendor"], "claude");
+    assert_eq!(row["state"], "running");
+    assert!(row["pid"].as_u64().is_some());
+    assert_eq!(row.get("vendor_versions"), Some(&Value::Null));
+    assert!(!f.root.path().join("fl.fls").exists());
+
+    let empty_ferro = f.root.path().join("fl.fls");
+    std::fs::write(&empty_ferro, []).unwrap();
+    assert_eq!(f.json(&["host", "list", "--json"], false), rows);
+    assert_eq!(std::fs::metadata(&empty_ferro).unwrap().len(), 0);
+
+    let legacy = f.root.path().join("legacy.redb");
+    drop(fl_store::open_redb(&legacy).unwrap());
+    let original = std::fs::read(&legacy).unwrap();
+    let output = f
+        .command_with_db(&legacy)
+        .args(["host", "list"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(text.contains("CLI VERSION"));
+    assert!(text.contains("Ada.claude"));
+    assert!(text.contains("unknown"));
+    assert_eq!(std::fs::read(&legacy).unwrap(), original);
+    assert!(!legacy.with_extension("fls").exists());
 }
 
 #[test]

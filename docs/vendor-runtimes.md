@@ -35,6 +35,19 @@ Attempt rows from the store have no `quota_usage`. Claude Code, Antigravity, and
 fill `quota_usage` from a direct probe, an override JSON value, or a rate-limit error
 in the transcript.
 
+### Hosted launch versions
+
+`GET /api/v1/hosted-sessions` and `fl host list --json` expose `vendor_versions` when
+an observation has been recorded for the launch. It includes the CLI version (`cli`),
+whether a daemon version is expected (`daemon_expected`), the daemon version
+(`daemon`), and any `changes` with the component, previous version and current
+version. A null version means the observation had insufficient evidence. The CLI
+looks up the receipt for the exact Host stream in the workspace store or the store
+selected by `--db` or `FL_DB`.
+
+FerroDeck and `fl host list` show the observed versions and flag any changes. A change
+warns the operator while allowing the launch to proceed.
+
 ## Clear and Reforge
 
 Clear and Reforge resolve targets only from saved/registered routes. A single request for
