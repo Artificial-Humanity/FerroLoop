@@ -2537,25 +2537,27 @@ where
         readiness_result(readiness, binding.startup_confirmed).map(|target| (target, Some(binding)))
     }
 
-    /// The caller holds the enqueue gate. Keep the triggering manual event until
-    /// the replay worker has relinquished its queue and restored any failed fence.
+    /// The caller holds the enqueue gate. Keep manual releases until the timed replay
+    /// ends. An ACK also waits for an overflow prefix because pending receipts in that
+    /// queue may still have earlier delivery attempts.
     fn defer_fence_release(
         &self,
         recipient: &str,
+        wait_for_overflow_prefix: bool,
         update: impl FnOnce(&mut DeferredFenceRelease),
     ) -> bool {
         let queues = lock(&self.dispatch_queues);
-        let Some(run) = queues
-            .get(recipient)
-            .and_then(|queue| queue.recovery.as_ref())
-        else {
+        let Some(queue) = queues.get(recipient) else {
             return false;
         };
         let mut recoveries = lock(&self.fence_recoveries);
-        let Some(state) = recoveries
-            .get_mut(recipient)
-            .filter(|state| run.is_current(state))
-        else {
+        let Some(state) = recoveries.get_mut(recipient).filter(|state| {
+            queue
+                .recovery
+                .as_ref()
+                .is_some_and(|run| run.is_current(state))
+                || (wait_for_overflow_prefix && state.phase == RetainedFencePhase::OverflowOnly)
+        }) else {
             return false;
         };
         update(&mut state.deferred_release);
@@ -2571,26 +2573,32 @@ where
     }
 
     fn release_deferred_fences(self: &Arc<Self>) {
-        let ready: Vec<_> = lock(&self.fence_recoveries)
-            .iter_mut()
-            .filter(|(_, state)| {
-                state.phase != RetainedFencePhase::InProgress
-                    && (state.deferred_release.route.is_some()
-                        || state.deferred_release.ack.is_some())
-            })
-            .map(|(recipient, state)| {
-                (
-                    recipient.clone(),
-                    Arc::clone(&state.token),
-                    std::mem::take(&mut state.deferred_release),
-                )
-            })
-            .collect();
-        for (recipient, token, release) in ready {
-            if let Some(route) = release.route {
+        let ready: Vec<_> = {
+            let queues = lock(&self.dispatch_queues);
+            lock(&self.fence_recoveries)
+                .iter_mut()
+                .filter(|(_, state)| state.phase != RetainedFencePhase::InProgress)
+                .filter_map(|(recipient, state)| {
+                    // A replacement can release the fence while an ordinary tail is
+                    // parked. Keep the ACK until that prefix no longer owns the queue.
+                    let ack = if state.phase == RetainedFencePhase::OverflowOnly
+                        && queues.contains_key(recipient)
+                    {
+                        None
+                    } else {
+                        state.deferred_release.ack.take()
+                    };
+                    let route = state.deferred_release.route.take();
+                    (route.is_some() || ack.is_some())
+                        .then(|| (recipient.clone(), Arc::clone(&state.token), route, ack))
+                })
+                .collect()
+        };
+        for (recipient, token, route, ack) in ready {
+            if let Some(route) = route {
                 self.release_fence_for_new_route(&recipient, route, Some(&token));
             }
-            if let Some(at) = release.ack {
+            if let Some(at) = ack {
                 self.unfence_after_ack(&recipient, at, Some(&token));
             }
         }
@@ -2797,7 +2805,7 @@ where
             return;
         }
         let at = release.at.clone();
-        if self.defer_fence_release(&name, |deferred| deferred.route = Some(release))
+        if self.defer_fence_release(&name, false, |deferred| deferred.route = Some(release))
             || !self.is_recipient_fenced(&name)
         {
             return;
@@ -2888,7 +2896,7 @@ where
         }
         let _order = lock(&self.enqueue_gate);
         if !self.recovery_fence_matches(&name, expected)
-            || self.defer_fence_release(&name, |deferred| deferred.ack = Some(now.clone()))
+            || self.defer_fence_release(&name, true, |deferred| deferred.ack = Some(now.clone()))
             || !self.is_recipient_fenced(&name)
         {
             return;
@@ -5705,6 +5713,87 @@ mod tests {
                 inner.diagnostics_snapshot().fence_recovery_attempts.len(),
                 1
             );
+        }
+    }
+
+    #[test]
+    fn timed_fence_recovery_retains_deferred_ack_while_overflow_prefix_drains() {
+        for ack_during_replay in [true, false] {
+            let (_tmp, inner, _listener, first, since) = timed_recovery_fixture();
+            let block_receipt_write = || {
+                let (entered_tx, entered_rx) = mpsc::channel();
+                let (resume_tx, resume_rx) = mpsc::channel();
+                *lock(&inner.store.before_receipt_write) = Some(Box::new(move || {
+                    entered_tx.send(()).unwrap();
+                    resume_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                }));
+                (entered_rx, resume_tx)
+            };
+            let ack_first = || {
+                let (response, _) = inner.handle_local_request(LocalRequest::Ack {
+                    recipient: "held".into(),
+                    message_ids: vec![first.clone()],
+                });
+                assert!(matches!(response, LocalResponse::Acked { .. }));
+            };
+            let (first_write, finish_first) = block_receipt_write();
+            *lock(&inner.fence_recovery_probe_hook) = Some(Box::new(|| {
+                RecoveryReadiness::Ready(RecoveryTarget::FixtureWebhook)
+            }));
+            inner.queue_limit_override.store(1, Ordering::SeqCst);
+            let due = since.unix_millis() + 300_000;
+            inner.poll_retained_fences(At::from_unix_millis(due));
+            first_write.recv_timeout(Duration::from_secs(5)).unwrap();
+
+            let tail = send_to_held_recipient(&inner, "previously attempted prefix tail");
+            inner
+                .store
+                .update_wire_receipt(&tail, "held", DeliveryStatus::Pending, true, now_at())
+                .unwrap()
+                .unwrap();
+            let overflow = send_to_held_recipient(&inner, "stored beyond the prefix");
+            assert!(lock(&inner.dispatch_queues)["held"].overflowed);
+            if ack_during_replay {
+                ack_first();
+            }
+            let (tail_write, finish_tail) = block_receipt_write();
+            finish_first.send(()).unwrap();
+            tail_write.recv_timeout(Duration::from_secs(5)).unwrap();
+            if !ack_during_replay {
+                ack_first();
+            }
+
+            assert_eq!(
+                lock(&inner.dispatch_queues)["held"].in_flight.as_ref(),
+                Some(&tail)
+            );
+            let receipt = &inner.store.list_wire_receipts(&tail).unwrap()[0];
+            assert_eq!(receipt.status, DeliveryStatus::Pending);
+            assert_eq!(receipt.attempts, 1);
+            inner.poll_retained_fences(At::from_unix_millis(due + 300_000));
+            let ack_retained = lock(&inner.fence_recoveries)["held"]
+                .deferred_release
+                .ack
+                .is_some();
+            let fenced_during_tail = inner.is_recipient_fenced("held");
+            finish_tail.send(()).unwrap();
+            assert!(
+                ack_retained,
+                "prefix poll lost ACK (during replay: {ack_during_replay})"
+            );
+            assert!(fenced_during_tail);
+            wait_on_recovery(|| !lock(&inner.dispatch_queues).contains_key("held"));
+
+            inner.poll_retained_fences(At::from_unix_millis(due + 600_000));
+            wait_on_recovery(|| !lock(&inner.dispatch_queues).contains_key("held"));
+            assert!(!inner.is_recipient_fenced("held"));
+            assert_eq!(
+                inner.store.list_wire_receipts(&overflow).unwrap()[0].attempts,
+                1
+            );
+            let attempts = inner.diagnostics_snapshot().fence_recovery_attempts;
+            assert_eq!(attempts.len(), 1);
+            assert_eq!(attempts[0].outcome, FenceRecoveryOutcome::PrefixOverflow);
         }
     }
 
