@@ -3078,6 +3078,32 @@ mod tests {
     }
 
     #[test]
+    fn inspect_thread_queues_rejects_a_valid_page_with_the_wrong_response_id() {
+        let dir = TempDir::new().unwrap();
+        let (sock, server) = spawn(dir.path(), |c| {
+            c.handshake();
+            assert_eq!(c.expect_json()["method"], "initialize");
+            c.send_text(&queue_init_reply(1, "0.172.0"));
+            assert_eq!(c.expect_json()["method"], "initialized");
+            let request = c.expect_json();
+            assert_eq!(request["id"], 2);
+            assert_eq!(request["method"], "thread/queue/list");
+            c.send_text(r#"{"id":3,"result":{"data":[],"nextCursor":null}}"#);
+            c.drain_until_eof();
+        });
+
+        assert_eq!(
+            inspect_thread_queues(&sock, &["registered-thread"], 0, SHORT),
+            [CodexQueueInspection::Unknown {
+                reason: "Codex app-server response ID did not match `thread/queue/list`".into(),
+                verified_codex_version: MIN_CODEX_QUEUE_RPC_VERSION.into(),
+                detected_codex_version: Some("0.172.0".into()),
+            }]
+        );
+        server.join().unwrap();
+    }
+
+    #[test]
     fn inspect_thread_queues_fails_closed_to_unknown_never_zero() {
         let now_ms: u64 = 1_762_000_100_000;
 
