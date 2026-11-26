@@ -1445,8 +1445,9 @@ mod tests {
         assert_eq!(versions[0].changes[0].previous, "1.0.0");
         assert!(versions[1].changes.is_empty());
         assert!(versions[2].changes.is_empty());
+        let latest = receipt(4);
         let (baseline, _): (VendorBaseline, _) =
-            load_revision(&writer, &baseline_slug(&receipt(4))).unwrap();
+            load_revision(&writer, &baseline_slug(&latest.host, &latest.vendor)).unwrap();
         assert_eq!(baseline.cli.unwrap().launch, launch(4));
     }
 

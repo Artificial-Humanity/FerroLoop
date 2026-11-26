@@ -21,8 +21,6 @@ fl doctor --fix <check-id>
   root, as for `fl install`. A prefix that cannot be an install exits 3.
 * `--db PATH` (or `$FL_DB`) names the one store to verify. Without it doctor verifies the
   workspace state store and every project store the config binds, each once, at most 64.
-  Vendor history comes from one store. Doctor uses the explicit path first, then
-  `[state].store`, the current directory's bound project store, or the default workspace store.
 * `--fix <check-id>` is parsed and refused: exit 3, `repairs are not implemented in this
   release`. A repair is an explicit, separate action with its own plan.
 
