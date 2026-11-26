@@ -5486,6 +5486,20 @@ fn screen_has_dialog_or_menu_markers_with_context(
     route_keys: &[String],
 ) -> bool {
     let cleaned = normalize_terminal_screen(screen);
+    normalized_screen_has_dialog_or_menu_markers(
+        &cleaned,
+        post_paste_trimmed,
+        post_paste_raw,
+        route_keys,
+    )
+}
+
+fn normalized_screen_has_dialog_or_menu_markers(
+    cleaned: &str,
+    post_paste_trimmed: Option<&str>,
+    post_paste_raw: Option<&str>,
+    route_keys: &[String],
+) -> bool {
     let lines: Vec<&str> = cleaned.lines().collect();
     if lines.is_empty() {
         return false;
@@ -7377,6 +7391,42 @@ fn retained_fence_screen_readiness(
     }
 }
 
+/// A blocker recognized on a hosted vendor's active terminal screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostedScreenBlocker {
+    VendorSignIn,
+    BlockingDialog,
+}
+
+/// Classifies a rendered screen for a canonical vendor name without sending any input.
+/// A missing result means no blocker was recognized, including for unsupported vendors.
+pub fn classify_hosted_screen_blocker(vendor: &str, contents: &str) -> Option<HostedScreenBlocker> {
+    if !supports_hosted_screen_blockers(vendor) {
+        return None;
+    }
+    classify_normalized_screen_blocker(vendor, &normalize_terminal_screen(contents))
+}
+
+fn supports_hosted_screen_blockers(vendor: &str) -> bool {
+    matches!(vendor, "codex" | "claude" | "muse" | "grok")
+}
+
+fn classify_normalized_screen_blocker(vendor: &str, cleaned: &str) -> Option<HostedScreenBlocker> {
+    if (vendor == "codex" && codex_screen_is_onboarding(cleaned))
+        || cleaned
+            .lines()
+            .any(|line| line.trim().eq_ignore_ascii_case("Sign in to continue"))
+    {
+        return Some(HostedScreenBlocker::VendorSignIn);
+    }
+    if normalized_screen_has_dialog_or_menu_markers(cleaned, None, None, &[])
+        || (vendor == "muse" && muse_screen_is_hook_trust_dialog(cleaned))
+    {
+        return Some(HostedScreenBlocker::BlockingDialog);
+    }
+    None
+}
+
 fn retained_fence_screen_gate(
     route: &VendorRoute,
     contents: &str,
@@ -7385,25 +7435,18 @@ fn retained_fence_screen_gate(
         BlankScreen, DialogWaiting, SeatBusy, UnsupportedRoute, VendorSignIn,
     };
 
-    let cleaned = normalize_terminal_screen(contents);
     let vendor = route.canonical_vendor();
-    if !matches!(vendor, "codex" | "claude" | "muse" | "grok") {
+    if !supports_hosted_screen_blockers(vendor) {
         return Err(UnsupportedRoute);
     }
+    let cleaned = normalize_terminal_screen(contents);
     if cleaned.trim().is_empty() {
         return Err(BlankScreen);
     }
-    if (vendor == "codex" && retained_fence_codex_onboarding(&cleaned))
-        || cleaned
-            .lines()
-            .any(|line| line.trim().eq_ignore_ascii_case("Sign in to continue"))
-    {
-        return Err(VendorSignIn);
-    }
-    if screen_has_dialog_or_menu_markers_with_context(contents, None, None, &[])
-        || (vendor == "muse" && retained_fence_muse_trust_dialog(&cleaned))
-    {
-        return Err(DialogWaiting);
+    match classify_normalized_screen_blocker(vendor, &cleaned) {
+        Some(HostedScreenBlocker::VendorSignIn) => return Err(VendorSignIn),
+        Some(HostedScreenBlocker::BlockingDialog) => return Err(DialogWaiting),
+        None => {}
     }
     let busy = match vendor {
         "claude" => claude_screen_is_busy_main(contents),
@@ -7421,7 +7464,7 @@ fn retained_fence_screen_gate(
     Ok(())
 }
 
-fn retained_fence_codex_onboarding(cleaned: &str) -> bool {
+fn codex_screen_is_onboarding(cleaned: &str) -> bool {
     let lines: Vec<_> = cleaned.lines().collect();
     // Onboarding replaces the composer. Match the heading and choice as
     // standalone UI rows, so references in an ordinary reply are not a login screen.
@@ -7442,7 +7485,7 @@ fn retained_fence_codex_onboarding(cleaned: &str) -> bool {
             })
 }
 
-fn retained_fence_muse_trust_dialog(cleaned: &str) -> bool {
+fn muse_screen_is_hook_trust_dialog(cleaned: &str) -> bool {
     // Muse places its hook-trust choices at the bottom, separated from the title by blank rows.
     let mut lines = cleaned
         .lines()
@@ -21363,6 +21406,10 @@ exit 1"#,
             retained_fence_screen_readiness(&codex, onboarding, None),
             Err(FenceRecoveryOutcome::VendorSignIn)
         );
+        assert_eq!(
+            classify_hosted_screen_blocker("codex", onboarding),
+            Some(HostedScreenBlocker::VendorSignIn)
+        );
         let quoted = "• The dialog said Welcome to Codex and Sign in with ChatGPT.\n\n\
                       › Ask Codex to do anything\n\n\
                       \x20 GPT-6.1-Sol medium · ~/project\n\
@@ -21370,6 +21417,19 @@ exit 1"#,
         assert_eq!(
             retained_fence_screen_readiness(&codex, quoted, None),
             Ok(())
+        );
+        assert_eq!(classify_hosted_screen_blocker("codex", quoted), None);
+    }
+
+    #[test]
+    fn hosted_screen_blocker_ignores_blank_unsupported_and_busy_screens() {
+        let busy = "• Working (4s · esc to interrupt)\n› Ask Codex to do anything\n  GPT-6.1-Sol medium · ~/project";
+
+        assert_eq!(classify_hosted_screen_blocker("codex", busy), None);
+        assert_eq!(classify_hosted_screen_blocker("codex", " \n "), None);
+        assert_eq!(
+            classify_hosted_screen_blocker("unknown", "Sign in to continue"),
+            None
         );
     }
 
@@ -21390,6 +21450,11 @@ exit 1"#,
         assert_eq!(
             retained_fence_screen_readiness(&claude, claude_trust, None),
             Err(FenceRecoveryOutcome::DialogWaiting)
+        );
+
+        assert_eq!(
+            classify_hosted_screen_blocker("claude", claude_trust),
+            Some(HostedScreenBlocker::BlockingDialog)
         );
 
         let muse = VendorRoute::Muse {
@@ -21414,12 +21479,18 @@ exit 1"#,
             Err(FenceRecoveryOutcome::DialogWaiting)
         );
 
+        assert_eq!(
+            classify_hosted_screen_blocker("muse", &muse_trust),
+            Some(HostedScreenBlocker::BlockingDialog)
+        );
+
         let rule = "────────────────────────────────────────";
         let muse_idle = format!("{muse_trust}\n{rule}\n❯ \n{rule}\n  muse-wonder-full-1.0 · idle");
         assert_eq!(
             retained_fence_screen_readiness(&muse, &muse_idle, Some(CursorState::new(20, 2))),
             Ok(())
         );
+        assert_eq!(classify_hosted_screen_blocker("muse", &muse_idle), None);
     }
 
     #[test]
