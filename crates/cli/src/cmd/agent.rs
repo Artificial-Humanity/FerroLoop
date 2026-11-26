@@ -505,7 +505,8 @@ where
             .then(|| (w.trim().to_ascii_lowercase(), "muse".to_string())),
             Some((s, w)) => (s.eq_ignore_ascii_case(target_trimmed)
                 || sid.eq_ignore_ascii_case(target_trimmed)
-                || format!("{s}:{w}").eq_ignore_ascii_case(target_trimmed))
+                || format!("{s}:{w}").eq_ignore_ascii_case(target_trimmed)
+                || format!("{w}:{s}").eq_ignore_ascii_case(target_trimmed))
             .then(|| (s.trim().to_ascii_lowercase(), w.trim().to_ascii_lowercase())),
             None => sid
                 .eq_ignore_ascii_case(target_trimmed)
@@ -1687,6 +1688,22 @@ mod tests {
         );
         let line = format_liveness_line("feira", None, Some(&adapter), &verdict);
         assert!(line.starts_with("feira\tlive\tadapter=antigravity\tduration=5000ms"));
+
+        for target in [
+            "Feira.antigravity",
+            "Feira:antigravity",
+            "Antigravity:Feira",
+        ] {
+            let resolved =
+                hosted_session_liveness(target, &sessions, None, &now, "ai-lab-0", |pid| {
+                    pid == 2270049
+                });
+            assert_eq!(
+                resolved,
+                Some((adapter.clone(), agent.clone(), verdict.clone())),
+                "hosted session target {target} must identify the same live session"
+            );
+        }
 
         // RouteTable fallback when fl-host session list is empty.
         let mut routes = RouteTable::default();
