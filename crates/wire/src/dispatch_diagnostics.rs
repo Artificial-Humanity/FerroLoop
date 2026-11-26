@@ -33,7 +33,7 @@ pub struct DispatchDiagnostics {
     /// Most recent attempts, including attempts for fences that have cleared.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub fence_recovery_attempts: Vec<FenceRecoveryAttempt>,
-    /// Recipient fences still held after timed recovery ran.
+    /// Retained fences waiting for timed recovery or held for an operator-visible reason.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub fence_recovery_attention: Vec<FenceRecoveryAttention>,
 }
@@ -48,18 +48,28 @@ pub enum DiagnosticsScope {
 #[serde(rename_all = "snake_case")]
 pub enum FenceRecoveryOutcome {
     Released,
+    WaitingForDelay,
+    WaitingForWorker,
+    RecoveryDisabled,
     DeadRoute,
     VendorSignIn,
     UnconfirmedStartup,
     HostedBindingUnavailable,
     HostedCaptureUnavailable,
+    HostedLeaderPidUnavailable,
     NonHostedRoute,
     UnsupportedRoute,
+    SeatBusy,
+    DialogWaiting,
+    ComposerDraft,
+    BlankScreen,
+    HostProbesDisabled,
     Inconclusive,
     RouteChanged,
     FenceSuperseded,
     InboxUnavailable,
     ReplayFailed,
+    PrefixOverflow,
     #[serde(other)]
     Unsupported,
 }
@@ -68,18 +78,28 @@ impl FenceRecoveryOutcome {
     pub fn label(self) -> &'static str {
         match self {
             Self::Released => "fence released",
+            Self::WaitingForDelay => "waiting for the recovery delay",
+            Self::WaitingForWorker => "waiting for a delivery worker slot",
+            Self::RecoveryDisabled => "timed recovery is disabled",
             Self::DeadRoute => "dead route",
             Self::VendorSignIn => "vendor sign-in screen",
             Self::UnconfirmedStartup => "hosted startup unconfirmed",
             Self::HostedBindingUnavailable => "no hosted stream binding",
             Self::HostedCaptureUnavailable => "hosted screen capture unavailable",
+            Self::HostedLeaderPidUnavailable => "no recorded hosted leader PID",
             Self::NonHostedRoute => "non-hosted route",
             Self::UnsupportedRoute => "timed recovery unsupported for this route",
+            Self::SeatBusy => "seat is in a turn",
+            Self::DialogWaiting => "a dialog waits for input",
+            Self::ComposerDraft => "the composer holds a draft",
+            Self::BlankScreen => "hosted screen is blank",
+            Self::HostProbesDisabled => "host probes are disabled",
             Self::Inconclusive => "route readiness unverified",
             Self::RouteChanged => "route changed during recovery",
             Self::FenceSuperseded => "fence superseded during recovery",
             Self::InboxUnavailable => "inbox unavailable",
             Self::ReplayFailed => "replay failed",
+            Self::PrefixOverflow => "backlog exceeded the admitted delivery queue",
             Self::Unsupported => "unrecognized recovery outcome",
         }
     }
@@ -375,11 +395,14 @@ pub(crate) struct DispatchReport {
     pub(crate) route_dispatch_calls: u64,
     pub(crate) route_dispatch_calls_saturated: bool,
     pub(crate) recognised_composer_payload: Option<&'static str>,
+    /// A dispatch reported known session activity and sent no keys in that call.
+    pub(crate) composer_busy: bool,
 }
 
 impl DispatchReport {
     pub(crate) fn record_composer_occupied(&mut self, err: &str) {
         self.record_failure(FailureStage::ComposerOccupiedByNonWireInput);
+        self.composer_busy |= crate::dispatcher::is_composer_session_busy_error(err);
         if let Some(payload) = crate::dispatcher::recognised_payload_from_error(err) {
             self.recognised_composer_payload = Some(payload);
         }

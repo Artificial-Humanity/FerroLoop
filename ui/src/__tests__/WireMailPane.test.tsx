@@ -316,6 +316,12 @@ describe("WireMailPane", () => {
             reason_label: "hosted screen capture unavailable",
             exhausted: false,
           },
+          {
+            recipient: "ada",
+            outcome: "waiting_for_worker",
+            reason_label: "waiting for a delivery worker slot",
+            exhausted: false,
+          },
         ],
       },
       pending_recipients: [],
@@ -338,6 +344,9 @@ describe("WireMailPane", () => {
     );
     expect(screen.getByTestId("wire-fence-recovery-attention-jarvis")).toHaveTextContent(
       "jarvis: Wire recovery needs attention (hosted screen capture unavailable)",
+    );
+    expect(screen.getByTestId("wire-fence-recovery-attention-ada")).toHaveTextContent(
+      "ada: Wire recovery pending (waiting for a delivery worker slot)",
     );
     expect(screen.queryByTestId("wire-diagnostics-available")).toBeNull();
   });

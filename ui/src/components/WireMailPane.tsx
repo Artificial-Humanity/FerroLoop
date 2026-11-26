@@ -1401,9 +1401,13 @@ export const WireMailPane: React.FC<WireMailPaneProps> = ({
                       backgroundColor: "rgba(251, 191, 36, 0.14)",
                     }}
                   >
-                    {`${recipient}: Wire recovery needs attention (${
-                      reason_label ?? outcome.replace(/_/g, " ")
-                    }${exhausted ? ", attempt limit reached" : ""})`}
+                    {`${recipient}: Wire recovery ${
+                      outcome === "waiting_for_delay" || outcome === "waiting_for_worker"
+                        ? "pending"
+                        : "needs attention"
+                    } (${reason_label ?? outcome.replace(/_/g, " ")}${
+                      exhausted ? ", attempt limit reached" : ""
+                    })`}
                   </span>
                 ))}
 

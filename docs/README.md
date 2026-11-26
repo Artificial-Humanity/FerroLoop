@@ -69,13 +69,16 @@ In addition to the guides above, `fl --help` documents the full command surface:
   When an unresolved route delivery causes a retained fence, the daemon runs a read-only
   readiness check after `FL_WIRE_FENCE_RECOVERY_DELAY_SECS` (default 300 seconds). It checks at
   most once per delay period, up to `FL_WIRE_FENCE_RECOVERY_MAX_ATTEMPTS` (default 3) per fence.
-  Both settings take positive integers. Invalid values use the defaults and log a warning.
-  After the daemon verifies readiness, it attempts to redeliver the held messages.
-  A redelivery notice warns that an earlier attempt may already have arrived. A dead, blocked,
-  or unverified route stays fenced. `fl wire status` shows which routes need attention.
-  The FerroDeck mail view shows this status on its next refresh. Timed recovery can replay
-  only supported hosted routes. Non-hosted, Antigravity, and webhook routes stay fenced
-  and report the reason.
+  Set `FL_WIRE_FENCE_RECOVERY_MAX_ATTEMPTS=0` to disable timed recovery. The delay must be
+  positive. Invalid values use the defaults and log a warning.
+  After the daemon verifies readiness, it sends the first held message with a warning that an
+  earlier attempt may already have arrived. Once the submit is confirmed, normal dispatch
+  resumes in admission order. Previously attempted messages in that queue also carry the warning.
+  A dead, blocked, or unverified route stays fenced. `fl wire status` and the FerroDeck mail
+  view show the reason, including while recovery waits for the delay or a delivery worker.
+  Timed recovery supports hosted Claude, Codex, and Muse routes. Non-hosted, Antigravity, Grok,
+  and webhook routes stay fenced and report the reason. Fences caused by queue overflow,
+  receipt bookkeeping errors, or global capacity limits do not start timed recovery.
 * `fl github pr` — pull-request review and merge policy evaluation, structured review markers, and gated merges.
 * `fl flow` — DAG workflow validation, import, step execution, review loops, and human approval sign-off.
 * `fl arch` — `.fl/architecture.toml` validation, Cargo workspace dependency/source conformance checks, and LikeC4 export.

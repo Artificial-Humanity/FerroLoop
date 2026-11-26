@@ -13520,6 +13520,11 @@ mod council_guidance_tests {
                             exhausted: true,
                         },
                         FenceRecoveryAttention {
+                            recipient: "ada".into(),
+                            outcome: FenceRecoveryOutcome::WaitingForWorker,
+                            exhausted: false,
+                        },
+                        FenceRecoveryAttention {
                             recipient: "/secret/recovery-diagnostic".into(),
                             outcome: FenceRecoveryOutcome::Inconclusive,
                             exhausted: false,
@@ -13641,12 +13646,20 @@ mod council_guidance_tests {
         );
         assert_eq!(
             body["dispatch_diagnostics"]["fence_recovery_attention"],
-            json!([{
-                "recipient": "felix",
-                "outcome": "vendor_sign_in",
-                "reason_label": "vendor sign-in screen",
-                "exhausted": true,
-            }])
+            json!([
+                {
+                    "recipient": "felix",
+                    "outcome": "vendor_sign_in",
+                    "reason_label": "vendor sign-in screen",
+                    "exhausted": true,
+                },
+                {
+                    "recipient": "ada",
+                    "outcome": "waiting_for_worker",
+                    "reason_label": "waiting for a delivery worker slot",
+                    "exhausted": false,
+                },
+            ])
         );
         let obs = rec["route_observations"].as_array().unwrap();
         assert_eq!(obs.len(), 2);
