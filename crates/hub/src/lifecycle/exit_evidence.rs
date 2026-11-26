@@ -330,7 +330,7 @@ pub(super) fn spawn_and_remember<S: StateStore>(
     if spawned {
         let leader = leader_pid.and_then(launch_versions::ProcessIdentity::capture);
         remember_spawn(store, env, state, record, stream.clone(), by)?;
-        launch_versions::remember_launch(store, record, stream, leader, config, by);
+        launch_versions::remember_launch(store, env, record, stream, leader, config, by);
     }
     Ok(spawned)
 }

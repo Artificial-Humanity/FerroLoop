@@ -212,6 +212,8 @@ pub struct LifecycleEnv<'a> {
     /// Log guidance warnings independently of response consumption (the hub default).
     /// CLI callers disable this and render the returned warnings once in their output format.
     pub log_hydration_warnings: bool,
+    /// Receipt IDs captured by a direct CLI operation for passive, post-fence observation.
+    direct_version_receipts: Option<&'a std::sync::Mutex<Vec<uuid::Uuid>>>,
     /// Borrowed proof for nested helpers; never a bypass for a different persona.
     pub(crate) lifecycle_fence: Option<&'a lock::LifecycleFence>,
     pub(crate) blocker_evidence: Option<&'a blockers::PromptExitEvidence>,
@@ -246,9 +248,30 @@ impl<'a> LifecycleEnv<'a> {
             key_probe: &HostKeyProbe,
             workspace_root: None,
             log_hydration_warnings: true,
+            direct_version_receipts: None,
             lifecycle_fence: None,
             blocker_evidence: None,
         }
+    }
+
+    /// Run a direct CLI operation, then record passive evidence from exactly its launches.
+    /// The operation's persona fence has dropped before any version evidence is read.
+    pub fn with_direct_launch_versions<S: StateStore, T>(
+        &self,
+        store: &S,
+        ferro_file: Option<&Path>,
+        operation: impl FnOnce(&LifecycleEnv<'_>) -> T,
+    ) -> T {
+        let receipts = std::sync::Mutex::new(Vec::new());
+        let result = operation(&LifecycleEnv {
+            direct_version_receipts: Some(&receipts),
+            ..*self
+        });
+        let receipts = receipts.into_inner().unwrap_or_else(|e| e.into_inner());
+        if let Err(err) = launch_versions::observe_direct_launches(store, ferro_file, &receipts) {
+            eprintln!("warning: could not record hosted launch versions: {err}");
+        }
+        result
     }
 
     /// Look up a dependency-injected [`fl_core::VendorHostAdapter`] for `vendor`.
@@ -2839,6 +2862,7 @@ impl FakeRuntime {
             log_hydration_warnings: true,
             lifecycle_fence: None,
             blocker_evidence: None,
+            direct_version_receipts: None,
         }
     }
 
@@ -12002,6 +12026,7 @@ mod tests {
             log_hydration_warnings: true,
             lifecycle_fence: None,
             blocker_evidence: None,
+            direct_version_receipts: None,
         }
     }
 

@@ -244,14 +244,27 @@ fn resolve_target_session_with_agents<'a>(
         .ok_or_else(|| anyhow::anyhow!("no fl-host session matching `{target}`"))
 }
 
-fn host_store_path(db: Option<&Path>, bound_cwd: Option<&Path>) -> Option<PathBuf> {
+fn host_store_paths(db: Option<&Path>, bound_cwd: Option<&Path>) -> Vec<PathBuf> {
     match crate::explicit_db(db.map(Path::to_path_buf)) {
-        Some(p) => Some(p),
+        Some(p) => vec![p],
         None => {
             let default = crate::default_state_store_path().ok();
             let config_path = crate::config::path();
             match crate::config::load(config_path.as_deref()) {
-                Ok(cfg) => super::hub::configured_hub_store_path(&cfg, bound_cwd).or(default),
+                Ok(cfg) => {
+                    let mut paths: Vec<_> = super::hub::configured_hub_store_path(&cfg, bound_cwd)
+                        .into_iter()
+                        .collect();
+                    // Direct `fl agent` launches use the workspace default even inside a
+                    // bound project. Hub launches can use either store.
+                    if let Some(workspace) =
+                        default.as_deref().map(|p| cfg.workspace_state_store(p))
+                        && !paths.contains(&workspace)
+                    {
+                        paths.push(workspace);
+                    }
+                    paths
+                }
                 Err(error) => {
                     eprintln!(
                         "warning: failed to load {}: {error:#}; using default store",
@@ -260,7 +273,7 @@ fn host_store_path(db: Option<&Path>, bound_cwd: Option<&Path>) -> Option<PathBu
                             |p| p.display().to_string()
                         )
                     );
-                    default
+                    default.into_iter().collect()
                 }
             }
         }
@@ -268,7 +281,7 @@ fn host_store_path(db: Option<&Path>, bound_cwd: Option<&Path>) -> Option<PathBu
 }
 
 fn load_registry_agents(db: Option<&Path>) -> Result<Vec<fl_core::AgentRecord>> {
-    let Some(path) = host_store_path(db, None) else {
+    let Some(path) = host_store_paths(db, None).into_iter().next() else {
         return Ok(Vec::new());
     };
     if !fl_store::store_exists(&path) {
@@ -489,20 +502,26 @@ pub fn execute_with_db(cmd: HostCmd, db: Option<&Path>) -> Result<()> {
                     .list_sessions()
                     .context("failed to list fl-host sessions")?,
             );
-            let versions = if sessions.is_empty() {
-                Vec::new()
-            } else {
+            let mut versions = vec![None; sessions.len()];
+            if !sessions.is_empty() {
                 let cwd = std::env::current_dir().ok();
-                host_store_path(db, cwd.as_deref())
-                    .and_then(|path| {
-                        let streams = sessions.iter().map(|s| &s.stream).collect::<Vec<_>>();
-                        read_hosted_vendor_versions(&path, &streams).ok()
-                    })
-                    .unwrap_or_default()
-            };
+                let streams = sessions.iter().map(|s| &s.stream).collect::<Vec<_>>();
+                for path in host_store_paths(db, cwd.as_deref()) {
+                    if let Ok(read) = read_hosted_vendor_versions(&path, &streams) {
+                        for (current, observed) in versions.iter_mut().zip(read) {
+                            if current.is_none() {
+                                *current = observed;
+                            }
+                        }
+                    }
+                    if versions.iter().all(Option::is_some) {
+                        break;
+                    }
+                }
+            }
             let rows: Vec<_> = sessions
                 .iter()
-                .zip(versions.into_iter().chain(std::iter::repeat(None)))
+                .zip(versions)
                 .map(|(session, versions)| HostListRow::from_session(session, versions))
                 .collect();
             if json {

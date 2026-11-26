@@ -732,6 +732,16 @@ pub fn run<S: AgentRegistry + Handles + StateStore + Catalog + fl_core::MessageS
     store: &S,
     cmd: AgentCmd,
 ) -> Result<(), (i32, String)> {
+    run_with_store_file(store, cmd, None)
+}
+
+pub fn run_with_store_file<
+    S: AgentRegistry + Handles + StateStore + Catalog + fl_core::MessageStore,
+>(
+    store: &S,
+    cmd: AgentCmd,
+    ferro_file: Option<&Path>,
+) -> Result<(), (i32, String)> {
     match cmd {
         AgentCmd::Area { cmd } => match cmd {
             AreaCmd::Set {
@@ -902,7 +912,10 @@ pub fn run<S: AgentRegistry + Handles + StateStore + Catalog + fl_core::MessageS
             let mut env = LifecycleEnv::new(None);
             env.workspace_root = Some(&ws_root);
             env.log_hydration_warnings = false;
-            let out = lifecycle::spin_up(store, &env, &req, &by, lifecycle::Caller::Owner)
+            let out = env
+                .with_direct_launch_versions(store, ferro_file, |env| {
+                    lifecycle::spin_up(store, env, &req, &by, lifecycle::Caller::Owner)
+                })
                 .map_err(lifecycle_failure)?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&out).unwrap());
@@ -928,14 +941,17 @@ pub fn run<S: AgentRegistry + Handles + StateStore + Catalog + fl_core::MessageS
             let mut env = LifecycleEnv::new(None);
             env.workspace_root = Some(&ws_root);
             env.log_hydration_warnings = false;
-            let out = lifecycle::restart_agent_session(
-                store,
-                &env,
-                &session,
-                &by,
-                lifecycle::Caller::Owner,
-            )
-            .map_err(lifecycle_failure)?;
+            let out = env
+                .with_direct_launch_versions(store, ferro_file, |env| {
+                    lifecycle::restart_agent_session(
+                        store,
+                        env,
+                        &session,
+                        &by,
+                        lifecycle::Caller::Owner,
+                    )
+                })
+                .map_err(lifecycle_failure)?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&out).unwrap());
             } else {
@@ -1044,16 +1060,19 @@ pub fn run<S: AgentRegistry + Handles + StateStore + Catalog + fl_core::MessageS
             let mut env = LifecycleEnv::new(None);
             env.workspace_root = Some(&ws_root);
             env.log_hydration_warnings = false;
-            let out = lifecycle::remodel_session(
-                store,
-                &env,
-                &target,
-                &req,
-                &by,
-                lifecycle::Caller::Owner,
-                |_| {},
-            )
-            .map_err(lifecycle_failure)?;
+            let out = env
+                .with_direct_launch_versions(store, ferro_file, |env| {
+                    lifecycle::remodel_session(
+                        store,
+                        env,
+                        &target,
+                        &req,
+                        &by,
+                        lifecycle::Caller::Owner,
+                        |_| {},
+                    )
+                })
+                .map_err(lifecycle_failure)?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&out).unwrap());
             } else if out.mode == RemodelMode::Prepare {
