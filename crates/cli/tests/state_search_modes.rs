@@ -8,6 +8,13 @@ use std::path::Path;
 use std::process::Stdio;
 
 use assert_cmd::Command;
+use fl_core::ids::Kind;
+use fl_core::state::{
+    MergeMode, RuntimeEntry, SensitivityPatch, StatePayload, StateScope, UpsertStateArgs,
+};
+use fl_core::store::{Handles, StateStore};
+use fl_hub::lifecycle::HOSTED_RESPAWN_STATE_SLUG_PREFIX;
+use fl_wire::hosted_recovery_notice::NOTICE_STATE_SLUG_PREFIX;
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
@@ -502,4 +509,161 @@ fn mcp_fl_memory_search_takes_a_mode_and_defaults_to_auto() {
 
     drop(input);
     assert!(child.wait().unwrap().success());
+}
+
+#[test]
+fn internal_hosted_runtime_is_hidden_from_cli_and_mcp() {
+    let cfg = TempDir::new().unwrap();
+    let db = cfg.path().join("state.fls");
+    let hidden_slugs = [
+        format!("{HOSTED_RESPAWN_STATE_SLUG_PREFIX}fixture"),
+        format!("{NOTICE_STATE_SLUG_PREFIX}fixture"),
+    ];
+    let store = fl_store::open_store(&db).unwrap();
+    let mut hidden = Vec::new();
+    for key in hidden_slugs
+        .iter()
+        .map(String::as_str)
+        .chain(["visible-runtime"])
+    {
+        let entry = store
+            .upsert_state(UpsertStateArgs {
+                scope: StateScope::Workspace,
+                slug: key.into(),
+                sensitivity: if key == hidden_slugs[1].as_str() {
+                    SensitivityPatch::SetSensitive
+                } else {
+                    SensitivityPatch::Inherit
+                },
+                payload: StatePayload::Runtime(RuntimeEntry {
+                    value: json!("fixture recovered terminal output"),
+                    merge_mode: MergeMode::Conflict,
+                }),
+                at: fl_core::at::At::from_unix_millis(0),
+                by: "test".into(),
+            })
+            .unwrap();
+        if key != "visible-runtime" {
+            let handle = store
+                .handle_of(Kind::State, entry.id.iri())
+                .unwrap()
+                .unwrap();
+            hidden.push([key.to_owned(), entry.id.to_string(), handle.to_string()]);
+        }
+    }
+    drop(store);
+
+    let out = fl(&cfg, &db, None)
+        .args(["state", "list", "--json"])
+        .assert()
+        .success();
+    let list: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    assert_eq!(list.as_array().unwrap().len(), 1, "{list}");
+    assert_eq!(list[0]["slug"], "visible-runtime");
+
+    let mcp_call = |name: &str, arguments: Value| -> (bool, String) {
+        let request = json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": { "name": name, "arguments": arguments }
+        });
+        let out = fl(&cfg, &db, None)
+            .args(["state", "mcp"])
+            .write_stdin(format!("{request}\n"))
+            .assert()
+            .success();
+        let response: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+        let result = &response["result"];
+        (
+            result["isError"].as_bool().unwrap(),
+            result["content"][0]["text"].as_str().unwrap().to_owned(),
+        )
+    };
+    let (error, text) = mcp_call("state_list", json!({}));
+    assert!(!error, "{text}");
+    assert_eq!(serde_json::from_str::<Value>(&text).unwrap(), list);
+
+    for identifiers in &hidden {
+        for id in identifiers {
+            fl(&cfg, &db, None)
+                .args(["state", "get", id])
+                .args(["--scope", "workspace", "--history", "--json"])
+                .assert()
+                .code(1)
+                .stderr(predicates::str::contains("no state entry"));
+            let (error, text) = mcp_call(
+                "state_get",
+                json!({
+                    "id_or_key": id, "scope": "workspace", "concern": "runtime", "history": true,
+                }),
+            );
+            assert!(error && text.contains("no state entry"), "{text}");
+        }
+    }
+    let query = "recovered terminal output";
+    for mode in ["auto", "lexical", "vector", "hybrid"] {
+        let cli = search(&cfg, &db, None, &[query, "--mode", mode]);
+        assert_eq!(slugs(&cli), ["visible-runtime"], "{cli}");
+        assert_eq!(cli["total_hits"], 1, "{cli}");
+        let (error, text) = mcp_call("fl_memory_search", json!({"query": query, "mode": mode}));
+        assert!(!error, "{text}");
+        assert_eq!(serde_json::from_str::<Value>(&text).unwrap(), cli);
+    }
+
+    fl(&cfg, &db, None)
+        .args(["state", "runtime", "set", "--scope", "workspace"])
+        .args(["--key", &hidden_slugs[0].to_ascii_uppercase()])
+        .args(["--value", "null", "--not-sensitive", "--by", "test"])
+        .assert()
+        .code(1)
+        .stderr(predicates::str::contains("reserved"));
+    let (error, text) = mcp_call(
+        "state_set_runtime",
+        json!({
+            "scope": "workspace", "key": hidden_slugs[1].to_ascii_uppercase(),
+            "value": null, "clear_sensitive": true, "by": "test",
+        }),
+    );
+    assert!(error && text.contains("reserved"), "{text}");
+
+    let (error, text) = mcp_call(
+        "state_set_runtime",
+        json!({
+            "scope": "project:demo", "key": hidden[0][0], "value": "ordinary project state", "by": "test",
+        }),
+    );
+    assert!(!error, "{text}");
+    let (error, text) = mcp_call(
+        "state_get",
+        json!({"scope": "project:demo", "id_or_key": hidden[0][0]}),
+    );
+    assert!(!error && text.contains("ordinary project state"), "{text}");
+
+    set_memory(
+        &cfg,
+        &db,
+        None,
+        "workspace",
+        &hidden[1][0],
+        "ordinary workspace memory",
+        "body",
+    );
+    let cli = fl(&cfg, &db, None)
+        .args([
+            "state",
+            "render",
+            "--scope",
+            "workspace",
+            "--include-sensitive",
+        ])
+        .assert()
+        .success();
+    let cli = std::str::from_utf8(&cli.get_output().stdout).unwrap();
+    assert!(cli.contains("ordinary workspace memory"), "{cli}");
+    assert!(!cli.contains("fixture recovered terminal output"), "{cli}");
+    let (error, text) = mcp_call(
+        "state_render",
+        json!({"scope": "workspace", "include_sensitive": true}),
+    );
+    assert!(!error, "{text}");
+    assert_eq!(text, cli);
 }

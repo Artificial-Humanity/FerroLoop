@@ -1,0 +1,207 @@
+//! Private attachments for local hosted recovery notices.
+
+use fl_core::agent::{AgentRole, AgentStatus};
+use fl_core::at::At;
+use fl_core::ferrowire::{
+    MAX_WIRE_BODY_BYTES, MessageKind, WireAddress, WireFilter, WireInboxItem,
+};
+use fl_core::ids::{AgentId, MessageId};
+use fl_core::iri::Iri;
+pub use fl_core::state::NOTICE_STATE_SLUG_PREFIX;
+use fl_core::state::{
+    MergeMode, RuntimeEntry, SensitivityPatch, StateConcern, StatePayload, StateScope,
+    UpsertStateArgs, validate_slug,
+};
+use fl_core::store::{AgentRegistry, MessageStore, StateStore, StoreError};
+use fl_host_proto::{MAX_HOSTED_EXIT_TAIL_BYTES, MAX_HOSTED_EXIT_TAIL_LINES};
+use serde::{Deserialize, Serialize};
+use uuid::Uuid;
+
+// Mark the low random bits to screen ordinary mail before querying private state.
+// The v7 timestamp, variant and version are left intact.
+const NOTICE_UUID_MARKER: &[u8; 2] = b"hr";
+const TAIL_HEADING: &str = "\n\nSanitized terminal excerpt from the captured exit\n";
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Attachment {
+    recipient_id: AgentId,
+    project: String,
+    #[serde(default)]
+    session_id: Option<String>,
+    terminal_tail: String,
+}
+
+fn bounded_tail(tail: &str) -> bool {
+    tail.len() <= MAX_HOSTED_EXIT_TAIL_BYTES
+        && tail.lines().count() <= MAX_HOSTED_EXIT_TAIL_LINES
+        && !tail.trim().is_empty()
+        && tail
+            .chars()
+            .all(|ch| !ch.is_control() || matches!(ch, '\n' | '\t'))
+}
+
+/// Save a sanitized terminal excerpt in sensitive workspace state. Send the
+/// returned ID as a direct durable system mail with a safe body.
+pub fn prepare(
+    store: &impl StateStore,
+    recipient: &AgentId,
+    project: &str,
+    session_id: &str,
+    terminal_tail: &str,
+    at: At,
+    by: &str,
+) -> Result<MessageId, StoreError> {
+    if !bounded_tail(terminal_tail) {
+        return Err(StoreError::InvalidState(
+            "invalid hosted recovery terminal excerpt".into(),
+        ));
+    }
+    let project =
+        validate_slug(project).map_err(|err| StoreError::InvalidState(err.to_string()))?;
+    let mut bytes = *Uuid::now_v7().as_bytes();
+    bytes[14..].copy_from_slice(NOTICE_UUID_MARKER);
+    let uuid = Uuid::from_bytes(bytes);
+    let id = MessageId(Iri::parse(&format!("urn:uuid:{uuid}")).expect("a UUIDv7 is a valid URN"));
+
+    store.upsert_state(UpsertStateArgs {
+        scope: StateScope::Workspace,
+        slug: attachment_slug(uuid),
+        sensitivity: SensitivityPatch::SetSensitive,
+        payload: StatePayload::Runtime(RuntimeEntry {
+            value: serde_json::json!(Attachment {
+                recipient_id: recipient.clone(),
+                project,
+                session_id: Some(session_id.into()),
+                terminal_tail: terminal_tail.into(),
+            }),
+            merge_mode: MergeMode::Conflict,
+        }),
+        at,
+        by: by.into(),
+    })?;
+    Ok(id)
+}
+
+/// Drop the live attachment after a send failure only when the mail is absent.
+pub fn discard_unsent(store: &(impl StateStore + MessageStore), id: &MessageId) {
+    if let Some(uuid) = notice_uuid(id)
+        && matches!(store.get_wire_message(id), Ok(None))
+    {
+        let _ = store.delete_state_by_key(
+            &StateScope::Workspace,
+            StateConcern::Runtime,
+            &attachment_slug(uuid),
+        );
+    }
+}
+
+/// Drop current local attachment rows for this exact session, including writes
+/// whose corresponding notice was never queued. Safe to repeat after a failure.
+pub fn discard_for_session(store: &impl StateStore, session_id: &str) -> Result<(), StoreError> {
+    for entry in store.list_state(Some(&StateScope::Workspace), Some(StateConcern::Runtime))? {
+        if !entry.sensitive || !entry.slug.starts_with(NOTICE_STATE_SLUG_PREFIX) {
+            continue;
+        }
+        let StatePayload::Runtime(runtime) = entry.payload else {
+            continue;
+        };
+        if runtime
+            .value
+            .get("session_id")
+            .and_then(serde_json::Value::as_str)
+            == Some(session_id)
+        {
+            store.delete_state_by_key(
+                &StateScope::Workspace,
+                StateConcern::Runtime,
+                &entry.slug,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn attachment_slug(uuid: Uuid) -> String {
+    format!("{NOTICE_STATE_SLUG_PREFIX}{uuid}")
+}
+
+fn notice_uuid(id: &MessageId) -> Option<Uuid> {
+    let id = id.as_str().strip_prefix("urn:uuid:")?;
+    let uuid = Uuid::parse_str(id).ok()?;
+    (id.len() == 36
+        && uuid.get_version_num() == 7
+        && uuid.get_variant() == uuid::Variant::RFC4122
+        && uuid.as_bytes().ends_with(NOTICE_UUID_MARKER))
+    .then_some(uuid)
+}
+
+/// Append private excerpts only to a local inbox read scoped to one recipient.
+/// Call after ACK and publication so only a response to that read holds a tail.
+pub fn attach_to_local_inbox(
+    store: &(impl StateStore + AgentRegistry),
+    filter: &WireFilter,
+    items: &mut [WireInboxItem],
+) {
+    let Some(recipient) = filter.recipient.as_deref().map(str::trim) else {
+        return;
+    };
+    let name = crate::identity::normalize_persona(recipient);
+    for item in items {
+        if item.receipt.recipient_id.as_str() != recipient
+            && name.as_deref() != Some(item.receipt.recipient_name.as_str())
+        {
+            continue;
+        }
+        if let Some(tail) = load_tail(store, item)
+            && item.message.body.len() + TAIL_HEADING.len() + tail.len() <= MAX_WIRE_BODY_BYTES
+        {
+            item.message.body.push_str(TAIL_HEADING);
+            item.message.body.push_str(&tail);
+        }
+    }
+}
+
+fn load_tail(store: &(impl StateStore + AgentRegistry), item: &WireInboxItem) -> Option<String> {
+    let message = &item.message;
+    let WireAddress::AgentId(recipient) = &message.to else {
+        return None;
+    };
+    // The store can infer a sender ID from an active system registration.
+    if message.sender_name != "system"
+        || message.kind != MessageKind::Mail
+        || !message.durable
+        || item.receipt.message_id != message.id
+        || &item.receipt.recipient_id != recipient.iri()
+    {
+        return None;
+    }
+    let uuid = notice_uuid(&message.id)?;
+    let entry = store
+        .get_state_by_key(
+            &StateScope::Workspace,
+            StateConcern::Runtime,
+            &attachment_slug(uuid),
+        )
+        .ok()??;
+    if !entry.sensitive {
+        return None;
+    }
+    let StatePayload::Runtime(runtime) = entry.payload else {
+        return None;
+    };
+    let attachment: Attachment = serde_json::from_value(runtime.value).ok()?;
+    if &attachment.recipient_id != recipient || !bounded_tail(&attachment.terminal_tail) {
+        return None;
+    }
+    let agent = store.get_agent(recipient).ok()??;
+    if &agent.id != recipient
+        || agent.name_key != item.receipt.recipient_name
+        || agent.status != AgentStatus::Active
+        || !(agent.role == AgentRole::LabManager
+            || (agent.role == AgentRole::Lead && agent.covers_area(&attachment.project)))
+    {
+        return None;
+    }
+    Some(attachment.terminal_tail)
+}

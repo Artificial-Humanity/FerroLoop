@@ -8,7 +8,7 @@ use fl_core::at::At;
 use fl_core::ferrowire::{DeliveryReceipt, DeliveryStatus, WireMessage};
 use fl_core::ids::{MessageId, StateId};
 use fl_core::iri::Iri;
-use fl_core::state::{StateRevision, StateScope, StateSyncCursor};
+use fl_core::state::{StateRevision, StateScope, StateSyncCursor, is_internal_hosted_runtime_key};
 use fl_core::store::{AgentRegistry, MessageStore, StateStore, StoreError, WorkflowStore};
 use fl_core::workflow::{WorkflowDef, WorkflowRun};
 use sha2::{Digest, Sha256};
@@ -883,7 +883,7 @@ where
         } else {
             0
         };
-        let ordered_remote_revs = topo_sort_revisions(&base_snapshot.revisions);
+        let mut ordered_remote_revs = topo_sort_revisions(&base_snapshot.revisions);
         if !target.private {
             for rev in &ordered_remote_revs {
                 if rev.sensitive || rev.ever_sensitive {
@@ -893,6 +893,9 @@ where
                 }
             }
         }
+        // Keep legacy revisions in the remote snapshot for append-only verification.
+        ordered_remote_revs
+            .retain(|rev| !is_internal_hosted_runtime_key(&rev.scope, rev.concern, &rev.slug));
         store.import_state_revisions(&ordered_remote_revs, now.clone())?;
         let imported_revisions = ordered_remote_revs.len();
 
@@ -944,7 +947,9 @@ where
         // Step 4: Collect unpublished local events/revisions/wire records and enforce sensitivity guard.
         if !target.private {
             for entry in store.list_state(target.scope_filter.as_ref(), None)? {
-                if entry.sensitive || entry.ever_sensitive {
+                if (entry.sensitive || entry.ever_sensitive)
+                    && !is_internal_hosted_runtime_key(&entry.scope, entry.concern, &entry.slug)
+                {
                     return Err(StateSyncError::Store(StoreError::SensitiveDisclosure(
                         entry.id,
                     )));
@@ -963,6 +968,7 @@ where
             .into_iter()
             .map(|(_, r)| r)
             .filter(|r| target.scope_filter.as_ref().is_none_or(|sc| &r.scope == sc))
+            .filter(|r| !is_internal_hosted_runtime_key(&r.scope, r.concern, &r.slug))
             .filter(|r| !remote_rev_ids.contains(&r.revision_id))
             .collect();
 
@@ -1414,8 +1420,8 @@ mod tests {
     use fl_core::agent::{AgentRole, RegisterAgentArgs};
     use fl_core::mem::MemStore;
     use fl_core::state::{
-        HandoffEntry, MergeMode, RuntimeEntry, SensitivityPatch, StatePayload, StateScope,
-        UpsertStateArgs,
+        HOSTED_RESPAWN_STATE_SLUG_PREFIX, HandoffEntry, MergeMode, RuntimeEntry, SensitivityPatch,
+        StateConcern, StatePayload, StateScope, UpsertStateArgs,
     };
     use std::process::Command;
     use tempfile::TempDir;
@@ -1632,6 +1638,67 @@ mod tests {
         };
         let rep = sync_state(&store, &private_target, At::from_unix_millis(13)).unwrap();
         assert_eq!(rep.published_revisions, 2);
+    }
+
+    #[test]
+    fn sync_preserves_legacy_hosted_recovery_history_without_importing_it() {
+        let (_tmp, clone_a, clone_b) = setup_two_clones();
+        let legacy_store = MemStore::default();
+        let slug = format!("{HOSTED_RESPAWN_STATE_SLUG_PREFIX}fixture");
+        let runtime = |scope, at| UpsertStateArgs {
+            scope,
+            slug: slug.clone(),
+            sensitivity: SensitivityPatch::Inherit,
+            payload: StatePayload::Runtime(RuntimeEntry {
+                value: serde_json::json!({"respawns": 1}),
+                merge_mode: MergeMode::Conflict,
+            }),
+            at: At::from_unix_millis(at),
+            by: "fixture".into(),
+        };
+        legacy_store
+            .upsert_state(runtime(StateScope::Workspace, 10))
+            .unwrap();
+        let mut snapshot = BranchSnapshot::default();
+        let revisions = legacy_store.state_revisions_after(0).unwrap();
+        let (_, revision) = &revisions[0];
+        append_revision_to_segments(&mut snapshot.segments, revision);
+        let tree = write_snapshot_tree(&clone_a, &snapshot).unwrap();
+        let tip = Git::commit_tree(&clone_a, &tree, None, "legacy state", "fixture").unwrap();
+        assert_eq!(
+            Git::push_cas(&clone_a, "origin", "fl/state", None, &tip).unwrap(),
+            PushCasOutcome::Updated
+        );
+
+        let store = MemStore::starting_at(100);
+        // The same slug under a project scope is ordinary syncable runtime state.
+        let ordinary = store
+            .upsert_state(runtime(StateScope::Project("fixture".into()), 11))
+            .unwrap();
+        let target = StateSyncTarget {
+            repo_dir: clone_b,
+            remote: "origin".into(),
+            branch: "fl/state".into(),
+            private: false,
+            sync_registry: false,
+            sync_wire: false,
+            scope_filter: None,
+            by: "fixture".into(),
+        };
+        let report = sync_state(&store, &target, At::from_unix_millis(12)).unwrap();
+        assert_eq!(report.previous_commit, Some(tip));
+        assert_eq!(report.imported_revisions, 0);
+        assert_eq!(report.published_revisions, 1);
+        assert_eq!(
+            store
+                .get_state_by_key(&StateScope::Workspace, StateConcern::Runtime, &slug)
+                .unwrap(),
+            None
+        );
+        assert_eq!(store.get_state(&ordinary.id).unwrap(), Some(ordinary));
+        let verify = verify_state(&store, &target).unwrap();
+        assert_eq!(verify.verified_commits, 2);
+        assert_eq!(verify.verified_revisions, 2);
     }
 
     #[test]

@@ -5,6 +5,7 @@ import {
   type AgentRecord,
   type AreaRecord,
   type DiscoveredSessionSummary,
+  type HostedRecoveryAttentionTarget,
   type SessionContextUsage,
   type SessionQuotaUsage,
   type TranscriptTurn,
@@ -426,6 +427,8 @@ export interface RosterSidebarProps {
   liveness: AgentLivenessItem[];
   unreadByAgent: Record<string, number | AgentUnreadSummary>;
   unreadSeverityByAgent?: Record<string, UnreadSeverity>;
+  recoveryAttentionByAgent?: Record<string, HostedRecoveryAttentionTarget>;
+  onOpenRecoveryEvidence?: (agentKey: string, sessionId: string, opener: HTMLButtonElement) => void;
   busyByAgent?: Record<string, boolean>;
   transcriptsByAgent?: Record<string, TranscriptTurn[]>;
   contextUsageByAgent?: Record<string, SessionContextUsage | null>;
@@ -724,6 +727,8 @@ export const RosterSidebar: React.FC<RosterSidebarProps> = ({
   liveness = [],
   unreadByAgent = {},
   unreadSeverityByAgent,
+  recoveryAttentionByAgent,
+  onOpenRecoveryEvidence,
   busyByAgent,
   transcriptsByAgent,
   contextUsageByAgent,
@@ -1441,6 +1446,10 @@ export const RosterSidebar: React.FC<RosterSidebarProps> = ({
                       const key = record.name_key.toLowerCase();
                       const isSelected = key === selectedKey;
                       const isAgentPinned = pinnedAgents.has(key);
+                      const recoveryAttention = recoveryAttentionByAgent?.[key];
+                      const recoveryLabel = recoveryAttention?.phase === "exhausted"
+                        ? "Hosted session recovery exhausted"
+                        : "Hosted session recovery in progress";
                       const quotaEval = evaluateQuotaStatus({
                         quotaUsage,
                         vendor: adapter,
@@ -1570,6 +1579,32 @@ export const RosterSidebar: React.FC<RosterSidebarProps> = ({
                             </div>
 
                             <div style={{ display: "flex", alignItems: "center", gap: "4px" }}>
+                              {recoveryAttention && onOpenRecoveryEvidence && (
+                                <button
+                                  type="button"
+                                  aria-label={`${recoveryLabel} for ${record.display_name}. View evidence`}
+                                  aria-haspopup="dialog"
+                                  title={`${recoveryLabel}. View evidence`}
+                                  className="fd-badge"
+                                  onClick={(event) => {
+                                    event.stopPropagation();
+                                    onOpenRecoveryEvidence(key, recoveryAttention.sessionId, event.currentTarget);
+                                  }}
+                                  onKeyDown={(event) => {
+                                    if (event.key === "Enter" || event.key === " ") event.stopPropagation();
+                                  }}
+                                  style={{
+                                    ...getUnreadBadgeStyle(recoveryAttention.phase === "exhausted" ? "important" : "question"),
+                                    color: "#0A0D12",
+                                    cursor: "pointer",
+                                    justifyContent: "center",
+                                    minWidth: 24,
+                                    minHeight: 24,
+                                  }}
+                                >
+                                  !
+                                </button>
+                              )}
                               {unreadCount > 0 && (
                                 <span
                                   data-testid={`unread-badge-${key}`}

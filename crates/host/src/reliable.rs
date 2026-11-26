@@ -1,4 +1,5 @@
 //! An epoch-local authoritative journal. Transport completion never acknowledges it.
+use crate::exit_evidence::TerminalTail;
 use crate::slice_budget::{ChargeKind, EPOCH_LIFECYCLE, Reservation, SliceBudget, reserve};
 use fl_host_proto::{
     ControlEvent, Cursor, ExtensionRefusal, MAX_EVENT_ENVELOPE, MAX_STDOUT_LINE, StreamId,
@@ -157,7 +158,9 @@ impl ReliableJournal {
                 + fl_host_proto::MAX_HOSTED_OWNER_BYTES + std::mem::size_of::<usize>()
                 + 2 * ARC_OVERHEAD
                 + 64
-                + 2 * std::mem::size_of::<ChargedBytes>(),
+                + 2 * std::mem::size_of::<ChargedBytes>()
+                // Reserve before spawning. Only owned PTY sessions allocate this tail.
+                + usize::from(pty_mode) * TerminalTail::STORAGE_BYTES,
         )?;
         let mut life = reserve(&budget, ChargeKind::Lifecycle, EPOCH_LIFECYCLE)?;
         let mut nodes = reserve(&budget, ChargeKind::Metadata, 4 * RECORD_METADATA)?;
