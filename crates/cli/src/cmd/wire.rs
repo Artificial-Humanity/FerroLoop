@@ -2866,14 +2866,13 @@ fn dispatch_diagnostics_summary(
             continue;
         };
         let reason = row.reason_label();
-        let since = row
-            .busy_since
-            .as_ref()
-            .map_or_else(String::new, |at| format!(" since {at}"));
+        let since = row.busy_since.as_ref().map_or_else(String::new, |at| {
+            // Keep colons available as field delimiters.
+            format!(" since {}", at.as_str().replace(':', "-"))
+        });
         let exhausted = if row.exhausted { ":exhausted" } else { "" };
         let group = match row.outcome {
-            WaitingForDelay | WaitingForWorker => &mut waiting,
-            SeatBusy if !row.exhausted => &mut waiting,
+            WaitingForDelay | WaitingForWorker | SeatBusy => &mut waiting,
             _ => &mut needs_attention,
         };
         group.push(format!("{recipient}:{reason}{since}{exhausted}"));
@@ -3055,7 +3054,7 @@ pub(crate) mod tests {
                 {"recipient": "ari", "outcome": "waiting_for_delay", "exhausted": false},
                 {"recipient": "bea", "outcome": "waiting_for_worker", "exhausted": false},
                 {"recipient": "cal", "outcome": "recovery_disabled", "exhausted": false},
-                {"recipient": "den", "outcome": "seat_busy", "exhausted": false, "busy_since": "2026-11-26T00:00:00.000Z"},
+                {"recipient": "den", "outcome": "seat_busy", "exhausted": true, "busy_since": "2026-11-26T00:12:34.567Z"},
                 {"recipient": "eve", "outcome": "seat_busy_prolonged", "exhausted": false, "busy_since": "2026-11-26T01:00:00.000Z", "busy_elapsed_ms": 341_000},
                 {"recipient": "max", "outcome": "seat_busy_prolonged", "exhausted": false},
                 {"recipient": "eli", "outcome": "dialog_waiting", "exhausted": false},
@@ -3076,11 +3075,11 @@ pub(crate) mod tests {
         let (attention, waiting) = summary.split_once("\tfence_recovery_waiting=").unwrap();
         assert_eq!(
             waiting,
-            "ari:waiting for the recovery delay,bea:waiting for a delivery worker slot,den:seat is in a turn since 2026-11-26T00:00:00.000Z"
+            "ari:waiting for the recovery delay,bea:waiting for a delivery worker slot,den:seat is in a turn since 2026-11-26T00-12-34.567Z:exhausted"
         );
         assert!(
             attention
-                .contains("eve:seat has been in a turn for 5m 41s since 2026-11-26T01:00:00.000Z")
+                .contains("eve:seat has been in a turn for 5m 41s since 2026-11-26T01-00-00.000Z")
         );
         assert!(attention.contains("max:seat is still in a turn"));
         for entry in [
