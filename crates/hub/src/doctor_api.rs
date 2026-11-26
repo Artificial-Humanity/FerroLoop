@@ -18,6 +18,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
+use fl_core::VendorDoctorContext;
 use fl_core::doctor::{StoreFact, StoreFacts};
 use fl_core::install::resolve_layout;
 use fl_install::{Observe, UiDir, observe};
@@ -47,6 +48,13 @@ pub(crate) fn report(state: &HubState) -> Result<Value, String> {
         notes: Vec::new(),
     };
     let home_override = state.config.home_override.as_deref();
+    // Match runtime discovery: an override Hub observes only its home's installation
+    // and settings, without the ambient PATH or vendor configuration overrides.
+    let path = if home_override.is_some() {
+        None
+    } else {
+        std::env::var_os("PATH")
+    };
     let report = observe(Observe {
         binary: crate::version_api::build_info(),
         binary_name: "fl-hub",
@@ -66,7 +74,17 @@ pub(crate) fn report(state: &HubState) -> Result<Value, String> {
     let report = crate::with_vendor_doctor_checks(
         report,
         crate::lifecycle::launch_versions::vendor_version_adapters(),
-        home.as_deref(),
+        &VendorDoctorContext {
+            home: home.as_deref(),
+            path: path.as_deref(),
+            env: &|key| {
+                if home_override.is_some() {
+                    None
+                } else {
+                    std::env::var_os(key)
+                }
+            },
+        },
         Some(store),
         state.store_backend,
     );

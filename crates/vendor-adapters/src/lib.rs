@@ -15,6 +15,7 @@ pub use codex::CodexHostAdapter;
 
 use std::sync::Arc;
 
+use fl_core::vendor_adapter::valid_release_version;
 use fl_core::{VendorHostAdapterRegistry, VendorVersionRegistry};
 
 /// Build a [`VendorHostAdapterRegistry`] pre-populated with all concrete vendor host adapters
@@ -40,12 +41,6 @@ pub fn default_vendor_version_registry() -> VendorVersionRegistry {
     registry.register(grok::GrokVersionAdapter);
     registry.register(muse::MuseVersionAdapter);
     registry
-}
-
-fn valid_release_version(version: &str) -> Option<&str> {
-    const MAX_VERSION_BYTES: usize = 128;
-    (version.len() <= MAX_VERSION_BYTES && semver::Version::parse(version).is_ok())
-        .then_some(version)
 }
 
 #[cfg(test)]

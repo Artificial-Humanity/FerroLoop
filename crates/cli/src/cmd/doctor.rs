@@ -13,6 +13,7 @@
 //! implemented in this release).
 
 use clap::Args;
+use fl_core::VendorDoctorContext;
 use fl_core::doctor::{StoreFact, StoreFacts};
 use fl_core::install::resolve_layout;
 use fl_install::{Observe, UiDir, observe};
@@ -85,10 +86,15 @@ pub fn run(cmd: Cmd, db: Option<PathBuf>) -> anyhow::Result<i32> {
         stores: report_stores,
         budget: PATH_BUDGET,
     });
+    let path = std::env::var_os("PATH");
     let report = fl_hub::with_vendor_doctor_checks(
         report,
         Some(&fl_vendor_adapters::default_vendor_version_registry()),
-        home.as_deref(),
+        &VendorDoctorContext {
+            home: home.as_deref(),
+            path: path.as_deref(),
+            env: &|key| std::env::var_os(key),
+        },
         history_store.as_deref(),
         None,
     );

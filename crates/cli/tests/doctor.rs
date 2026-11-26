@@ -788,11 +788,116 @@ fn codex_client_and_shared_daemon_have_independent_versions_and_update_settings(
     let policies = detail(&report, VENDOR_UPDATE_POLICY);
     assert!(policies.contains("codex CLI: configured disabled, hosted launch disabled"));
     assert!(policies.contains("codex daemon: configured enabled (shared daemon)"));
+
+    let oversized = format!("1.2.3-{}", "a".repeat(128));
+    for malformed in ["", "1.2.3\u{1b}[31m", oversized.as_str()] {
+        let store = fl_store::FerroStore::open(&store_path).unwrap();
+        seed_vendor_baseline(&store, "codex", Some(malformed), Some("0.172.0"));
+        drop(store);
+        let (_, report) = w.doctor(&["--db", store_path.to_str().unwrap()]);
+        assert_eq!(status(&report, VENDOR_VERSION_DRIFT), "unsupported");
+        let versions = detail(&report, VENDOR_VERSION_DRIFT);
+        assert!(versions.contains("codex CLI: installed 0.171.0, last hosted unknown |"));
+        assert!(versions.contains("codex daemon: installed 0.172.0, last hosted 0.172.0 |"));
+        assert!(!versions.contains("(changed)"));
+    }
+
     assert_eq!(
         listener.accept().unwrap_err().kind(),
         std::io::ErrorKind::WouldBlock,
         "doctor contacted the Codex daemon"
     );
+}
+
+#[test]
+fn hub_owner_doctor_uses_the_isolated_home_and_store() {
+    const ISOLATED_HOME: &str = "FL_TEST_DOCTOR_ISOLATED_HOME";
+    const OWNER: &str = "doctor-owner-test-token";
+
+    if let Some(home) = std::env::var_os(ISOLATED_HOME).map(PathBuf::from) {
+        fl_hub::lifecycle::set_global_vendor_version_adapters(
+            fl_vendor_adapters::default_vendor_version_registry(),
+        );
+        let hub = fl_hub::HubState::new(fl_hub::HubServerConfig {
+            home_override: Some(home.clone()),
+            store_path: home.join("host.fls"),
+            repo_root: home,
+            owner_token: Some(OWNER.into()),
+            ..Default::default()
+        });
+        let request = fl_hub::HttpRequest::new("GET", "/api/v1/doctor")
+            .with_header("Authorization", format!("Bearer {OWNER}"));
+        let response = fl_hub::handle_http_request(&hub, &request);
+        assert_eq!(response.status, 200);
+        let report = response.json_value().unwrap();
+        let versions = detail(&report, VENDOR_VERSION_DRIFT);
+        assert!(
+            versions.contains("codex CLI: installed 0.171.0, last hosted 0.171.0 |"),
+            "{versions}"
+        );
+        assert!(
+            versions.contains("codex daemon: installed 0.172.0, last hosted 0.170.0 (changed)"),
+            "{versions}"
+        );
+        assert!(
+            detail(&report, VENDOR_UPDATE_POLICY)
+                .contains("codex CLI: configured disabled, hosted launch disabled")
+        );
+        return;
+    }
+
+    let local = World::new();
+    let ambient = World::new();
+    for (world, version, checks_for_updates) in
+        [(&local, "0.171.0", false), (&ambient, "0.175.0", true)]
+    {
+        let exe = world.fake_vendor(&format!(
+            ".codex/packages/standalone/releases/{version}-x86_64-unknown-linux-gnu/bin/codex"
+        ));
+        let launch = world.home.path().join(".local/bin/codex");
+        std::fs::create_dir_all(launch.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(exe, launch).unwrap();
+        std::fs::write(
+            world.home.path().join(".codex/config.toml"),
+            format!("check_for_update_on_startup = {checks_for_updates}"),
+        )
+        .unwrap();
+    }
+    let daemon = local.fake_vendor(
+        ".codex/packages/app-server-daemon/releases/0.172.0-x86_64-unknown-linux-gnu/bin/codex",
+    );
+    let release = daemon.parent().unwrap().parent().unwrap();
+    let package = release.parent().unwrap().parent().unwrap();
+    std::os::unix::fs::symlink(release, package.join("current")).unwrap();
+    let store = fl_store::FerroStore::open(local.home.path().join("host.fls")).unwrap();
+    seed_vendor_baseline(&store, "codex", Some("0.171.0"), Some("0.170.0"));
+    drop(store);
+
+    let before = (local.trees(), ambient.trees());
+    let out = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "hub_owner_doctor_uses_the_isolated_home_and_store",
+        ])
+        .env_clear()
+        .env(ISOLATED_HOME, local.home.path())
+        .env("HOME", ambient.home.path())
+        .env("FL_INSTALL_ROOT", local.root.path())
+        .env("PATH", ambient.home.path().join(".local/bin"))
+        .env("CODEX_HOME", ambient.home.path().join(".codex"))
+        .env(
+            "DOCTOR_PROBE_SENTINEL",
+            ambient.home.path().join("vendor-executed"),
+        )
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!((local.trees(), ambient.trees()), before);
 }
 
 #[test]

@@ -7,7 +7,7 @@ use fl_core::state::{
     HOSTED_VERSION_BASELINE_PREFIX, HOSTED_VERSION_GENERATION_PREFIX, HOSTED_VERSION_LAUNCH_PREFIX,
     HOSTED_VERSION_QUEUE_PREFIX,
 };
-use fl_core::vendor_adapter::VendorDaemonLaunchEvidence;
+use fl_core::vendor_adapter::{VendorDaemonLaunchEvidence, valid_release_version};
 use fl_core::{RevisionId, VendorVersionRegistry};
 use fl_host_proto::StreamId;
 use fl_store::{AnyStore, BackendKind, StoreOptions, Unmigrated, choose_backend, physical_path};
@@ -565,11 +565,17 @@ pub(crate) fn read_local_vendor_baselines(
     entries
         .into_iter()
         .map(|entry| {
-            let baseline: VendorBaseline = entry.and_then(decode).unwrap_or_default();
-            (
-                baseline.cli.map(|known| known.version),
-                baseline.daemon.map(|known| known.version),
-            )
+            let Some(StatePayload::Runtime(runtime)) = entry.map(|entry| entry.payload) else {
+                return (None, None);
+            };
+            let mut baseline = runtime.value;
+            let mut version = |component: &str| {
+                let known: KnownVersion =
+                    serde_json::from_value(baseline.get_mut(component)?.take()).ok()?;
+                valid_release_version(&known.version)?;
+                Some(known.version)
+            };
+            (version("cli"), version("daemon"))
         })
         .collect()
 }

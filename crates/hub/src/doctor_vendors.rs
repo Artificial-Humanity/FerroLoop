@@ -15,19 +15,12 @@ use crate::lifecycle::launch_versions::read_local_vendor_baselines;
 pub fn with_vendor_doctor_checks(
     report: DoctorReport,
     registry: Option<&VendorVersionRegistry>,
-    home: Option<&Path>,
+    context: &VendorDoctorContext<'_>,
     store: Option<&Path>,
     backend: Option<fl_store::BackendKind>,
 ) -> DoctorReport {
-    let path = std::env::var_os("PATH");
     let facts = registry
-        .map(|registry| {
-            registry.doctor_facts(&VendorDoctorContext {
-                home,
-                path: path.as_deref(),
-                env: &|key| std::env::var_os(key),
-            })
-        })
+        .map(|registry| registry.doctor_facts(context))
         .unwrap_or_default();
     let baselines =
         read_local_vendor_baselines(store, backend, facts.iter().map(|fact| fact.vendor));

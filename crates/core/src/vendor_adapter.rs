@@ -694,6 +694,13 @@ pub struct VendorCliVersionProbe {
     pub parse: fn(&str) -> Option<&str>,
 }
 
+/// Accept only bounded SemVer release identifiers in vendor observations and persisted baselines.
+pub fn valid_release_version(version: &str) -> Option<&str> {
+    const MAX_VERSION_BYTES: usize = 128;
+    (version.len() <= MAX_VERSION_BYTES && semver::Version::parse(version).is_ok())
+        .then_some(version)
+}
+
 /// Version evidence for one hosted vendor. Concrete install and protocol knowledge stays in the
 /// vendor adapter crate. Unknown evidence is `None`.
 pub trait VendorVersionAdapter: fmt::Debug + Send + Sync {
