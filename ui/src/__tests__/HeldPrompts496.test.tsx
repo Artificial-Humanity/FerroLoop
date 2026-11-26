@@ -2,7 +2,7 @@ import { act, fireEvent, render, screen, waitFor, within } from "@testing-librar
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { HubApiClient, HubApiError } from "../api/client";
 import { ChatPane, isComposerHeldPrompt, sessionDraftMemory } from "../components/ChatPane";
-import { parkedPromptDraftScope } from "../lib/parkedPromptDrafts";
+import { parkedPromptDraftScope, readParkedPromptDrafts, writeParkedPromptDraft, type ParkedPromptDraft } from "../lib/parkedPromptDrafts";
 import type { QueuedOperatorPrompt, SessionTranscriptResponse } from "../types/api";
 
 const HOLD_REASON =
@@ -98,8 +98,10 @@ describe("held operator prompts (#496 defect 1)", () => {
       const target = `claude-619-${change}`;
       const nextTarget = change === "hub restart" ? target : `${target}-new`;
       const initial = "Draft parked before the change";
+      const savedFile = { name: "saved.txt", media_type: "text/plain",
+        url: "/api/v1/attachments/saved.txt", path: "/data/attachments/saved.txt" };
       const item = heldItem({ id: target, session_id: target, prompt: initial,
-        hold_reason: "session_busy", claude_terminal: true });
+        hold_reason: "session_busy", claude_terminal: true, attachments: [savedFile] });
       let epoch = "original-hub";
       let queue: QueuedOperatorPrompt[] = [];
       const client = new HubApiClient({ fetchImpl: async () => new Response("{}") });
@@ -118,11 +120,16 @@ describe("held operator prompts (#496 defect 1)", () => {
         queue = [];
         return { session_id, prompt_id, status: "cancelled", queue };
       });
+      const readFile = vi.spyOn(client, "getQueuedPromptAttachment").mockResolvedValue(new Blob(["saved"]));
       const props = { agentName: target, adapter: "claude", sessionId: target, apiClient: client,
         authority: { tier: "owner", login: "owner" } as const };
       const { rerender } = render(<ChatPane {...props} wsConnected />);
       const composer = screen.getByLabelText("Message");
       fireEvent.change(composer, { target: { value: initial } });
+      fireEvent.change(screen.getByTestId("prompt-file-input"), {
+        target: { files: [new File(["original"], savedFile.name, { type: savedFile.media_type })] },
+      });
+      expect(await screen.findByTestId("attachment-chip-list")).toHaveTextContent(savedFile.name);
       fireEvent.click(screen.getByRole("button", { name: "Send Message" }));
       expect(await screen.findByTestId(`queued-hold-reason-${target}`)).toHaveTextContent("the session is busy");
       expect(composer).toHaveValue("");
@@ -145,6 +152,8 @@ describe("held operator prompts (#496 defect 1)", () => {
       fireEvent.change(composer, { target: { value: "" } });
       fireEvent.click(restore);
       await waitFor(() => expect(composer).toHaveValue(change === "hub restart" ? initial : edited));
+      expect(readFile).toHaveBeenCalledWith(savedFile.url);
+      expect(screen.getByTestId("attachment-chip-list")).toHaveTextContent(savedFile.name);
       expect(send).toHaveBeenCalledTimes(1);
       if (change === "hub restart") expect(cancel).not.toHaveBeenCalled();
       else expect(cancel).toHaveBeenCalledWith(target, item.id);
@@ -163,6 +172,89 @@ describe("held operator prompts (#496 defect 1)", () => {
     fireEvent.click(screen.getByRole("button", { name: "Send Message" }));
     expect(await screen.findByText(/prompt queue is full/)).toBeVisible();
     expect(composer).toHaveValue("Keep this draft");
+  });
+
+  it("keeps a refused submission and its file when another draft is already open", async () => {
+    const target = "claude-619-delayed-refusal";
+    const client = new HubApiClient({ fetchImpl: async () => new Response("{}") });
+    vi.spyOn(client, "getSessionTranscript").mockResolvedValue({ session_id: target, turns: [] });
+    let refuse!: (error: HubApiError) => void;
+    const send = vi.spyOn(client, "sendSessionPrompt").mockReturnValue(
+      new Promise((_, reject) => { refuse = reject; }),
+    );
+    render(<ChatPane sessionId={target} adapter="claude" apiClient={client} authority={{ tier: "owner", login: "owner" }} />);
+    const composer = screen.getByLabelText("Message");
+    fireEvent.change(composer, { target: { value: "First draft" } });
+    fireEvent.change(screen.getByTestId("prompt-file-input"), {
+      target: { files: [new File(["original"], "original.txt", { type: "text/plain" })] },
+    });
+    expect(await screen.findByTestId("attachment-chip-list")).toHaveTextContent("original.txt");
+    fireEvent.click(screen.getByRole("button", { name: "Send Message" }));
+    fireEvent.change(composer, { target: { value: "Second draft" } });
+    await act(async () => refuse(new HubApiError(409, "The prompt queue is full.")));
+
+    const restore = await screen.findByRole("button", { name: "Restore draft" });
+    expect(restore).toBeDisabled();
+    expect(composer).toHaveValue("Second draft");
+    fireEvent.change(composer, { target: { value: "" } });
+    fireEvent.click(restore);
+    await waitFor(() => expect(composer).toHaveValue("First draft"));
+    expect(screen.getByTestId("attachment-chip-list")).toHaveTextContent("original.txt");
+    expect(send).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps a restored draft private across principal and Hub switches at the same target", async () => {
+    const target = "claude-619-private-restore";
+    const scope = parkedPromptDraftScope("", "owner", target);
+    window.localStorage.setItem(`${scope}old.private`, JSON.stringify({
+      id: "private", sessionId: target, epoch: "old", text: "Owner draft", queuedText: "Owner draft",
+      files: [{ name: "owner.txt", media_type: "text/plain", url: "/api/v1/attachments/owner.txt" }],
+      recovery: "hub_restarted",
+    }));
+    const owner = { tier: "owner", login: "owner" } as const;
+    const client = new HubApiClient({ fetchImpl: async () => new Response("{}") });
+    const otherHub = new HubApiClient({ baseUrl: "https://other.example", fetchImpl: async () => new Response("{}") });
+    const readFile = vi.spyOn(client, "getQueuedPromptAttachment").mockResolvedValue(new Blob(["private"]));
+    const props = { sessionId: target, adapter: "claude", apiClient: client, turns: [] };
+    const { rerender } = render(<ChatPane {...props} authority={owner} />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "Restore draft" }));
+    const composer = screen.getByLabelText("Message");
+    await waitFor(() => expect(composer).toHaveValue("Owner draft"));
+    expect(screen.getByTestId("attachment-chip-list")).toHaveTextContent("owner.txt");
+    expect(readFile).toHaveBeenCalledWith("/api/v1/attachments/owner.txt");
+
+    rerender(<ChatPane {...props} authority={{ tier: "peer", agent: "peer" }} />);
+    expect(composer).toHaveValue("");
+    expect(screen.queryByTestId("attachment-chip-list")).not.toBeInTheDocument();
+    rerender(<ChatPane {...props} apiClient={otherHub} authority={owner} />);
+    expect(composer).toHaveValue("");
+    expect(screen.queryByTestId("attachment-chip-list")).not.toBeInTheDocument();
+    rerender(<ChatPane {...props} authority={owner} />);
+    expect(composer).toHaveValue("Owner draft");
+    expect(screen.getByTestId("attachment-chip-list")).toHaveTextContent("owner.txt");
+  });
+
+  it("bounds attachment bytes across locally refused submissions while retaining their draft text", () => {
+    const scope = parkedPromptDraftScope("", "owner", "claude-619-capped-drafts");
+    const data_base64 = "A".repeat(12 * 1024 * 1024 + 1);
+    const first: ParkedPromptDraft = {
+      id: "first", sessionId: "target", epoch: "local", text: "First", queuedText: "First",
+      files: [], recovery: "submission_refused", attachmentCount: 1,
+      attachments: [{ name: "first.txt", media_type: "text/plain", data_base64 }],
+    };
+    const second = { ...first, id: "second", text: "Second" };
+    try {
+      writeParkedPromptDraft(scope, first);
+      writeParkedPromptDraft(scope, second);
+      const drafts = readParkedPromptDrafts(scope);
+      expect(drafts.find((draft) => draft.id === "first")?.attachments).toHaveLength(1);
+      expect(drafts.find((draft) => draft.id === "second")).toMatchObject({ text: "Second", attachmentCount: 1 });
+      expect(drafts.find((draft) => draft.id === "second")?.attachments).toBeUndefined();
+    } finally {
+      writeParkedPromptDraft(scope, first, true);
+      writeParkedPromptDraft(scope, second, true);
+    }
   });
 
   it("restores persisted draft files where available and identifies that files need reattaching", async () => {

@@ -7,8 +7,9 @@ export interface ParkedPromptDraft {
   text: string;
   queuedText: string;
   files: Pick<SavedPromptAttachment, "name" | "media_type" | "url">[];
-  recovery?: "hub_restarted" | "session_replaced" | "refused";
-  /** Original files remain available in this tab. A reload uses the saved Hub files. */
+  recovery?: "hub_restarted" | "session_replaced" | "refused" | "submission_refused";
+  /** A refused POST may have no Hub file references to recover. */
+  attachmentCount?: number;
   attachments?: PromptAttachment[];
 }
 
@@ -17,6 +18,12 @@ export function parkedPromptDraftScope(hub: string, owner: string, seat: string)
 }
 
 const memory = new Map<string, ParkedPromptDraft>();
+// Retain at most one maximum-size request's worth of encoded, unsaved uploads.
+const MAX_REFUSED_ATTACHMENT_CHARS = 24 * 1024 * 1024;
+
+function attachmentChars(attachments: PromptAttachment[] = []): number {
+  return attachments.reduce((count, file) => count + file.data_base64.length, 0);
+}
 
 export function readParkedPromptDrafts(scope: string): ParkedPromptDraft[] {
   const drafts = new Map<string, ParkedPromptDraft>();
@@ -47,14 +54,20 @@ export function readParkedPromptDrafts(scope: string): ParkedPromptDraft[] {
 
 export function writeParkedPromptDraft(scope: string, draft: ParkedPromptDraft, remove = false): void {
   const key = `${scope}${draft.epoch}.${draft.id}`;
-  if (remove) memory.delete(key);
-  else memory.set(key, draft);
+  const { attachments, ...saved } = draft;
+  memory.delete(key);
+  if (!remove) {
+    let keepAttachments = false;
+    if (attachments?.length) {
+      let chars = attachmentChars(attachments);
+      for (const other of memory.values()) chars += attachmentChars(other.attachments);
+      keepAttachments = chars <= MAX_REFUSED_ATTACHMENT_CHARS;
+    }
+    memory.set(key, keepAttachments ? draft : saved);
+  }
   try {
     if (remove) window.localStorage.removeItem(key);
-    else {
-      const { attachments: _attachments, ...saved } = draft;
-      window.localStorage.setItem(key, JSON.stringify(saved));
-    }
+    else window.localStorage.setItem(key, JSON.stringify(saved));
   } catch {
     // Keep the in-tab copy if the browser cannot save the backup.
   }

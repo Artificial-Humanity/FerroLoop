@@ -1000,6 +1000,7 @@ interface PendingPrompt {
   content: string;
   attachments: PromptAttachment[];
   matchingBefore: number;
+  draftKey: string;
 }
 
 // A send can outlive the pane that started it. Keep its identity shared so a
@@ -1108,6 +1109,16 @@ function clearSessionDraft(targetKey: string): void {
     // Ignore storage errors.
   }
 }
+
+function selectSessionDraft(target: string, restoredKey: string | null): { key: string; draft: SessionDraft } {
+  if (restoredKey) {
+    const draft = loadSessionDraft(restoredKey);
+    if (draft.promptText || draft.attachments.length) return { key: restoredKey, draft };
+  }
+  return { key: target, draft: loadSessionDraft(target) };
+}
+
+let refusedDraftSequence = 0;
 
 type TranscriptRefreshState = "loading" | "ready" | "stale" | "unavailable" | "denied";
 interface TranscriptSnapshot {
@@ -1403,33 +1414,31 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
   >("all");
   useActiveTimeZone();
   const targetSessionOrAgent = sessionId || agentName || "";
+  // A raw target is external data. Reserve a distinct namespace for restored drafts.
+  const defaultDraftKey = targetSessionOrAgent.startsWith("\0") ? `\0session.${targetSessionOrAgent}` : targetSessionOrAgent;
   const recoveryScope = authority?.tier === "owner" && apiClient && targetSessionOrAgent
     ? parkedPromptDraftScope(apiClient.getBaseUrl(), authority.login, agentName?.trim().toLowerCase() || targetSessionOrAgent)
     : null;
-  const initialDraftRef = React.useRef<SessionDraft | null>(null);
-  if (initialDraftRef.current === null) {
-    initialDraftRef.current = loadSessionDraft(targetSessionOrAgent);
-  }
-  const [promptText, setPromptText] = React.useState<string>(
-    initialDraftRef.current.promptText,
-  );
+  const restoredDraftKey = recoveryScope ? `\0restored.${recoveryScope}${encodeURIComponent(targetSessionOrAgent)}` : null;
+  const [draftKey, setDraftKey] = React.useState(() => selectSessionDraft(defaultDraftKey, restoredDraftKey).key);
+  const [promptText, setPromptText] = React.useState(() => loadSessionDraft(draftKey).promptText);
   const [alwaysSendNow, setAlwaysSendNow] = React.useState<boolean>(() =>
     readInitialAlwaysSendNow(),
   );
-  const [attachments, setAttachments] = React.useState<PromptAttachment[]>(
-    initialDraftRef.current.attachments,
-  );
-  // Render-phase draft load on target switch: swap in the incoming
-  // target's draft before commit so effects never see the new target
-  // paired with the old target's draft.
-  const [prevDraftTarget, setPrevDraftTarget] =
-    React.useState<string>(targetSessionOrAgent);
-  if (prevDraftTarget !== targetSessionOrAgent) {
-    const draft = loadSessionDraft(targetSessionOrAgent);
-    setPrevDraftTarget(targetSessionOrAgent);
+  const [attachments, setAttachments] = React.useState(() => loadSessionDraft(draftKey).attachments);
+  // Load the next draft before commit so no effect can persist it under the
+  // wrong owner or session during a selection or authentication change.
+  const draftIdentity = restoredDraftKey ?? defaultDraftKey;
+  const [previousDraftIdentity, setPreviousDraftIdentity] = React.useState(draftIdentity);
+  if (previousDraftIdentity !== draftIdentity) {
+    const { key, draft } = selectSessionDraft(defaultDraftKey, restoredDraftKey);
+    setPreviousDraftIdentity(draftIdentity);
+    setDraftKey(key);
     setPromptText(draft.promptText);
     setAttachments(draft.attachments);
   }
+  const currentDraftKeyRef = React.useRef(draftKey);
+  currentDraftKeyRef.current = draftKey;
   // Tracks the live target so async completions can tell whether the composer
   // still belongs to the agent/session they were started for.
   const currentTargetRef = React.useRef<string>(targetSessionOrAgent);
@@ -1477,7 +1486,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
   React.useEffect(() => {
     const listener = (target: string, draft: SessionDraft | null, error?: string) => {
       if (error) setSendErrorsByTarget((prev) => ({ ...prev, [target]: error }));
-      if (draft && currentTargetRef.current === target) {
+      if (draft && currentDraftKeyRef.current === target) {
         draftRef.current = draft;
         setPromptText(draft.promptText);
         setAttachments(draft.attachments);
@@ -1615,25 +1624,13 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
   const displayTarget = agentDisplayName || agentName || sessionId || "Agent";
 
   React.useEffect(() => {
-    if (!targetSessionOrAgent) {
-      return;
-    }
+    if (!draftKey) return;
     if (promptText.length === 0 && attachments.length === 0) {
-      clearSessionDraft(targetSessionOrAgent);
+      clearSessionDraft(draftKey);
       return;
     }
-    sessionDraftMemory.set(targetSessionOrAgent, { promptText, attachments });
-    try {
-      if (typeof window !== "undefined" && window.localStorage) {
-        window.localStorage.setItem(
-          DRAFT_STORAGE_PREFIX + targetSessionOrAgent,
-          promptText,
-        );
-      }
-    } catch {
-      // Ignore storage errors.
-    }
-  }, [promptText, attachments, targetSessionOrAgent]);
+    saveSessionDraft(draftKey, { promptText, attachments });
+  }, [promptText, attachments, draftKey]);
 
   const contextEstimate = React.useMemo(
     () =>
@@ -2406,7 +2403,8 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
     return () => readGuard.invalidate();
   }, [apiClient, turns, sessionId, agentName, owner.authEpoch, owner.selectionEpoch, resetReadEpoch, readGuard]);
 
-  const pendingPrompt = pendingPrompts.get(targetSessionOrAgent);
+  const pending = pendingPrompts.get(targetSessionOrAgent);
+  const pendingPrompt = pending?.draftKey === defaultDraftKey || pending?.draftKey === restoredDraftKey ? pending : undefined;
   const filteredTurns = React.useMemo(() => {
     let visible = effectiveTurns;
     if (pendingPrompt) {
@@ -2557,12 +2555,12 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
 
   const readFilesAsAttachments = React.useCallback(async (files: FileList | File[]) => {
     const fileArray = Array.from(files);
-    const target = currentTargetRef.current;
+    const target = currentDraftKeyRef.current;
     if (fileArray.length === 0 || !target) return;
     pendingAttachmentReads.set(target, (pendingAttachmentReads.get(target) ?? 0) + 1);
     try {
       const loaded = await Promise.all(fileArray.map((f) => fileToPromptAttachment(f)));
-      const previous = mountedRef.current && currentTargetRef.current === target
+      const previous = mountedRef.current && currentDraftKeyRef.current === target
         ? draftRef.current : loadSessionDraft(target);
       const draft = { ...previous, attachments: [...previous.attachments, ...loaded] };
       saveSessionDraft(target, draft);
@@ -2606,10 +2604,10 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
   const handleRecoverParkedPrompt = async (draft: ParkedPromptDraft, restore: boolean) => {
     const authEpoch = getAuthEpochRef.current?.();
     const accepts = () => authEpoch !== null && authEpoch === getAuthEpochRef.current?.() && isCurrentOperation();
-    if (!apiClient || !recoveryScope || recovering || !accepts()) return;
+    if (!apiClient || !recoveryScope || !restoredDraftKey || recovering || !accepts()) return;
     const composerAvailable = () => !draftRef.current.promptText && !draftRef.current.attachments.length &&
-      !pendingPrompts.has(targetSessionOrAgent) && !pendingAttachmentReads.has(targetSessionOrAgent);
-    if (restore && (!sessionId || !composerAvailable())) return;
+      !pendingPrompts.has(targetSessionOrAgent) && !pendingAttachmentReads.has(draftKey);
+    if (restore && ((!sessionId && draft.recovery !== "submission_refused") || !composerAvailable())) return;
     setRecovering(true);
     try {
       let files = draft.attachments ?? [];
@@ -2621,7 +2619,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
         files = restored.flatMap((result) => result.status === "fulfilled" ? [result.value] : []);
       }
       if (!accepts() || (restore && !composerAvailable())) return;
-      if (draft.recovery !== "hub_restarted") {
+      if (draft.recovery === "session_replaced" || draft.recovery === "refused") {
         try {
           const response = await apiClient.cancelQueuedPrompt(draft.sessionId, draft.id);
           if (accepts() && !onCancelQueued && response.session_id === targetSessionOrAgent) {
@@ -2635,9 +2633,14 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
       if (!accepts() || (restore && !composerAvailable())) return;
       if (restore) {
         const restored = { promptText: draft.text, attachments: files };
-        saveSessionDraft(targetSessionOrAgent, restored);
-        notifyDraft(targetSessionOrAgent, restored);
-        if (files.length !== draft.files.length) setSubmitError("Reattach any unavailable files before sending this draft.");
+        saveSessionDraft(restoredDraftKey, restored);
+        draftRef.current = restored;
+        currentDraftKeyRef.current = restoredDraftKey;
+        setDraftKey(restoredDraftKey);
+        notifyDraft(restoredDraftKey, restored);
+        if (files.length !== (draft.attachmentCount ?? draft.files.length)) {
+          setSubmitError("Reattach any unavailable files before sending this draft.");
+        }
       }
       writeParkedPromptDraft(recoveryScope, draft, true);
       refreshPendingPrompts();
@@ -2724,8 +2727,8 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
       }
       if (codexSendNow && attempted) recordPromptRefusal(submittedTarget);
       const message = err instanceof Error ? err.message : "Failed to send queued message";
-      sessionSendErrors.set(submittedTarget, message);
-      notifyDraft(submittedTarget, null, message);
+      sessionSendErrors.set(defaultDraftKey, message);
+      notifyDraft(defaultDraftKey, null, message);
     }
   };
 
@@ -2829,9 +2832,12 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
       return;
     }
     const submittedTarget = targetSessionOrAgent;
-    const submittedAuthEpoch = getPromptAuthEpoch?.();
+    const submittedDraftKey = draftKey;
+    const submittedAuthEpoch = getAuthEpochRef.current?.();
     if (submittedAuthEpoch === null) return;
     const submittedToken = apiClient?.getToken();
+    const sameSubmissionAuth = () => submittedAuthEpoch === getAuthEpochRef.current?.() &&
+      owner.authEpoch === ownerRef.current.authEpoch && submittedToken === apiClient?.getToken();
     const submittedDraft = { promptText, attachments: [...attachments] };
     const content = trimmedPrompt || "Attached file(s).";
     const matchingBefore = effectiveTurns.filter((turn) =>
@@ -2849,17 +2855,19 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
       ...(alwaysSendNow ? { send_now: true } : {}),
     };
 
-    const pending: PendingPrompt = { content, attachments: submittedDraft.attachments, matchingBefore };
+    const pending: PendingPrompt = { content, attachments: submittedDraft.attachments, matchingBefore, draftKey: submittedDraftKey };
     pendingPrompts.set(submittedTarget, pending);
     notifyPendingPrompts();
     setSubmitError(null);
-    sessionSendErrors.delete(submittedTarget);
+    sessionSendErrors.delete(defaultDraftKey);
+    sessionSendErrors.delete(submittedDraftKey);
     setSendErrorsByTarget((prev) => {
       const next = { ...prev };
-      delete next[submittedTarget];
+      delete next[defaultDraftKey];
+      delete next[submittedDraftKey];
       return next;
     });
-    clearSessionDraft(submittedTarget);
+    clearSessionDraft(submittedDraftKey);
     draftRef.current = { promptText: "", attachments: [] };
     setPromptText("");
     setAttachments([]);
@@ -2880,24 +2888,19 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
         throw new Error("No prompt connection is available");
       }
       if (codexSendNow) res = codexSendNowReceipt(submittedTarget, res);
-      if (res?.delivery_stage === "held" && (
-        submittedAuthEpoch !== getPromptAuthEpoch?.() ||
-        owner.authEpoch !== ownerRef.current.authEpoch ||
-        submittedToken !== apiClient?.getToken()
-      )) return;
+      if (res?.delivery_stage === "held" && !sameSubmissionAuth()) return;
       const wasQueued = Boolean(res && (res.queued || res.status === "queued"));
       const deliveryFailed = !wasQueued && isPromptDeliveryFailure(res);
       const queuedItem = res?.queued_prompt;
       const epoch = res?.queue_epoch;
       const backupParked = wasQueued && Boolean(recoveryScope && epoch && queuedItem?.claude_terminal && queuedItem.session_id === res?.session_id) &&
-        submittedAuthEpoch === getPromptAuthEpoch?.() && owner.authEpoch === ownerRef.current.authEpoch && submittedToken === apiClient?.getToken();
+        sameSubmissionAuth();
       if (backupParked && recoveryScope && epoch && queuedItem &&
         !readParkedPromptDrafts(recoveryScope).some((draft) => draft.epoch === epoch && draft.id === queuedItem.id)) {
         writeParkedPromptDraft(recoveryScope, {
           id: queuedItem.id, sessionId: queuedItem.session_id, epoch,
           text: submittedDraft.promptText, queuedText: queuedItem.prompt,
           files: (queuedItem.attachments ?? []).map(({ name, media_type, url }) => ({ name, media_type, url })),
-          attachments: submittedDraft.attachments,
         });
       }
       if (
@@ -2922,6 +2925,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
         requestAnimationFrame(() => scrollToBottom("smooth"));
       }
     } catch (err) {
+      if (recoveryScope && !sameSubmissionAuth()) return;
       if (codexSendNow && attempted && !isPromptDeliveryFailure(res) && !isKnownPromptRefusal(err)) {
         recordUnconfirmedDelivery(submittedTarget);
         return;
@@ -2930,16 +2934,25 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
         recordPromptRefusal(submittedTarget);
       }
       const message = err instanceof Error ? err.message : "Failed to send message";
-      sessionSendErrors.set(submittedTarget, message);
-      const currentDraft = mountedRef.current && currentTargetRef.current === submittedTarget
-        ? draftRef.current : loadSessionDraft(submittedTarget);
+      sessionSendErrors.set(submittedDraftKey, message);
+      const currentDraft = mountedRef.current && currentDraftKeyRef.current === submittedDraftKey
+        ? draftRef.current : loadSessionDraft(submittedDraftKey);
       let restored: SessionDraft | null = null;
       if (currentDraft.promptText.length === 0 && currentDraft.attachments.length === 0 &&
-          !pendingAttachmentReads.has(submittedTarget)) {
+          !pendingAttachmentReads.has(submittedDraftKey)) {
         restored = submittedDraft;
-        saveSessionDraft(submittedTarget, restored);
+        saveSessionDraft(submittedDraftKey, restored);
+      } else if (recoveryScope && (adapter === "claude" || submittedDraftKey === restoredDraftKey) &&
+        (isKnownPromptRefusal(err) || res?.delivery_stage === "refused" ||
+          res?.delivery_stage === "not_connected" || res?.delivery_stage === "held")) {
+        writeParkedPromptDraft(recoveryScope, {
+          id: globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${++refusedDraftSequence}`,
+          sessionId: submittedTarget, epoch: "local", text: submittedDraft.promptText, queuedText: content,
+          files: [], recovery: "submission_refused", attachmentCount: submittedDraft.attachments.length,
+          attachments: submittedDraft.attachments,
+        });
       }
-      notifyDraft(submittedTarget, restored, message);
+      notifyDraft(submittedDraftKey, restored, message);
 
     } finally {
       if (pendingPrompts.get(submittedTarget) === pending) {
@@ -4197,9 +4210,11 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
               ? "The Hub restarted before FerroDeck could verify this queued prompt. Check the session before resending."
               : draft.recovery === "session_replaced"
                 ? "The original conversation changed. Its queued prompt is available as a draft."
-                : "The original session refused this queued prompt. Its draft is available to restore."}</div>
+                : draft.recovery === "submission_refused"
+                  ? "The submitted prompt was refused. Its draft is available to restore."
+                  : "The original session refused this queued prompt. Its draft is available to restore."}</div>
             <div style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={draft.text}>{draft.text || "Attached files"}</div>
-            <button type="button" className="fd-btn" disabled={!sessionId || recovering || Boolean(promptText || attachments.length) || submitting}
+            <button type="button" className="fd-btn" disabled={(!sessionId && draft.recovery !== "submission_refused") || recovering || Boolean(promptText || attachments.length) || submitting}
               onClick={() => void handleRecoverParkedPrompt(draft, true)}>
               Restore draft
             </button>{" "}
@@ -4209,7 +4224,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
             </button>
           </div>
         ))}
-        {(submitError || sendErrorsByTarget[targetSessionOrAgent]) && (
+        {(submitError || sendErrorsByTarget[draftKey] || sendErrorsByTarget[defaultDraftKey]) && (
           <div
             role="alert"
             style={{
@@ -4217,7 +4232,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
               color: "#FCA5A5",
             }}
           >
-            {submitError || sendErrorsByTarget[targetSessionOrAgent]}
+            {submitError || sendErrorsByTarget[draftKey] || sendErrorsByTarget[defaultDraftKey]}
           </div>
         )}
 
