@@ -1,11 +1,12 @@
 //! Read-only monitoring for hosted startup blockers.
 
 use std::collections::BTreeMap;
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use fl_host_proto::{
-    AsyncHostClient, ChildRecord, ChildState, HostEndpoint, HostError, SessionMode, SessionSummary,
-    StreamId,
+    AsyncHostClient, ChildRecord, ChildState, DEFAULT_MAX_SESSIONS, HostEndpoint, HostError,
+    SessionMode, SessionSummary, StreamId,
 };
 use fl_watch::{HostedBlock, HostedBlockReason};
 use fl_wire::dispatcher::{HostedScreenBlocker, classify_hosted_screen_blocker};
@@ -15,6 +16,9 @@ use super::{DEFAULT_NODE_ID, HostedSessionRecord, HydrationStatus, STATUS_RUNNIN
 const POLL_INTERVAL: Duration = Duration::from_secs(30);
 const IPC_BUDGET: Duration = Duration::from_millis(250);
 const MAX_CAPTURES: usize = 16;
+// Allow a full Host rotation plus one poll of slack for lifecycle reconciliation.
+const EXIT_EVIDENCE_AGE: Duration =
+    POLL_INTERVAL.saturating_mul((DEFAULT_MAX_SESSIONS.div_ceil(MAX_CAPTURES) + 1) as u32);
 const HYDRATION_OVERDUE_MS: u64 = 3 * 60 * 1_000;
 const ACTOR: &str = "hub-hosted-blockers";
 
@@ -47,10 +51,120 @@ impl ScreenEvidence {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct Observation {
     started_at_ms: u64,
     screen: ScreenEvidence,
+    stream: StreamId,
+    pid: u32,
+    checked_at: Instant,
+    observed_at_ms: u64,
+}
+
+impl Observation {
+    fn new(session: &SessionSummary, child: &ChildRecord, screen: ScreenEvidence) -> Self {
+        Self {
+            started_at_ms: child.started_at_ms,
+            screen,
+            stream: session.stream.clone(),
+            pid: child.pid,
+            checked_at: Instant::now(),
+            observed_at_ms: super::now_ms(),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct RecentBlock {
+    stream: StreamId,
+    pid: u32,
+    generation: Option<String>,
+    updated_at_ms: u64,
+    block: HostedBlock,
+    checked_at: Instant,
+}
+
+/// Completed PTYs release their rendered screen and cannot answer ownership checks.
+#[derive(Debug, Default)]
+pub(crate) struct ExitEvidence(Mutex<BTreeMap<String, RecentBlock>>);
+
+impl ExitEvidence {
+    fn remember(&self, record: &HostedSessionRecord, observation: &Observation) {
+        let ScreenEvidence::Blocked(reason) = observation.screen else {
+            return;
+        };
+        let Some(block) = record.block.filter(|block| block.reason == reason) else {
+            return;
+        };
+        let mut entries = self.0.lock().unwrap_or_else(|err| err.into_inner());
+        entries.insert(
+            record.session_id.clone(),
+            RecentBlock {
+                stream: observation.stream.clone(),
+                pid: observation.pid,
+                generation: record.hydration_generation.clone(),
+                updated_at_ms: record.updated_at_ms,
+                block,
+                checked_at: observation.checked_at,
+            },
+        );
+    }
+
+    fn clear(&self, record: &HostedSessionRecord, observation: &Observation) {
+        let mut entries = self.0.lock().unwrap_or_else(|err| err.into_inner());
+        if entries
+            .get(&record.session_id)
+            .is_some_and(|entry| entry.stream == observation.stream && entry.pid == observation.pid)
+        {
+            entries.remove(&record.session_id);
+        }
+    }
+
+    fn retain_current(&self, now: Instant, progress: &BTreeMap<String, (StreamId, u64)>) {
+        self.0
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .retain(|id, entry| {
+                now.saturating_duration_since(entry.checked_at) <= EXIT_EVIDENCE_AGE
+                    && progress
+                        .get(id)
+                        .is_none_or(|(stream, _)| stream == &entry.stream)
+            });
+    }
+
+    fn matches(&self, record: &HostedSessionRecord, block: HostedBlock, now: Instant) -> bool {
+        self.0
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .get(&record.session_id)
+            .is_some_and(|entry| {
+                now.saturating_duration_since(entry.checked_at) <= EXIT_EVIDENCE_AGE
+                    && record.host_session_id.as_deref() == Some(entry.stream.session.as_str())
+                    && record.runtime_leader_pid.or(record.pid) == Some(entry.pid)
+                    && entry.generation == record.hydration_generation
+                    && entry.updated_at_ms == record.updated_at_ms
+                    && entry.block == block
+            })
+    }
+}
+
+#[cfg(test)]
+pub(super) fn remember_test_block(evidence: &ExitEvidence, record: &HostedSessionRecord) {
+    let test_record = tests::summary(record);
+    let (session, child) = running_session(record, std::slice::from_ref(&test_record)).unwrap();
+    let reason = record.block.unwrap().reason;
+    let sample = Observation::new(session, child, ScreenEvidence::Blocked(reason));
+    evidence.remember(record, &sample);
+}
+
+pub(super) fn blocked_at_exit(
+    record: &HostedSessionRecord,
+    evidence: Option<&ExitEvidence>,
+) -> bool {
+    record.active_block().is_some_and(|block| {
+        block.reason == HostedBlockReason::HydrationOverdue
+            || evidence.is_some_and(|evidence| evidence.matches(record, block, Instant::now()))
+    })
 }
 
 impl Sampler {
@@ -81,6 +195,9 @@ impl Sampler {
         };
         if records.is_empty() {
             self.progress.clear();
+            state
+                .hosted_blocker_evidence
+                .retain_current(Instant::now(), &self.progress);
             return;
         }
         let endpoint = HostEndpoint::discover().ok();
@@ -96,8 +213,21 @@ impl Sampler {
             });
         }
         let now_ms = super::now_ms();
-        for (record, observation) in records.iter().zip(observations) {
+        let evidence = &state.hosted_blocker_evidence;
+        evidence.retain_current(Instant::now(), &self.progress);
+        for (record, observation) in records.iter().zip(observations.iter()) {
+            let observation = observation.as_ref();
+            if let Some(observation) =
+                observation.filter(|sample| sample.screen == ScreenEvidence::Clear)
+                && record.block.is_some()
+            {
+                // Clear risk of misclassified exits even if the durable flag cannot be written yet.
+                evidence.clear(record, observation);
+            }
             if block_reason(record) == next_reason(record, observation, now_ms) {
+                if let Some(observation) = observation {
+                    evidence.remember(record, observation);
+                }
                 continue;
             }
             super::with_background_lifecycle_fence(&env, record, ACTOR, |env| {
@@ -115,9 +245,13 @@ impl Sampler {
                 if block_reason(&fresh) != reason {
                     fresh.block = reason.map(|reason| HostedBlock {
                         reason,
-                        observed_at_ms: now_ms,
+                        observed_at_ms: observation.map_or(now_ms, |sample| sample.observed_at_ms),
                     });
+                    super::promote_confirmed_hydration(&*store, &mut fresh)?;
                     super::persist_hosted_session(&*store, &fresh, ACTOR)?;
+                }
+                if let Some(observation) = observation {
+                    evidence.remember(&fresh, observation);
                 }
                 Ok(())
             });
@@ -139,12 +273,12 @@ impl Sampler {
         let eligible = self.eligible(records, &sessions);
         // Candidates are sorted by record ID. Continue after the last attempted capture
         // so every quiet seat gets a turn even with a full Host.
-        let start = eligible.partition_point(|(index, _, _)| {
+        let start = eligible.partition_point(|(index, _, _, _)| {
             self.last_capture
                 .as_ref()
                 .is_some_and(|last| &records[*index].session_id <= last)
         });
-        for &(index, session, child) in eligible
+        for &(index, session, child, capture) in eligible
             .iter()
             .skip(start)
             .chain(&eligible[..start])
@@ -160,18 +294,19 @@ impl Sampler {
                 Ok(false) => continue,
                 Err(_) => break,
             }
-            // Verified liveness is enough to detect a hydration timeout, even if the
-            // screen cannot be read. A previous sign-in or dialog classification stays.
-            observations[index] = Some(Observation {
-                started_at_ms: child.started_at_ms,
-                screen: ScreenEvidence::Unknown,
-            });
+            if !capture {
+                // A confirmed, previously blocked seat has resumed writing output.
+                observations[index] = Some(Observation::new(session, child, ScreenEvidence::Clear));
+                continue;
+            }
+            // Verified liveness is enough to detect a hydration timeout if the screen
+            // is unavailable. It cannot renew the evidence of a previous screen block.
+            let mut observation = Observation::new(session, child, ScreenEvidence::Unknown);
+            observations[index] = Some(observation.clone());
             match client.capture_rendered(session.stream.clone()).await {
                 Ok(screen) if screen.stream == session.stream => {
-                    observations[index] = Some(Observation {
-                        started_at_ms: child.started_at_ms,
-                        screen: ScreenEvidence::classify(&record.vendor, &screen.contents),
-                    });
+                    observation.screen = ScreenEvidence::classify(&record.vendor, &screen.contents);
+                    observations[index] = Some(observation);
                 }
                 Ok(_) | Err(HostError::StaleEpoch { .. } | HostError::PtyEpochEvicted { .. }) => {
                     observations[index] = None;
@@ -186,7 +321,7 @@ impl Sampler {
         &mut self,
         records: &[HostedSessionRecord],
         sessions: &'a [SessionSummary],
-    ) -> Vec<(usize, &'a SessionSummary, &'a ChildRecord)> {
+    ) -> Vec<(usize, &'a SessionSummary, &'a ChildRecord, bool)> {
         let mut current = BTreeMap::new();
         let mut eligible = Vec::new();
         for (index, record) in records.iter().enumerate() {
@@ -194,12 +329,17 @@ impl Sampler {
                 continue;
             };
             let watermark = (session.stream.clone(), session.latest);
-            let quiet = self.progress.get(&record.session_id) == Some(&watermark);
+            let previous = self.progress.get(&record.session_id);
+            let quiet = previous == Some(&watermark);
+            let advancing = previous.is_some_and(|(stream, latest)| {
+                stream == &session.stream && session.latest > *latest
+            });
             current.insert(record.session_id.clone(), watermark);
-            // An advancing journal sequence proves activity. Coalesced output can leave
-            // it unchanged, so use it only to skip, and never to cache a classification.
-            if record.hydration_status == HydrationStatus::Unconfirmed || quiet {
-                eligible.push((index, session, child));
+            let capture = record.hydration_status == HydrationStatus::Unconfirmed || quiet;
+            // Existing positive flags can be cleared on resumed activity. Only an owner
+            // check is needed when the exact running stream's journal has advanced.
+            if capture || (advancing && record.active_block().is_some()) {
+                eligible.push((index, session, child, capture));
             }
         }
         self.progress = current;
@@ -277,7 +417,7 @@ fn hydration_started_at_ms(record: &HostedSessionRecord) -> Option<u64> {
 
 fn next_reason(
     record: &HostedSessionRecord,
-    observation: Option<Observation>,
+    observation: Option<&Observation>,
     now_ms: u64,
 ) -> Option<HostedBlockReason> {
     let previous = block_reason(record);
@@ -296,8 +436,12 @@ fn next_reason(
         && let Some(generation_ms) = hydration_started_at_ms(record)
         && (previous == Some(HostedBlockReason::HydrationOverdue)
             || observation.is_some_and(|observation| {
-                now_ms.saturating_sub(observation.started_at_ms.max(generation_ms))
-                    >= HYDRATION_OVERDUE_MS
+                now_ms.saturating_sub(
+                    observation
+                        .started_at_ms
+                        .max(generation_ms)
+                        .max(record.updated_at_ms),
+                ) >= HYDRATION_OVERDUE_MS
             }))
     {
         return Some(HostedBlockReason::HydrationOverdue);
@@ -329,7 +473,7 @@ mod tests {
         .unwrap()
     }
 
-    fn summary(record: &HostedSessionRecord) -> SessionSummary {
+    pub(super) fn summary(record: &HostedSessionRecord) -> SessionSummary {
         let stream = StreamId {
             host: HostInstance::new([1; 16]),
             session: SessionId::new(record.host_session_id.as_deref().unwrap()).unwrap(),
@@ -401,38 +545,35 @@ mod tests {
     fn tracks_hydration_timeout_and_preserves_known_block_on_unknown_screen() {
         let mut record = record(0);
         assert!(record.block.is_none());
-        let observe = |screen| {
-            Some(Observation {
-                started_at_ms: 1000,
-                screen,
-            })
-        };
+        let session = summary(&record);
+        let (session, child) = running_session(&record, std::slice::from_ref(&session)).unwrap();
+        let observe = |screen| Observation::new(session, child, screen);
         let now = 1000 + HYDRATION_OVERDUE_MS;
         assert_eq!(next_reason(&record, None, now), None);
         assert_eq!(
-            next_reason(&record, observe(ScreenEvidence::Unknown), now - 1),
+            next_reason(&record, Some(&observe(ScreenEvidence::Unknown)), now - 1),
             None
         );
         assert_eq!(
-            next_reason(&record, observe(ScreenEvidence::Unknown), now),
+            next_reason(&record, Some(&observe(ScreenEvidence::Unknown)), now),
             Some(HostedBlockReason::HydrationOverdue)
         );
         let generation = record
             .hydration_generation
             .replace("00000003-0000-7000-8000-000000000001".into());
         assert_eq!(
-            next_reason(&record, observe(ScreenEvidence::Unknown), now),
+            next_reason(&record, Some(&observe(ScreenEvidence::Unknown)), now),
             None
         );
         record.hydration_generation = None;
         assert_eq!(
-            next_reason(&record, observe(ScreenEvidence::Unknown), now),
+            next_reason(&record, Some(&observe(ScreenEvidence::Unknown)), now),
             None
         );
         record.hydration_generation = generation;
         let sign_in = ScreenEvidence::classify("codex", SIGN_IN);
         assert_eq!(
-            next_reason(&record, observe(sign_in), now),
+            next_reason(&record, Some(&observe(sign_in)), now),
             Some(HostedBlockReason::VendorSignIn)
         );
         record.block = Some(HostedBlock {
@@ -441,18 +582,105 @@ mod tests {
         });
         let blank = ScreenEvidence::classify("codex", " \n");
         assert_eq!(
-            next_reason(&record, observe(blank), now),
+            next_reason(&record, Some(&observe(blank)), now),
             Some(HostedBlockReason::VendorSignIn)
         );
         let ready = ScreenEvidence::classify("codex", "› Ready for a prompt");
-        assert_eq!(next_reason(&record, observe(ready), now - 1), None);
+        assert_eq!(next_reason(&record, Some(&observe(ready)), now - 1), None);
         assert_eq!(
-            next_reason(&record, observe(ready), now),
+            next_reason(&record, Some(&observe(ready)), now),
             Some(HostedBlockReason::HydrationOverdue)
         );
         record.block.as_mut().unwrap().reason = HostedBlockReason::HydrationOverdue;
         record.hydration_status = HydrationStatus::Confirmed;
         assert_eq!(next_reason(&record, None, now), None);
+    }
+
+    #[test]
+    fn stale_or_replaced_evidence_cannot_suppress_crash_recovery() {
+        let mut record = record(0);
+        record.hydration_status = HydrationStatus::Confirmed;
+        let block = HostedBlock {
+            reason: HostedBlockReason::BlockingDialog,
+            observed_at_ms: 1_001,
+        };
+        record.block = Some(block);
+        let mut session = summary(&record);
+        let (initial, child) = running_session(&record, std::slice::from_ref(&session)).unwrap();
+        let sample = Observation::new(initial, child, ScreenEvidence::Blocked(block.reason));
+        let evidence = ExitEvidence::default();
+        evidence.remember(&record, &sample);
+        assert!(evidence.matches(&record, block, sample.checked_at + EXIT_EVIDENCE_AGE));
+        assert!(!evidence.matches(
+            &record,
+            block,
+            sample.checked_at + EXIT_EVIDENCE_AGE + Duration::from_millis(1),
+        ));
+        record.runtime_leader_pid = Some(sample.pid + 1);
+        assert!(!evidence.matches(&record, block, sample.checked_at));
+        record.runtime_leader_pid = Some(sample.pid);
+        session.stream.epoch.0 += 1;
+        evidence.retain_current(
+            sample.checked_at,
+            &BTreeMap::from([(record.session_id.clone(), (session.stream, session.latest))]),
+        );
+        assert!(!evidence.matches(&record, block, sample.checked_at));
+    }
+
+    #[test]
+    fn advancing_confirmed_seat_is_eligible_for_flag_clear_without_capture() {
+        let mut record = record(0);
+        record.hydration_status = HydrationStatus::Confirmed;
+        record.block = Some(HostedBlock {
+            reason: HostedBlockReason::BlockingDialog,
+            observed_at_ms: 1_001,
+        });
+        let mut sessions = [summary(&record)];
+        let mut sampler = Sampler::default();
+        assert!(
+            sampler
+                .eligible(std::slice::from_ref(&record), &sessions)
+                .is_empty()
+        );
+        sessions[0].latest += 1;
+        let eligible = sampler.eligible(std::slice::from_ref(&record), &sessions);
+        let [(_, session, child, capture)] = eligible.as_slice() else {
+            panic!("one exact seat should be eligible");
+        };
+        assert!(!capture);
+        let activity = Observation::new(session, child, ScreenEvidence::Clear);
+        assert_eq!(next_reason(&record, Some(&activity), 2_000), None);
+        let evidence = ExitEvidence::default();
+        remember_test_block(&evidence, &record);
+        assert!(blocked_at_exit(&record, Some(&evidence)));
+        evidence.clear(&record, &activity);
+        assert!(!blocked_at_exit(&record, Some(&evidence)));
+    }
+
+    #[test]
+    fn reused_generation_gets_a_full_timeout_after_redispatch() {
+        let mut record = record(0);
+        record.updated_at_ms = 10 * HYDRATION_OVERDUE_MS;
+        let session = summary(&record);
+        let (session, child) = running_session(&record, std::slice::from_ref(&session)).unwrap();
+        let sample = Observation::new(session, child, ScreenEvidence::Clear);
+        let observation = Some(&sample);
+        assert_eq!(
+            next_reason(
+                &record,
+                observation,
+                record.updated_at_ms + HYDRATION_OVERDUE_MS - 1
+            ),
+            None,
+        );
+        assert_eq!(
+            next_reason(
+                &record,
+                observation,
+                record.updated_at_ms + HYDRATION_OVERDUE_MS
+            ),
+            Some(HostedBlockReason::HydrationOverdue),
+        );
     }
 
     #[cfg(unix)]
@@ -540,10 +768,11 @@ mod tests {
                 .iter()
                 .enumerate()
                 .filter_map(|(index, item)| {
-                    item.filter(|item| {
-                        item.screen == ScreenEvidence::Blocked(HostedBlockReason::VendorSignIn)
-                    })
-                    .map(|_| index)
+                    item.as_ref()
+                        .filter(|item| {
+                            item.screen == ScreenEvidence::Blocked(HostedBlockReason::VendorSignIn)
+                        })
+                        .map(|_| index)
                 })
                 .collect();
             assert_eq!(sampled, batch(sweep % 2));

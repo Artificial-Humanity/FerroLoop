@@ -8574,6 +8574,7 @@ fn lifecycle_error_response(err: &LifecycleError) -> HttpResponse {
 pub(crate) fn lifecycle_env(state: &HubState) -> LifecycleEnv<'_> {
     let mut env = LifecycleEnv::new(state.config.home_override.as_deref());
     env.workspace_root = state.config.repo_root.parent();
+    env.blocker_evidence = Some(&state.hosted_blocker_evidence);
     env
 }
 

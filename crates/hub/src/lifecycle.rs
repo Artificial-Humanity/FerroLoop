@@ -203,6 +203,7 @@ pub struct LifecycleEnv<'a> {
     pub log_hydration_warnings: bool,
     /// Borrowed proof for nested helpers; never a bypass for a different persona.
     pub(crate) lifecycle_fence: Option<&'a lock::LifecycleFence>,
+    pub(crate) blocker_evidence: Option<&'a blockers::ExitEvidence>,
 }
 
 /// Process-wide [`fl_core::VendorHostAdapterRegistry`] slot injected at startup by `fl-cli`.
@@ -235,6 +236,7 @@ impl<'a> LifecycleEnv<'a> {
             workspace_root: None,
             log_hydration_warnings: true,
             lifecycle_fence: None,
+            blocker_evidence: None,
         }
     }
 
@@ -2543,6 +2545,7 @@ impl FakeRuntime {
             workspace_root: None,
             log_hydration_warnings: true,
             lifecycle_fence: None,
+            blocker_evidence: None,
         }
     }
 
@@ -3801,11 +3804,26 @@ fn receipt_matches_record(receipt: &HydrationReceipt, record: &HostedSessionReco
             || receipt.session_id.eq_ignore_ascii_case(&record.session_id))
 }
 
+fn apply_hydration_receipt(receipt: &HydrationReceipt, record: &mut HostedSessionRecord) {
+    if !receipt_matches_record(receipt, record) {
+        return;
+    }
+    if record.hydration_status == HydrationStatus::Unconfirmed {
+        record.hydration_status = HydrationStatus::Confirmed;
+    }
+    if record.block.is_some_and(|block| {
+        block.reason == fl_watch::HostedBlockReason::HydrationOverdue
+            || (!receipt.session_id.is_empty() && receipt.accepted_at_ms > block.observed_at_ms)
+    }) {
+        record.block = None;
+    }
+}
+
 fn promote_confirmed_hydration<S: StateStore>(
     store: &S,
     record: &mut HostedSessionRecord,
 ) -> Result<(), LifecycleError> {
-    if record.hydration_status == HydrationStatus::Unconfirmed
+    if (record.hydration_status == HydrationStatus::Unconfirmed || record.block.is_some())
         && let Some(generation) = record.hydration_generation.as_deref()
         && is_valid_hydration_generation(generation)
         && let Some(entry) = store.get_state_by_key(
@@ -3815,9 +3833,8 @@ fn promote_confirmed_hydration<S: StateStore>(
         )?
         && let StatePayload::Runtime(rt) = entry.payload
         && let Ok(receipt) = serde_json::from_value::<HydrationReceipt>(rt.value)
-        && receipt_matches_record(&receipt, record)
     {
-        record.hydration_status = HydrationStatus::Confirmed;
+        apply_hydration_receipt(&receipt, record);
     }
     Ok(())
 }
@@ -4178,12 +4195,10 @@ pub fn list_hosted_sessions<S: StateStore>(
         }
     }
     for rec in &mut records {
-        if rec.hydration_status == HydrationStatus::Unconfirmed
-            && let Some(generation) = rec.hydration_generation.as_deref()
+        if let Some(generation) = rec.hydration_generation.as_deref()
             && let Some(receipt) = receipts.get(generation)
-            && receipt_matches_record(receipt, rec)
         {
-            rec.hydration_status = HydrationStatus::Confirmed;
+            apply_hydration_receipt(receipt, rec);
         }
     }
     records.sort_by(|a, b| a.session_id.cmp(&b.session_id));
@@ -6310,7 +6325,8 @@ where
             .filter(|r| {
                 v.hosted && !will_spawn && is_live_hosted(r) && r.tmux_target == tmux_target
             })
-            .and_then(|r| r.block),
+            .and_then(|r| r.block)
+            .filter(|block| block.reason != fl_watch::HostedBlockReason::HydrationOverdue),
         stop_reason: None,
         launch_prerequisite_detail: None,
         restart_policy: "on-failure".to_string(),
@@ -7712,7 +7728,11 @@ fn reconcile_dead_hosted_session_fenced<S: StateStore>(
         return Ok(());
     }
     load_hosted_respawn_state(store, &record.session_id)?;
+    let previous_block = record.block;
     let _ = promote_confirmed_hydration(store, &mut record);
+    if record.block != previous_block {
+        persist_hosted_session(store, &record, by)?;
+    }
     if record.vendor == "claude" {
         let mut rstate = load_claude_resume_state(store, &record.session_id);
         if claude_survival_window_active(env, &rstate, current_respawn_clock_ms()) {
@@ -7824,7 +7844,7 @@ fn reconcile_dead_hosted_session_fenced<S: StateStore>(
                         let _ = sync_claude_vendor_session_id_from_route(store, env, &mut record);
                     }
                 }
-                let stop_reason = if record.active_block().is_some() {
+                let stop_reason = if blockers::blocked_at_exit(&record, env.blocker_evidence) {
                     STOP_REASON_STARTUP_BLOCKED
                 } else if env
                     .runtime
@@ -8758,8 +8778,14 @@ where
     if is_claude_resume {
         record.hydration_dispatched = true;
     }
-    if will_spawn {
+    if will_spawn
+        || record
+            .block
+            .is_some_and(|block| block.reason == fl_watch::HostedBlockReason::HydrationOverdue)
+    {
         record.block = None;
+    }
+    if will_spawn {
         record.pid = None;
         record.runtime_leader_pid = None;
         record.pid_start_time = None;
@@ -11052,6 +11078,7 @@ mod tests {
             workspace_root: None,
             log_hydration_warnings: true,
             lifecycle_fence: None,
+            blocker_evidence: None,
         }
     }
 
@@ -18082,6 +18109,30 @@ mod tests {
             HydrationStatus::Unconfirmed,
             "I3: prior receipt for reused generation must be cleared before redelivery"
         );
+        let mut awaiting = i3_restarted.record;
+        awaiting.block = Some(fl_watch::HostedBlock {
+            reason: fl_watch::HostedBlockReason::HydrationOverdue,
+            observed_at_ms: awaiting.updated_at_ms,
+        });
+        persist_hosted_session(&i3_store, &awaiting, "test").unwrap();
+        let redelivered =
+            restart_hosted_session(&i3_store, &i3_env, "claude:ada", "owner").unwrap();
+        assert_eq!(
+            redelivered.record.hydration_generation,
+            awaiting.hydration_generation
+        );
+        assert_eq!(
+            redelivered.record.hydration_status,
+            HydrationStatus::Unconfirmed
+        );
+        assert_eq!(redelivered.record.block, None);
+        assert_eq!(
+            get_hosted_session_record(&i3_store, "claude:ada")
+                .unwrap()
+                .unwrap()
+                .block,
+            None,
+        );
         fence_hydration_register(&i3_store, "ada", Some(&g_orig)).unwrap();
         assert!(
             record_hydration_ack(&i3_store, "ada", true, Some(&g_orig), Some("claude:ada"))
@@ -20742,12 +20793,97 @@ mod tests {
     }
 
     #[test]
-    fn blocked_hosted_exit_stops_without_crash_attempt_or_respawn() {
+    fn newer_exact_hydration_receipt_clears_startup_block_before_dead_reconcile() {
         let home = TempDir::new().unwrap();
         let store = MemStore::default();
         let fake = FakeRuntime::default();
         let env = fake.env(home.path());
+        let mut record = hosted_record("muse", "recovered", STATUS_RUNNING, true);
+        record.hydration_generation = Some("00000000-03e8-7000-8000-000000000001".into());
+        record.hydration_status = HydrationStatus::Unconfirmed;
+        record.restart_policy = "manual".into();
+        let block = fl_watch::HostedBlock {
+            reason: fl_watch::HostedBlockReason::BlockingDialog,
+            observed_at_ms: 2_000,
+        };
+        record.block = Some(block);
+        persist_hosted_session(&store, &record, "test").unwrap();
+
+        let generation = record.hydration_generation.as_deref().unwrap();
+        let mut receipt = HydrationReceipt {
+            session_id: record.session_id.clone(),
+            persona: record.persona.clone(),
+            generation: generation.into(),
+            accepted_at_ms: block.observed_at_ms,
+        };
+        let save_receipt = |receipt: &HydrationReceipt| {
+            store
+                .upsert_state(UpsertStateArgs {
+                    scope: StateScope::Workspace,
+                    slug: hydration_ack_slug(generation),
+                    sensitivity: SensitivityPatch::Inherit,
+                    payload: StatePayload::Runtime(RuntimeEntry {
+                        value: serde_json::to_value(receipt).unwrap(),
+                        merge_mode: MergeMode::LastWriter,
+                    }),
+                    at: stamp::now(),
+                    by: "test".into(),
+                })
+                .unwrap();
+        };
+        let listed = || list_hosted_sessions(&store).unwrap().remove(0);
+        let keyed = || {
+            get_hosted_session_by_id(&store, &record.session_id)
+                .unwrap()
+                .unwrap()
+        };
+        save_receipt(&receipt);
+        assert_eq!(listed().block, Some(block));
+        assert_eq!(keyed().hydration_status, HydrationStatus::Confirmed);
+
+        receipt.accepted_at_ms += 1;
+        receipt.session_id = "codex:recovered".into();
+        save_receipt(&receipt);
+        assert_eq!(keyed().block, Some(block));
+
+        receipt.session_id = record.session_id.clone();
+        save_receipt(&receipt);
+        assert_eq!(listed().block, None);
+        assert_eq!(keyed().block, None);
+
+        let unit = record.tmux_target.as_ref().unwrap().clone();
+        fake.presence_of
+            .borrow_mut()
+            .insert(unit.clone(), RuntimePresence::Gone);
+        fake.exit_codes.borrow_mut().insert(unit, 1);
+        reconcile_dead_hosted_sessions(&store, &env, "test").unwrap();
+        let running = get_hosted_session_record(&store, &record.session_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(running.status, STATUS_RUNNING);
+        assert_eq!(running.block, None);
+        reconcile_dead_hosted_sessions(&store, &env, "test").unwrap();
+        let stopped = get_hosted_session_record(&store, &record.session_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stopped.status, STATUS_STOPPED);
+        assert_eq!(
+            stopped.stop_reason.as_deref(),
+            Some(STOP_REASON_RUNTIME_GONE)
+        );
+        assert_eq!(stopped.block, None);
+    }
+
+    #[test]
+    fn blocked_hosted_exit_stops_without_crash_attempt_or_respawn() {
+        let home = TempDir::new().unwrap();
+        let store = MemStore::default();
+        let fake = FakeRuntime::default();
+        let evidence = blockers::ExitEvidence::default();
+        let mut env = fake.env(home.path());
+        env.blocker_evidence = Some(&evidence);
         let mut record = hosted_record("muse", "waiting", STATUS_RUNNING, true);
+        record.runtime_leader_pid = Some(9876);
         record.block = Some(fl_watch::HostedBlock {
             reason: fl_watch::HostedBlockReason::BlockingDialog,
             observed_at_ms: 1,
@@ -20758,6 +20894,12 @@ mod tests {
             .insert(unit.clone(), RuntimePresence::Gone);
         fake.exit_codes.borrow_mut().insert(unit, 1);
         persist_hosted_session(&store, &record, "test").unwrap();
+        blockers::remember_test_block(
+            &evidence,
+            &get_hosted_session_record(&store, &record.session_id)
+                .unwrap()
+                .unwrap(),
+        );
         for _ in 0..3 {
             assert!(
                 reconcile_and_respawn_hosted_sessions(&store, &env)
