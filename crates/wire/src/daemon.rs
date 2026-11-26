@@ -37,8 +37,10 @@ use serde::{Deserialize, Serialize};
 
 pub use crate::codex_control::{
     CODEX_QUEUE_INSPECT_TIMEOUT, CODEX_QUEUE_LIST_LIMIT, CodexQueueInspection,
-    CodexRouteQueueStatus, VERIFIED_CODEX_QUEUE_RPC_VERSION, parse_uuid_v7_unix_ms,
+    CodexRouteQueueStatus, MIN_CODEX_QUEUE_RPC_VERSION, parse_uuid_v7_unix_ms,
 };
+// Keep the previous public constant name available to library callers.
+pub use crate::codex_control::MIN_CODEX_QUEUE_RPC_VERSION as VERIFIED_CODEX_QUEUE_RPC_VERSION;
 use crate::dispatch_diagnostics::{
     DiagnosticsState, DispatchCallOutcome, DispatchDiagnostics, DispatchReport, FailureStage,
     FenceDiagnostic, FenceReason, FenceRecoveryAttempt, FenceRecoveryOutcome,
@@ -10763,6 +10765,8 @@ mod tests {
         use fl_core::agent::AgentRole;
         use serde_json::json;
 
+        const CODEX_VERSION: &str = "0.172.0";
+
         let rig = rig();
         for (name, project) in [("Felix", "ferroloop"), ("Kacey", "ferroloop")] {
             rig.inner
@@ -10841,7 +10845,7 @@ mod tests {
                 &json!({
                     "id": 1,
                     "result": {
-                        "userAgent": format!("ferroloop/{VERIFIED_CODEX_QUEUE_RPC_VERSION} (Linux; x86_64)"),
+                        "userAgent": format!("ferroloop/{CODEX_VERSION} (Linux; x86_64)"),
                         "codexHome": "/tmp/.codex",
                         "platformFamily": "unix",
                         "platformOs": "linux",
@@ -10953,7 +10957,7 @@ mod tests {
                 assert!(*has_more);
                 let age = estimated_oldest_age_secs.expect("UUIDv7 oldest age");
                 assert!((14..=17).contains(&age), "unexpected age {age}");
-                assert_eq!(verified_codex_version, VERIFIED_CODEX_QUEUE_RPC_VERSION);
+                assert_eq!(verified_codex_version, CODEX_VERSION);
             }
             other => panic!("expected Known for felix, got {other:?}"),
         }
@@ -10973,7 +10977,7 @@ mod tests {
                 depth: 0,
                 has_more: false,
                 estimated_oldest_age_secs: None,
-                verified_codex_version: VERIFIED_CODEX_QUEUE_RPC_VERSION.into(),
+                verified_codex_version: CODEX_VERSION.into(),
             }
         );
 
