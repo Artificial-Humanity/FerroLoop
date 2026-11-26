@@ -584,6 +584,15 @@ pub trait SessionRuntime: std::fmt::Debug {
     fn recorded_exit_code(&self, _unit: &str, _expected_pid: Option<u32>) -> Option<i32> {
         None
     }
+    /// Exit code from the exact stream bound at launch, including when the Host cannot supply
+    /// terminal evidence. The same PID validation applies to this inventory read.
+    fn recorded_host_exit_code(
+        &self,
+        _stream: &fl_host_proto::StreamId,
+        _expected_pid: Option<u32>,
+    ) -> Option<i32> {
+        None
+    }
     /// The pause between the checks that a launched command's session is still there (see
     /// [`launch_survived`]). Zero for a runtime that answers at once.
     fn settle_delay(&self) -> std::time::Duration {
@@ -1896,6 +1905,27 @@ fn connect_host_client() -> Option<fl_host_proto::BlockingHostClient> {
     fl_host_proto::BlockingHostClient::connect(&endpoint).ok()
 }
 
+fn query_host_exit<T>(
+    read: impl AsyncFnOnce(&mut fl_host_proto::AsyncHostClient) -> Result<T, fl_host_proto::HostError>,
+) -> Option<T> {
+    let endpoint = lock::pinned_endpoint()
+        .map_or_else(fl_host_proto::HostEndpoint::discover, Ok)
+        .ok()?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .ok()?;
+    runtime.block_on(async {
+        tokio::time::timeout(Duration::from_millis(250), async {
+            let mut client = fl_host_proto::AsyncHostClient::connect(&endpoint).await?;
+            read(&mut client).await
+        })
+        .await
+        .ok()?
+        .ok()
+    })
+}
+
 fn exact_host_unit(unit: &str, hosted_id: &str) -> Option<fl_host_proto::SessionId> {
     let target = if unit.contains(':') || unit.contains('.') {
         unit.to_owned()
@@ -2204,35 +2234,8 @@ impl SessionRuntime for HostRuntime {
         stream: &fl_host_proto::StreamId,
         hosted_id: &str,
     ) -> fl_host_proto::HostedExitEvidenceStatus {
-        use fl_host_proto::HostedExitEvidenceStatus as Evidence;
-        let endpoint =
-            lock::pinned_endpoint().map_or_else(fl_host_proto::HostEndpoint::discover, Ok);
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build();
-        let (Ok(endpoint), Ok(runtime)) = (endpoint, runtime) else {
-            return Evidence::Unavailable;
-        };
-        runtime.block_on(async {
-            // Reconcile normally confirms Gone on two ticks at least ten seconds apart.
-            // Bound the additional wait, including connection and RPC, for immediate deaths.
-            tokio::time::timeout(Duration::from_millis(250), async {
-                let mut client = fl_host_proto::AsyncHostClient::connect(&endpoint).await?;
-                loop {
-                    match client
-                        .hosted_exit_evidence(stream.clone(), hosted_id)
-                        .await?
-                    {
-                        Evidence::Pending => tokio::time::sleep(Duration::from_millis(20)).await,
-                        status => return Ok::<_, fl_host_proto::HostError>(status),
-                    }
-                }
-            })
-            .await
-            .ok()
-            .and_then(Result::ok)
-            .unwrap_or(Evidence::Unavailable)
-        })
+        query_host_exit(async |client| client.hosted_exit_evidence(stream.clone(), hosted_id).await)
+            .unwrap_or(fl_host_proto::HostedExitEvidenceStatus::Unavailable)
     }
 
     fn kill(&self, unit: &str, hosted_id: &str) -> bool {
@@ -2418,6 +2421,17 @@ impl SessionRuntime for HostRuntime {
         select_host_recorded_exit_code(&sessions, &wanted, expected_pid)
     }
 
+    fn recorded_host_exit_code(
+        &self,
+        stream: &fl_host_proto::StreamId,
+        expected_pid: Option<u32>,
+    ) -> Option<i32> {
+        // The owner RPC is limited to running sessions. Inventory can supply the status
+        // of our durable launch binding, which includes the Host instance and epoch.
+        let sessions = query_host_exit(async |client| client.list_sessions().await)?;
+        select_host_stream_exit_code(&sessions, stream, expected_pid)
+    }
+
     fn settle_delay(&self) -> std::time::Duration {
         std::time::Duration::from_millis(50)
     }
@@ -2460,22 +2474,37 @@ fn select_host_recorded_exit_code(
         .iter()
         .filter(|s| &s.stream.session == wanted)
         .max_by_key(|s| s.stream.epoch.0)
-        .and_then(|s| match &s.state {
-            fl_host_proto::ChildState::LeaderExited(r)
-            | fl_host_proto::ChildState::CleanupComplete(r) => {
-                if let Some(epid) = expected_pid.filter(|&p| p > 0)
-                    && r.pid > 0
-                    && r.pid != epid
-                {
-                    return None;
-                }
-                r.exit
-                    .as_ref()
-                    .filter(|e| e.signal.is_none())
-                    .and_then(|e| e.code)
+        .and_then(|s| host_exit_code(&s.state, expected_pid))
+}
+
+fn select_host_stream_exit_code(
+    sessions: &[fl_host_proto::SessionSummary],
+    stream: &fl_host_proto::StreamId,
+    expected_pid: Option<u32>,
+) -> Option<i32> {
+    sessions
+        .iter()
+        .find(|s| s.stream == *stream)
+        .and_then(|s| host_exit_code(&s.state, expected_pid))
+}
+
+fn host_exit_code(state: &fl_host_proto::ChildState, expected_pid: Option<u32>) -> Option<i32> {
+    match state {
+        fl_host_proto::ChildState::LeaderExited(r)
+        | fl_host_proto::ChildState::CleanupComplete(r) => {
+            if let Some(epid) = expected_pid.filter(|&p| p > 0)
+                && r.pid > 0
+                && r.pid != epid
+            {
+                return None;
             }
-            fl_host_proto::ChildState::Running(_) => None,
-        })
+            r.exit
+                .as_ref()
+                .filter(|e| e.signal.is_none())
+                .and_then(|e| e.code)
+        }
+        fl_host_proto::ChildState::Running(_) => None,
+    }
 }
 
 /// The real runtime: the host's `tmux`.
@@ -2592,6 +2621,7 @@ pub(crate) struct FakeRuntime {
     pub(crate) exit_codes: std::cell::RefCell<BTreeMap<String, i32>>,
     hosted_exit_fixture: std::cell::RefCell<Option<fl_host_proto::HostedExitEvidence>>,
     hosted_exit_lookups: std::cell::RefCell<Vec<(fl_host_proto::StreamId, String)>>,
+    hosted_exit_pending_epoch: std::cell::Cell<Option<fl_host_proto::SessionEpoch>>,
     /// The [`HOSTED_MARK`] of each window of the shared session that has one, by `muse:<window>`.
     /// A window opened by anyone but a spawn has none. Whatever removes a window removes its
     /// mark ([`Self::close_window`]).
@@ -2888,6 +2918,9 @@ impl SessionRuntime for FakeRuntime {
         self.hosted_exit_lookups
             .borrow_mut()
             .push((stream.clone(), hosted_id.into()));
+        if self.hosted_exit_pending_epoch.get() == Some(stream.epoch) {
+            return Evidence::Pending;
+        }
         self.hosted_exit_fixture
             .borrow()
             .clone()
@@ -8012,14 +8045,19 @@ fn reconcile_dead_hosted_session_fenced<S: StateStore>(
                     }
                 }
                 let evidence = respawn_state.exit_evidence.capture(env.runtime, &record);
+                let expected_pid = record.runtime_leader_pid.or(record.pid);
                 let clean_exit = match &evidence {
-                    Some(evidence) => {
+                    fl_host_proto::HostedExitEvidenceStatus::Exited(evidence) => {
                         evidence.exit.code == Some(0) && evidence.exit.signal.is_none()
                     }
-                    None => {
-                        env.runtime
-                            .recorded_exit_code(&target, record.runtime_leader_pid.or(record.pid))
-                            == Some(0)
+                    _ => {
+                        let code = match respawn_state.exit_evidence.bound_stream(&record) {
+                            Some(stream) => {
+                                env.runtime.recorded_host_exit_code(stream, expected_pid)
+                            }
+                            None => env.runtime.recorded_exit_code(&target, expected_pid),
+                        };
+                        code == Some(0)
                     }
                 };
                 if !clean_exit
@@ -8665,6 +8703,14 @@ where
             ));
         }
         let loaded_state = respawn_state.clone();
+        if respawn_state
+            .exit_evidence
+            .refresh_pending(env.runtime, &record.session_id, now)
+        {
+            return Err(LifecycleError::Conflict(
+                "automatic restart is waiting for hosted exit evidence".into(),
+            ));
+        }
         let decision = recovery::classify(
             &mut respawn_state,
             record.stop_reason.as_deref().unwrap_or(""),
@@ -9661,6 +9707,12 @@ where
             };
             let _ = promote_confirmed_hydration(&*guard, &mut fresh);
             let loaded_state = rstate.clone();
+            if rstate
+                .exit_evidence
+                .refresh_pending(env.runtime, &fresh.session_id, now)
+            {
+                return Ok(());
+            }
             let was_incident = rstate.recovery_started_at_ms.is_some();
             let decision =
                 recovery::classify(&mut rstate, fresh.stop_reason.as_deref().unwrap_or(""), now);
@@ -21585,6 +21637,32 @@ mod tests {
 
         let e1_fail = mk_summary(1, 1111, Some(1), false);
         let e2_clean = mk_summary(2, 2222, Some(0), false);
+        let mut other_host = e1_fail.clone();
+        other_host.stream.host = fl_host_proto::HostInstance::new([1u8; 16]);
+        assert_eq!(
+            select_host_stream_exit_code(
+                &[e2_clean.clone(), other_host.clone(), e1_fail.clone()],
+                &e1_fail.stream,
+                Some(1111),
+            ),
+            Some(1)
+        );
+        assert_eq!(
+            select_host_stream_exit_code(&[e2_clean.clone(), other_host], &e1_fail.stream, None,),
+            None
+        );
+        assert_eq!(
+            select_host_stream_exit_code(
+                std::slice::from_ref(&e1_fail),
+                &e1_fail.stream,
+                Some(2222)
+            ),
+            None
+        );
+        assert_eq!(
+            select_host_stream_exit_code(std::slice::from_ref(&e2_clean), &e2_clean.stream, None),
+            Some(0)
+        );
         // Both slice orders must pick epoch 2 (exit code 0).
         assert_eq!(
             select_host_recorded_exit_code(&[e1_fail.clone(), e2_clean.clone()], &wanted, None),
@@ -22409,6 +22487,7 @@ mod tests {
         fake.presence_of
             .borrow_mut()
             .insert("Early:codex".into(), RuntimePresence::Gone);
+        fake.hosted_exit_pending_epoch.set(Some(SessionEpoch(4)));
         for launch in 1..=10 {
             let due = load_hosted_respawn_state(&*store, id)
                 .unwrap()
@@ -22427,6 +22506,31 @@ mod tests {
                 sweep(now + DEAD_STREAK_MIN_SPACING_MS + 1),
                 usize::from(launch == 1)
             );
+            if launch == 4 {
+                let state = load_hosted_respawn_state(&*store, id).unwrap();
+                assert_eq!(state.recovery_started_at_ms, None);
+                assert!(
+                    store
+                        .list_wire_inbox(&Default::default())
+                        .unwrap()
+                        .is_empty()
+                );
+                fake.hosted_exit_pending_epoch.set(None);
+                assert_eq!(
+                    sweep(
+                        now + DEAD_STREAK_MIN_SPACING_MS
+                            + 1
+                            + crate::boot_reconcile::RETRY_INTERVAL.as_millis() as u64
+                    ),
+                    0
+                );
+                assert!(
+                    load_hosted_respawn_state(&*store, id)
+                        .unwrap()
+                        .recovery_started_at_ms
+                        .is_some()
+                );
+            }
             let state = load_hosted_respawn_state(&*store, id).unwrap();
             let evidence = state.exit_evidence.latest_evidence().unwrap();
             assert_eq!(evidence.stream.epoch, SessionEpoch(launch));
@@ -22434,17 +22538,14 @@ mod tests {
             assert!(!format!("{state:?}").contains("private fixed terminal"));
         }
 
-        assert_eq!(fake.hosted_exit_lookups.borrow().len(), 10);
+        let lookups = fake.hosted_exit_lookups.borrow();
         assert!(
-            fake.hosted_exit_lookups
-                .borrow()
+            lookups
                 .iter()
-                .enumerate()
-                .all(
-                    |(n, (stream, owner))| stream.epoch == SessionEpoch(n as u64 + 1)
-                        && owner == id
-                )
+                .map(|(stream, _)| stream.epoch.0)
+                .eq([1, 2, 3, 4, 4, 5, 6, 7, 8, 9, 10])
         );
+        assert!(lookups.iter().all(|(_, owner)| owner == id));
         let stored = store
             .get_state_by_key(
                 &StateScope::Workspace,
@@ -22555,7 +22656,10 @@ mod tests {
                     .unwrap()
                     .stream
                     .epoch = SessionEpoch(2);
+                fake.exit_codes.borrow_mut().insert("Clean:codex".into(), 0);
             }
+            assert_eq!(running.pid, None);
+            assert_eq!(running.runtime_leader_pid, None);
             fake.presence_of
                 .borrow_mut()
                 .insert("Clean:codex".into(), RuntimePresence::Gone);
@@ -22595,6 +22699,13 @@ mod tests {
                 reconcile(1_002 + 2 * DEAD_STREAK_MIN_SPACING_MS);
                 assert_eq!(fake.hosted_exit_lookups.borrow().len(), 1);
                 assert_eq!(load_hosted_respawn_state(&store, id).unwrap(), state);
+                assert_eq!(
+                    reconcile_and_respawn_hosted_sessions(&store, &env)
+                        .unwrap()
+                        .len(),
+                    1,
+                    "the replacement's clean exit must not suppress recovery"
+                );
             }
         }
     }

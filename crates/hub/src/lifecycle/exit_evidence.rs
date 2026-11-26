@@ -3,6 +3,9 @@ use super::*;
 use fl_host_proto::{HostedExitEvidence, HostedExitEvidenceStatus, StreamId};
 
 const MAX_EXITS: usize = 1 + AUTO_RESPAWN_MAX_IN_WINDOW + recovery::RECOVERY_MAX_ATTEMPTS as usize;
+// Allow the Host's post-leader-exit cleanup and terminal drain to finish. A normal
+// monitor tick can land later, so it still gets one final lookup before giving up.
+const PENDING_EXIT_EVIDENCE_MS: u64 = 2_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 enum LaunchAttempt {
@@ -24,6 +27,8 @@ struct CountedExit {
     attempt: LaunchAttempt,
     observed_at_ms: u64,
     evidence: Option<HostedExitEvidence>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pending: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -76,7 +81,22 @@ impl HostedExitIncident {
         })
     }
 
+    pub(super) fn bound_stream(&self, record: &HostedSessionRecord) -> Option<&StreamId> {
+        self.matching_launch(record).map(|launch| &launch.stream)
+    }
+
     pub(super) fn prune_fast_exits(&mut self, fast_attempts: &[u64], now: u64) {
+        if fast_attempts.is_empty()
+            && let [older @ .., latest] = self.exits.as_mut_slice()
+            && let LaunchAttempt::Fast(at) = latest.attempt
+            && now.saturating_sub(at) >= AUTO_RESPAWN_WINDOW_MS
+            && now.saturating_sub(latest.observed_at_ms) < AUTO_RESPAWN_WINDOW_MS
+        {
+            // A fresh exit from a launch whose fast reservation expired starts the new burst.
+            latest.attempt = LaunchAttempt::Baseline;
+            let older_count = older.len();
+            self.exits.drain(..older_count);
+        }
         self.exits.retain(|entry| match entry.attempt {
             LaunchAttempt::Baseline => {
                 now.saturating_sub(entry.observed_at_ms) < AUTO_RESPAWN_WINDOW_MS
@@ -92,37 +112,52 @@ impl HostedExitIncident {
         &self,
         runtime: &dyn SessionRuntime,
         record: &HostedSessionRecord,
-    ) -> Option<HostedExitEvidence> {
-        let launch = self.matching_launch(record)?;
-        if let Some(counted) = self
-            .exits
-            .iter()
-            .find(|entry| entry.stream == launch.stream)
+    ) -> HostedExitEvidenceStatus {
+        let Some(stream) = self.bound_stream(record) else {
+            return HostedExitEvidenceStatus::Unavailable;
+        };
+        if let Some(counted) = self.exits.iter().find(|entry| entry.stream == *stream) {
+            return if counted.pending {
+                HostedExitEvidenceStatus::Pending
+            } else {
+                counted.evidence.clone().map_or(
+                    HostedExitEvidenceStatus::Unavailable,
+                    HostedExitEvidenceStatus::Exited,
+                )
+            };
+        }
+        capture_exact(runtime, stream, &record.session_id)
+    }
+
+    /// Return true while the latest counted exit is still waiting for terminal evidence.
+    pub(super) fn refresh_pending(
+        &mut self,
+        runtime: &dyn SessionRuntime,
+        hosted_id: &str,
+        now: u64,
+    ) -> bool {
+        let Some(exit) = self.exits.last_mut().filter(|exit| exit.pending) else {
+            return false;
+        };
+        let elapsed = now.checked_sub(exit.observed_at_ms);
+        if elapsed == Some(0) {
+            return true;
+        }
+        if let HostedExitEvidenceStatus::Exited(evidence) =
+            capture_exact(runtime, &exit.stream, hosted_id)
         {
-            return counted.evidence.clone();
+            exit.evidence = Some(evidence);
+        } else if elapsed.is_some_and(|ms| ms < PENDING_EXIT_EVIDENCE_MS) {
+            return true;
         }
-        match runtime.hosted_exit_evidence(&launch.stream, &record.session_id) {
-            HostedExitEvidenceStatus::Exited(evidence)
-                if evidence.stream == launch.stream
-                    && evidence.terminal_tail.len()
-                        <= fl_host_proto::MAX_HOSTED_EXIT_TAIL_BYTES
-                    && evidence.terminal_tail.lines().count()
-                        <= fl_host_proto::MAX_HOSTED_EXIT_TAIL_LINES
-                    && evidence
-                        .terminal_tail
-                        .chars()
-                        .all(|ch| !ch.is_control() || matches!(ch, '\n' | '\t')) =>
-            {
-                Some(evidence)
-            }
-            _ => None,
-        }
+        exit.pending = false;
+        false
     }
 
     pub(super) fn count_exit(
         &mut self,
         record: &HostedSessionRecord,
-        evidence: Option<HostedExitEvidence>,
+        status: HostedExitEvidenceStatus,
         now: u64,
     ) -> bool {
         let Some(launch) = self.matching_launch(record) else {
@@ -131,17 +166,46 @@ impl HostedExitIncident {
         if self.exits.iter().any(|entry| entry.stream == launch.stream) {
             return false;
         }
+        let (evidence, pending) = match status {
+            HostedExitEvidenceStatus::Exited(evidence) => (Some(evidence), false),
+            HostedExitEvidenceStatus::Pending => (None, true),
+            HostedExitEvidenceStatus::Unavailable => (None, false),
+        };
         let entry = CountedExit {
             stream: launch.stream.clone(),
             attempt: launch.attempt,
             observed_at_ms: now,
             evidence,
+            pending,
         };
         if self.exits.len() >= MAX_EXITS {
             self.exits.drain(..self.exits.len() - MAX_EXITS + 1);
         }
         self.exits.push(entry);
         true
+    }
+}
+
+fn capture_exact(
+    runtime: &dyn SessionRuntime,
+    stream: &StreamId,
+    hosted_id: &str,
+) -> HostedExitEvidenceStatus {
+    match runtime.hosted_exit_evidence(stream, hosted_id) {
+        HostedExitEvidenceStatus::Exited(evidence)
+            if evidence.stream == *stream
+                && evidence.terminal_tail.len() <= fl_host_proto::MAX_HOSTED_EXIT_TAIL_BYTES
+                && evidence.terminal_tail.lines().count()
+                    <= fl_host_proto::MAX_HOSTED_EXIT_TAIL_LINES
+                && evidence
+                    .terminal_tail
+                    .chars()
+                    .all(|ch| !ch.is_control() || matches!(ch, '\n' | '\t')) =>
+        {
+            HostedExitEvidenceStatus::Exited(evidence)
+        }
+        HostedExitEvidenceStatus::Pending => HostedExitEvidenceStatus::Pending,
+        _ => HostedExitEvidenceStatus::Unavailable,
     }
 }
 
@@ -171,19 +235,20 @@ pub(super) fn save_counted_exit<S: StateStore>(
     store: &S,
     record: &HostedSessionRecord,
     state: &mut HostedRespawnState,
-    evidence: Option<HostedExitEvidence>,
+    status: HostedExitEvidenceStatus,
     by: &str,
 ) -> Result<(), LifecycleError> {
     if state
         .exit_evidence
-        .count_exit(record, evidence, current_respawn_clock_ms())
+        .count_exit(record, status, current_respawn_clock_ms())
     {
         save_hosted_respawn_state(store, &record.session_id, state, by)?;
         if let Some(exit) = state.exit_evidence.exits.last() {
-            let detail = exit.evidence.as_ref().map_or_else(
-                || "evidence: unavailable".to_string(),
-                |evidence| exit_status(evidence),
-            );
+            let detail = match &exit.evidence {
+                Some(evidence) => exit_status(evidence),
+                None if exit.pending => "evidence: pending".into(),
+                None => "evidence: unavailable".into(),
+            };
             eprintln!(
                 "hub: warning ({}): counted hosted child exit at epoch {}. {detail}",
                 record.session_id, exit.stream.epoch.0,
@@ -316,6 +381,61 @@ mod tests {
     }
 
     #[test]
+    fn hosted_exit_evidence_restarts_the_burst_after_a_long_lived_fast_launch() {
+        let mut state = HostedRespawnState::default();
+        fn count(
+            state: &mut HostedRespawnState,
+            epoch: u64,
+            attempt: LaunchAttempt,
+            now: u64,
+            tail: &str,
+        ) {
+            let failure = evidence(epoch, Some(1), None, tail);
+            state.exit_evidence.exits.push(CountedExit {
+                stream: failure.stream.clone(),
+                attempt,
+                observed_at_ms: now,
+                evidence: Some(failure),
+                pending: false,
+            });
+        }
+
+        count(&mut state, 1, LaunchAttempt::Baseline, 1_000, "old failure");
+        recovery::reserve_attempt(&mut state, 1_000);
+        let new_burst = 1_000 + AUTO_RESPAWN_WINDOW_MS + 1;
+        count(
+            &mut state,
+            2,
+            LaunchAttempt::Fast(1_000),
+            new_burst,
+            "repeat failure",
+        );
+        for epoch in 3..=5 {
+            let due = state.next_allowed_at_ms.unwrap().max(new_burst);
+            assert_eq!(
+                recovery::classify(&mut state, STOP_REASON_RUNTIME_GONE, due),
+                recovery::Decision::FastLaunch
+            );
+            recovery::reserve_attempt(&mut state, due);
+            count(
+                &mut state,
+                epoch,
+                LaunchAttempt::Fast(due),
+                due + 1,
+                "repeat failure",
+            );
+        }
+        let now = state.respawn_timestamps_ms[2] + 1;
+        assert_eq!(
+            recovery::classify(&mut state, STOP_REASON_RUNTIME_GONE, now),
+            recovery::Decision::Wait
+        );
+        assert!(state.recovery_started_at_ms.is_some());
+        assert!(summary(&state).contains("deterministic launch failure"));
+        assert!(!summary(&state).contains("repeat failure"));
+    }
+
+    #[test]
     fn hosted_exit_evidence_requires_all_counted_failures_to_match() {
         let fixed_tail = "private deterministic failure";
         let baseline = evidence(1, Some(1), None, fixed_tail);
@@ -330,12 +450,14 @@ mod tests {
                         attempt: LaunchAttempt::Baseline,
                         observed_at_ms: 2,
                         evidence: Some(baseline),
+                        pending: false,
                     },
                     CountedExit {
                         stream: fast.stream.clone(),
                         attempt: LaunchAttempt::Fast(2),
                         observed_at_ms: 3,
                         evidence: Some(fast),
+                        pending: false,
                     },
                 ],
             },
