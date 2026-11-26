@@ -4162,6 +4162,7 @@ fn delete_hosted_respawn_state<S: StateStore>(
     session_id: &str,
 ) -> Result<(), LifecycleError> {
     hosted_recovery_notice::discard_for_session(store, session_id)?;
+    launch_versions::forget_session(store, session_id)?;
     store.delete_state_by_key(
         &StateScope::Workspace,
         StateConcern::Runtime,

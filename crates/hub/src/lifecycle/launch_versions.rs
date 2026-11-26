@@ -5,8 +5,8 @@ use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use fl_core::state::{
-    HOSTED_VERSION_BASELINE_PREFIX, HOSTED_VERSION_GENERATION_PREFIX, HOSTED_VERSION_LAUNCH_PREFIX,
-    HOSTED_VERSION_QUEUE_PREFIX,
+    HOSTED_VERSION_BASELINE_PREFIX, HOSTED_VERSION_GENERATION_PREFIX, HOSTED_VERSION_INDEX_PREFIX,
+    HOSTED_VERSION_LAUNCH_PREFIX, HOSTED_VERSION_QUEUE_PREFIX,
 };
 use fl_core::vendor_adapter::VendorDaemonLaunchEvidence;
 use fl_core::{RevisionId, VendorVersionRegistry};
@@ -374,6 +374,21 @@ fn generation_slug(session_id: &str, generation: &str) -> String {
     )
 }
 
+/// Native receipts are keyed by Host stream. A legacy launch has only its receipt id.
+fn receipt_slug(receipt: &LaunchReceipt) -> String {
+    receipt.stream.as_ref().map_or_else(
+        || format!("{HOSTED_VERSION_LAUNCH_PREFIX}{}", receipt.id),
+        stream_slug,
+    )
+}
+
+fn session_index_slug(session_id: &str) -> String {
+    format!(
+        "{HOSTED_VERSION_INDEX_PREFIX}{}",
+        digest(session_id.as_bytes())
+    )
+}
+
 fn baseline_slug(receipt: &LaunchReceipt) -> String {
     let key = format!("{}/{}", receipt.host, receipt.vendor);
     format!("{HOSTED_VERSION_BASELINE_PREFIX}{}", digest(key.as_bytes()))
@@ -667,11 +682,15 @@ fn save_versions<S: StateStore>(
 ) -> Result<(), LifecycleError> {
     receipt.evidence = None;
     receipt.versions = Some(versions);
-    let receipt_slug = receipt.stream.as_ref().map_or_else(
-        || format!("{HOSTED_VERSION_LAUNCH_PREFIX}{}", receipt.id),
-        stream_slug,
-    );
-    write(store, receipt_slug, &receipt)?;
+    write(store, receipt_slug(&receipt), &receipt)?;
+    save_generation(store, &receipt)?;
+    retire_superseded(store, &receipt)
+}
+
+fn save_generation<S: StateStore>(
+    store: &S,
+    receipt: &LaunchReceipt,
+) -> Result<(), LifecycleError> {
     let slug = generation_slug(&receipt.session_id, &receipt.generation);
     for _ in 0..STATE_UPDATE_ATTEMPTS {
         let current =
@@ -687,7 +706,7 @@ fn save_versions<S: StateStore>(
             return Ok(());
         }
         if store
-            .upsert_state_if_current(write_args(slug.clone(), &receipt)?, revision.as_ref())?
+            .upsert_state_if_current(write_args(slug.clone(), receipt)?, revision.as_ref())?
             .is_some()
         {
             return Ok(());
@@ -696,6 +715,95 @@ fn save_versions<S: StateStore>(
     Err(LifecycleError::Conflict(
         "hosted launch generation index is busy".into(),
     ))
+}
+
+/// The receipt keys of a session's newest saved launch. Readers need only these: the Hub
+/// API reads the record's bound stream or current generation, and Host inventory reads
+/// the session's current stream.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SessionReceipts {
+    launch: uuid::Uuid,
+    slugs: Vec<String>,
+}
+
+/// Delete receipts of this session that a newer launch supersedes. A key is kept when it
+/// now holds the newest receipt, as a reused legacy generation does.
+fn delete_superseded<S: StateStore>(
+    store: &S,
+    session_id: &str,
+    slugs: &[String],
+    newest: uuid::Uuid,
+) -> Result<(), LifecycleError> {
+    for slug in slugs {
+        let superseded = read::<_, LaunchReceipt>(store, slug)?
+            .is_some_and(|receipt| receipt.session_id == session_id && receipt.id < newest);
+        if superseded {
+            store.delete_state_by_key(&StateScope::Workspace, StateConcern::Runtime, slug)?;
+        }
+    }
+    Ok(())
+}
+
+/// Keep at most one stream or legacy receipt and one generation receipt per session.
+/// The previous receipts are deleted before the index moves, so a failure is retried.
+fn retire_superseded<S: StateStore>(
+    store: &S,
+    receipt: &LaunchReceipt,
+) -> Result<(), LifecycleError> {
+    let slug = session_index_slug(&receipt.session_id);
+    let saved = SessionReceipts {
+        launch: receipt.id,
+        slugs: vec![
+            receipt_slug(receipt),
+            generation_slug(&receipt.session_id, &receipt.generation),
+        ],
+    };
+    for _ in 0..STATE_UPDATE_ATTEMPTS {
+        let current =
+            store.get_state_by_key(&StateScope::Workspace, StateConcern::Runtime, &slug)?;
+        let revision = current.as_ref().map(|entry| entry.head_revision.clone());
+        let index = current.and_then(decode::<SessionReceipts>);
+        if let Some(newest) = index.as_ref().filter(|index| index.launch >= receipt.id) {
+            if newest.launch > receipt.id {
+                // This launch settled after a newer one. Its own keys are already stale.
+                delete_superseded(store, &receipt.session_id, &saved.slugs, newest.launch)?;
+            }
+            return Ok(());
+        }
+        if let Some(previous) = &index {
+            delete_superseded(store, &receipt.session_id, &previous.slugs, receipt.id)?;
+        }
+        if store
+            .upsert_state_if_current(write_args(slug.clone(), &saved)?, revision.as_ref())?
+            .is_some()
+        {
+            return Ok(());
+        }
+    }
+    Err(LifecycleError::Conflict(
+        "hosted launch receipt index is busy".into(),
+    ))
+}
+
+/// Remove a decommissioned session's queued launches, current receipts, and index.
+/// Host baselines stay: they belong to the host and vendor, not to the session.
+pub(super) fn forget_session<S: StateStore>(
+    store: &S,
+    session_id: &str,
+) -> Result<(), LifecycleError> {
+    update_pending(store, |pending| {
+        let before = pending.len();
+        pending.retain(|receipt| receipt.session_id != session_id);
+        pending.len() != before
+    })?;
+    let slug = session_index_slug(session_id);
+    if let Some(index) = read::<_, SessionReceipts>(store, &slug)? {
+        for receipt in &index.slugs {
+            store.delete_state_by_key(&StateScope::Workspace, StateConcern::Runtime, receipt)?;
+        }
+    }
+    store.delete_state_by_key(&StateScope::Workspace, StateConcern::Runtime, &slug)?;
+    Ok(())
 }
 
 fn compare_versions<S: StateStore>(
@@ -1174,9 +1282,10 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+        // The second launch of the session supersedes the first receipt.
         assert_eq!(
             hosted_vendor_versions_for_stream(&store, &first_stream).unwrap(),
-            Some(sample(Some("1.0.0"), None))
+            None
         );
         assert_eq!(
             hosted_vendor_versions_for_stream(&store, &second_stream).unwrap(),
@@ -1334,6 +1443,9 @@ mod tests {
         seed(&writer, &before);
         commit(&writer, before, sample(Some("1.0.0"), None), true).unwrap();
         let mut abandoned = receipt(2);
+        // A separate session keeps this receipt current after the later launches settle.
+        abandoned.session_id = "codex:cy".into();
+        abandoned.stream.as_mut().unwrap().session = SessionId::new("Cy.codex").unwrap();
         let mut first = receipt(3);
         let mut second = receipt(4);
         second.session_id = "codex:bea".into();
@@ -1426,7 +1538,7 @@ mod tests {
     }
 
     #[test]
-    fn versions_keep_distinct_legacy_launches_that_reuse_a_generation() {
+    fn versions_keep_current_legacy_generation_when_an_earlier_launch_settles_late() {
         let store = MemStore::default();
         let mut first = receipt(1);
         let mut second = receipt(2);
@@ -1441,11 +1553,141 @@ mod tests {
         // A delayed earlier result must not replace the current generation projection.
         save_versions(&store, second, new.clone()).unwrap();
         save_versions(&store, first, old.clone()).unwrap();
-        let earlier: LaunchReceipt = read(&store, &first_slug).unwrap().unwrap();
         let current: LaunchReceipt = read(&store, &generation).unwrap().unwrap();
-        assert_eq!(earlier.versions, Some(old));
         assert_eq!(current.id, second_id);
         assert_eq!(current.versions, Some(new));
+        // The late result is superseded. The shared generation key keeps the newer receipt.
+        assert!(
+            read::<_, LaunchReceipt>(&store, &first_slug)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(receipt_keys(&store, "codex:ada").len(), 2);
+    }
+
+    /// Launch and generation receipt keys that hold a receipt for `session_id`.
+    fn receipt_keys(store: &impl StateStore, session_id: &str) -> Vec<String> {
+        store
+            .list_state(Some(&StateScope::Workspace), Some(StateConcern::Runtime))
+            .unwrap()
+            .into_iter()
+            .filter(|entry| {
+                entry.slug.starts_with(HOSTED_VERSION_LAUNCH_PREFIX)
+                    || entry.slug.starts_with(HOSTED_VERSION_GENERATION_PREFIX)
+            })
+            .filter_map(|entry| {
+                let slug = entry.slug.clone();
+                let receipt: LaunchReceipt = decode(entry)?;
+                (receipt.session_id == session_id).then_some(slug)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn versions_keep_one_receipt_pair_per_session_across_launches() {
+        let store = MemStore::default();
+        let mut other = receipt(1);
+        other.session_id = "codex:bea".into();
+        other.stream.as_mut().unwrap().session = SessionId::new("Bea.codex").unwrap();
+        seed(&store, &other);
+        commit(
+            &store,
+            other.clone(),
+            sample(Some("1.0.0"), Some("2.0.0")),
+            true,
+        )
+        .unwrap();
+
+        let mut last = None;
+        for index in 2..=11 {
+            let mut launch = receipt(index);
+            if index % 3 == 0 {
+                // Legacy launches have no Host stream and use the receipt id key.
+                launch.stream = None;
+            }
+            let cli = if index == 11 { "1.1.0" } else { "1.0.0" };
+            seed(&store, &launch);
+            let observed = commit(
+                &store,
+                launch.clone(),
+                sample(Some(cli), Some("2.0.0")),
+                true,
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(receipt_keys(&store, "codex:ada").len(), 2, "launch {index}");
+            last = Some((launch, observed));
+        }
+        let (latest, observed) = last.unwrap();
+        // Drift still compares against the host baseline, not the pruned receipts.
+        assert_eq!(
+            observed.versions.changes,
+            vec![HostedVendorVersionChange {
+                component: HostedVendorVersionComponent::Cli,
+                previous: "1.0.0".into(),
+                current: "1.1.0".into(),
+            }]
+        );
+        assert_eq!(
+            hosted_vendor_versions_for_stream(&store, latest.stream.as_ref().unwrap()).unwrap(),
+            Some(observed.versions)
+        );
+        let (baseline, _): (VendorBaseline, _) =
+            load_revision(&store, &baseline_slug(&latest)).unwrap();
+        assert_eq!(baseline.cli.unwrap().launch, latest.id);
+
+        // An older launch that settles late removes its own keys again.
+        let mut late = receipt(5);
+        late.generation = next_hydration_generation();
+        save_versions(&store, late, sample(Some("1.0.0"), None)).unwrap();
+        assert_eq!(receipt_keys(&store, "codex:ada").len(), 2);
+        // Other sessions keep their receipts.
+        assert_eq!(receipt_keys(&store, "codex:bea").len(), 2);
+        assert!(
+            hosted_vendor_versions_for_stream(&store, other.stream.as_ref().unwrap())
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn versions_decommission_forgets_session_receipts() {
+        let store = MemStore::default();
+        let saved = receipt(1);
+        seed(&store, &saved);
+        commit(&store, saved.clone(), sample(Some("1.0.0"), None), true).unwrap();
+        let queued = receipt(2);
+        seed(&store, &queued);
+        let mut other = receipt(3);
+        other.session_id = "codex:bea".into();
+        other.stream.as_mut().unwrap().session = SessionId::new("Bea.codex").unwrap();
+        seed(&store, &other);
+        assert_eq!(receipt_keys(&store, "codex:ada").len(), 2);
+
+        delete_hosted_respawn_state(&store, "codex:ada").unwrap();
+
+        assert!(receipt_keys(&store, "codex:ada").is_empty());
+        assert!(
+            read::<_, SessionReceipts>(&store, &session_index_slug("codex:ada"))
+                .unwrap()
+                .is_none()
+        );
+        let (pending, _): (Vec<LaunchReceipt>, _) = load_revision(&store, &queue_slug()).unwrap();
+        assert_eq!(
+            pending.iter().map(|item| item.id).collect::<Vec<_>>(),
+            [other.id]
+        );
+        // A queued launch of the decommissioned session can no longer settle.
+        assert!(
+            commit(&store, queued, sample(Some("1.0.0"), None), true)
+                .unwrap()
+                .is_none()
+        );
+        assert!(receipt_keys(&store, "codex:ada").is_empty());
+        // The host baseline still carries the last known version for drift detection.
+        let (baseline, _): (VendorBaseline, _) =
+            load_revision(&store, &baseline_slug(&saved)).unwrap();
+        assert_eq!(baseline.cli.unwrap().version, "1.0.0");
     }
 
     #[test]

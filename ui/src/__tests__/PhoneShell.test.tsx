@@ -369,7 +369,8 @@ describe("Phone shell (< 768px)", () => {
       "/api/v1/hosted-sessions": { sessions: [
         { ...hosted, session_id: "codex:jarvis", hydration_generation: generation, vendor: "codex", vendor_versions: versions("1.0.0") },
         { ...hosted, session_id: "claude:jarvis", vendor_session_id: "claude-native", vendor: "claude", vendor_versions: versions("2.0.0") },
-        { ...hosted, session_id: "grok:jarvis", vendor_session_id: "external", vendor: "grok", hosted: false, vendor_versions: versions("9.0.0") },
+        // An external record of the same vendor is excluded only by its `hosted: false` flag.
+        { ...hosted, session_id: "codex:jarvis-external", vendor_session_id: "external", vendor: "codex", hosted: false, vendor_versions: versions("9.0.0") },
       ] },
       "/api/v1/sessions": discovery,
     });
@@ -411,6 +412,42 @@ describe("Phone shell (< 768px)", () => {
     expect(screen.queryByText(/CLI version/)).not.toBeInTheDocument();
     fireEvent.change(selector, { target: { value: "previous-codex" } });
     expect(screen.queryByText(/CLI version/)).not.toBeInTheDocument();
+  });
+
+  it.each([390, 1280])("flags version drift only on each persona's preferred hosted record at %ipx", async (width) => {
+    setViewport(width, 844);
+    const record = (persona: string, vendor: string, status: string, changed: boolean) => ({
+      session_id: `${vendor}:${persona}`, persona, project: "AI-Lab-AMD", role: "lab_manager",
+      vendor, hosted: true, hydration_dispatched: true, node_id: "lab", status,
+      vendor_versions: {
+        cli: "2.0.0", daemon: null, daemon_expected: false,
+        changes: changed ? [{ component: "cli" as const, previous: "1.0.0", current: "2.0.0" }] : [],
+      },
+    });
+    const apiClient = makeRoutedApiClient({
+      "/api/v1/auth/session": { authenticated: true, authority: { tier: "owner", login: "owner" } },
+      "/api/v1/agents": { agents: TEST_WORKSPACE_AGENTS, routes: [] },
+      "/api/v1/projects": { projects: TEST_PROJECTS },
+      "/api/v1/hosted-sessions": { sessions: [
+        // A stopped record of another vendor does not flag the running launch.
+        record("ferris", "codex", "running", false),
+        record("ferris", "claude", "stopped", true),
+        record("felicia", "codex", "running", true),
+        // An external record is not a hosted launch.
+        { ...record("kayla", "codex", "running", true), hosted: false },
+      ] },
+    });
+    render(<App apiClient={apiClient} wsClient={makeStubWsClient()} />);
+    if (width < 768) fireEvent.click(screen.getByTestId("phone-tab-agents"));
+    expect(
+      await screen.findByRole("img", { name: "Hosted vendor version changed for Felicia" }),
+    ).toBeVisible();
+    expect(
+      screen.queryByRole("img", { name: "Hosted vendor version changed for Ferris" }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("img", { name: "Hosted vendor version changed for Kayla" }),
+    ).not.toBeInTheDocument();
   });
 
   it("ignores a hosted GET started before a restart reused the same session id", async () => {
