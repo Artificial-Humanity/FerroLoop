@@ -467,7 +467,7 @@ pub struct HubState {
     /// The ONE persistent gate-governor store shared by every hub governed
     /// gate path, built lazily on first use (see [`GateGovernorStoreCache`]).
     pub(crate) gate_governor_store: GateGovernorStoreCache,
-    pub(crate) hosted_blocker_evidence: Arc<lifecycle::blockers::ExitEvidence>,
+    pub(crate) hosted_blocker_evidence: Arc<lifecycle::blockers::PromptExitEvidence>,
 }
 
 /// Lazily-built single [`fl_store::PersistentGovernorStore`] shared by all

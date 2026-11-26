@@ -423,7 +423,9 @@ impl HubServer {
                         let _flight_guard = flight_guard;
                         let _ = crate::lifecycle::reconcile_and_respawn_hosted_sessions_in_hub(&state);
                         if let Ok(mut sampler) = hosted_blocker_sampler.lock() {
-                            sampler.reconcile(&state);
+                            sampler.reconcile(&state, &crate::api::lifecycle_env(&state), || {
+                                fl_host_proto::HostEndpoint::discover().ok()
+                            });
                         }
                     }));
                 }

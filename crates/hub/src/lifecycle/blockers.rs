@@ -26,6 +26,7 @@ const ACTOR: &str = "hub-hosted-blockers";
 pub(crate) struct Sampler {
     next_poll: Option<Instant>,
     progress: BTreeMap<String, (StreamId, u64)>,
+    clear_captures: BTreeMap<String, (StreamId, u64)>,
     last_capture: Option<String>,
 }
 
@@ -86,9 +87,9 @@ struct RecentBlock {
 
 /// Completed PTYs release their rendered screen and cannot answer ownership checks.
 #[derive(Debug, Default)]
-pub(crate) struct ExitEvidence(Mutex<BTreeMap<String, RecentBlock>>);
+pub(crate) struct PromptExitEvidence(Mutex<BTreeMap<String, RecentBlock>>);
 
-impl ExitEvidence {
+impl PromptExitEvidence {
     fn remember(&self, record: &HostedSessionRecord, observation: &Observation) {
         let ScreenEvidence::Blocked(reason) = observation.screen else {
             return;
@@ -149,7 +150,7 @@ impl ExitEvidence {
 }
 
 #[cfg(test)]
-pub(super) fn remember_test_block(evidence: &ExitEvidence, record: &HostedSessionRecord) {
+pub(super) fn remember_test_block(evidence: &PromptExitEvidence, record: &HostedSessionRecord) {
     let test_record = tests::summary(record);
     let (session, child) = running_session(record, std::slice::from_ref(&test_record)).unwrap();
     let reason = record.block.unwrap().reason;
@@ -159,7 +160,7 @@ pub(super) fn remember_test_block(evidence: &ExitEvidence, record: &HostedSessio
 
 pub(super) fn blocked_at_exit(
     record: &HostedSessionRecord,
-    evidence: Option<&ExitEvidence>,
+    evidence: Option<&PromptExitEvidence>,
 ) -> bool {
     record.active_block().is_some_and(|block| {
         // A missing hydration receipt leaves the seat's ability to run unknown.
@@ -171,17 +172,17 @@ pub(super) fn blocked_at_exit(
 }
 
 impl Sampler {
-    fn poll_due(&mut self, now: Instant) -> bool {
-        if self.next_poll.is_some_and(|next| now < next) {
-            return false;
-        }
-        self.next_poll = Some(now + POLL_INTERVAL);
-        true
+    fn poll_due(&self, now: Instant) -> bool {
+        self.next_poll.is_none_or(|next| now >= next)
     }
 
     /// Runs in the existing blocking lifecycle worker after ordinary reconciliation.
-    pub(crate) fn reconcile(&mut self, state: &crate::HubState) {
-        let env = crate::api::lifecycle_env(state);
+    pub(crate) fn reconcile(
+        &mut self,
+        state: &crate::HubState,
+        env: &super::LifecycleEnv<'_>,
+        endpoint: impl FnOnce() -> Option<HostEndpoint>,
+    ) {
         if !env.spawn_runtime || !self.poll_due(Instant::now()) {
             return;
         }
@@ -196,21 +197,23 @@ impl Sampler {
             },
             Err(_) => return,
         };
+        // Store contention can defer this pass without consuming the IPC sampling interval.
+        self.next_poll = Some(Instant::now() + POLL_INTERVAL);
         if records.is_empty() {
             self.progress.clear();
+            self.clear_captures.clear();
             state
                 .hosted_blocker_evidence
                 .retain_current(Instant::now(), &self.progress);
             return;
         }
-        let endpoint = HostEndpoint::discover().ok();
         let mut observations = vec![None; records.len()];
-        if let Some(endpoint) = &endpoint {
+        if let Some(endpoint) = endpoint() {
             tokio::runtime::Handle::current().block_on(async {
                 // An unresponsive Host cannot hold up the next lifecycle pass.
                 let _ = tokio::time::timeout(
                     IPC_BUDGET,
-                    self.observe(endpoint, &records, &mut observations),
+                    self.observe(&endpoint, &records, &mut observations),
                 )
                 .await;
             });
@@ -222,7 +225,6 @@ impl Sampler {
             let observation = observation.as_ref();
             if let Some(observation) =
                 observation.filter(|sample| sample.screen == ScreenEvidence::Clear)
-                && record.block.is_some()
             {
                 // Clear risk of misclassified exits even if the durable flag cannot be written yet.
                 evidence.clear(record, observation);
@@ -233,7 +235,7 @@ impl Sampler {
                 }
                 continue;
             }
-            super::with_background_lifecycle_fence(&env, record, ACTOR, |env| {
+            super::with_background_lifecycle_fence(env, record, ACTOR, |env| {
                 let store = state.try_open_lifecycle_store()?;
                 let Some(mut fresh) =
                     super::reload_background_session(&*store, env, &record.session_id)?
@@ -304,6 +306,16 @@ impl Sampler {
             match client.capture_rendered(session.stream.clone()).await {
                 Ok(screen) if screen.stream == session.stream => {
                     observation.screen = ScreenEvidence::classify(&record.vendor, &screen.contents);
+                    // Use the pre-capture journal watermark: output between ListSessions and
+                    // the capture can only make the next sweep take another sample.
+                    if observation.screen == ScreenEvidence::Clear {
+                        self.clear_captures.insert(
+                            record.session_id.clone(),
+                            (session.stream.clone(), session.latest),
+                        );
+                    } else {
+                        self.clear_captures.remove(&record.session_id);
+                    }
                     observations[index] = Some(observation);
                 }
                 Ok(_) | Err(HostError::StaleEpoch { .. } | HostError::PtyEpochEvicted { .. }) => {
@@ -328,12 +340,22 @@ impl Sampler {
             };
             let watermark = (session.stream.clone(), session.latest);
             let quiet = self.progress.get(&record.session_id) == Some(&watermark);
+            let known_clear = self.clear_captures.get(&record.session_id) == Some(&watermark);
             current.insert(record.session_id.clone(), watermark);
-            // Advancing output can be a repaint of the same prompt.
-            if record.hydration_status == HydrationStatus::Unconfirmed || quiet {
+            // Sign-in may animate, and a flagged seat needs an actual clear sample.
+            // Unconfirmed hydration still needs liveness for its deadline.
+            if record.block.is_some()
+                || matches!(
+                    record.hydration_status,
+                    HydrationStatus::Unconfirmed | HydrationStatus::Failed
+                )
+                || (quiet && !known_clear)
+            {
                 eligible.push((index, session, child));
             }
         }
+        self.clear_captures
+            .retain(|id, watermark| current.get(id) == Some(watermark));
         self.progress = current;
         eligible
     }
@@ -495,6 +517,7 @@ mod tests {
         let mut sampler = Sampler::default();
         let now = Instant::now();
         assert!(sampler.poll_due(now));
+        sampler.next_poll = Some(now + POLL_INTERVAL);
         assert!(!sampler.poll_due(now + Duration::from_secs(15)));
         assert!(sampler.poll_due(now + POLL_INTERVAL));
 
@@ -600,7 +623,7 @@ mod tests {
         let mut session = summary(&record);
         let (initial, child) = running_session(&record, std::slice::from_ref(&session)).unwrap();
         let sample = Observation::new(initial, child, ScreenEvidence::Blocked(block.reason));
-        let evidence = ExitEvidence::default();
+        let evidence = PromptExitEvidence::default();
         evidence.remember(&record, &sample);
         assert!(evidence.matches(&record, block, sample.checked_at + EXIT_EVIDENCE_AGE));
         assert!(!evidence.matches(
@@ -620,44 +643,38 @@ mod tests {
     }
 
     #[test]
-    fn prompt_repaint_keeps_blocker_until_quiet_capture_confirms_recovery() {
-        let mut record = record(0);
-        record.hydration_status = HydrationStatus::Confirmed;
-        let block = HostedBlock {
+    fn sampling_includes_advancing_flagged_and_failed_seats() {
+        let mut flagged = record(0);
+        flagged.hydration_status = HydrationStatus::Confirmed;
+        flagged.block = Some(HostedBlock {
             reason: HostedBlockReason::VendorSignIn,
             observed_at_ms: 1_001,
-        };
-        record.block = Some(block);
-        let mut sessions = [summary(&record)];
-        let records = std::slice::from_ref(&record);
+        });
+        let mut failed = record(1);
+        failed.hydration_status = HydrationStatus::Failed;
+        let mut healthy = record(2);
+        healthy.hydration_status = HydrationStatus::Confirmed;
+        let records = [flagged, failed, healthy];
+        let mut sessions = records.each_ref().map(summary);
         let mut sampler = Sampler::default();
-        let evidence = ExitEvidence::default();
-
-        assert!(sampler.eligible(records, &sessions).is_empty());
-        let eligible = sampler.eligible(records, &sessions);
-        let [(_, session, child)] = eligible.as_slice() else {
-            panic!("one quiet seat should be eligible");
+        let eligible = |sampler: &mut Sampler, sessions: &[SessionSummary]| -> Vec<_> {
+            sampler
+                .eligible(&records, sessions)
+                .into_iter()
+                .map(|entry| entry.0)
+                .collect()
         };
-        let sign_in = ScreenEvidence::classify(&record.vendor, SIGN_IN);
-        let before_repaint = Observation::new(session, child, sign_in);
-        evidence.remember(&record, &before_repaint);
-
-        // A resize can repaint the same prompt and advance the journal.
-        sessions[0].latest += 1;
-        assert!(sampler.eligible(records, &sessions).is_empty());
-        assert_eq!(next_reason(&record, None, 2_000), Some(block.reason));
-        evidence.retain_current(before_repaint.checked_at, &sampler.progress);
-        assert!(blocked_at_exit(&record, Some(&evidence)));
-
-        let eligible = sampler.eligible(records, &sessions);
-        let [(_, session, child)] = eligible.as_slice() else {
-            panic!("the seat should be eligible again after it goes quiet");
-        };
-        let ready = ScreenEvidence::classify(&record.vendor, "› Ready for a prompt");
-        let recovered = Observation::new(session, child, ready);
-        assert_eq!(next_reason(&record, Some(&recovered), 2_000), None);
-        evidence.clear(&record, &recovered);
-        assert!(!blocked_at_exit(&record, Some(&evidence)));
+        assert_eq!(eligible(&mut sampler, &sessions), [0, 1]);
+        for session in &mut sessions {
+            session.latest += 1;
+        }
+        assert_eq!(eligible(&mut sampler, &sessions), [0, 1]);
+        assert_eq!(eligible(&mut sampler, &sessions), [0, 1, 2]);
+        sampler.clear_captures.insert(
+            records[2].session_id.clone(),
+            (sessions[2].stream.clone(), sessions[2].latest),
+        );
+        assert_eq!(eligible(&mut sampler, &sessions), [0, 1]);
     }
 
     #[test]
@@ -684,6 +701,207 @@ mod tests {
             ),
             Some(HostedBlockReason::HydrationOverdue),
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sampler_reconcile_sets_clears_and_does_not_inherit_a_block() {
+        use fl_core::store::StateStore;
+        use fl_host_proto::{
+            ExtensionLimits, ExtensionRequest, ExtensionResponse, HostConfig, HostListener,
+            HostRequest, HostResponse, RENDERED_PTY_FEATURE, RenderedScreen, SESSION_OWNER_FEATURE,
+        };
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::Arc;
+
+        let sign_in =
+            include_str!("../../../wire/tests/fixtures/hosted-screen/codex-0.172.0-signin.txt");
+        let ready = "› Ask Codex to do anything\n\n  GPT-6.1-Sol medium · ~/project";
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = dir.path().join("test-lifecycle-host.sock");
+        let endpoint = HostEndpoint::unix(&path).unwrap();
+        let mut listener = HostListener::bind(HostConfig::new(endpoint.clone()))
+            .await
+            .unwrap();
+        let _fixture = fl_host_proto::register_hub_test_host_fixture(&path).unwrap();
+
+        let state = crate::HubState::new(crate::HubServerConfig {
+            store_path: dir.path().join("fixture.fls"),
+            home_override: Some(dir.path().into()),
+            repo_root: dir.path().into(),
+            ..Default::default()
+        });
+        let mut env = crate::api::lifecycle_env(&state);
+        env.spawn_runtime = true;
+        let save = |record: &HostedSessionRecord| {
+            let store = state.open_store().unwrap();
+            super::super::persist_hosted_session(&*store, record, "fixture").unwrap();
+        };
+        let load = |id: &str| {
+            let store = state.open_store().unwrap();
+            let record = super::super::get_hosted_session_record(&*store, id)
+                .unwrap()
+                .unwrap();
+            (record, store.state_revisions_after(0).unwrap().len())
+        };
+        let mut record = record(0);
+        record.tmux_target = Some("Seat-00:codex".into());
+        record.hydration_status = HydrationStatus::Failed;
+        save(&record);
+        let mut sampler = Sampler::default();
+
+        let fixture = Arc::new(Mutex::new((summary(&record), sign_in, 0usize)));
+        let server_fixture = fixture.clone();
+        let server = tokio::spawn(async move {
+            while let Ok(mut conn) = listener.accept().await {
+                while let Ok(HostRequest::Extended { id, request }) = conn.recv().await {
+                    let response = {
+                        let mut fixture = server_fixture.lock().unwrap();
+                        match request {
+                            ExtensionRequest::ListSessions => ExtensionResponse::Sessions {
+                                records: vec![fixture.0.clone()],
+                            },
+                            ExtensionRequest::Capabilities => ExtensionResponse::Capabilities {
+                                host: fixture.0.stream.host.clone(),
+                                features: SESSION_OWNER_FEATURE | RENDERED_PTY_FEATURE,
+                                limits: ExtensionLimits::default(),
+                            },
+                            ExtensionRequest::CheckSessionOwner { stream, hosted_id } => {
+                                ExtensionResponse::SessionOwner {
+                                    matches: stream == fixture.0.stream
+                                        && hosted_id == "codex:seat-00",
+                                }
+                            }
+                            ExtensionRequest::CaptureRendered { stream } => {
+                                fixture.2 += 1;
+                                ExtensionResponse::RenderedCapture {
+                                    screen: RenderedScreen {
+                                        schema: 1,
+                                        stream,
+                                        contents: fixture.1.into(),
+                                        cursor_row: 20,
+                                        cursor_col: 0,
+                                        rows: 24,
+                                        cols: 100,
+                                        generation: 1,
+                                        output_seq: fixture.0.latest,
+                                        output_bytes: fixture.1.len() as u64,
+                                    },
+                                }
+                            }
+                            _ => panic!("unexpected sampler request"),
+                        }
+                    };
+                    if conn
+                        .respond(&HostResponse::Extended { id, response })
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            }
+        });
+        let sweep = |sampler: &mut Sampler| {
+            sampler.next_poll = None;
+            tokio::task::block_in_place(|| {
+                sampler.reconcile(&state, &env, || Some(endpoint.clone()))
+            });
+        };
+        let id = record.session_id.clone();
+
+        let held_store = state.open_store().unwrap();
+        sweep(&mut sampler);
+        assert!(
+            sampler.next_poll.is_none(),
+            "a busy store must not consume the interval"
+        );
+        drop(held_store);
+
+        sweep(&mut sampler);
+        let (flagged, _) = load(&id);
+        let block = flagged
+            .block
+            .expect("real Codex sign-in screen was classified");
+        assert_eq!(block.reason, HostedBlockReason::VendorSignIn);
+        assert!(blocked_at_exit(
+            &flagged,
+            Some(&state.hosted_blocker_evidence)
+        ));
+
+        let mut confirmed = flagged;
+        confirmed.hydration_status = HydrationStatus::Confirmed;
+        save(&confirmed);
+        let (_, before_repaint) = load(&id);
+        fixture.lock().unwrap().0.latest += 1;
+        sweep(&mut sampler);
+        let (after_repaint, after_repaint_rev) = load(&id);
+        assert_eq!(fixture.lock().unwrap().2, 2);
+        assert_eq!(after_repaint.block, Some(block));
+        assert_eq!(before_repaint, after_repaint_rev);
+
+        {
+            let mut fixture = fixture.lock().unwrap();
+            fixture.0.latest += 1;
+            fixture.1 = ready;
+        }
+        sweep(&mut sampler);
+        let (recovered, after_clear) = load(&id);
+        assert_eq!(recovered.block, None);
+        assert!(after_clear > after_repaint_rev);
+        assert!(
+            !blocked_at_exit(&after_repaint, Some(&state.hosted_blocker_evidence)),
+            "even a stale record cannot use the superseded prompt evidence",
+        );
+        sweep(&mut sampler);
+        assert_eq!(fixture.lock().unwrap().2, 3, "unchanged Clear is cached");
+        assert_eq!(load(&id).1, after_clear);
+
+        {
+            let mut fixture = fixture.lock().unwrap();
+            fixture.0.latest += 1;
+            fixture.1 = sign_in;
+        }
+        sweep(&mut sampler);
+        sweep(&mut sampler);
+        let (flagged_again, _) = load(&id);
+        assert!(flagged_again.block.is_some());
+        assert!(blocked_at_exit(
+            &flagged_again,
+            Some(&state.hosted_blocker_evidence)
+        ));
+
+        record.hydration_status = HydrationStatus::Failed;
+        record.hydration_generation = Some("00000000-03e9-7000-8000-000000000001".into());
+        record.runtime_leader_pid = Some(record.runtime_leader_pid.unwrap() + 1);
+        record.restart_count += 1;
+        save(&record);
+        let (_, replacement_rev) = load(&id);
+        // The previous epoch can still answer on the Host during startup. Do not use it.
+        sweep(&mut sampler);
+        assert_eq!(load(&id).1, replacement_rev);
+        assert_eq!(load(&id).0.block, None);
+        {
+            let mut fixture = fixture.lock().unwrap();
+            let mut replacement = summary(&record);
+            replacement.stream.epoch.0 += 1;
+            let ChildState::Running(child) = &mut replacement.state else {
+                unreachable!("replacement summary is running");
+            };
+            child.session_epoch = replacement.stream.epoch;
+            fixture.0 = replacement;
+            fixture.1 = ready;
+        }
+        sweep(&mut sampler);
+        let (new_seat, revision) = load(&id);
+        assert_eq!(revision, replacement_rev);
+        assert_eq!(new_seat.block, None);
+        assert!(!blocked_at_exit(
+            &flagged_again,
+            Some(&state.hosted_blocker_evidence)
+        ));
+        server.abort();
     }
 
     #[cfg(unix)]
@@ -782,7 +1000,7 @@ mod tests {
         }
         assert_eq!(
             requests.load(Ordering::Relaxed),
-            SWEEPS * (1 + 4 * MAX_CAPTURES)
+            SWEEPS * (2 + 2 * MAX_CAPTURES)
         );
         eprintln!(
             "Hosted blocker sampler fixture: {SWEEPS} sweeps, {MAX_CAPTURES} captures per sweep, {:?} mean IPC time",

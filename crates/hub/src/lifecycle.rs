@@ -203,7 +203,7 @@ pub struct LifecycleEnv<'a> {
     pub log_hydration_warnings: bool,
     /// Borrowed proof for nested helpers; never a bypass for a different persona.
     pub(crate) lifecycle_fence: Option<&'a lock::LifecycleFence>,
-    pub(crate) blocker_evidence: Option<&'a blockers::ExitEvidence>,
+    pub(crate) blocker_evidence: Option<&'a blockers::PromptExitEvidence>,
 }
 
 /// Process-wide [`fl_core::VendorHostAdapterRegistry`] slot injected at startup by `fl-cli`.
@@ -3401,6 +3401,11 @@ pub struct HostedSessionRecord {
 }
 
 impl HostedSessionRecord {
+    fn stopped_while_blocked(&self) -> bool {
+        self.status.eq_ignore_ascii_case(STATUS_STOPPED)
+            && self.stop_reason.as_deref() == Some(STOP_REASON_STARTUP_BLOCKED)
+    }
+
     fn active_block(&self) -> Option<fl_watch::HostedBlock> {
         self.block.filter(|block| {
             block.reason != fl_watch::HostedBlockReason::HydrationOverdue
@@ -3811,10 +3816,12 @@ fn apply_hydration_receipt(receipt: &HydrationReceipt, record: &mut HostedSessio
     if record.hydration_status == HydrationStatus::Unconfirmed {
         record.hydration_status = HydrationStatus::Confirmed;
     }
-    if record.block.is_some_and(|block| {
-        block.reason == fl_watch::HostedBlockReason::HydrationOverdue
-            || (!receipt.session_id.is_empty() && receipt.accepted_at_ms > block.observed_at_ms)
-    }) {
+    if !record.stopped_while_blocked()
+        && record.block.is_some_and(|block| {
+            block.reason == fl_watch::HostedBlockReason::HydrationOverdue
+                || (!receipt.session_id.is_empty() && receipt.accepted_at_ms > block.observed_at_ms)
+        })
+    {
         record.block = None;
     }
 }
@@ -4140,8 +4147,9 @@ pub fn persist_hosted_session<S: StateStore>(
             record.session_id
         );
     }
-    if !normalized.status.eq_ignore_ascii_case(STATUS_RUNNING)
-        || normalized.active_block().is_none()
+    if !normalized.stopped_while_blocked()
+        && (!normalized.status.eq_ignore_ascii_case(STATUS_RUNNING)
+            || normalized.active_block().is_none())
     {
         normalized.block = None;
     }
@@ -8766,6 +8774,7 @@ where
             &hydration_ack_slug(&hydration_generation),
         );
     }
+    let was_stopped_while_blocked = record.stopped_while_blocked();
     record.status = STATUS_RUNNING.to_string();
     record.stop_reason = None;
     record.launch_prerequisite_detail = None;
@@ -8779,6 +8788,7 @@ where
         record.hydration_dispatched = true;
     }
     if will_spawn
+        || was_stopped_while_blocked
         || record
             .block
             .is_some_and(|block| block.reason == fl_watch::HostedBlockReason::HydrationOverdue)
@@ -20795,19 +20805,25 @@ mod tests {
     #[test]
     fn newer_exact_hydration_receipt_clears_startup_block_before_dead_reconcile() {
         let home = TempDir::new().unwrap();
+        let cwd = TempDir::new().unwrap();
+        let _trusted_codex = trusted_codex_home(home.path(), cwd.path());
         let store = MemStore::default();
         let fake = FakeRuntime::default();
-        let env = fake.env(home.path());
-        let mut record = hosted_record("muse", "recovered", STATUS_RUNNING, true);
+        let evidence = blockers::PromptExitEvidence::default();
+        let mut env = fake.env(home.path());
+        env.blocker_evidence = Some(&evidence);
+        let mut record = hosted_record("codex", "recovered", STATUS_RUNNING, true);
         record.hydration_generation = Some("00000000-03e8-7000-8000-000000000001".into());
         record.hydration_status = HydrationStatus::Unconfirmed;
-        record.restart_policy = "manual".into();
+        record.cwd = Some(cwd.path().to_str().unwrap().into());
+        record.runtime_leader_pid = Some(9876);
         let block = fl_watch::HostedBlock {
             reason: fl_watch::HostedBlockReason::BlockingDialog,
             observed_at_ms: 2_000,
         };
         record.block = Some(block);
         persist_hosted_session(&store, &record, "test").unwrap();
+        blockers::remember_test_block(&evidence, &record);
 
         let generation = record.hydration_generation.as_deref().unwrap();
         let mut receipt = HydrationReceipt {
@@ -20842,9 +20858,10 @@ mod tests {
         assert_eq!(keyed().hydration_status, HydrationStatus::Confirmed);
 
         receipt.accepted_at_ms += 1;
-        receipt.session_id = "codex:recovered".into();
+        receipt.session_id = "muse:recovered".into();
         save_receipt(&receipt);
         assert_eq!(keyed().block, Some(block));
+        assert!(blockers::blocked_at_exit(&keyed(), Some(&evidence)));
 
         receipt.session_id = record.session_id.clone();
         save_receipt(&receipt);
@@ -20872,6 +20889,18 @@ mod tests {
             Some(STOP_REASON_RUNTIME_GONE)
         );
         assert_eq!(stopped.block, None);
+
+        let respawned = reconcile_and_respawn_hosted_sessions(&store, &env).unwrap();
+        assert_eq!(respawned.len(), 1);
+        assert_eq!(respawned[0].record.status, STATUS_RUNNING);
+        assert_eq!(respawned[0].record.block, None);
+        assert_eq!(
+            load_hosted_respawn_state(&store, &record.session_id)
+                .unwrap()
+                .respawn_timestamps_ms
+                .len(),
+            1
+        );
     }
 
     #[test]
@@ -20879,7 +20908,7 @@ mod tests {
         let home = TempDir::new().unwrap();
         let store = MemStore::default();
         let fake = FakeRuntime::default();
-        let evidence = blockers::ExitEvidence::default();
+        let evidence = blockers::PromptExitEvidence::default();
         let mut env = fake.env(home.path());
         env.blocker_evidence = Some(&evidence);
         let mut record = hosted_record("muse", "waiting", STATUS_RUNNING, true);
@@ -20915,7 +20944,7 @@ mod tests {
             stopped.stop_reason.as_deref(),
             Some(STOP_REASON_STARTUP_BLOCKED)
         );
-        assert_eq!(stopped.block, None);
+        assert_eq!(stopped.block, record.block);
         assert_eq!(stopped.restart_count, 0);
         assert!(fake.launches.borrow().is_empty());
         assert_eq!(

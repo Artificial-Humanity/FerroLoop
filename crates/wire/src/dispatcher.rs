@@ -21451,6 +21451,45 @@ exit 1"#,
     }
 
     #[test]
+    fn hosted_screen_blockers_recognize_real_terminal_captures() {
+        let codex = include_str!("../tests/fixtures/hosted-screen/codex-0.172.0-signin.txt");
+        assert_eq!(
+            classify_hosted_screen_blocker("codex", codex),
+            Some(HostedScreenBlocker::VendorSignIn),
+        );
+
+        let onboarding_rows = codex
+            .lines()
+            .skip_while(|line| !line.trim_start().starts_with("Welcome to Codex"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            classify_hosted_screen_blocker("codex", &onboarding_rows),
+            Some(HostedScreenBlocker::VendorSignIn),
+        );
+        let with_composer = format!(
+            "{onboarding_rows}\n\n› Ask Codex to do anything\n\n  GPT-6.1-Sol medium · ~/project\n"
+        );
+        assert_eq!(
+            classify_hosted_screen_blocker("codex", &with_composer),
+            None
+        );
+
+        let mut terminal = vt100::Parser::new(
+            std::num::NonZeroU16::new(24).unwrap(),
+            std::num::NonZeroU16::new(100).unwrap(),
+            0,
+        );
+        terminal.process(include_bytes!(
+            "../tests/fixtures/hosted-screen/muse-1.4.25-hook-trust.raw"
+        ));
+        assert_eq!(
+            classify_hosted_screen_blocker("muse", &terminal.screen().contents()),
+            Some(HostedScreenBlocker::BlockingDialog),
+        );
+    }
+
+    #[test]
     fn hosted_screen_blocker_does_not_treat_reply_prose_as_a_prompt() {
         let codex = VendorRoute::Codex {
             thread_id: "thread".into(),
