@@ -6619,7 +6619,37 @@ mod tests {
         exercise_timed_recovery_hosted_busy_backlog(true);
     }
 
-    fn exercise_timed_recovery_hosted_busy_backlog(exhaust_busy_parks: bool) {
+    #[derive(Debug, Default)]
+    struct HostedRecoveryScreen {
+        writes: Vec<String>,
+        captures: usize,
+        busy: bool,
+        busy_captures: usize,
+        busy_on_capture: Option<usize>,
+        busy_after_paste: bool,
+    }
+
+    struct HostedRecoveryFixture {
+        endpoint: fl_host_proto::HostEndpoint,
+        screen: Arc<Mutex<HostedRecoveryScreen>>,
+        listener: crate::test_isolation::RegisteredUnixListener,
+        stop: tokio::sync::oneshot::Sender<()>,
+        server: std::thread::JoinHandle<()>,
+    }
+
+    impl HostedRecoveryFixture {
+        fn stop(self) {
+            self.stop.send(()).unwrap();
+            self.server.join().unwrap();
+        }
+    }
+
+    // Give each scenario a distinct host session so the in-process paste ledger stays isolated.
+    fn hosted_claude_recovery_fixture(
+        inner: &DaemonInner<FaultStore>,
+        tmp: &TempDir,
+        host_session: &str,
+    ) -> HostedRecoveryFixture {
         use fl_host_proto::{
             ChildRecord, ChildState, ControllerLease, ExtensionLimits, ExtensionRequest,
             ExtensionResponse, HostConfig, HostEndpoint, HostInstance, HostListener, HostRequest,
@@ -6628,19 +6658,9 @@ mod tests {
         };
         use std::os::unix::fs::PermissionsExt;
 
-        #[derive(Debug, Default)]
-        struct ScreenState {
-            writes: Vec<String>,
-            busy: bool,
-            busy_captures: usize,
-        }
-
-        let _env_lock = lock(&crate::dispatcher::TMUX_ENV_LOCK);
-        let (tmp, mut inner) = production_recovery_rig();
-        Arc::get_mut(&mut inner).unwrap().config.home_override = None;
         fs::set_permissions(tmp.path(), fs::Permissions::from_mode(0o700)).unwrap();
         let endpoint = HostEndpoint::unix(tmp.path().join("fl-host.sock")).unwrap();
-        let session_id = SessionId::new("Held.claude").unwrap();
+        let session_id = SessionId::new(host_session).unwrap();
         let stream = StreamId {
             host: HostInstance::new([6; 16]),
             session: session_id.clone(),
@@ -6663,7 +6683,7 @@ mod tests {
             acked: 0,
             latest: 0,
         };
-        let screen_state = Arc::new(Mutex::new(ScreenState::default()));
+        let screen_state = Arc::new(Mutex::new(HostedRecoveryScreen::default()));
         let observed = Arc::clone(&screen_state);
         let (ready_tx, ready_rx) = mpsc::channel();
         let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel::<()>();
@@ -6714,23 +6734,27 @@ mod tests {
                                 ExtensionRequest::CaptureRendered { stream } => {
                                     let mut state = lock(&observed);
                                     let rule = "────────────────────────────────────────";
-                                    let (composer, footer) = if state.busy {
-                                        state.busy_captures += 1;
-                                        (String::new(), "esc to interrupt")
-                                    } else if let Some(paste) =
-                                        state.writes.last().filter(|write| write.as_str() != "\r")
-                                    {
-                                        (
+                                    state.captures += 1;
+                                    let pasted =
+                                        state.writes.last().filter(|write| write.as_str() != "\r");
+                                    let busy = state.busy
+                                        || state.busy_on_capture == Some(state.captures)
+                                        || (state.busy_after_paste && pasted.is_some());
+                                    let composer = pasted
+                                        .map(|paste| {
                                             paste
                                                 .strip_prefix("\x1b[200~")
                                                 .unwrap()
                                                 .strip_suffix("\x1b[201~")
                                                 .unwrap()
-                                                .replace('\n', "\n  "),
-                                            "? for shortcuts",
-                                        )
+                                                .replace('\n', "\n  ")
+                                        })
+                                        .unwrap_or_default();
+                                    let footer = if busy {
+                                        state.busy_captures += 1;
+                                        "esc to interrupt"
                                     } else {
-                                        (String::new(), "? for shortcuts")
+                                        "? for shortcuts"
                                     };
                                     ExtensionResponse::RenderedCapture {
                                         screen: RenderedScreen {
@@ -6776,7 +6800,6 @@ mod tests {
                 });
         });
         ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-        let _scope = crate::runtime_context::pin(endpoint, None);
 
         // Ordinary dispatch goes through Claude's native message socket after
         // the test releases the active turn on the hosted stream.
@@ -6799,20 +6822,154 @@ mod tests {
             true,
         );
         put_recovery_runtime(
-            &inner,
+            inner,
             "claude",
             serde_json::json!({
                 "session_id": "claude:held",
                 "vendor": "claude",
                 "persona": "held",
                 "hosted": true,
-                "host_session_id": "Held.claude",
+                "host_session_id": host_session,
                 "status": "running",
                 "hydration_generation": "gen-1",
                 "hydration_status": "confirmed",
                 "runtime_leader_pid": 42,
             }),
         );
+        HostedRecoveryFixture {
+            endpoint,
+            screen: screen_state,
+            listener,
+            stop: stop_tx,
+            server,
+        }
+    }
+
+    #[test]
+    fn timed_fence_recovery_refunds_busy_at_target_dispatch() {
+        let _env_lock = lock(&crate::dispatcher::TMUX_ENV_LOCK);
+        let (tmp, mut inner) = production_recovery_rig();
+        let daemon = Arc::get_mut(&mut inner).unwrap();
+        daemon.config.home_override = None;
+        daemon.fence_recovery_policy.max_attempts = 1;
+        let host = hosted_claude_recovery_fixture(&inner, &tmp, "HELD.claude");
+        let _scope = crate::runtime_context::pin(host.endpoint.clone(), None);
+        // The scheduler and worker probes find a ready composer. Only the
+        // pinned RecoveryTarget's own capture observes the busy footer.
+        lock(&host.screen).busy_on_capture = Some(3);
+        let (message, since) = hold_recovery_mail(&inner);
+        let before = inner.store.list_wire_receipts(&message).unwrap();
+        let delay = inner.fence_recovery_policy.delay_ms;
+        let due = since.unix_millis() + delay;
+
+        inner.poll_retained_fences(At::from_unix_millis(due));
+        wait_on_recovery(|| {
+            !inner
+                .diagnostics_snapshot()
+                .fence_recovery_attempts
+                .is_empty()
+        });
+        let status = inner.diagnostics_snapshot();
+        let attempt = &status.fence_recovery_attempts[0];
+        assert_eq!(attempt.outcome, FenceRecoveryOutcome::SeatBusy);
+        assert_eq!(attempt.attempt, 1);
+        assert_eq!(attempt.busy_probe_count, Some(1));
+        assert!(!status.fence_recovery_attention[0].exhausted);
+        assert!(inner.is_recipient_fenced("held"));
+        assert_eq!(lock(&inner.fence_recoveries)["held"].attempts, 0);
+        assert_eq!(inner.store.list_wire_receipts(&message).unwrap(), before);
+        {
+            let screen = lock(&host.screen);
+            assert_eq!(screen.captures, 3);
+            assert_eq!(screen.busy_captures, 1);
+            assert!(screen.writes.is_empty());
+        }
+
+        inner.poll_retained_fences(At::from_unix_millis(due + delay));
+        wait_on_recovery(|| inner.diagnostics_snapshot().fence_recovery_attempts.len() == 2);
+        let status = inner.diagnostics_snapshot();
+        assert_eq!(
+            status.fence_recovery_attempts[1].outcome,
+            FenceRecoveryOutcome::Released
+        );
+        assert_eq!(status.fence_recovery_attempts[1].attempt, 1);
+        assert!(!inner.is_recipient_fenced("held"));
+        let receipt = &inner.store.list_wire_receipts(&message).unwrap()[0];
+        assert_eq!(receipt.status, DeliveryStatus::Acked);
+        assert_eq!(receipt.attempts, before[0].attempts + 1);
+        {
+            let screen = lock(&host.screen);
+            assert_eq!(screen.writes.len(), 2);
+            assert!(screen.writes[0].contains(message.as_str()));
+            assert_eq!(screen.writes[1], "\r");
+        }
+        host.stop();
+    }
+
+    #[test]
+    fn timed_fence_recovery_charges_busy_after_hosted_paste() {
+        let _env_lock = lock(&crate::dispatcher::TMUX_ENV_LOCK);
+        let (tmp, mut inner) = production_recovery_rig();
+        let daemon = Arc::get_mut(&mut inner).unwrap();
+        daemon.config.home_override = None;
+        daemon.fence_recovery_policy.max_attempts = 1;
+        let host = hosted_claude_recovery_fixture(&inner, &tmp, "held.claude");
+        let _scope = crate::runtime_context::pin(host.endpoint.clone(), None);
+        lock(&host.screen).busy_after_paste = true;
+        let (message, since) = hold_recovery_mail(&inner);
+        let before = inner.store.list_wire_receipts(&message).unwrap();
+        let delay = inner.fence_recovery_policy.delay_ms;
+        let due = since.unix_millis() + delay;
+
+        inner.poll_retained_fences(At::from_unix_millis(due));
+        wait_on_recovery(|| {
+            !inner
+                .diagnostics_snapshot()
+                .fence_recovery_attempts
+                .is_empty()
+        });
+        let status = inner.diagnostics_snapshot();
+        let attempt = &status.fence_recovery_attempts[0];
+        assert_eq!(attempt.outcome, FenceRecoveryOutcome::ReplayFailed);
+        assert_eq!(attempt.attempt, 1);
+        assert_eq!(attempt.busy_probe_count, None);
+        assert!(status.fence_recovery_attention[0].exhausted);
+        assert!(inner.is_recipient_fenced("held"));
+        assert_eq!(lock(&inner.fence_recoveries)["held"].attempts, 1);
+        let receipt = &inner.store.list_wire_receipts(&message).unwrap()[0];
+        assert_eq!(receipt.status, DeliveryStatus::Pending);
+        assert_eq!(receipt.attempts, before[0].attempts + 1);
+        let captures = {
+            let screen = lock(&host.screen);
+            assert!(screen.busy_captures > 0);
+            assert_eq!(screen.writes.len(), 1);
+            let paste = &screen.writes[0];
+            assert!(paste.starts_with("\x1b[200~"));
+            assert!(paste.contains(message.as_str()));
+            assert!(paste.ends_with("\x1b[201~"));
+            screen.captures
+        };
+        inner.poll_retained_fences(At::from_unix_millis(due + delay));
+        assert_eq!(
+            inner.diagnostics_snapshot().fence_recovery_attempts.len(),
+            1
+        );
+        {
+            let screen = lock(&host.screen);
+            assert_eq!(screen.captures, captures);
+            assert_eq!(screen.writes.len(), 1);
+        }
+        host.stop();
+    }
+
+    fn exercise_timed_recovery_hosted_busy_backlog(exhaust_busy_parks: bool) {
+        let _env_lock = lock(&crate::dispatcher::TMUX_ENV_LOCK);
+        let (tmp, mut inner) = production_recovery_rig();
+        Arc::get_mut(&mut inner).unwrap().config.home_override = None;
+        let host = hosted_claude_recovery_fixture(&inner, &tmp, "Held.claude");
+        let _scope = crate::runtime_context::pin(host.endpoint.clone(), None);
+        let screen_state = &host.screen;
+        let listener = &host.listener;
         let (first, since) = hold_recovery_mail(&inner);
         let admit_tail = |n| {
             let (response, _) = inner.handle_local_request(LocalRequest::Send {
@@ -6846,7 +7003,7 @@ mod tests {
             inner.diagnostics_snapshot().fence_recovery_attempts[0].outcome,
             FenceRecoveryOutcome::Released,
             "fixture capture state: {:?}",
-            lock(&screen_state)
+            lock(screen_state)
         );
         wait_on_recovery(|| {
             lock(&inner.dispatch_queues)
@@ -6862,7 +7019,7 @@ mod tests {
             io::ErrorKind::WouldBlock
         );
         {
-            let screen = lock(&screen_state);
+            let screen = lock(screen_state);
             assert_eq!(screen.writes.len(), 2);
             assert!(screen.writes[0].contains(first.as_str()));
             assert!(screen.writes[0].contains(TIMED_FENCE_REDELIVERY_NOTICE));
@@ -6947,7 +7104,7 @@ mod tests {
                 1
             );
             {
-                let mut screen = lock(&screen_state);
+                let mut screen = lock(screen_state);
                 assert_eq!(screen.writes.len(), 2);
                 assert!(screen.busy_captures > COMPOSER_OCCUPIED_MAX_REPROBES as usize);
                 screen.busy = false;
@@ -6966,14 +7123,14 @@ mod tests {
             assert_eq!(replay.attempt, 1);
             assert_eq!(replay.outcome, FenceRecoveryOutcome::Released);
             assert!(!inner.is_recipient_fenced("held"));
-            let screen = lock(&screen_state);
+            let screen = lock(screen_state);
             assert_eq!(screen.writes.len(), 4);
             assert!(screen.writes[2].contains(second.as_str()));
             assert!(screen.writes[2].contains(TIMED_FENCE_REDELIVERY_NOTICE));
             assert_eq!(screen.writes[3], "\r");
         }
 
-        lock(&screen_state).busy = false;
+        lock(screen_state).busy = false;
         let retry_at = lock(&inner.dispatch_queues)["held"]
             .composer_retry_at
             .clone()
@@ -6981,9 +7138,9 @@ mod tests {
         inner.poll_retained_fences(retry_at);
         wait_on_recovery(|| !lock(&inner.dispatch_queues).contains_key("held"));
         if !exhaust_busy_parks {
-            assert_hosted_claude_peer_delivery(&listener, &second, true);
+            assert_hosted_claude_peer_delivery(listener, &second, true);
         }
-        assert_hosted_claude_peer_delivery(&listener, &third, false);
+        assert_hosted_claude_peer_delivery(listener, &third, false);
         for id in [&second, &third] {
             assert_eq!(
                 inner.store.list_wire_receipts(id).unwrap()[0].status,
@@ -6999,11 +7156,10 @@ mod tests {
             if exhaust_busy_parks { 3 } else { 1 }
         );
         assert_eq!(
-            lock(&screen_state).writes.len(),
+            lock(screen_state).writes.len(),
             if exhaust_busy_parks { 4 } else { 2 }
         );
-        stop_tx.send(()).unwrap();
-        server.join().unwrap();
+        host.stop();
     }
 
     fn assert_hosted_claude_peer_delivery(
