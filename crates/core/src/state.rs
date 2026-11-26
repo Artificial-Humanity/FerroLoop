@@ -24,11 +24,14 @@ pub const HOSTED_VERSION_LAUNCH_PREFIX: &str = "hosted-vendor-launch-";
 pub const HOSTED_VERSION_BASELINE_PREFIX: &str = "hosted-vendor-baseline-";
 pub const HOSTED_VERSION_GENERATION_PREFIX: &str = "hosted-version-gen-";
 pub const HOSTED_VERSION_QUEUE_PREFIX: &str = "hosted-version-queue-";
-pub const HOSTED_VERSION_STATE_SLUG_PREFIXES: [&str; 4] = [
+/// Per-session index of the receipt keys that are still current, so older ones can be deleted.
+pub const HOSTED_VERSION_INDEX_PREFIX: &str = "hosted-version-index-";
+pub const HOSTED_VERSION_STATE_SLUG_PREFIXES: [&str; 5] = [
     HOSTED_VERSION_LAUNCH_PREFIX,
     HOSTED_VERSION_BASELINE_PREFIX,
     HOSTED_VERSION_GENERATION_PREFIX,
     HOSTED_VERSION_QUEUE_PREFIX,
+    HOSTED_VERSION_INDEX_PREFIX,
 ];
 
 pub fn is_hosted_version_state_slug(slug: &str) -> bool {

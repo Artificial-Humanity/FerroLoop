@@ -2536,18 +2536,26 @@ export const App: React.FC<AppProps> = ({
       (versionLaunch?.session_id === session.session_id &&
         versionLaunch.hydration_generation === session.hydration_generation &&
         activeSession?.persona?.trim().toLowerCase() === activeAgentKey));
+  const preferredVersionRecords = useMemo(
+    () => selectPreferredHostedSessions(hostedVersionRecords),
+    [hostedVersionRecords],
+  );
   const versionRecord = versionSessionId
     ? hostedVersionRecords.find(matchesVersionSession)
-    : selectPreferredHostedSessions(hostedVersionRecords)[activeAgentKey];
+    : preferredVersionRecords[activeAgentKey];
   const hostedVendorVersions = versionRecord
     ? versionRecord.vendor_versions ?? null
     : activeHostedSession && matchesVersionSession(activeHostedSession) ? null : undefined;
-  const vendorVersionChangedAgents = useMemo(
-    () => new Set(hostedVersionRecords
-      .filter((session) => session.vendor_versions?.changes.length)
-      .map((session) => session.persona.trim().toLowerCase())),
-    [hostedVersionRecords],
-  );
+  const activeVersionChanged = Boolean(versionRecord?.vendor_versions?.changes.length);
+  // Flag only the record that the Chat version row shows: the selected session's launch
+  // for the active persona, and the preferred hosted record for each other persona.
+  const vendorVersionChangedAgents = useMemo(() => {
+    const changed = new Set(Object.entries(preferredVersionRecords)
+      .filter(([key, session]) => key !== activeAgentKey && session.vendor_versions?.changes.length)
+      .map(([key]) => key));
+    if (activeAgentKey && activeVersionChanged) changed.add(activeAgentKey);
+    return changed;
+  }, [preferredVersionRecords, activeAgentKey, activeVersionChanged]);
   const activeHydrationStatus = useMemo<HydrationStatus | null>(() => {
     const raw =
       activeSession?.hydration_status ??

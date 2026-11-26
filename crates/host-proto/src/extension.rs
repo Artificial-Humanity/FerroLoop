@@ -22,6 +22,8 @@ pub const SESSION_OWNER_FEATURE: u64 = 16;
 pub const PTY_RETENTION_FEATURE: u64 = 32;
 /// Opt-in, private evidence for an exact owned hosted launch.
 pub const HOSTED_EXIT_EVIDENCE_FEATURE: u64 = 64;
+/// Opt-in rendered capture with a cursor-row dim suffix from the same projection.
+pub const RENDERED_CURSOR_STYLE_FEATURE: u64 = 128;
 pub const MAX_HOSTED_EXIT_TAIL_BYTES: usize = 4 * 1024;
 pub const MAX_HOSTED_EXIT_TAIL_LINES: usize = 40;
 // The tail may double under JSON escaping. The validated StreamId, integers
@@ -517,6 +519,9 @@ pub enum ExtensionRequest {
     CaptureRendered {
         stream: StreamId,
     },
+    CaptureRenderedCursorStyle {
+        stream: StreamId,
+    },
     Resize {
         stream: StreamId,
         lease: ControllerLease,
@@ -761,6 +766,12 @@ pub enum ExtensionResponse {
     RenderedCapture {
         screen: RenderedScreen,
     },
+    RenderedCursorStyleCapture {
+        screen: RenderedScreen,
+        /// Index in the plain-text screen of the unwrapped cursor row, when
+        /// all of its visible non-whitespace text from the cursor onward is dim.
+        dim_suffix_line: Option<u16>,
+    },
     Resized {
         cols: u16,
         rows: u16,
@@ -799,6 +810,18 @@ impl ExtensionResponse {
                 Err(HostError::EventTooLarge)
             }
             Self::RenderedCapture { screen } => screen.validate(),
+            Self::RenderedCursorStyleCapture {
+                screen,
+                dim_suffix_line,
+            } => {
+                screen.validate()?;
+                if dim_suffix_line.is_some_and(|line| line > screen.cursor_row) {
+                    return Err(HostError::Protocol(
+                        "dim suffix line outside cursor row".into(),
+                    ));
+                }
+                Ok(())
+            }
             Self::Resized { cols, rows, .. } => validate_pty_geometry(*cols, *rows),
             Self::Attachment { .. } => Err(HostError::Unsupported {
                 subject: "PTY backend/schema",
