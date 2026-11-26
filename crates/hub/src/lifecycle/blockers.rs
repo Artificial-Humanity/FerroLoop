@@ -273,12 +273,12 @@ impl Sampler {
         let eligible = self.eligible(records, &sessions);
         // Candidates are sorted by record ID. Continue after the last attempted capture
         // so every quiet seat gets a turn even with a full Host.
-        let start = eligible.partition_point(|(index, _, _, _)| {
+        let start = eligible.partition_point(|(index, _, _)| {
             self.last_capture
                 .as_ref()
                 .is_some_and(|last| &records[*index].session_id <= last)
         });
-        for &(index, session, child, capture) in eligible
+        for &(index, session, child) in eligible
             .iter()
             .skip(start)
             .chain(&eligible[..start])
@@ -293,11 +293,6 @@ impl Sampler {
                 Ok(true) => {}
                 Ok(false) => continue,
                 Err(_) => break,
-            }
-            if !capture {
-                // A confirmed, previously blocked seat has resumed writing output.
-                observations[index] = Some(Observation::new(session, child, ScreenEvidence::Clear));
-                continue;
             }
             // Verified liveness is enough to detect a hydration timeout if the screen
             // is unavailable. It cannot renew the evidence of a previous screen block.
@@ -321,7 +316,7 @@ impl Sampler {
         &mut self,
         records: &[HostedSessionRecord],
         sessions: &'a [SessionSummary],
-    ) -> Vec<(usize, &'a SessionSummary, &'a ChildRecord, bool)> {
+    ) -> Vec<(usize, &'a SessionSummary, &'a ChildRecord)> {
         let mut current = BTreeMap::new();
         let mut eligible = Vec::new();
         for (index, record) in records.iter().enumerate() {
@@ -329,17 +324,11 @@ impl Sampler {
                 continue;
             };
             let watermark = (session.stream.clone(), session.latest);
-            let previous = self.progress.get(&record.session_id);
-            let quiet = previous == Some(&watermark);
-            let advancing = previous.is_some_and(|(stream, latest)| {
-                stream == &session.stream && session.latest > *latest
-            });
+            let quiet = self.progress.get(&record.session_id) == Some(&watermark);
             current.insert(record.session_id.clone(), watermark);
-            let capture = record.hydration_status == HydrationStatus::Unconfirmed || quiet;
-            // Existing positive flags can be cleared on resumed activity. Only an owner
-            // check is needed when the exact running stream's journal has advanced.
-            if capture || (advancing && record.active_block().is_some()) {
-                eligible.push((index, session, child, capture));
+            // Advancing output can be a repaint of the same prompt.
+            if record.hydration_status == HydrationStatus::Unconfirmed || quiet {
+                eligible.push((index, session, child));
             }
         }
         self.progress = current;
@@ -628,32 +617,43 @@ mod tests {
     }
 
     #[test]
-    fn advancing_confirmed_seat_is_eligible_for_flag_clear_without_capture() {
+    fn prompt_repaint_keeps_blocker_until_quiet_capture_confirms_recovery() {
         let mut record = record(0);
         record.hydration_status = HydrationStatus::Confirmed;
-        record.block = Some(HostedBlock {
-            reason: HostedBlockReason::BlockingDialog,
+        let block = HostedBlock {
+            reason: HostedBlockReason::VendorSignIn,
             observed_at_ms: 1_001,
-        });
-        let mut sessions = [summary(&record)];
-        let mut sampler = Sampler::default();
-        assert!(
-            sampler
-                .eligible(std::slice::from_ref(&record), &sessions)
-                .is_empty()
-        );
-        sessions[0].latest += 1;
-        let eligible = sampler.eligible(std::slice::from_ref(&record), &sessions);
-        let [(_, session, child, capture)] = eligible.as_slice() else {
-            panic!("one exact seat should be eligible");
         };
-        assert!(!capture);
-        let activity = Observation::new(session, child, ScreenEvidence::Clear);
-        assert_eq!(next_reason(&record, Some(&activity), 2_000), None);
+        record.block = Some(block);
+        let mut sessions = [summary(&record)];
+        let records = std::slice::from_ref(&record);
+        let mut sampler = Sampler::default();
         let evidence = ExitEvidence::default();
-        remember_test_block(&evidence, &record);
+
+        assert!(sampler.eligible(records, &sessions).is_empty());
+        let eligible = sampler.eligible(records, &sessions);
+        let [(_, session, child)] = eligible.as_slice() else {
+            panic!("one quiet seat should be eligible");
+        };
+        let sign_in = ScreenEvidence::classify(&record.vendor, SIGN_IN);
+        let before_repaint = Observation::new(session, child, sign_in);
+        evidence.remember(&record, &before_repaint);
+
+        // A resize can repaint the same prompt and advance the journal.
+        sessions[0].latest += 1;
+        assert!(sampler.eligible(records, &sessions).is_empty());
+        assert_eq!(next_reason(&record, None, 2_000), Some(block.reason));
+        evidence.retain_current(before_repaint.checked_at, &sampler.progress);
         assert!(blocked_at_exit(&record, Some(&evidence)));
-        evidence.clear(&record, &activity);
+
+        let eligible = sampler.eligible(records, &sessions);
+        let [(_, session, child)] = eligible.as_slice() else {
+            panic!("the seat should be eligible again after it goes quiet");
+        };
+        let ready = ScreenEvidence::classify(&record.vendor, "› Ready for a prompt");
+        let recovered = Observation::new(session, child, ready);
+        assert_eq!(next_reason(&record, Some(&recovered), 2_000), None);
+        evidence.clear(&record, &recovered);
         assert!(!blocked_at_exit(&record, Some(&evidence)));
     }
 
