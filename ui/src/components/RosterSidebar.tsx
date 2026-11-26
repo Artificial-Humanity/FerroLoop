@@ -1583,7 +1583,10 @@ export const RosterSidebar: React.FC<RosterSidebarProps> = ({
                                   aria-label={recoveryLabel}
                                   title={recoveryLabel}
                                   className="fd-badge"
-                                  style={getUnreadBadgeStyle(recoveryAttention === "exhausted" ? "important" : "question")}
+                                  style={{
+                                    ...getUnreadBadgeStyle(recoveryAttention === "exhausted" ? "important" : "question"),
+                                    color: "#0A0D12",
+                                  }}
                                 >
                                   !
                                 </span>

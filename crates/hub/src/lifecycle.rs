@@ -1099,6 +1099,7 @@ thread_local! {
     static TEST_LAUNCH_PREREQUISITE_CALLS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
     static TEST_RESPAWN_LOAD_FAILURE_SESSION: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
     static TEST_RESPAWN_SAVE_FAILURE_SESSION: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+    static TEST_RECOVERY_ATTACHMENT_FAILURE: std::cell::Cell<Option<&'static str>> = const { std::cell::Cell::new(None) };
     static TEST_RESPAWN_SAVE_FAILURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static TEST_RUNNING_RECORD_SAVE_FAILURE: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
     static TEST_CODEX_HOME: std::cell::RefCell<Option<Option<std::ffi::OsString>>> = const { std::cell::RefCell::new(None) };
@@ -9500,8 +9501,14 @@ fn notify_crash_loop_recipients<S: AgentRegistry + MessageStore + StateStore>(
             return false;
         };
         let at = stamp::now();
-        let id = tail.as_deref().and_then(|tail| {
-            // Store the private excerpt first. The mail remains useful if the write fails.
+        let attachment = tail.as_deref().map(|tail| {
+            #[cfg(test)]
+            if TEST_RECOVERY_ATTACHMENT_FAILURE.with(|fail| fail.get() == Some(recipient)) {
+                return Err(StoreError::Credential(
+                    "injected recovery attachment write failure".into(),
+                ));
+            }
+            // Store the private excerpt before queuing the notice.
             hosted_recovery_notice::prepare(
                 store,
                 &agent.id,
@@ -9510,8 +9517,19 @@ fn notify_crash_loop_recipients<S: AgentRegistry + MessageStore + StateStore>(
                 at.clone(),
                 AUTO_RESPAWN_ACTOR,
             )
-            .ok()
         });
+        let id = match attachment.transpose() {
+            Ok(id) => id,
+            Err(_) => {
+                if should_log_auto_respawn_warning(&fresh.session_id, current_respawn_clock_ms()) {
+                    eprintln!(
+                        "hub: warning ({}): failed to store private recovery excerpt for `{recipient}`",
+                        fresh.session_id
+                    );
+                }
+                return false;
+            }
+        };
         let body = if id.is_some() {
             format!(
                 "{body} To read the sanitized terminal excerpt on the originating node, run `fl wire read --for {recipient} --all`."
@@ -22325,6 +22343,7 @@ mod tests {
     impl Drop for RecoveryFixtureReset {
         fn drop(&mut self) {
             TEST_RESPAWN_NOW_MS.with(|clock| clock.set(None));
+            TEST_RECOVERY_ATTACHMENT_FAILURE.with(|fail| fail.set(None));
             TEST_RESPAWN_SAVE_FAILURE.with(|fail| fail.set(false));
             TEST_RUNNING_RECORD_SAVE_FAILURE.with(|fail| fail.set(None));
             TEST_LAUNCH_PREREQUISITE.with(|slot| *slot.borrow_mut() = None);
@@ -23047,6 +23066,95 @@ mod tests {
             "legacy boolean cannot suppress Lab Manager fallback"
         );
     }
+    #[test]
+    fn recovery_notice_retries_a_failed_private_attachment_without_delaying_other_recipients() {
+        use fl_host_proto::{
+            ChildExit, HostInstance, HostedExitEvidence, SessionEpoch, SessionId, StreamId,
+        };
+
+        let _reset = RecoveryFixtureReset;
+        let home = TempDir::new().unwrap();
+        let store = MemStore::default();
+        let fake = FakeRuntime::default();
+        let env = fake.env(home.path());
+        let mut record = hosted_record("codex", "worker", STATUS_STOPPED, false);
+        record.hydration_generation = Some("generation".into());
+        let mut state = HostedRespawnState {
+            recovery_started_at_ms: Some(1),
+            recovery_attempts: recovery::RECOVERY_MAX_ATTEMPTS,
+            ..Default::default()
+        };
+        let tail = "private terminal excerpt for retry";
+        *fake.hosted_exit_fixture.borrow_mut() = Some(HostedExitEvidence {
+            stream: StreamId {
+                host: HostInstance::new([1; 16]),
+                session: SessionId::new("Worker.codex").unwrap(),
+                epoch: SessionEpoch(0),
+            },
+            exit: ChildExit {
+                code: Some(1),
+                signal: None,
+            },
+            started_at_ms: 10,
+            captured_at_ms: 20,
+            terminal_tail: tail.into(),
+        });
+        assert!(
+            exit_evidence::spawn_and_remember(
+                &store,
+                &env,
+                &mut state,
+                &record,
+                None,
+                AUTO_RESPAWN_ACTOR,
+            )
+            .unwrap()
+        );
+        let evidence = state.exit_evidence.capture(&fake, &record).unwrap();
+        assert!(state.exit_evidence.count_exit(&record, Some(evidence), 20));
+
+        let recipient_filter = |name: &str| fl_core::ferrowire::WireFilter {
+            recipient: Some(name.into()),
+            ..Default::default()
+        };
+        let inbox = |name| store.list_wire_inbox(&recipient_filter(name)).unwrap();
+
+        notify_crash_loop_recipients(&store, &record, &mut state);
+        register(&store, "manager-a", "workspace", AgentRole::LabManager);
+        TEST_RECOVERY_ATTACHMENT_FAILURE.with(|fail| fail.set(Some("manager-a")));
+        notify_crash_loop_recipients(&store, &record, &mut state);
+        assert!(inbox("manager-a").is_empty());
+        assert!(!recovery::notice_delivered(&state, "manager-a"));
+        assert_eq!(
+            state.recovery_attention,
+            Some(HostedRecoveryAttention::Exhausted)
+        );
+
+        register(&store, "manager-b", "workspace", AgentRole::LabManager);
+        notify_crash_loop_recipients(&store, &record, &mut state);
+        assert!(inbox("manager-a").is_empty());
+        assert_eq!(inbox("manager-b").len(), 1);
+        assert!(!state.crash_loop_notified);
+        assert_eq!(state.recovery_attention, None);
+
+        TEST_RECOVERY_ATTACHMENT_FAILURE.with(|fail| fail.set(None));
+        for _ in 0..2 {
+            notify_crash_loop_recipients(&store, &record, &mut state);
+        }
+        assert!(state.crash_loop_notified);
+        for name in ["manager-a", "manager-b"] {
+            let mut notices = inbox(name);
+            assert_eq!(notices.len(), 1);
+            assert!(!notices[0].message.body.contains(tail));
+            hosted_recovery_notice::attach_to_local_inbox(
+                &store,
+                &recipient_filter(name),
+                &mut notices,
+            );
+            assert!(notices[0].message.body.contains(tail));
+        }
+    }
+
     #[test]
     fn slow_recovery_exhaustion_clears_prerequisite_detail_without_another_probe() {
         let home = TempDir::new().unwrap();
