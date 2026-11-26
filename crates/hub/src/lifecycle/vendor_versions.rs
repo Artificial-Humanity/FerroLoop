@@ -697,8 +697,9 @@ impl VersionObserver {
         }
         let (_, store) = self.ferro.as_ref().expect("Ferro handle was opened");
         let result = operation(store);
-        // Reconnect on the next pass if a served handle stopped responding.
-        if result.is_err() && store.is_remote() {
+        // Reopen on the next pass: an error may leave a local handle poisoned or a
+        // served handle disconnected.
+        if result.is_err() {
             self.ferro = None;
         }
         result
@@ -954,6 +955,38 @@ mod tests {
         assert_eq!(earlier.versions, Some(old));
         assert_eq!(current.id, second_id);
         assert_eq!(current.versions, Some(new));
+    }
+
+    #[test]
+    fn versions_observer_reopens_a_local_store_after_an_operation_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = crate::HubState::new(crate::HubServerConfig {
+            store_path: dir.path().join("workspace.fls"),
+            home_override: Some(dir.path().into()),
+            ..crate::HubServerConfig::default()
+        });
+        state.store_backend = Some(BackendKind::Ferro);
+        drop(state.open_store().unwrap());
+        let target = ObservationTarget::resolve(&state).unwrap().unwrap();
+        let mut observer = VersionObserver::default();
+
+        let failure = observer.with_store(&state, &target, |store| {
+            assert!(!store.is_remote());
+            Err::<(), _>(LifecycleError::Store("injected operation failure".into()))
+        });
+        assert!(failure.is_err());
+        assert!(observer.ferro.is_none());
+
+        observer
+            .with_store(&state, &target, |store| {
+                let launch = receipt(1);
+                seed(store, &launch);
+                let settled = commit(store, launch, sample(Some("1.0.0"), None))?;
+                assert!(settled.is_some());
+                Ok(())
+            })
+            .unwrap();
+        assert!(observer.ferro.is_some());
     }
 
     #[cfg(target_os = "linux")]
