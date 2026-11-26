@@ -57,6 +57,17 @@ pub struct HostedVendorVersions {
     pub changes: Vec<HostedVendorVersionChange>,
 }
 
+impl HostedVendorVersions {
+    fn fill_missing(&mut self, observed: Self) {
+        self.cli = self.cli.take().or(observed.cli);
+        self.daemon = self.daemon.take().or(observed.daemon);
+    }
+
+    fn complete(&self) -> bool {
+        self.cli.is_some() && (!self.daemon_expected || self.daemon.is_some())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(super) struct ProcessIdentity {
     pid: u32,
@@ -277,10 +288,12 @@ impl VendorBaseline {
         launch: uuid::Uuid,
         mut versions: HostedVendorVersions,
     ) -> HostedVendorVersions {
-        if let Some((applied, versions)) = &self.last_applied
+        if let Some((applied, previous)) = &self.last_applied
             && *applied == launch
         {
-            return versions.clone();
+            let mut recovered = previous.clone();
+            recovered.fill_missing(versions);
+            versions = recovered;
         }
         let components = [
             (
@@ -447,9 +460,29 @@ fn update_pending<S: StateStore>(
     ))
 }
 
+fn queue_launch<S: StateStore>(store: &S, receipt: &LaunchReceipt) -> Result<bool, LifecycleError> {
+    update_pending(store, |pending| {
+        if pending.len() >= MAX_PENDING_LAUNCHES {
+            // A direct CLI can accumulate entries already recorded in its store that
+            // are only waiting for Hub notification or enrichment. Reclaim one before
+            // giving up any launch that still has no observation.
+            let Some(index) = pending
+                .iter()
+                .position(|receipt| receipt.versions.is_some())
+            else {
+                return false;
+            };
+            pending.remove(index);
+        }
+        pending.push(receipt.clone());
+        true
+    })
+}
+
 /// Save the already available launch identity. Adapter probes belong to the worker.
 pub(super) fn remember_launch<S: StateStore>(
     store: &S,
+    env: &LifecycleEnv<'_>,
     record: &HostedSessionRecord,
     stream: Option<StreamId>,
     leader: Option<ProcessIdentity>,
@@ -484,14 +517,12 @@ pub(super) fn remember_launch<S: StateStore>(
         }),
         versions: None,
     };
-    let queued = update_pending(store, |pending| {
-        if pending.len() >= MAX_PENDING_LAUNCHES {
-            return false;
+    let queued = queue_launch(store, &receipt);
+    if matches!(queued, Ok(true)) {
+        if let Some(receipts) = env.direct_version_receipts {
+            receipts.lock().unwrap_or_else(|e| e.into_inner()).push(id);
         }
-        pending.push(receipt.clone());
-        true
-    });
-    if !matches!(queued, Ok(true)) {
+    } else {
         // Keep the exact launch visible as an unknown observation when the queue cannot accept it.
         let versions = HostedVendorVersions {
             daemon_expected: receipt.daemon_expected,
@@ -622,11 +653,18 @@ pub(crate) fn hosted_vendor_versions_for_record<S: StateStore>(
     receipt.versions
 }
 
-fn observe(receipt: &LaunchReceipt, adapters: &VendorVersionRegistry) -> HostedVendorVersions {
-    let mut versions = HostedVendorVersions {
-        daemon_expected: receipt.daemon_expected,
-        ..Default::default()
-    };
+fn observe(
+    receipt: &LaunchReceipt,
+    adapters: &VendorVersionRegistry,
+    allow_manual_probe: bool,
+) -> HostedVendorVersions {
+    let mut versions = receipt
+        .versions
+        .clone()
+        .unwrap_or_else(|| HostedVendorVersions {
+            daemon_expected: receipt.daemon_expected,
+            ..Default::default()
+        });
     if receipt.host != local_host_key() {
         return versions;
     }
@@ -644,18 +682,23 @@ fn observe(receipt: &LaunchReceipt, adapters: &VendorVersionRegistry) -> HostedV
     {
         return versions;
     }
-    versions.cli = evidence.leader.as_ref().and_then(|leader| {
-        let passive = leader.cli_version(adapter, 2);
-        #[cfg(target_os = "linux")]
-        if passive.is_none() && !evidence.automatic {
-            return leader.manual_cli_version(adapter);
-        }
-        passive
+    let allow_manual_probe = allow_manual_probe && !evidence.automatic;
+    versions.cli = versions.cli.or_else(|| {
+        evidence.leader.as_ref().and_then(|leader| {
+            let passive = leader.cli_version(adapter, 2);
+            #[cfg(target_os = "linux")]
+            if passive.is_none() && allow_manual_probe {
+                return leader.manual_cli_version(adapter);
+            }
+            passive
+        })
     });
-    versions.daemon = evidence
-        .daemon
-        .as_ref()
-        .and_then(|daemon| daemon.observe(adapter, !evidence.automatic));
+    versions.daemon = versions.daemon.or_else(|| {
+        evidence
+            .daemon
+            .as_ref()
+            .and_then(|daemon| daemon.observe(adapter, allow_manual_probe))
+    });
     versions
 }
 
@@ -678,7 +721,10 @@ fn save_versions<S: StateStore>(
         let revision = current.as_ref().map(|entry| entry.head_revision.clone());
         if current
             .and_then(decode::<LaunchReceipt>)
-            .is_some_and(|prior| prior.id >= receipt.id)
+            .is_some_and(|prior| {
+                prior.id > receipt.id
+                    || (prior.id == receipt.id && prior.versions == receipt.versions)
+            })
         {
             return Ok(());
         }
@@ -702,11 +748,6 @@ fn compare_versions<S: StateStore>(
     let slug = baseline_slug(&receipt.host, &receipt.vendor);
     for _ in 0..STATE_UPDATE_ATTEMPTS {
         let (mut baseline, revision): (VendorBaseline, _) = load_revision(store, &slug)?;
-        if let Some((id, versions)) = baseline.last_applied.as_ref()
-            && *id == receipt.id
-        {
-            return Ok(versions.clone());
-        }
         let compared = baseline.apply(receipt.id, versions.clone());
         if store
             .upsert_state_if_current(write_args(slug.clone(), &baseline)?, revision.as_ref())?
@@ -720,24 +761,98 @@ fn compare_versions<S: StateStore>(
     ))
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct CommittedObservation {
+    versions: HostedVendorVersions,
+    already_reported: usize,
+}
+
+impl CommittedObservation {
+    fn warn_about_drift(&self, prefix: &str, session_id: &str, vendor: &str) {
+        for change in self.versions.changes.iter().skip(self.already_reported) {
+            eprintln!(
+                "{prefix}warning ({session_id}): {vendor} {:?} version changed from {} to {}",
+                change.component, change.previous, change.current,
+            );
+        }
+    }
+}
+
 fn commit<S: StateStore>(
     store: &S,
     receipt: LaunchReceipt,
-    versions: HostedVendorVersions,
-) -> Result<Option<HostedVendorVersions>, LifecycleError> {
+    observed: HostedVendorVersions,
+    finalize: bool,
+) -> Result<Option<CommittedObservation>, LifecycleError> {
     let (pending, _): (Vec<LaunchReceipt>, _) = load_revision(store, &queue_slug())?;
-    if !pending.iter().any(|current| current.id == receipt.id) {
+    let Some(current) = pending.into_iter().find(|current| current.id == receipt.id) else {
         return Ok(None);
-    }
+    };
+    let mut versions = current.versions.unwrap_or(HostedVendorVersions {
+        daemon_expected: current.daemon_expected,
+        ..Default::default()
+    });
+    let already_reported = versions.changes.len();
+    versions.fill_missing(observed);
     let versions = compare_versions(store, &receipt, versions)?;
     let id = receipt.id;
     save_versions(store, receipt, versions.clone())?;
-    let removed = update_pending(store, |pending| {
-        let count = pending.len();
-        pending.retain(|current| current.id != id);
-        pending.len() < count
+    let applied = update_pending(store, |pending| {
+        let Some(index) = pending.iter().position(|current| current.id == id) else {
+            return false;
+        };
+        if finalize {
+            pending.remove(index);
+        } else {
+            pending[index].versions = Some(versions.clone());
+            // Keep the durable queue item so a Hub owning this store can announce
+            // the observation, and enrich any still-missing component.
+            if versions.complete() {
+                pending[index].evidence = None;
+            }
+        }
+        true
     })?;
-    Ok(removed.then_some(versions))
+    Ok(applied.then_some(CommittedObservation {
+        versions,
+        already_reported,
+    }))
+}
+
+pub(super) fn observe_direct_launches<S: StateStore>(
+    store: &S,
+    ferro_file: Option<&Path>,
+    receipts: &[uuid::Uuid],
+) -> Result<(), LifecycleError> {
+    let Some(adapters) = ADAPTERS.get().filter(|_| !receipts.is_empty()) else {
+        return Ok(());
+    };
+    let _worker = if let Some(file) = ferro_file {
+        let file = file
+            .canonicalize()
+            .map_err(|err| LifecycleError::Store(err.to_string()))?;
+        let Some(worker) = lock::try_version_observer(&file)? else {
+            return Ok(());
+        };
+        Some(worker)
+    } else {
+        // The direct CLI's redb handle already owns the file exclusively.
+        None
+    };
+    let (mut pending, _): (Vec<LaunchReceipt>, _) = load_revision(store, &queue_slug())?;
+    pending.sort_unstable_by_key(|receipt| receipt.id);
+    for receipt in pending
+        .into_iter()
+        .filter(|receipt| receipts.contains(&receipt.id))
+    {
+        let versions = observe(&receipt, adapters, false);
+        let session_id = receipt.session_id.clone();
+        let vendor = receipt.vendor.clone();
+        if let Some(applied) = commit(store, receipt, versions, false)? {
+            applied.warn_about_drift("", &session_id, &vendor);
+        }
+    }
+    Ok(())
 }
 
 /// The file that owns the queue now. Re-resolve it before each commit: a migration or a
@@ -883,7 +998,7 @@ impl VersionObserver {
         for receipt in batch {
             // The observer lock is private to this worker. Process and daemon reads hold no
             // workspace transaction, redb handle or persona fence.
-            let versions = observe(&receipt, adapters);
+            let versions = observe(&receipt, adapters, true);
             if !target.is_current(state)? {
                 // A different file means a different worker lock. Let that worker settle the
                 // persisted queue instead of applying an old observation under this lock.
@@ -893,15 +1008,12 @@ impl VersionObserver {
             let stream = receipt.stream.clone();
             let generation = receipt.generation.clone();
             let vendor = receipt.vendor.clone();
-            let applied =
-                self.with_store(state, &target, |store| commit(store, receipt, versions))?;
-            if let Some(versions) = applied {
-                for change in &versions.changes {
-                    eprintln!(
-                        "hub: warning ({session_id}): {vendor} {:?} version changed from {} to {}",
-                        change.component, change.previous, change.current,
-                    );
-                }
+            let applied = self.with_store(state, &target, |store| {
+                commit(store, receipt, versions, true)
+            })?;
+            if let Some(applied) = applied {
+                applied.warn_about_drift("hub: ", &session_id, &vendor);
+                let versions = applied.versions;
                 let event = if versions.changes.is_empty() {
                     "session.vendor_versions_observed"
                 } else {
@@ -1028,18 +1140,25 @@ mod tests {
         let first_stream = first.stream.clone().unwrap();
         let second_stream = second.stream.clone().unwrap();
         assert!(
-            commit(&store, first, sample(Some("1.0.0"), None))
+            commit(&store, first, sample(Some("1.0.0"), None), true)
                 .unwrap()
                 .unwrap()
+                .versions
                 .changes
                 .is_empty()
         );
-        let observed = commit(&store, second.clone(), sample(Some("1.1.0"), Some("2.0.0")))
-            .unwrap()
-            .unwrap();
+        let observed = commit(
+            &store,
+            second.clone(),
+            sample(Some("1.1.0"), Some("2.0.0")),
+            true,
+        )
+        .unwrap()
+        .unwrap()
+        .versions;
         assert_eq!(observed.changes.len(), 1);
         assert!(
-            commit(&store, second, sample(Some("3.0.0"), None))
+            commit(&store, second, sample(Some("3.0.0"), None), true)
                 .unwrap()
                 .is_none()
         );
@@ -1058,6 +1177,107 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn versions_keep_partial_direct_drift_when_worker_adds_daemon() {
+        let store = MemStore::default();
+        let first = receipt(1);
+        let mut second = receipt(2);
+        second.stream = None;
+        seed(&store, &first);
+        seed(&store, &second);
+        commit(&store, first, sample(Some("1.0.0"), Some("2.0.0")), true).unwrap();
+
+        let direct = commit(&store, second.clone(), sample(Some("1.1.0"), None), false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(direct.already_reported, 0);
+        assert_eq!(direct.versions.changes.len(), 1);
+        assert_eq!(
+            direct.versions.changes[0].component,
+            HostedVendorVersionComponent::Cli
+        );
+
+        let slug = generation_slug(&second.session_id, &second.generation);
+        let partial: LaunchReceipt = read(&store, &slug).unwrap().unwrap();
+        assert_eq!(partial.versions, Some(direct.versions));
+
+        // A worker that already sampled its batch can complete this observation using a
+        // stale receipt. The previously observed CLI and its warning remain authoritative.
+        let final_observation = commit(&store, second, sample(Some("9.9.9"), Some("2.1.0")), true)
+            .unwrap()
+            .unwrap();
+        assert_eq!(final_observation.already_reported, 1);
+        assert_eq!(final_observation.versions.cli.as_deref(), Some("1.1.0"));
+        assert_eq!(final_observation.versions.daemon.as_deref(), Some("2.1.0"));
+        assert_eq!(final_observation.versions.changes.len(), 2);
+        assert_eq!(
+            final_observation.versions.changes[1].component,
+            HostedVendorVersionComponent::Daemon
+        );
+        let saved: LaunchReceipt = read(&store, &slug).unwrap().unwrap();
+        assert_eq!(saved.versions, Some(final_observation.versions));
+    }
+
+    #[test]
+    fn versions_at_capacity_reclaim_already_recorded_direct_observations() {
+        let store = MemStore::default();
+        let unresolved = receipt(1);
+        let already_recorded = receipt(2);
+        let limit = u8::try_from(MAX_PENDING_LAUNCHES).unwrap();
+        for index in 1..=limit {
+            seed(&store, &receipt(index));
+        }
+        let next = receipt(limit + 1);
+        assert!(!queue_launch(&store, &next).unwrap());
+
+        commit(&store, already_recorded.clone(), sample(None, None), false).unwrap();
+        assert!(queue_launch(&store, &next).unwrap());
+        let (pending, _): (Vec<LaunchReceipt>, _) = load_revision(&store, &queue_slug()).unwrap();
+        assert_eq!(pending.len(), MAX_PENDING_LAUNCHES);
+        assert!(pending.iter().any(|item| item.id == unresolved.id));
+        assert!(pending.iter().any(|item| item.id == next.id));
+        assert!(!pending.iter().any(|item| item.id == already_recorded.id));
+        assert_eq!(
+            hosted_vendor_versions_for_stream(&store, &already_recorded.stream.unwrap()).unwrap(),
+            Some(sample(None, None)),
+        );
+    }
+
+    #[test]
+    fn versions_observer_announces_a_complete_direct_observation_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = crate::HubState::new(crate::HubServerConfig {
+            store_path: dir.path().join("workspace.fls"),
+            home_override: Some(dir.path().into()),
+            ..crate::HubServerConfig::default()
+        });
+        state.store_backend = Some(BackendKind::Ferro);
+        let first = receipt(1);
+        let mut second = receipt(2);
+        second.captured_at_ms = now_ms().saturating_sub(SETTLE_MS);
+        {
+            let store = state.open_store().unwrap();
+            seed(&*store, &first);
+            seed(&*store, &second);
+            commit(&*store, first, sample(Some("1.0.0"), Some("2.0.0")), true).unwrap();
+            commit(&*store, second, sample(Some("1.1.0"), Some("2.0.0")), false).unwrap();
+            let (pending, _): (Vec<LaunchReceipt>, _) =
+                load_revision(&*store, &queue_slug()).unwrap();
+            assert_eq!(pending.len(), 1);
+            assert!(pending[0].evidence.is_none());
+        }
+        let mut events = state.subscribe();
+        let mut observer = VersionObserver::default();
+        let adapters = VendorVersionRegistry::default();
+        observer.observe_with_adapters(&state, &adapters).unwrap();
+        assert_eq!(
+            events.try_recv().unwrap().event,
+            "session.vendor_version_changed"
+        );
+        observer.observe_with_adapters(&state, &adapters).unwrap();
+        assert!(events.try_recv().is_err());
     }
 
     #[test]
@@ -1090,8 +1310,11 @@ mod tests {
         let expected = baseline.apply(second.id, sample(Some("2.0.0"), None));
         write(&store, baseline_slug, &baseline).unwrap();
         // The process can disappear after the checkpoint and before saving the receipt.
-        let recovered = commit(&store, second, sample(None, None)).unwrap();
-        assert_eq!(recovered, Some(expected));
+        let recovered = commit(&store, second, sample(None, None), true).unwrap();
+        assert_eq!(
+            recovered.map(|observation| observation.versions),
+            Some(expected)
+        );
     }
 
     #[test]
@@ -1141,7 +1364,7 @@ mod tests {
             .with_store(&state, &target, |store| {
                 let launch = receipt(1);
                 seed(store, &launch);
-                let settled = commit(store, launch, sample(Some("1.0.0"), None))?;
+                let settled = commit(store, launch, sample(Some("1.0.0"), None), true)?;
                 assert!(settled.is_some());
                 Ok(())
             })
@@ -1208,14 +1431,17 @@ mod tests {
         let evidence = launch.evidence.as_mut().unwrap();
         evidence.leader = Some(process);
         evidence.automatic = true;
-        let automatic = observe(&launch, &adapters);
+        let automatic = observe(&launch, &adapters, true);
         let automatic_probes = probes.load(Ordering::Relaxed);
         launch.evidence.as_mut().unwrap().automatic = false;
         let mut foreign_launch = launch.clone();
         foreign_launch.host = "another-host".into();
-        let foreign = observe(&foreign_launch, &adapters);
+        let foreign = observe(&foreign_launch, &adapters, true);
         let foreign_probes = probes.load(Ordering::Relaxed);
-        let manual = observe(&launch, &adapters);
+        let passive = observe(&launch, &adapters, false);
+        assert_eq!(passive.cli, None);
+        assert_eq!(probes.load(Ordering::Relaxed), 0);
+        let manual = observe(&launch, &adapters, true);
 
         child.kill().unwrap();
         child.wait().unwrap();
@@ -1299,7 +1525,7 @@ mod tests {
         {
             let store = writer.open_store().unwrap();
             seed(&*store, &first);
-            commit(&*store, first, sample(Some("1.0.0"), None)).unwrap();
+            commit(&*store, first, sample(Some("1.0.0"), None), true).unwrap();
             seed(&*store, &second);
         }
         let (entered, on_probe) = mpsc::channel();

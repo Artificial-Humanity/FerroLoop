@@ -559,6 +559,7 @@ export interface DiscoveredSessionSummary {
   thinking_level?: string | null;
   available_models?: string[] | null;
   persona?: string | null;
+  hosted_launch?: { session_id: string; hydration_generation: string };
   status: string;
   updated_at?: string | null;
   cwd?: string | null;
@@ -803,6 +804,7 @@ export interface HostedSessionSummary {
   posture?: PermissionPosture;
   hydration_dispatched: boolean;
   hydration_status?: HydrationStatus;
+  hydration_generation?: string;
   node_id: string;
   status: string;
   stop_reason?: string | null;

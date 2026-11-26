@@ -1078,7 +1078,7 @@ fn run(cli: Cli) -> Result<i32> {
             }
             let store = fl_store::open_store(&store_path)
                 .with_context(|| format!("could not open the store at {}", store_path.display()))?;
-            return match cmd::agent::run(&store, cmd) {
+            return match cmd::agent::run_with_store_file(&store, cmd, store.ferro_file()) {
                 Ok(()) => Ok(0),
                 Err((code, msg)) => {
                     eprintln!("error: {msg}");

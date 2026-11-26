@@ -1362,6 +1362,7 @@ mod tests {
             source: source.into(),
             adapter: adapter.into(),
             persona: None,
+            hosted_launch: None,
             status: status.into(),
             updated_at: None,
             cwd: None,

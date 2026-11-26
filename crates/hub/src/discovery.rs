@@ -53,6 +53,12 @@ use walkdir::WalkDir;
 
 mod execution_mode;
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiscoveredHostedLaunch {
+    pub session_id: String,
+    pub hydration_generation: String,
+}
+
 /// Summary of an active or historical agent session on the host or in the store (spec §3.2).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DiscoveredSessionSummary {
@@ -61,6 +67,10 @@ pub struct DiscoveredSessionSummary {
     pub adapter: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub persona: Option<String>,
+    /// The launch explicitly bound to this route's native session. Compare its generation
+    /// with the current hosted record before attributing launch information to the route.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hosted_launch: Option<DiscoveredHostedLaunch>,
     pub status: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub updated_at: Option<String>,
@@ -1080,6 +1090,12 @@ fn discover_sessions_from_routes(
                 source: "route".to_string(),
                 adapter: adapter.to_string(),
                 persona: Some(persona.clone()),
+                hosted_launch: entry.registered_hosted_launch(persona).map(
+                    |(session_id, generation)| DiscoveredHostedLaunch {
+                        session_id: session_id.to_owned(),
+                        hydration_generation: generation.to_owned(),
+                    },
+                ),
                 status: "active".to_string(),
                 updated_at: Some(entry.updated_at.to_string()),
                 cwd,
@@ -1103,6 +1119,7 @@ fn discover_sessions_from_routes(
                 source: "attempt".to_string(),
                 adapter: attempt.adapter.clone(),
                 persona: None,
+                hosted_launch: None,
                 status: attempt.status.clone(),
                 updated_at: attempt.updated_at.clone(),
                 cwd: Some(attempt.cwd.clone()),
@@ -10499,6 +10516,7 @@ mod tests {
                 source: "route".to_string(),
                 adapter: "codex".to_string(),
                 persona: None,
+                hosted_launch: None,
                 status: "active".to_string(),
                 updated_at: None,
                 cwd: None,
@@ -12720,6 +12738,7 @@ mod tests {
                 source: "route".into(),
                 adapter: "codex".into(),
                 persona: None,
+                hosted_launch: None,
                 status: "active".into(),
                 updated_at: None,
                 cwd: None,
@@ -15070,6 +15089,7 @@ mod tests {
             source: "route".into(),
             adapter: "grok".into(),
             persona: None,
+            hosted_launch: None,
             status: "active".into(),
             updated_at: None,
             cwd: None,

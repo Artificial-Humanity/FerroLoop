@@ -42,9 +42,11 @@ in the transcript.
 an observation has been recorded for the launch. It includes the CLI version (`cli`),
 whether a daemon version is expected (`daemon_expected`), the daemon version
 (`daemon`), and any `changes` with the component, previous version and current
-version. A null version means the observation had insufficient evidence. The CLI
-looks up the receipt for the exact Host stream in the workspace store or the store
-selected by `--db` or `FL_DB`.
+version. A null version means the observation had insufficient evidence. Direct
+`fl agent` launches record passive evidence after the persona fence is released.
+By default, `fl host list` looks up each exact Host stream in the configured Hub
+store and then in the workspace store. `--db` or `FL_DB` confines the lookup to
+the named store.
 
 FerroDeck and `fl host list` show the observed versions and flag any changes. A change
 warns the operator while allowing the launch to proceed.

@@ -319,6 +319,7 @@ mod tests {
             explicit: true,
             hosted_id: Some("claude:ada".into()),
             hydration_generation: Some("generation".into()),
+            registered_hosted_native_id: None,
             pid_start_time: proc_start_time_ticks(pid),
         };
         (dir, source, entry)

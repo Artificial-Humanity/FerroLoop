@@ -54,6 +54,11 @@ impl Fixture {
         self.command_with_db(&self.root.path().join("fl.fls"))
     }
     fn command_with_db(&self, db: &std::path::Path) -> Command {
+        let mut c = self.command_without_db();
+        c.args(["--db"]).arg(db);
+        c
+    }
+    fn command_without_db(&self) -> Command {
         let mut c = Command::new(env!("CARGO_BIN_EXE_fl"));
         c.env_clear()
             .current_dir(self.root.path())
@@ -65,9 +70,7 @@ impl Fixture {
             .env("FL_HOST_SOCK", self.endpoint.socket_path())
             .env("FL_WIRE_DISABLE_HOST_DISCOVERY", "1")
             .env("FL_WIRE_CLAUDE_BIN", self.root.path().join("vendor"))
-            .env("FL_WIRE_AGY_BIN", self.root.path().join("vendor"))
-            .args(["--db"])
-            .arg(db);
+            .env("FL_WIRE_AGY_BIN", self.root.path().join("vendor"));
         c
     }
     fn json(&self, args: &[&str], no_spawn: bool) -> Value {
@@ -206,6 +209,113 @@ fn host_list_preserves_live_rows_without_migrating_a_store() {
     assert!(text.contains("unknown"));
     assert_eq!(std::fs::read(&legacy).unwrap(), original);
     assert!(!legacy.with_extension("fls").exists());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn host_list_reports_standalone_launch_and_restart_versions_from_the_workspace_store() {
+    let f = Fixture::new();
+    let root = f.root.path();
+    let project_store = root.join("bound.fls");
+    let config_dir = root.join("config/fl");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::write(
+        config_dir.join("config.toml"),
+        format!("[[project]]\nroot = {root:?}\nstore = {project_store:?}\n"),
+    )
+    .unwrap();
+
+    let versions = root.join(".local/share/claude/versions");
+    std::fs::create_dir_all(&versions).unwrap();
+    let install = |version: &str| {
+        let executable = versions.join(version);
+        std::fs::copy("/bin/sh", &executable).unwrap();
+        std::fs::write(
+            root.join("vendor"),
+            format!("#!/bin/sh\nexec {executable:?} -c 'while IFS= read -r line; do :; done'\n"),
+        )
+        .unwrap();
+    };
+    let run = |mut command: Command, args: &[&str]| -> (Value, String) {
+        let output = command.args(args).output().unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        assert!(output.status.success(), "{args:?}: {stderr}");
+        (serde_json::from_slice(&output.stdout).unwrap(), stderr)
+    };
+    let list = |command| run(command, &["host", "list", "--json"]).0;
+
+    install("1.2.3");
+    let (started, warnings) = run(
+        f.command_without_db(),
+        &[
+            "agent",
+            "spin-up",
+            "ada",
+            "--project",
+            "FerroLoop",
+            "--role",
+            "assistant",
+            "--vendor",
+            "claude",
+            "--by",
+            "owner",
+            "--json",
+        ],
+    );
+    assert_eq!(
+        started["runtime_spawned"],
+        true,
+        "{started}: {warnings}; Host output: {:?}",
+        f.rpc()
+            .capture_output(SessionId::new("Ada.claude").unwrap(), 4096),
+    );
+    let rows = list(f.command_without_db());
+    assert_eq!(rows[0]["id"], "Ada.claude");
+    assert_eq!(rows[0]["vendor_versions"]["cli"], "1.2.3");
+    assert_eq!(rows[0]["vendor_versions"]["changes"], serde_json::json!([]));
+
+    let confined = list(f.command_with_db(&project_store));
+    assert_eq!(confined[0]["vendor_versions"], Value::Null);
+    let mut confined = f.command_without_db();
+    confined.env("FL_DB", &project_store);
+    assert_eq!(list(confined)[0]["vendor_versions"], Value::Null);
+    assert!(!project_store.exists());
+
+    let mut rpc = f.rpc();
+    let stream = rpc.list_sessions().unwrap().remove(0).stream;
+    let grant = rpc.claim_controller(stream.clone()).unwrap();
+    rpc.kill_session(stream.clone(), grant.lease).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(8);
+    while rpc
+        .list_sessions()
+        .unwrap()
+        .iter()
+        .any(|s| s.stream == stream && !matches!(s.state, ChildState::CleanupComplete(_)))
+    {
+        assert!(Instant::now() < deadline, "standalone fixture did not stop");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    install("1.2.4");
+    let (restart, warnings) = run(
+        f.command_without_db(),
+        &["agent", "restart", "claude:ada", "--by", "owner", "--json"],
+    );
+    assert_eq!(restart["runtime_live"], true);
+    assert_eq!(
+        warnings
+            .matches("version changed from 1.2.3 to 1.2.4")
+            .count(),
+        1
+    );
+    let versions = &list(f.command_without_db())[0]["vendor_versions"];
+    assert_eq!(versions["cli"], "1.2.4");
+    assert_eq!(
+        versions["changes"],
+        serde_json::json!([
+            {"component": "cli", "previous": "1.2.3", "current": "1.2.4"}
+        ])
+    );
 }
 
 #[test]
