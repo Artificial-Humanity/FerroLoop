@@ -211,6 +211,105 @@ mod tests {
     }
 
     #[test]
+    fn codex_daemon_validates_the_whole_settings_document() {
+        use VendorUpdateStatus::{Disabled, Unknown};
+
+        let root = tempfile::tempdir().unwrap();
+        let path = ".codex/app-server-daemon/settings.json";
+        for source in [
+            r#"{"updater":{"autoUpdateEnabled":false,"updateIntervalMinutes":0}}"#,
+            r#"{"updater":{"autoUpdateEnabled":false,"updateIntervalMinutes":"60"}}"#,
+            r#"{"updater":{"autoUpdateEnabled":false,"updateIntervalMinutes":4294967296}}"#,
+            r#"{"updater":{"autoUpdateEnabled":false},"shutdownGraceSeconds":301}"#,
+            r#"{"updater":{"autoUpdateEnabled":false},"shutdownGraceSeconds":null}"#,
+            r#"{"updater":{"autoUpdateEnabled":false},"remoteControlEnabled":0}"#,
+            r#"{"updater":{"autoUpdateEnabled":false},"featureOverrides":{"x":"no"}}"#,
+        ] {
+            write(root.path(), path, source);
+            let observed = facts(Some(root.path()), None, &[]);
+            assert_eq!(
+                vendor(&observed, "codex")
+                    .daemon
+                    .as_ref()
+                    .unwrap()
+                    .configured_updates,
+                Unknown,
+                "{source}",
+            );
+        }
+        write(
+            root.path(),
+            path,
+            r#"{"updater":{"autoUpdateEnabled":false,"updateIntervalMinutes":1},"shutdownGraceSeconds":300,"remoteControlEnabled":true,"featureOverrides":{"x":false}}"#,
+        );
+        let observed = facts(Some(root.path()), None, &[]);
+        assert_eq!(
+            vendor(&observed, "codex")
+                .daemon
+                .as_ref()
+                .unwrap()
+                .configured_updates,
+            Disabled,
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn codex_daemon_selects_the_managed_install_using_retained_daemon_artifacts() {
+        use VendorInstalledVersion::{Absent, Known, Unknown};
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path();
+        let legacy = write(
+            home,
+            ".codex/packages/standalone/releases/0.167.0-x86_64-unknown-linux-musl/codex",
+            "legacy-image",
+        );
+        fs::set_permissions(&legacy, fs::Permissions::from_mode(0o700)).unwrap();
+        symlink(
+            legacy.parent().unwrap(),
+            home.join(".codex/packages/standalone/current"),
+        )
+        .unwrap();
+        let version = || {
+            let observed = facts(Some(home), None, &[]);
+            vendor(&observed, "codex")
+                .daemon
+                .as_ref()
+                .unwrap()
+                .installed_version
+                .clone()
+        };
+        write(home, ".codex/app-server-daemon/daemon.lock", "");
+        assert_eq!(version(), Absent);
+
+        write(
+            home,
+            ".codex/app-server-daemon/app-server-updater.stderr.log",
+            "",
+        );
+        assert_eq!(version(), Known("0.167.0".into()));
+
+        write(home, ".codex/app-server-daemon/daemon.pid", "");
+        assert_eq!(version(), Unknown);
+        fs::remove_file(home.join(".codex/app-server-daemon/daemon.pid")).unwrap();
+
+        let dedicated = write(
+            home,
+            ".codex/packages/app-server-daemon/releases/0.172.0-x86_64-unknown-linux-musl/codex",
+            "daemon-image",
+        );
+        fs::set_permissions(&dedicated, fs::Permissions::from_mode(0o700)).unwrap();
+        symlink(
+            dedicated.parent().unwrap(),
+            home.join(".codex/packages/app-server-daemon/current"),
+        )
+        .unwrap();
+        assert_eq!(version(), Known("0.172.0".into()));
+    }
+
+    #[test]
     fn oversized_or_non_regular_config_does_not_report_a_default() {
         let root = tempfile::tempdir().unwrap();
         let config = write(root.path(), ".grok/config.toml", "[cli]\n");
