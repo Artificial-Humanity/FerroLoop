@@ -11,7 +11,7 @@ import {
   mapToPhoneView,
 } from "../components/phone/phoneNavigation";
 import { OPEN_ARTIFACT_EVENT } from "../components/RichMarkdown";
-import type { HostedSessionSummary } from "../types/api";
+import type { DiscoveredSessionSummary, HostedSessionSummary } from "../types/api";
 import { TEST_PROJECTS, TEST_WORKSPACE_AGENTS } from "./fixtures/testAgents";
 
 function makeStubApiClient(): HubApiClient {
@@ -347,17 +347,27 @@ describe("Phone shell (< 768px)", () => {
       hydration_dispatched: true, hosted: true, node_id: "lab", status: "running",
     };
     const versions = (cli: string) => ({ cli, daemon: null, daemon_expected: false, changes: [] });
-    const discovery = { sessions: [
-      { id: "codex-native", persona: "jarvis", adapter: "codex", source: "route", status: "active" },
+    const generation = "01a218bb-a7e5-7000-8000-7219bb6a4f89";
+    const codex: DiscoveredSessionSummary = {
+      id: "codex-native", persona: "jarvis", adapter: "codex", source: "route", status: "active",
+    };
+    const discovery: { sessions: DiscoveredSessionSummary[] } = { sessions: [
+      codex,
       { id: "claude-native", persona: "jarvis", adapter: "claude", source: "route", status: "active" },
-      { id: "external", persona: "jarvis", adapter: "grok", source: "route", status: "active" },
+      { id: "external", persona: "jarvis", adapter: "codex", source: "route", status: "active" },
+      {
+        id: "previous-codex", persona: "jarvis", adapter: "codex", source: "route", status: "active",
+        hosted_launch: {
+          session_id: "codex:jarvis", hydration_generation: "01a218bb-a7e4-7000-8000-7219bb6a4f89",
+        },
+      },
     ] };
     const apiClient = makeRoutedApiClient({
       "/api/v1/auth/session": { authenticated: true, authority: { tier: "owner", login: "owner" } },
       "/api/v1/agents": { agents: TEST_WORKSPACE_AGENTS, routes: [] },
       "/api/v1/projects": { projects: TEST_PROJECTS },
       "/api/v1/hosted-sessions": { sessions: [
-        { ...hosted, session_id: "codex:jarvis", vendor_session_id: "codex-native", vendor: "codex", vendor_versions: versions("1.0.0") },
+        { ...hosted, session_id: "codex:jarvis", hydration_generation: generation, vendor: "codex", vendor_versions: versions("1.0.0") },
         { ...hosted, session_id: "claude:jarvis", vendor_session_id: "claude-native", vendor: "claude", vendor_versions: versions("2.0.0") },
         { ...hosted, session_id: "grok:jarvis", vendor_session_id: "external", vendor: "grok", hosted: false, vendor_versions: versions("9.0.0") },
       ] },
@@ -373,8 +383,14 @@ describe("Phone shell (< 768px)", () => {
     render(<App apiClient={apiClient} wsClient={wsClient} />);
     if (width < 768) fireEvent.click(screen.getByTestId("phone-tab-agents"));
     fireEvent.click(await screen.findByTestId("agent-row-jarvis"));
+    const selector = await screen.findByTestId(width < 768 ? "phone-session-selector" : "session-selector");
+    expect(selector).toHaveValue("codex-native");
+    expect(screen.queryByText(/CLI version/)).not.toBeInTheDocument();
+
+    // A route can acquire its binding after the hosted launch version was already loaded.
+    codex.hosted_launch = { session_id: "codex:jarvis", hydration_generation: generation };
+    act(() => window.dispatchEvent(new Event("focus")));
     expect(await screen.findByText("CLI version 1.0.0")).toBeVisible();
-    const selector = screen.getByTestId(width < 768 ? "phone-session-selector" : "session-selector");
     fireEvent.change(selector, { target: { value: "claude-native" } });
     expect(await screen.findByText("CLI version 2.0.0")).toBeVisible();
     expect(screen.queryByText("CLI version 1.0.0")).not.toBeInTheDocument();
@@ -392,6 +408,8 @@ describe("Phone shell (< 768px)", () => {
     expect(screen.queryByText("CLI version 2.0.0")).not.toBeInTheDocument();
 
     fireEvent.change(selector, { target: { value: "external" } });
+    expect(screen.queryByText(/CLI version/)).not.toBeInTheDocument();
+    fireEvent.change(selector, { target: { value: "previous-codex" } });
     expect(screen.queryByText(/CLI version/)).not.toBeInTheDocument();
   });
 

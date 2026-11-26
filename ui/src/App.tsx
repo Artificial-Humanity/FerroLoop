@@ -10,7 +10,7 @@ import { HubApiClient, HubApiError, normalizeHubSettings } from "./api/client";
 import { HubWsClient } from "./api/ws";
 import { createTranscriptReadGuard, isObservedTranscriptTurns, isTransientTranscriptReadError, type TranscriptReadOwner, type TranscriptReadTicket } from "./lib/transcriptReadGuard";
 import { ArtifactPreviewPane } from "./components/ArtifactPreviewPane";
-import { ChatPane, coalesceTurnsWithToolOutputs } from "./components/ChatPane";
+import { ChatPane, canonicalAdapter, coalesceTurnsWithToolOutputs } from "./components/ChatPane";
 import { ContextHeader, RightPanelHeader } from "./components/ContextHeader";
 import { GitPrPane } from "./components/GitPrPane";
 import {
@@ -2527,11 +2527,15 @@ export const App: React.FC<AppProps> = ({
     ? hostedSessionsByAgent[activeAgentKey]
     : undefined;
   const versionSessionId = activeSession?.id ?? selectedSessionId;
+  const versionLaunch = activeSession?.hosted_launch;
   const matchesVersionSession = (session: HostedSessionSummary) =>
     session.hosted !== false && session.persona.trim().toLowerCase() === activeAgentKey &&
+    (!activeSession || canonicalAdapter(session.vendor) === canonicalAdapter(activeSession.adapter)) &&
     (!versionSessionId || session.session_id === versionSessionId ||
-      (session.vendor_session_id === versionSessionId &&
-        (activeSession?.id !== versionSessionId || session.vendor === activeSession.adapter)));
+      session.vendor_session_id === versionSessionId ||
+      (versionLaunch?.session_id === session.session_id &&
+        versionLaunch.hydration_generation === session.hydration_generation &&
+        activeSession?.persona?.trim().toLowerCase() === activeAgentKey));
   const versionRecord = versionSessionId
     ? hostedVersionRecords.find(matchesVersionSession)
     : selectPreferredHostedSessions(hostedVersionRecords)[activeAgentKey];
