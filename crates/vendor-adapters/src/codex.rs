@@ -27,8 +27,8 @@ use fl_core::vendor_adapter::{
     AdapterIdentityBinding, AdapterReadiness, AttachOrResumeOutcome, AttachOrResumeRequest,
     ConfigEffectiveScope, LaunchPrerequisiteRefusal, NormalizedSessionTurn, TeardownOutcome,
     TeardownTarget, TranscriptNormalizeReport, TurnDeliveryOutcome, TurnDeliveryRequest,
-    VendorAdapterError, VendorConfigSpec, VendorHostAdapter, VendorLaunchPlan, VendorLaunchRequest,
-    VendorStartupPromptRule,
+    VendorAdapterError, VendorConfigSpec, VendorDaemonLaunchEvidence, VendorHostAdapter,
+    VendorLaunchPlan, VendorLaunchRequest, VendorStartupPromptRule,
 };
 #[cfg(unix)]
 use ring::rand::{SecureRandom, SystemRandom};
@@ -271,6 +271,24 @@ impl fl_core::VendorVersionAdapter for CodexHostAdapter {
             Conn::connect_and_read_initialize(&socket, deadline, "codex_app_server_daemon").ok()?;
         initialize_server_version(&result).map(str::to_owned)
     }
+
+    #[cfg(unix)]
+    fn observe_launched_daemon_version(
+        &self,
+        config_home: &Path,
+        expected_peer_pid: u32,
+    ) -> Option<String> {
+        let socket = codex_launch_control_socket(config_home);
+        let deadline = Instant::now() + Duration::from_millis(500);
+        let (_, result) = Conn::connect_and_read_initialize_with_peer(
+            &socket,
+            deadline,
+            "codex_app_server_daemon",
+            Some(expected_peer_pid),
+        )
+        .ok()?;
+        initialize_server_version(&result).map(str::to_owned)
+    }
 }
 
 fn installed_package_version(executable: &Path) -> Option<(&str, &str)> {
@@ -332,6 +350,13 @@ impl VendorHostAdapter for CodexHostAdapter {
         &self,
         config_home: Option<&Path>,
     ) -> Result<(), LaunchPrerequisiteRefusal> {
+        self.preflight_launch_with_daemon(config_home).map(drop)
+    }
+
+    fn preflight_launch_with_daemon(
+        &self,
+        config_home: Option<&Path>,
+    ) -> Result<Option<VendorDaemonLaunchEvidence>, LaunchPrerequisiteRefusal> {
         let config_home = config_home.ok_or_else(|| {
             codex_prerequisite_refusal(
                 Path::new("<unresolved CODEX_HOME>"),
@@ -341,9 +366,19 @@ impl VendorHostAdapter for CodexHostAdapter {
         let socket = codex_launch_control_socket(config_home);
         #[cfg(unix)]
         {
-            connect_unix_with_deadline(&socket, Instant::now() + Duration::from_millis(250))
-                .map(drop)
-                .map_err(|e| codex_prerequisite_refusal(&socket, &format!("{:?}", e.kind())))
+            let socket_identity = VendorDaemonLaunchEvidence::socket_identity(&socket);
+            let stream =
+                connect_unix_with_deadline(&socket, Instant::now() + Duration::from_millis(250))
+                    .map_err(|e| codex_prerequisite_refusal(&socket, &format!("{:?}", e.kind())))?;
+            let socket_identity = socket_identity.filter(|identity| {
+                VendorDaemonLaunchEvidence::socket_identity(&socket).as_ref() == Some(identity)
+            });
+            Ok(Some(VendorDaemonLaunchEvidence {
+                config_home: config_home.to_owned(),
+                socket,
+                socket_identity,
+                peer_pid: unix_peer_pid(&stream),
+            }))
         }
         #[cfg(not(unix))]
         {
@@ -1478,6 +1513,38 @@ struct Conn {
 }
 
 #[cfg(unix)]
+fn unix_peer_pid(stream: &UnixStream) -> Option<u32> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+
+        let mut cred = std::mem::MaybeUninit::<libc::ucred>::uninit();
+        let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+        // getsockopt writes the peer credentials into a correctly sized buffer.
+        let rc = unsafe {
+            libc::getsockopt(
+                stream.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_PEERCRED,
+                cred.as_mut_ptr().cast(),
+                &mut len,
+            )
+        };
+        if rc != 0 || len as usize != std::mem::size_of::<libc::ucred>() {
+            return None;
+        }
+        u32::try_from(unsafe { cred.assume_init() }.pid)
+            .ok()
+            .filter(|pid| *pid > 0)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = stream;
+        None
+    }
+}
+
+#[cfg(unix)]
 impl Conn {
     fn connect_and_initialize(sock: &Path, deadline: Instant) -> Result<Self, (RpcStage, String)> {
         let (mut conn, _) = Self::connect_and_read_initialize(sock, deadline, "ferroloop")?;
@@ -1491,6 +1558,15 @@ impl Conn {
         deadline: Instant,
         client_name: &str,
     ) -> Result<(Self, Value), (RpcStage, String)> {
+        Self::connect_and_read_initialize_with_peer(sock, deadline, client_name, None)
+    }
+
+    fn connect_and_read_initialize_with_peer(
+        sock: &Path,
+        deadline: Instant,
+        client_name: &str,
+        expected_peer_pid: Option<u32>,
+    ) -> Result<(Self, Value), (RpcStage, String)> {
         let stream = connect_unix_with_deadline(sock, deadline).map_err(|e| {
             (
                 RpcStage::Connect,
@@ -1500,6 +1576,14 @@ impl Conn {
                 ),
             )
         })?;
+        if let Some(expected_pid) = expected_peer_pid
+            && unix_peer_pid(&stream) != Some(expected_pid)
+        {
+            return Err((
+                RpcStage::Connect,
+                "app-server peer changed since launch".into(),
+            ));
+        }
         let mut conn = Self {
             stream,
             rbuf: Vec::new(),

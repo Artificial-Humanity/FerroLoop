@@ -1245,6 +1245,7 @@ delegate! {
     }
     StateStore {
         fn upsert_state(&self, args: UpsertStateArgs) -> Result<StateEntry, StoreError>;
+        fn upsert_state_if_current(&self, args: UpsertStateArgs, expected: Option<&RevisionId>) -> Result<Option<StateEntry>, StoreError>;
         fn retire_memory(&self, scope: &StateScope, slug: &str, lifecycle: MemoryLifecycle, superseded_by: Option<StateId>, at: At, by: &str) -> Result<StateEntry, StoreError>;
         fn get_state(&self, id: &StateId) -> Result<Option<StateEntry>, StoreError>;
         fn get_state_by_key(&self, scope: &StateScope, concern: StateConcern, slug: &str) -> Result<Option<StateEntry>, StoreError>;

@@ -1460,6 +1460,34 @@ impl HubState {
         Err(last_err.expect("at least one attempt ran"))
     }
 
+    /// The version observer can defer a pass if a CLI or lifecycle operation owns the store.
+    pub(crate) fn try_open_version_observation_store(
+        &self,
+    ) -> Result<HubStoreGuard<'_>, StoreError> {
+        let guard = match self.store_lock.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::Poisoned(err)) => err.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                return Err(StoreError::Unreachable {
+                    store: "workspace state store".into(),
+                    cause: "workspace state store is busy".into(),
+                });
+            }
+        };
+        let store = fl_store::open_store_with(
+            &self.config.store_path,
+            &fl_store::StoreOptions {
+                backend: self.store_backend,
+                retries: 0,
+                unmigrated: fl_store::Unmigrated::Refuse,
+            },
+        )?;
+        Ok(HubStoreGuard {
+            store: Some(store),
+            _guard: Some(guard),
+        })
+    }
+
     /// Pre-fence candidate selection may refuse a busy local guard. Owned operations use
     /// `open_store` so polling and post-watch reopen contention wait in rank order.
     pub(crate) fn try_open_lifecycle_store(

@@ -658,8 +658,12 @@ impl AgentRegistry for FerroStore {
     }
 }
 
-impl StateStore for FerroStore {
-    fn upsert_state(&self, args: UpsertStateArgs) -> Result<StateEntry, StoreError> {
+impl FerroStore {
+    fn upsert_state_when(
+        &self,
+        args: UpsertStateArgs,
+        expected: Option<Option<&RevisionId>>,
+    ) -> Result<Option<StateEntry>, StoreError> {
         let slug =
             validate_slug(&args.slug).map_err(|err| StoreError::InvalidState(err.to_string()))?;
         let concern = args.payload.concern();
@@ -672,6 +676,11 @@ impl StateStore for FerroStore {
                 Some(id_str) => doc::get_json::<StateEntry>(txn, STATE_ENTRIES, &id_str)?,
                 None => None,
             };
+            if let Some(expected) = expected
+                && existing.as_ref().map(|entry| &entry.head_revision) != expected
+            {
+                return Ok(None);
+            }
             if let Some(ref existing) = existing
                 && let Some(conflict) =
                     doc::get_json::<StateConflict>(txn, STATE_CONFLICTS, existing.id.as_str())?
@@ -753,8 +762,23 @@ impl StateStore for FerroStore {
             append_state_revision(txn, &rev)?;
             doc::put_json(txn, STATE_ENTRIES, entry_id.as_str(), &entry)?;
             doc::put_json(txn, STATE_KEYS, &key, &entry_id.as_str())?;
-            Ok(entry)
+            Ok(Some(entry))
         })
+    }
+}
+
+impl StateStore for FerroStore {
+    fn upsert_state(&self, args: UpsertStateArgs) -> Result<StateEntry, StoreError> {
+        self.upsert_state_when(args, None)
+            .map(|entry| entry.expect("unconditional state upsert always writes"))
+    }
+
+    fn upsert_state_if_current(
+        &self,
+        args: UpsertStateArgs,
+        expected: Option<&RevisionId>,
+    ) -> Result<Option<StateEntry>, StoreError> {
+        self.upsert_state_when(args, Some(expected))
     }
 
     fn retire_memory(

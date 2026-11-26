@@ -41,6 +41,11 @@ pub use exit_evidence::HostedExitIncident;
 mod fence_tests;
 mod lock;
 mod recovery;
+pub(crate) mod vendor_versions;
+pub use vendor_versions::{
+    HostedVendorVersionChange, HostedVendorVersionComponent, HostedVendorVersions,
+    hosted_vendor_versions_for_stream, set_global_vendor_version_adapters,
+};
 
 #[cfg(test)]
 use crate::api::canonical_reforge_prompt;
@@ -519,6 +524,19 @@ pub trait SessionRuntime: std::fmt::Debug {
         (self.spawn(session, window, cwd, launch, hosted_id), None)
     }
 
+    /// Keep the leader PID from the same native Host response as the exact stream.
+    fn spawn_with_launch_identity(
+        &self,
+        session: &str,
+        window: &str,
+        cwd: Option<&str>,
+        launch: Option<&LaunchSpec>,
+        hosted_id: &str,
+    ) -> (bool, Option<fl_host_proto::StreamId>, Option<u32>) {
+        let (spawned, stream) = self.spawn_with_stream(session, window, cwd, launch, hosted_id);
+        (spawned, stream, None)
+    }
+
     fn rollback_host_spawn(&self, _stream: &fl_host_proto::StreamId, unit: &str, hosted_id: &str) {
         let _ = self.kill(unit, hosted_id);
     }
@@ -981,6 +999,12 @@ pub(crate) use fl_wire::vendor_adapter::{
     resolve_vendor_bin, split_window_tag, with_local_bin,
 };
 
+struct CheckedVendorConfig {
+    home: PathBuf,
+    daemon_expected: bool,
+    daemon: Option<vendor_versions::DaemonEvidence>,
+}
+
 /// Read-only launch checks run independently of adapter selection. Return the checked
 /// configuration directory so a daemon child cannot inherit a different CODEX_HOME.
 fn preflight_vendor_launch(
@@ -988,7 +1012,7 @@ fn preflight_vendor_launch(
     vendor: &str,
     hosted: bool,
     cwd: &mut Option<String>,
-) -> Result<Option<PathBuf>, LifecycleError> {
+) -> Result<Option<CheckedVendorConfig>, LifecycleError> {
     if vendor != "codex" || !hosted || !env.spawn_runtime {
         return Ok(None);
     }
@@ -1020,37 +1044,48 @@ fn preflight_vendor_launch(
             .ok_or_else(|| invalid_field("cwd", "must be valid UTF-8"))?
             .to_string(),
     );
-    if env
+    let daemon_expected = env
         .vendor_launch_options_for_vendor(vendor, fl_core::permissions::Posture::Auto)
-        .remote_control
-    {
-        check_vendor_launch_prerequisite(env, vendor, Some(&config_home))?;
-    }
-    Ok(Some(config_home))
+        .remote_control;
+    let daemon = if daemon_expected {
+        check_vendor_launch_prerequisite(env, vendor, Some(&config_home))?
+            .map(vendor_versions::DaemonEvidence::capture)
+    } else {
+        None
+    };
+    Ok(Some(CheckedVendorConfig {
+        home: config_home,
+        daemon_expected,
+        daemon,
+    }))
 }
 
 fn check_vendor_launch_prerequisite(
     env: &LifecycleEnv<'_>,
     vendor: &str,
     config_home: Option<&Path>,
-) -> Result<(), LifecycleError> {
+) -> Result<Option<fl_core::vendor_adapter::VendorDaemonLaunchEvidence>, LifecycleError> {
     #[cfg(test)]
     TEST_LAUNCH_PREREQUISITE_CALLS.with(|calls| calls.set(calls.get() + 1));
     #[cfg(test)]
     if let Some(result) =
         TEST_LAUNCH_PREREQUISITE_SEQUENCE.with(|slot| slot.borrow_mut().pop_front())
     {
-        return result.map_err(|r| LifecycleError::PrerequisiteUnavailable {
-            code: r.code,
-            detail: r.detail,
-        });
+        return result
+            .map(|()| None)
+            .map_err(|r| LifecycleError::PrerequisiteUnavailable {
+                code: r.code,
+                detail: r.detail,
+            });
     }
     #[cfg(test)]
     if let Some(result) = TEST_LAUNCH_PREREQUISITE.with(|slot| slot.borrow().clone()) {
-        return result.map_err(|r| LifecycleError::PrerequisiteUnavailable {
-            code: r.code,
-            detail: r.detail,
-        });
+        return result
+            .map(|()| None)
+            .map_err(|r| LifecycleError::PrerequisiteUnavailable {
+                code: r.code,
+                detail: r.detail,
+            });
     }
     // Production hosted Codex launch must never silently fall back around its prerequisite.
     let adapter =
@@ -1060,7 +1095,7 @@ fn check_vendor_launch_prerequisite(
                 detail: "launch adapter unavailable".into(),
             })?;
     adapter
-        .preflight_launch(config_home)
+        .preflight_launch_with_daemon(config_home)
         .map_err(|r| LifecycleError::PrerequisiteUnavailable {
             code: r.code,
             detail: bounded_prerequisite_detail(&r.detail),
@@ -2132,21 +2167,31 @@ impl SessionRuntime for HostRuntime {
         launch: Option<&LaunchSpec>,
         hosted_id: &str,
     ) -> (bool, Option<fl_host_proto::StreamId>) {
+        let (spawned, stream, _) =
+            self.spawn_with_launch_identity(session, window, cwd, launch, hosted_id);
+        (spawned, stream)
+    }
+
+    fn spawn_with_launch_identity(
+        &self,
+        session: &str,
+        window: &str,
+        cwd: Option<&str>,
+        launch: Option<&LaunchSpec>,
+        hosted_id: &str,
+    ) -> (bool, Option<fl_host_proto::StreamId>, Option<u32>) {
         if use_legacy_tmux_fallback() {
-            return (
-                TmuxRuntime.spawn(session, window, cwd, launch, hosted_id),
-                None,
-            );
+            return TmuxRuntime.spawn_with_launch_identity(session, window, cwd, launch, hosted_id);
         }
         let session = session.trim();
         let window = window.trim();
         if session.is_empty()
             || (session == MUSE_SESSION && (window.is_empty() || hosted_id.trim().is_empty()))
         {
-            return (false, None);
+            return (false, None, None);
         }
         let Some(mut client) = connect_host_client() else {
-            return (false, None);
+            return (false, None, None);
         };
         // Ownership must be verifiable before a child is created: an older host cannot
         // satisfy the survival check or safely clean up the newly launched runtime.
@@ -2156,10 +2201,10 @@ impl SessionRuntime for HostRuntime {
                 Ok(fl_host_proto::ExtensionResponse::Capabilities { features, .. })
                     if features & fl_host_proto::SESSION_OWNER_FEATURE != 0)
         {
-            return (false, None);
+            return (false, None, None);
         }
         let Ok(sessions) = client.list_sessions() else {
-            return (false, None);
+            return (false, None, None);
         };
         let raw_id = if window.is_empty() {
             session.to_string()
@@ -2167,13 +2212,13 @@ impl SessionRuntime for HostRuntime {
             format!("{session}.{window}")
         };
         let Ok(session_id) = fl_host_proto::SessionId::new(&raw_id) else {
-            return (false, None);
+            return (false, None, None);
         };
         if sessions.iter().any(|s| {
             s.stream.session == session_id
                 && !matches!(s.state, fl_host_proto::ChildState::CleanupComplete(_))
         }) {
-            return (false, None);
+            return (false, None, None);
         }
         let argv = match launch {
             Some(spec) if !spec.argv.is_empty() => spec.argv.clone(),
@@ -2197,11 +2242,11 @@ impl SessionRuntime for HostRuntime {
                 env_allow: env_allow.clone(),
             };
             match client.spawn_pty_session(pty_spec, None) {
-                Ok((id, _)) => return (true, Some(id)),
+                Ok((id, child)) => return (true, Some(id), running_leader_pid(child)),
                 Err(err)
                     if matches!(err, fl_host_proto::HostError::Unsupported { .. })
                         || err.to_string().contains("Unsupported") => {}
-                Err(_) => return (false, None),
+                Err(_) => return (false, None, None),
             }
         }
         env_allow.insert("FL_HOST_PTY".to_string());
@@ -2214,10 +2259,10 @@ impl SessionRuntime for HostRuntime {
             env: env_map,
             env_allow,
         };
-        if let Ok((id, _)) = client.spawn_reliable_session(pipe_spec) {
-            (true, Some(id))
+        if let Ok((id, child)) = client.spawn_reliable_session(pipe_spec) {
+            (true, Some(id), running_leader_pid(child))
         } else {
-            (false, None)
+            (false, None, None)
         }
     }
 
@@ -2447,6 +2492,13 @@ impl SessionRuntime for HostRuntime {
     }
 }
 
+fn running_leader_pid(child: fl_host_proto::ChildState) -> Option<u32> {
+    match child {
+        fl_host_proto::ChildState::Running(record) => Some(record.pid).filter(|pid| *pid > 0),
+        _ => None,
+    }
+}
+
 fn select_host_recorded_pid(
     sessions: &[fl_host_proto::SessionSummary],
     wanted: &fl_host_proto::SessionId,
@@ -2534,7 +2586,19 @@ impl SessionRuntime for TmuxRuntime {
         launch: Option<&LaunchSpec>,
         hosted_id: &str,
     ) -> bool {
-        spawn_tmux_runtime(session, window, cwd, launch, hosted_id)
+        spawn_tmux_runtime(session, window, cwd, launch, hosted_id, false).0
+    }
+
+    fn spawn_with_launch_identity(
+        &self,
+        session: &str,
+        window: &str,
+        cwd: Option<&str>,
+        launch: Option<&LaunchSpec>,
+        hosted_id: &str,
+    ) -> (bool, Option<fl_host_proto::StreamId>, Option<u32>) {
+        let (spawned, pane_pid) = spawn_tmux_runtime(session, window, cwd, launch, hosted_id, true);
+        (spawned, None, pane_pid)
     }
 
     fn kill(&self, unit: &str, hosted_id: &str) -> bool {
@@ -5119,12 +5183,28 @@ fn spawn_tmux_runtime(
     cwd: Option<&str>,
     launch: Option<&LaunchSpec>,
     hosted_id: &str,
-) -> bool {
+    record_pid: bool,
+) -> (bool, Option<u32>) {
     if session == MUSE_SESSION {
-        return spawn_muse_window(window, cwd, launch, hosted_id);
+        return spawn_muse_window(window, cwd, launch, hosted_id, record_pid);
     }
-    let args = tmux_new_session_args_with_hosted_id(session, window, cwd, launch, hosted_id);
-    tmux_ok(&args.iter().map(String::as_str).collect::<Vec<_>>())
+    let mut args = tmux_new_session_args_with_hosted_id(session, window, cwd, launch, hosted_id);
+    if !record_pid {
+        return (
+            tmux_ok(&args.iter().map(String::as_str).collect::<Vec<_>>()),
+            None,
+        );
+    }
+    // Capture the pane PID in the existing spawn call, before its unit can be replaced.
+    args.splice(2..2, ["-P", "-F", "#{pane_pid}"].map(String::from));
+    match tmux_stdout(&args.iter().map(String::as_str).collect::<Vec<_>>()) {
+        Some(out) => (true, tmux_pane_pid(&out)),
+        None => (false, None),
+    }
+}
+
+fn tmux_pane_pid(out: &str) -> Option<u32> {
+    out.trim().parse().ok().filter(|pid| *pid > 0)
 }
 
 /// Open a window named `window` in the shared Muse session: a new window when the session
@@ -5142,28 +5222,41 @@ fn spawn_muse_window(
     cwd: Option<&str>,
     launch: Option<&LaunchSpec>,
     hosted_id: &str,
-) -> bool {
+    record_pid: bool,
+) -> (bool, Option<u32>) {
     if hosted_id.is_empty() {
-        return false;
+        return (false, None);
     }
     let session_runs = tmux_session_exists(MUSE_SESSION);
     if session_runs && listed_window_count(MUSE_SESSION, window) != Some(0) {
-        return false;
+        return (false, None);
     }
-    let args = tmux_muse_spawn_args_with_hosted_id(session_runs, window, cwd, launch, hosted_id);
-    let Some(out) = tmux_stdout(&args.iter().map(String::as_str).collect::<Vec<_>>()) else {
-        return false;
+    let output_format = if record_pid {
+        "#{window_id}\t#{pane_pid}"
+    } else {
+        "#{window_id}"
     };
-    let id = out.trim();
+    let args = tmux_muse_spawn_args_with_hosted_id(
+        session_runs,
+        window,
+        cwd,
+        launch,
+        hosted_id,
+        output_format,
+    );
+    let Some(out) = tmux_stdout(&args.iter().map(String::as_str).collect::<Vec<_>>()) else {
+        return (false, None);
+    };
+    let (id, pid) = out.trim().split_once('\t').unwrap_or((out.trim(), ""));
     if !is_window_id(id) {
         // The window may exist, but without its id it cannot be marked or removed safely.
-        return false;
+        return (false, None);
     }
     if tmux_ok(&["set-option", "-w", "-t", id, HOSTED_MARK, hosted_id]) {
-        return true;
+        return (true, tmux_pane_pid(pid));
     }
     let _ = tmux_ok(&["kill-window", "-t", id]);
-    false
+    (false, None)
 }
 
 /// `true` for a tmux window id (`@12`): unique within one tmux server's life, never reused.
@@ -5237,7 +5330,7 @@ fn tmux_muse_spawn_args(
     cwd: Option<&str>,
     launch: Option<&LaunchSpec>,
 ) -> Vec<String> {
-    tmux_muse_spawn_args_with_hosted_id(session_runs, window, cwd, launch, "")
+    tmux_muse_spawn_args_with_hosted_id(session_runs, window, cwd, launch, "", "#{window_id}")
 }
 
 fn tmux_muse_spawn_args_with_hosted_id(
@@ -5246,6 +5339,7 @@ fn tmux_muse_spawn_args_with_hosted_id(
     cwd: Option<&str>,
     launch: Option<&LaunchSpec>,
     hosted_id: &str,
+    output_format: &str,
 ) -> Vec<String> {
     // `-P -F '#{window_id}'` prints the new window's id, to mark the window by.
     let mut args: Vec<String> = if session_runs {
@@ -5255,7 +5349,7 @@ fn tmux_muse_spawn_args_with_hosted_id(
             "-d",
             "-P",
             "-F",
-            "#{window_id}",
+            output_format,
             "-t",
             &target,
             "-n",
@@ -5269,7 +5363,7 @@ fn tmux_muse_spawn_args_with_hosted_id(
             "-d",
             "-P",
             "-F",
-            "#{window_id}",
+            output_format,
             "-s",
             MUSE_SESSION,
             "-n",
@@ -6590,7 +6684,10 @@ where
             (sid, spec)
         }
     };
-    pin_launch_config(&mut launch, config_home.as_deref());
+    pin_launch_config(
+        &mut launch,
+        config_home.as_ref().map(|config| config.home.as_path()),
+    );
     register_spun_up_agent(store, &v, by)?;
 
     let now = now_ms();
@@ -6683,6 +6780,7 @@ where
             &mut respawn_state,
             &record,
             launch.as_ref(),
+            config_home.as_ref(),
             by,
         )?;
     if raw_spawned && let Some(target) = tmux_target.as_deref() {
@@ -6832,7 +6930,10 @@ where
                 vendor_session_id.as_deref(),
                 Some(&hydration_generation),
             )?;
-            pin_launch_config(&mut launch, config_home.as_deref());
+            pin_launch_config(
+                &mut launch,
+                config_home.as_ref().map(|config| config.home.as_path()),
+            );
             record.vendor_session_id = vendor_session_id;
             record.hydration_generation = Some(hydration_generation.clone());
             record.hydration_status = HydrationStatus::Unconfirmed;
@@ -6849,6 +6950,7 @@ where
                 &mut respawn_state,
                 &record,
                 launch.as_ref(),
+                config_home.as_ref(),
                 by,
             )?;
             if !raw_spawned && let Some(exit) = failed_resume {
@@ -9076,7 +9178,10 @@ where
             }
         }
     };
-    pin_launch_config(&mut launch, config_home.as_deref());
+    pin_launch_config(
+        &mut launch,
+        config_home.as_ref().map(|config| config.home.as_path()),
+    );
     if !will_spawn && !is_claude_resume && existing_gen.is_some() {
         let _ = store.delete_state_by_key(
             &StateScope::Workspace,
@@ -9130,6 +9235,7 @@ where
             &mut respawn_state,
             &record,
             launch.as_ref(),
+            config_home.as_ref(),
             by,
         )?;
     let _reopened_guard;
@@ -9283,7 +9389,10 @@ where
                 record.vendor_session_id.as_deref(),
                 Some(&hydration_generation),
             )?;
-            pin_launch_config(&mut launch, config_home.as_deref());
+            pin_launch_config(
+                &mut launch,
+                config_home.as_ref().map(|config| config.home.as_path()),
+            );
             persist_hosted_session(store, &record, by)?;
             let retry_raw = exit_evidence::spawn_and_remember(
                 store,
@@ -9291,6 +9400,7 @@ where
                 &mut respawn_state,
                 &record,
                 launch.as_ref(),
+                config_home.as_ref(),
                 by,
             )?;
             if retry_raw {
@@ -9369,7 +9479,11 @@ where
             .vendor_launch_options_for_vendor(&record.vendor, record.posture)
             .remote_control
         && let Err(err @ LifecycleError::PrerequisiteUnavailable { .. }) =
-            check_vendor_launch_prerequisite(env, &record.vendor, config_home.as_deref())
+            check_vendor_launch_prerequisite(
+                env,
+                &record.vendor,
+                config_home.as_ref().map(|config| config.home.as_path()),
+            )
     {
         if raw_spawned {
             let observed_at_ms = current_respawn_clock_ms();
@@ -22579,8 +22693,10 @@ mod tests {
             ..evidence.clone()
         });
         assert!(
-            exit_evidence::spawn_and_remember(&store, &env, &mut state, &record, None, "owner",)
-                .unwrap()
+            exit_evidence::spawn_and_remember(
+                &store, &env, &mut state, &record, None, None, "owner",
+            )
+            .unwrap()
         );
         let summary = SessionSummary {
             stream: stream.clone(),
@@ -23815,6 +23931,7 @@ mod tests {
                 &env,
                 &mut state,
                 &record,
+                None,
                 None,
                 AUTO_RESPAWN_ACTOR,
             )

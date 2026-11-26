@@ -9081,6 +9081,8 @@ fn handle_get_hosted_sessions(state: &HubState, authority: &HubAuthority) -> Htt
         record: lifecycle::HostedSessionRecord,
         #[serde(skip_serializing_if = "Option::is_none")]
         recovery_attention: Option<lifecycle::HostedRecoveryAttention>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        vendor_versions: Option<lifecycle::HostedVendorVersions>,
     }
 
     let Ok(store) = open_store_response(state) else {
@@ -9106,9 +9108,12 @@ fn handle_get_hosted_sessions(state: &HubState, authority: &HubAuthority) -> Htt
             } else {
                 None
             };
+            let vendor_versions =
+                lifecycle::vendor_versions::hosted_vendor_versions_for_record(&*store, &record);
             HostedSessionView {
                 record,
                 recovery_attention,
+                vendor_versions,
             }
         })
         .collect();

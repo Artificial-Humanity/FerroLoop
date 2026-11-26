@@ -30,6 +30,9 @@ pub fn now_at() -> At {
 
 /// Compose and install the concrete [`fl_core::VendorHostAdapterRegistry`] from `fl-vendor-adapters`.
 pub fn composed_vendor_host_adapters() -> &'static fl_core::VendorHostAdapterRegistry {
+    fl_hub::lifecycle::set_global_vendor_version_adapters(
+        fl_vendor_adapters::default_vendor_version_registry(),
+    );
     fl_hub::lifecycle::set_global_vendor_host_adapters(
         fl_vendor_adapters::default_vendor_host_adapter_registry(),
     )

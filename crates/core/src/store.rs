@@ -783,6 +783,20 @@ pub trait AgentRegistry {
 /// Durable project/agent memory, handoff snapshots, and workflow runtime state (spec §1, §3).
 pub trait StateStore {
     fn upsert_state(&self, args: UpsertStateArgs) -> Result<StateEntry, StoreError>;
+
+    /// Update only when the current revision agrees. `None` expects a new entry.
+    /// Stores supporting concurrent callers must check and write in one transaction.
+    fn upsert_state_if_current(
+        &self,
+        args: UpsertStateArgs,
+        expected: Option<&RevisionId>,
+    ) -> Result<Option<StateEntry>, StoreError> {
+        let current = self.get_state_by_key(&args.scope, args.payload.concern(), &args.slug)?;
+        if current.as_ref().map(|entry| &entry.head_revision) != expected {
+            return Ok(None);
+        }
+        self.upsert_state(args).map(Some)
+    }
     fn retire_memory(
         &self,
         scope: &StateScope,

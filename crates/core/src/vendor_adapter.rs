@@ -397,6 +397,15 @@ pub trait VendorHostAdapter: fmt::Debug + Send + Sync {
 
     // --- 1. Identity & Lifecycle -------------------------------------------
 
+    /// Reuse the launch prerequisite check to capture an optional daemon identity.
+    /// Implementations must not perform an additional probe.
+    fn preflight_launch_with_daemon(
+        &self,
+        config_home: Option<&Path>,
+    ) -> Result<Option<VendorDaemonLaunchEvidence>, LaunchPrerequisiteRefusal> {
+        self.preflight_launch(config_home).map(|()| None)
+    }
+
     /// Read-only prerequisite check immediately before a hosted launch. `config_home` is
     /// the effective configuration directory pinned into the child, not a delivery endpoint.
     /// Launch-plan preparation remains deterministic and performs no availability probes.
@@ -604,6 +613,40 @@ impl VendorHostAdapterRegistry {
     }
 }
 
+/// A shared daemon endpoint and peer returned by an existing launch prerequisite check.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VendorDaemonLaunchEvidence {
+    pub config_home: PathBuf,
+    pub socket: PathBuf,
+    /// Filesystem socket identity: device, inode, ctime seconds, ctime nanoseconds.
+    pub socket_identity: Option<(u64, u64, i64, i64)>,
+    pub peer_pid: Option<u32>,
+}
+
+impl VendorDaemonLaunchEvidence {
+    pub fn socket_identity(path: &Path) -> Option<(u64, u64, i64, i64)> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{FileTypeExt, MetadataExt};
+
+            let metadata = std::fs::metadata(path).ok()?;
+            metadata.file_type().is_socket().then(|| {
+                (
+                    metadata.dev(),
+                    metadata.ino(),
+                    metadata.ctime(),
+                    metadata.ctime_nsec(),
+                )
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = path;
+            None
+        }
+    }
+}
+
 /// Version evidence for one hosted vendor. Concrete install and protocol knowledge stays in the
 /// vendor adapter crate. Unknown evidence is `None`.
 pub trait VendorVersionAdapter: fmt::Debug + Send + Sync {
@@ -623,6 +666,16 @@ pub trait VendorVersionAdapter: fmt::Debug + Send + Sync {
     /// must run this away from the launch path and pass the vendor configuration directory pinned
     /// into the launch. This must never start a daemon or vendor CLI.
     fn observe_daemon_version(&self, _config_home: &Path) -> Option<String> {
+        None
+    }
+
+    /// Like `observe_daemon_version`, but verifies that this connection reached the
+    /// same peer PID recorded by the original prerequisite check before exchanging RPCs.
+    fn observe_launched_daemon_version(
+        &self,
+        _config_home: &Path,
+        _expected_peer_pid: u32,
+    ) -> Option<String> {
         None
     }
 }
