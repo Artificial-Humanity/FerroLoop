@@ -3926,6 +3926,7 @@ fn host_build_identity_is_opt_in() {
     let expected = expected
         | fl_host_proto::PTY_FEATURE
         | fl_host_proto::RENDERED_PTY_FEATURE
+        | fl_host_proto::RENDERED_CURSOR_STYLE_FEATURE
         | fl_host_proto::HOSTED_EXIT_EVIDENCE_FEATURE;
     assert_eq!(features, expected);
     let request = serde_json::from_str(r#"{"op":"host_status"}"#).unwrap();
@@ -4340,6 +4341,58 @@ fn default_pty_capacity_supports_sixteen_live_gated_children() {
             }
         ));
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn rendered_cursor_style_redraw_and_epoch_use_the_same_capture() {
+    let daemon = Daemon::start(DaemonOpts { chunk: None });
+    let mut rpc = daemon.rpc();
+    let mut child = spec("cursor-style", &[]);
+    child.argv = vec![
+        "/bin/sh".into(),
+        "-c".into(),
+        r"stty -echo; printf '❯ \033[2mA suggested action\033[22m\033[3G'; read line; printf 'A suggested action\033[3G'; read line".into(),
+    ];
+    child.kind = SpawnKind::Pty;
+    let (stream, _) = rpc.inner.spawn_pty_session(child, None).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let capture = |rpc: &mut Rpc| {
+        rpc.inner
+            .capture_rendered_cursor_style(stream.clone())
+            .unwrap()
+    };
+    let dim = rendered_deadline::wait(deadline, "initial dim suffix", || {
+        let (screen, proof) = capture(&mut rpc);
+        (screen.contents == "❯ A suggested action" && screen.cursor_col == 2)
+            .then_some((screen, proof))
+    });
+    assert_eq!(dim.1, Some(0));
+    assert_eq!(dim.0.stream, stream);
+    assert_eq!(rpc.inner.capture_rendered(stream.clone()).unwrap(), dim.0);
+
+    let lease = rpc.inner.claim_controller(stream.clone()).unwrap().lease;
+    rpc.inner
+        .write_raw(stream.clone(), lease, b"redraw\n".to_vec())
+        .unwrap();
+    let plain = rendered_deadline::wait(deadline, "redraw without dim styling", || {
+        let (screen, proof) = capture(&mut rpc);
+        (screen.output_bytes > dim.0.output_bytes && screen.cursor_col == 2)
+            .then_some((screen, proof))
+    });
+    assert_eq!(plain.0.contents, dim.0.contents);
+    assert_eq!(plain.1, None);
+
+    let mut stale = stream;
+    stale.epoch.0 += 1;
+    assert_eq!(
+        rpc.inner
+            .extension_request(XReq::CaptureRenderedCursorStyle { stream: stale })
+            .unwrap(),
+        XResp::Refused {
+            code: Refuse::StaleEpoch
+        }
+    );
 }
 
 // Catches missing opt-in host support, name-based identity fallback and ioctl/parser divergence.

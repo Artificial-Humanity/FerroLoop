@@ -338,6 +338,7 @@ impl AsyncHostClient {
             | R::KillSession { stream, .. }
             | R::Write { stream, .. }
             | R::CaptureRendered { stream }
+            | R::CaptureRenderedCursorStyle { stream }
             | R::Resize { stream, .. } => Some(stream.clone()),
             R::Ack { cursor, .. } => Some(cursor.stream.clone()),
             _ => None,
@@ -691,9 +692,10 @@ impl AsyncHostClient {
         Ok(features)
     }
 
-    async fn require_rendered_pty(&mut self) -> Result<(), HostError> {
-        if self.extension_features().await? & crate::RENDERED_PTY_FEATURE != 0 {
-            Ok(())
+    async fn require_rendered_pty(&mut self) -> Result<u64, HostError> {
+        let features = self.extension_features().await?;
+        if features & crate::RENDERED_PTY_FEATURE != 0 {
+            Ok(features)
         } else {
             Err(HostError::Unsupported {
                 subject: "rendered PTY",
@@ -705,12 +707,38 @@ impl AsyncHostClient {
         &mut self,
         stream: crate::StreamId,
     ) -> Result<crate::RenderedScreen, HostError> {
-        self.require_rendered_pty().await?;
-        match self
-            .diagnosed_extension_request(crate::ExtensionRequest::CaptureRendered { stream })
-            .await?
-        {
-            crate::ExtensionResponse::RenderedCapture { screen } => Ok(screen),
+        self.capture_rendered_inner(stream, false)
+            .await
+            .map(|(screen, _)| screen)
+    }
+
+    /// Return the rendered screen and an optional dim suffix line. On legacy
+    /// hosts, use the plain capture and leave the dim suffix unproven.
+    pub async fn capture_rendered_cursor_style(
+        &mut self,
+        stream: crate::StreamId,
+    ) -> Result<(crate::RenderedScreen, Option<u16>), HostError> {
+        self.capture_rendered_inner(stream, true).await
+    }
+
+    async fn capture_rendered_inner(
+        &mut self,
+        stream: crate::StreamId,
+        include_cursor_style: bool,
+    ) -> Result<(crate::RenderedScreen, Option<u16>), HostError> {
+        let features = self.require_rendered_pty().await?;
+        let styled = include_cursor_style && features & crate::RENDERED_CURSOR_STYLE_FEATURE != 0;
+        let request = if styled {
+            crate::ExtensionRequest::CaptureRenderedCursorStyle { stream }
+        } else {
+            crate::ExtensionRequest::CaptureRendered { stream }
+        };
+        match self.diagnosed_extension_request(request).await? {
+            crate::ExtensionResponse::RenderedCapture { screen } if !styled => Ok((screen, None)),
+            crate::ExtensionResponse::RenderedCursorStyleCapture {
+                screen,
+                dim_suffix_line,
+            } if styled => Ok((screen, dim_suffix_line)),
             other => Err(HostError::Protocol(format!(
                 "capture_rendered refused: {other:?}"
             ))),
@@ -978,6 +1006,15 @@ impl BlockingHostClient {
         stream: crate::StreamId,
     ) -> Result<crate::RenderedScreen, HostError> {
         self.runtime.block_on(self.inner.capture_rendered(stream))
+    }
+
+    /// Blocking counterpart of `AsyncHostClient::capture_rendered_cursor_style`.
+    pub fn capture_rendered_cursor_style(
+        &mut self,
+        stream: crate::StreamId,
+    ) -> Result<(crate::RenderedScreen, Option<u16>), HostError> {
+        self.runtime
+            .block_on(self.inner.capture_rendered_cursor_style(stream))
     }
 
     pub fn resize_session(
@@ -1435,6 +1472,76 @@ mod tests {
             };
             tokio::join!(caller, daemon);
         }
+    }
+
+    #[tokio::test]
+    async fn cursor_style_request_uses_plain_capture_on_legacy_rendered_host() {
+        let (mut client, mut server) = memory_rpc();
+        client.minor = 1;
+        let stream = crate::StreamId {
+            host: crate::HostInstance::new([0; 16]),
+            session: SessionId::new("legacy-rendered").unwrap(),
+            epoch: SessionEpoch(1),
+        };
+        let screen = crate::RenderedScreen {
+            schema: 1,
+            stream: stream.clone(),
+            contents: "❯ A suggested action".into(),
+            cursor_row: 0,
+            cursor_col: 2,
+            rows: 40,
+            cols: 120,
+            generation: 1,
+            output_seq: 0,
+            output_bytes: 20,
+        };
+        let caller = async {
+            let (captured, proof) = client
+                .capture_rendered_cursor_style(stream.clone())
+                .await
+                .unwrap();
+            assert_eq!(captured, screen);
+            assert_eq!(proof, None);
+        };
+        let daemon = async {
+            for (expected, response) in [
+                (
+                    crate::ExtensionRequest::Capabilities,
+                    crate::ExtensionResponse::Capabilities {
+                        host: stream.host.clone(),
+                        features: crate::RENDERED_PTY_FEATURE,
+                        limits: crate::ExtensionLimits::default(),
+                    },
+                ),
+                (
+                    crate::ExtensionRequest::CaptureRendered {
+                        stream: stream.clone(),
+                    },
+                    crate::ExtensionResponse::RenderedCapture {
+                        screen: screen.clone(),
+                    },
+                ),
+            ] {
+                let frame = auth::read_frame_async(
+                    &mut server,
+                    Instant::now() + Duration::from_secs(2),
+                    false,
+                )
+                .await
+                .unwrap();
+                let HostRequest::Extended { id, request } =
+                    crate::decode_request_for_minor(1, &frame).unwrap()
+                else {
+                    panic!("expected extension");
+                };
+                assert_eq!(request, expected);
+                let response =
+                    crate::encode_response_for_minor(1, &HostResponse::Extended { id, response })
+                        .unwrap();
+                send(&mut server, &response).await;
+            }
+        };
+        tokio::join!(caller, daemon);
     }
 
     #[tokio::test]
