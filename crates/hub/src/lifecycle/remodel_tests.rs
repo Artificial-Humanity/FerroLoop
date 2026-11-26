@@ -446,9 +446,10 @@ fn failing_spin<'a>(
     &SpinUpRequest,
     &str,
     Caller,
+    LaunchAuth<'_>,
 ) -> Result<SpinUpResponse, LifecycleError>
 + 'a {
-    move |store, env, req, by, caller| {
+    move |store, env, req, by, caller, auth| {
         calls.borrow_mut().push(req.vendor.clone());
         if failing.contains(&req.vendor.as_str()) {
             return Err(LifecycleError::Store(format!(
@@ -456,7 +457,7 @@ fn failing_spin<'a>(
                 req.vendor
             )));
         }
-        spin_up(store, env, req, by, caller)
+        spin_up_fenced(store, || Ok(store), env, req, by, caller, auth)
     }
 }
 
@@ -904,11 +905,224 @@ fn an_old_runtime_the_teardown_cannot_stop_is_refused_before_anything_changes() 
 }
 
 #[test]
+fn direct_remodel_refuses_persona_contention_before_probing_sign_in() {
+    let home = TempDir::new().unwrap();
+    let _trusted = trusted_codex_home(home.path(), home.path());
+    let fake = FakeRuntime::default();
+    let env = fake.env(home.path());
+    let store = MemStore::default();
+    spin_with(
+        &store,
+        &env,
+        "ada",
+        "assistant",
+        "claude",
+        None,
+        Some(home.path()),
+    );
+
+    let probes = std::rc::Rc::new(std::cell::Cell::new(0));
+    let called = probes.clone();
+    TEST_LAUNCH_AUTH.with(|slot| {
+        *slot.borrow_mut() = Some(Box::new(move |_| {
+            called.set(called.get() + 1);
+            Some(LaunchSignInIssue::Rejected)
+        }));
+    });
+    let attempt = || {
+        remodel(
+            &store,
+            &env,
+            "claude:ada",
+            &remodel_req("codex"),
+            Caller::Owner,
+        )
+        .unwrap_err()
+    };
+    with_lifecycle_fence(&env, "ada", "restart", |_| {
+        // Use the original environment to model a caller without the held fence.
+        let error = attempt();
+        assert_eq!(error.status(), 409);
+        assert!(error.to_string().contains("in progress"), "{error}");
+        assert_eq!(probes.get(), 0);
+        Ok(())
+    })
+    .unwrap();
+
+    let error = attempt();
+    assert!(
+        error
+            .to_string()
+            .contains(LaunchSignInIssue::Rejected.message())
+    );
+    assert_eq!(probes.get(), 1);
+}
+
+#[test]
+fn blocked_codex_sign_in_refuses_before_remodel_teardown_unless_overridden() {
+    let home = TempDir::new().unwrap();
+    let _trusted = trusted_codex_home(home.path(), home.path());
+    let fake = FakeRuntime::default();
+    let env = fake.env(home.path());
+    let store = MemStore::default();
+    spin_with(
+        &store,
+        &env,
+        "ada",
+        "assistant",
+        "claude",
+        None,
+        Some(home.path()),
+    );
+
+    for issue in [LaunchSignInIssue::Rejected, LaunchSignInIssue::NotSignedIn] {
+        TEST_LAUNCH_AUTH.with(|slot| *slot.borrow_mut() = Some(Box::new(move |_| Some(issue))));
+        fake.calls.borrow_mut().clear();
+        let err = remodel(
+            &store,
+            &env,
+            "claude:ada",
+            &remodel_req("codex"),
+            Caller::Owner,
+        )
+        .unwrap_err();
+        assert_eq!(err.status(), 409);
+        assert!(err.to_string().contains(issue.message()), "{err}");
+        assert!(err.to_string().contains("--allow-blocked-sign-in"), "{err}");
+        assert!(
+            fake.calls.borrow().is_empty(),
+            "a runtime effect preceded the refusal"
+        );
+        assert!(fake.is_live("Ada"));
+        assert_eq!(record(&store, "claude:ada").status, STATUS_RUNNING);
+        assert!(
+            find_hosted_session(&store, &["codex:ada"])
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    let mut prepare = RemodelRequest {
+        mode: Some("prepare".into()),
+        ..remodel_req("codex")
+    };
+    let err = remodel(&store, &env, "claude:ada", &prepare, Caller::Owner).unwrap_err();
+    assert_eq!(err.status(), 409);
+    assert!(err.to_string().contains("--allow-blocked-sign-in"), "{err}");
+    assert_eq!(record(&store, "claude:ada").status, STATUS_RUNNING);
+    assert!(fake.calls.borrow().is_empty());
+    assert!(handoff(&store, "ada").is_none());
+
+    prepare.allow_blocked_sign_in = true;
+    let prepared = remodel(&store, &env, "claude:ada", &prepare, Caller::Owner).unwrap();
+    assert_eq!(
+        prepared.warnings,
+        [LaunchSignInIssue::NotSignedIn.message()]
+    );
+    assert_eq!(record(&store, "claude:ada").status, STATUS_DECOMMISSIONING);
+    assert!(fake.is_live("Ada"));
+
+    let probes = std::rc::Rc::new(std::cell::Cell::new(0));
+    let called = probes.clone();
+    TEST_LAUNCH_AUTH.with(|slot| {
+        *slot.borrow_mut() = Some(Box::new(move |_| {
+            called.set(called.get() + 1);
+            Some(LaunchSignInIssue::NotSignedIn)
+        }))
+    });
+    let request = RemodelRequest {
+        allow_blocked_sign_in: true,
+        ..remodel_req("codex")
+    };
+    let out = remodel(&store, &env, "claude:ada", &request, Caller::Owner).unwrap();
+    assert_eq!(out.session_id, "codex:ada");
+    assert!(out.runtime_stopped);
+    assert_eq!(record(&store, "codex:ada").status, STATUS_RUNNING);
+    assert_eq!(record(&store, "claude:ada").status, STATUS_DECOMMISSIONED);
+    assert_eq!(
+        handoff(&store, "ada").unwrap().1["allow_blocked_sign_in"],
+        true
+    );
+    assert_eq!(
+        probes.get(),
+        1,
+        "activation must reuse the destination verdict"
+    );
+    assert_eq!(
+        out.warnings
+            .iter()
+            .filter(|warning| warning.as_str() == LaunchSignInIssue::NotSignedIn.message())
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn inconclusive_codex_sign_in_allows_remodel_with_one_warning() {
+    let home = TempDir::new().unwrap();
+    let workspace = home.path().join("workspace");
+    let project = workspace.join("FerroLoop");
+    std::fs::create_dir_all(workspace.join(".agents/roles")).unwrap();
+    std::fs::create_dir(workspace.join(".agents/memory")).unwrap();
+    std::fs::create_dir(&project).unwrap();
+    std::fs::write(workspace.join(".agents/AGENTS.md"), "workspace guidance").unwrap();
+    std::fs::write(
+        workspace.join(".agents/roles/assistant.md"),
+        "role guidance",
+    )
+    .unwrap();
+    for file in ["AGENTS.md", "WORKFLOW.md", "PERSONA.md"] {
+        std::fs::write(project.join(file), "project guidance").unwrap();
+    }
+    let _trusted = trusted_codex_home(home.path(), &project);
+    let fake = FakeRuntime::default();
+    let mut env = fake.env(home.path());
+    env.workspace_root = Some(&workspace);
+    let store = MemStore::default();
+    spin_with(
+        &store,
+        &env,
+        "ada",
+        "assistant",
+        "claude",
+        None,
+        Some(&project),
+    );
+    TEST_LAUNCH_AUTH.with(|slot| {
+        *slot.borrow_mut() = Some(Box::new(|_| Some(LaunchSignInIssue::Inconclusive)));
+    });
+
+    let out = remodel(
+        &store,
+        &env,
+        "claude:ada",
+        &remodel_req("codex"),
+        Caller::Owner,
+    )
+    .unwrap();
+    assert_eq!(out.warnings, ["Codex sign-in not verified."]);
+    assert_eq!(out.session_id, "codex:ada");
+    assert!(out.runtime_stopped);
+    assert_eq!(record(&store, "codex:ada").status, STATUS_RUNNING);
+    assert_eq!(
+        handoff(&store, "ada").unwrap().1["allow_blocked_sign_in"],
+        false
+    );
+}
+
+#[test]
 fn the_precheck_refuses_what_a_remodel_refuses_and_touches_nothing() {
     let home = TempDir::new().unwrap();
     let _trusted = trusted_codex_home(home.path(), &std::env::current_dir().unwrap());
     let precheck = |store: &MemStore, env: &LifecycleEnv<'_>, id: &str, caller: Caller| {
-        remodel_precheck(store, env, &target(store, id), &remodel_req("grok"), caller)
+        remodel_precheck(
+            store,
+            env,
+            &target(store, id),
+            &remodel_req("grok"),
+            caller,
+            |_| Ok(None),
+        )
     };
 
     // A runtime another live session shares.
@@ -1823,9 +2037,9 @@ fn a_failed_remodel_refreshes_tombstones_when_it_undoes_the_new_record() {
         "owner",
         Caller::Owner,
         |_| {},
-        &mut |store, env, req, by, caller| {
+        &mut |store, env, req, by, caller, auth| {
             if req.vendor == "grok" {
-                return spin_up(store, env, req, by, caller);
+                return spin_up_fenced(store, || Ok(store), env, req, by, caller, auth);
             }
             Err(LifecycleError::Store(
                 "restore refused before spin-up".into(),
@@ -1916,6 +2130,7 @@ fn recast_deleted_catalog_role_is_refused_by_remodel_before_any_writes() {
         &target(&store, "claude:ada"),
         &remodel_req("codex"),
         Caller::Owner,
+        |_| panic!("an invalid destination must not reach the probe"),
     )
     .unwrap_err();
     assert_eq!(error.status(), 400);

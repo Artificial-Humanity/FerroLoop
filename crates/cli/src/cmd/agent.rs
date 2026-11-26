@@ -170,6 +170,9 @@ pub enum AgentCmd {
         /// `prepare` (handoff prompt, status `decommissioning`) or `execute`.
         #[arg(long)]
         mode: Option<String>,
+        /// Prepare or execute even if the destination daemon has no usable sign-in.
+        #[arg(long)]
+        allow_blocked_sign_in: bool,
         /// Working directory for the new runtime (default: the session's own).
         #[arg(long)]
         cwd: Option<String>,
@@ -1014,6 +1017,7 @@ pub fn run<S: AgentRegistry + Handles + StateStore + Catalog + fl_core::MessageS
             thinking_level,
             posture,
             mode,
+            allow_blocked_sign_in,
             cwd,
             node_id,
             hosted,
@@ -1026,6 +1030,7 @@ pub fn run<S: AgentRegistry + Handles + StateStore + Catalog + fl_core::MessageS
                 thinking_level,
                 posture,
                 mode,
+                allow_blocked_sign_in,
                 cwd,
                 node_id,
                 hosted,
@@ -1071,6 +1076,8 @@ pub fn run<S: AgentRegistry + Handles + StateStore + Catalog + fl_core::MessageS
                     out.previous_session_id,
                     out.hydration_status
                 );
+            }
+            if !json {
                 for warning in &out.warnings {
                     eprintln!("warning: {warning}");
                 }
@@ -1359,6 +1366,26 @@ mod tests {
     struct AgentTestCli {
         #[command(subcommand)]
         cmd: AgentCmd,
+    }
+
+    #[test]
+    fn remodel_blocked_sign_in_override_defaults_to_false() {
+        use clap::Parser;
+
+        for explicit in [false, true] {
+            let mut args = vec!["fl", "remodel", "ada", "--vendor", "codex"];
+            if explicit {
+                args.push("--allow-blocked-sign-in");
+            }
+            let AgentCmd::Remodel {
+                allow_blocked_sign_in,
+                ..
+            } = AgentTestCli::try_parse_from(args).unwrap().cmd
+            else {
+                panic!("not remodel");
+            };
+            assert_eq!(allow_blocked_sign_in, explicit);
+        }
     }
 
     #[test]

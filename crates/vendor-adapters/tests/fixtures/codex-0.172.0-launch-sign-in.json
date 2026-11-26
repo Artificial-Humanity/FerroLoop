@@ -1,0 +1,76 @@
+{
+  "account_rate_limits_read": {
+    "id": 4,
+    "result": {
+      "accountId": "<redacted>",
+      "rateLimitResetCredits": {
+        "availableCount": 0,
+        "credits": null
+      },
+      "rateLimits": {
+        "credits": {
+          "balance": "<redacted>",
+          "hasCredits": false,
+          "unlimited": false
+        },
+        "limitId": "codex",
+        "limitName": null,
+        "planType": "<redacted>",
+        "primary": {
+          "resetsAt": 0,
+          "usedPercent": 0,
+          "windowDurationMins": 0
+        },
+        "rateLimitReachedType": null,
+        "secondary": null
+      },
+      "rateLimitsByLimitId": {
+        "codex": {
+          "credits": {
+            "balance": "<redacted>",
+            "hasCredits": false,
+            "unlimited": false
+          },
+          "limitId": "codex",
+          "limitName": null,
+          "planType": "<redacted>",
+          "primary": {
+            "resetsAt": 0,
+            "usedPercent": 0,
+            "windowDurationMins": 0
+          },
+          "rateLimitReachedType": null,
+          "secondary": null
+        }
+      }
+    }
+  },
+  "config_read": {
+    "id": 2,
+    "result": {
+      "config": {
+        "chatgpt_base_url": "https://chatgpt.com/backend-api/",
+        "model_provider": null,
+        "openai_base_url": null
+      },
+      "origins": {}
+    }
+  },
+  "get_auth_status": {
+    "id": 3,
+    "result": {
+      "authMethod": "chatgpt",
+      "authToken": null,
+      "requiresOpenaiAuth": true
+    }
+  },
+  "initialize": {
+    "id": 1,
+    "result": {
+      "codexHome": "<redacted>",
+      "platformFamily": "unix",
+      "platformOs": "linux",
+      "userAgent": "codex-tui/0.172.0 (ferroloop; 0.1.0)"
+    }
+  }
+}
