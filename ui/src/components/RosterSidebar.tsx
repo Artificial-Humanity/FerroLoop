@@ -1577,7 +1577,7 @@ export const RosterSidebar: React.FC<RosterSidebarProps> = ({
                             </div>
 
                             <div style={{ display: "flex", alignItems: "center", gap: "4px" }}>
-                              {recoveryAttention && (
+                              {(recoveryAttention === "recovery" || recoveryAttention === "exhausted") && (
                                 <span
                                   role="img"
                                   aria-label={recoveryLabel}
