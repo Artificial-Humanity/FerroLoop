@@ -1259,6 +1259,7 @@ fn failure_reason(stage: FailureStage) -> FenceReason {
         FailureStage::MessageLookupError => FenceReason::MessageLookupError,
         FailureStage::InitialReceiptReadError => FenceReason::InitialReceiptReadError,
         FailureStage::InitialReceiptReadMissing => FenceReason::InitialReceiptReadMissing,
+        FailureStage::InitialReceiptReadAmbiguous => FenceReason::InitialReceiptReadAmbiguous,
         FailureStage::TransportError => FenceReason::TransportError,
         FailureStage::DeadExplicitRoute => FenceReason::DeadExplicitRoute,
         FailureStage::ComposerOccupiedByNonWireInput => FenceReason::ComposerOccupiedByNonWireInput,
@@ -6051,6 +6052,65 @@ mod tests {
             assert_eq!(receipt.status, DeliveryStatus::Pending);
             assert_eq!(receipt.attempts, 1);
         }
+    }
+
+    #[test]
+    fn timed_fence_recovery_stops_before_sending_case_colliding_receipts() {
+        let (_tmp, inner, listener, first, since) = timed_recovery_fixture();
+        let original = inner.store.list_wire_receipts(&first).unwrap().remove(0);
+        let alias = DeliveryReceipt {
+            recipient_id: fl_core::ids::seq_iri(42),
+            recipient_name: "HeLd".into(),
+            ..original.clone()
+        };
+        assert_ne!(alias.recipient_id, original.recipient_id);
+        let imported = inner.store.import_wire_batch(&[], &[alias]).unwrap();
+        assert_eq!(imported.imported_receipts, 1);
+        let before = inner.store.list_wire_receipts(&first).unwrap();
+        assert_eq!(before.len(), 2);
+        assert!(before.iter().all(|receipt| {
+            receipt.recipient_name.eq_ignore_ascii_case("held")
+                && receipt.status == DeliveryStatus::Pending
+                && receipt.attempts == 1
+        }));
+        *lock(&inner.fence_recovery_probe_hook) = Some(Box::new(|| {
+            RecoveryReadiness::Ready(RecoveryTarget::FixtureWebhook)
+        }));
+        let due = since.unix_millis() + 300_000;
+        inner.poll_retained_fences(At::from_unix_millis(due));
+        wait_on_recovery(|| !lock(&inner.dispatch_queues).contains_key("held"));
+
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        assert_eq!(inner.store.list_wire_receipts(&first).unwrap(), before);
+        assert!(inner.is_recipient_fenced("held"));
+        let status = inner.diagnostics_snapshot();
+        assert_eq!(status.records[0].route_dispatch_calls, 0);
+        assert_eq!(
+            status.records[0].first_reason,
+            FenceReason::InitialReceiptReadAmbiguous
+        );
+        assert_eq!(
+            status.fence_recovery_attempts[0].outcome,
+            FenceRecoveryOutcome::ReceiptBookkeepingFailed
+        );
+        assert_eq!(
+            status.fence_recovery_attention[0].outcome,
+            FenceRecoveryOutcome::ReceiptBookkeepingFailed
+        );
+
+        inner.poll_retained_fences(At::from_unix_millis(due + 300_001));
+        wait_on_recovery(|| !lock(&inner.dispatch_queues).contains_key("held"));
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        assert_eq!(
+            inner.diagnostics_snapshot().fence_recovery_attempts.len(),
+            1
+        );
     }
 
     #[test]
