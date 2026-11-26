@@ -42,10 +42,10 @@ mod exit_evidence;
 pub use exit_evidence::HostedExitIncident;
 #[cfg(test)]
 mod fence_tests;
+pub(crate) mod launch_versions;
 mod lock;
 mod recovery;
-pub(crate) mod vendor_versions;
-pub use vendor_versions::{
+pub use launch_versions::{
     HostedVendorVersionChange, HostedVendorVersionComponent, HostedVendorVersions,
     hosted_vendor_versions_for_stream, read_hosted_vendor_versions,
     set_global_vendor_version_adapters,
@@ -1009,7 +1009,7 @@ pub(crate) use fl_wire::vendor_adapter::{
 struct CheckedVendorConfig {
     home: PathBuf,
     daemon_expected: bool,
-    daemon: Option<vendor_versions::DaemonEvidence>,
+    daemon: Option<launch_versions::DaemonEvidence>,
 }
 
 /// Validate Codex project trust and pin the same configuration home and working directory
@@ -1161,7 +1161,7 @@ fn check_vendor_launch_config(
     home.map(|home| {
         let daemon = if daemon_expected {
             check_vendor_launch_prerequisite(env, vendor, Some(&home))?
-                .map(vendor_versions::DaemonEvidence::capture)
+                .map(launch_versions::DaemonEvidence::capture)
         } else {
             None
         };

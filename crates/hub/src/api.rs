@@ -9144,7 +9144,7 @@ fn handle_get_hosted_sessions(state: &HubState, authority: &HubAuthority) -> Htt
                 None
             };
             let vendor_versions =
-                lifecycle::vendor_versions::hosted_vendor_versions_for_record(&*store, &record);
+                lifecycle::launch_versions::hosted_vendor_versions_for_record(&*store, &record);
             HostedSessionView {
                 record,
                 recovery_attention,

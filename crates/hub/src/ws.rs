@@ -336,7 +336,7 @@ impl HubServer {
             let version_state = state.clone();
             let mut version_stop = shutdown_rx.clone();
             tokio::spawn(async move {
-                let mut observer = crate::lifecycle::vendor_versions::VersionObserver::default();
+                let mut observer = crate::lifecycle::launch_versions::VersionObserver::default();
                 let mut tick = tokio::time::interval(Duration::from_secs(1));
                 tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 loop {
