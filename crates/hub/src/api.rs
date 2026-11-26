@@ -8170,16 +8170,17 @@ fn reset_session_with_prompt(
     // A reset runs once: after its `/clear` or `/new` lands the session has changed, so a reset
     // that then fails is never run again on another route.
     #[cfg(test)]
-    let stubbed = RESET_DISPATCH_STUB
+    let reset = RESET_DISPATCH_STUB
         .with(|slot| slot.borrow_mut().take())
-        .map(|run| {
-            run();
-            Ok(())
-        });
+        .map_or_else(
+            || clear_or_reforge_session(&route, reset_mode, actor, prompt.as_deref()),
+            |run| {
+                run();
+                Ok(())
+            },
+        );
     #[cfg(not(test))]
-    let stubbed: Option<Result<(), String>> = None;
-    let reset = stubbed
-        .unwrap_or_else(|| clear_or_reforge_session(&route, reset_mode, actor, prompt.as_deref()));
+    let reset = clear_or_reforge_session(&route, reset_mode, actor, prompt.as_deref());
     if let Some(claim) = reset_claim {
         claim.finish();
     }
@@ -15251,7 +15252,7 @@ mod claude_registration_binding_tests {
         assert!(event.data.get("queue").is_none());
 
         let read = |authority, target, view| {
-            let req = HttpRequest::new("GET", &format!("/api/v1/sessions/{target}/{view}"));
+            let req = HttpRequest::new("GET", format!("/api/v1/sessions/{target}/{view}"));
             handle_dynamic_api_routes(&state, authority, &req)
                 .json_value()
                 .unwrap()
