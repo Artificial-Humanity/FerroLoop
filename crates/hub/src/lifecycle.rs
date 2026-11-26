@@ -4481,6 +4481,30 @@ fn get_hosted_session_record<S: StateStore>(
     Ok(Some(rec))
 }
 
+/// Reads the latest exit for a flagged incident without promoting hydration state.
+/// The caller must check Owner authority before calling this function.
+pub(crate) fn hosted_recovery_evidence<S: StateStore>(
+    store: &S,
+    session_id: &str,
+) -> Result<Option<fl_host_proto::HostedExitEvidence>, LifecycleError> {
+    let not_found = || LifecycleError::NotFound("no active hosted recovery incident".into());
+    let record = get_hosted_session_record(store, session_id)?
+        .filter(|record| {
+            record.session_id == session_id
+                && record.hosted
+                && !matches!(
+                    record.status.as_str(),
+                    STATUS_DECOMMISSIONING | STATUS_DECOMMISSIONED
+                )
+        })
+        .ok_or_else(not_found)?;
+    let respawn = load_hosted_respawn_state(store, &record.session_id)?;
+    if respawn.recovery_attention.is_none() {
+        return Err(not_found());
+    }
+    Ok(respawn.exit_evidence.latest_evidence().cloned())
+}
+
 /// Vendor and persona of a `vendor:persona` session id, when the vendor is a known one.
 fn split_vendor_id(id: &str) -> Option<(String, &str)> {
     let (vendor, persona) = id.trim().split_once(':')?;

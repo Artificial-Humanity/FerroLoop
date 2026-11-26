@@ -5,7 +5,7 @@ import {
   type AgentRecord,
   type AreaRecord,
   type DiscoveredSessionSummary,
-  type HostedRecoveryAttention,
+  type HostedRecoveryAttentionTarget,
   type SessionContextUsage,
   type SessionQuotaUsage,
   type TranscriptTurn,
@@ -427,7 +427,8 @@ export interface RosterSidebarProps {
   liveness: AgentLivenessItem[];
   unreadByAgent: Record<string, number | AgentUnreadSummary>;
   unreadSeverityByAgent?: Record<string, UnreadSeverity>;
-  recoveryAttentionByAgent?: Record<string, HostedRecoveryAttention>;
+  recoveryAttentionByAgent?: Record<string, HostedRecoveryAttentionTarget>;
+  onOpenRecoveryEvidence?: (agentKey: string, sessionId: string, opener: HTMLButtonElement) => void;
   busyByAgent?: Record<string, boolean>;
   transcriptsByAgent?: Record<string, TranscriptTurn[]>;
   contextUsageByAgent?: Record<string, SessionContextUsage | null>;
@@ -727,6 +728,7 @@ export const RosterSidebar: React.FC<RosterSidebarProps> = ({
   unreadByAgent = {},
   unreadSeverityByAgent,
   recoveryAttentionByAgent,
+  onOpenRecoveryEvidence,
   busyByAgent,
   transcriptsByAgent,
   contextUsageByAgent,
@@ -1445,7 +1447,7 @@ export const RosterSidebar: React.FC<RosterSidebarProps> = ({
                       const isSelected = key === selectedKey;
                       const isAgentPinned = pinnedAgents.has(key);
                       const recoveryAttention = recoveryAttentionByAgent?.[key];
-                      const recoveryLabel = recoveryAttention === "exhausted"
+                      const recoveryLabel = recoveryAttention?.phase === "exhausted"
                         ? "Hosted session recovery exhausted"
                         : "Hosted session recovery in progress";
                       const quotaEval = evaluateQuotaStatus({
@@ -1577,19 +1579,31 @@ export const RosterSidebar: React.FC<RosterSidebarProps> = ({
                             </div>
 
                             <div style={{ display: "flex", alignItems: "center", gap: "4px" }}>
-                              {(recoveryAttention === "recovery" || recoveryAttention === "exhausted") && (
-                                <span
-                                  role="img"
-                                  aria-label={recoveryLabel}
-                                  title={recoveryLabel}
+                              {recoveryAttention && onOpenRecoveryEvidence && (
+                                <button
+                                  type="button"
+                                  aria-label={`${recoveryLabel} for ${record.display_name}. View evidence`}
+                                  aria-haspopup="dialog"
+                                  title={`${recoveryLabel}. View evidence`}
                                   className="fd-badge"
+                                  onClick={(event) => {
+                                    event.stopPropagation();
+                                    onOpenRecoveryEvidence(key, recoveryAttention.sessionId, event.currentTarget);
+                                  }}
+                                  onKeyDown={(event) => {
+                                    if (event.key === "Enter" || event.key === " ") event.stopPropagation();
+                                  }}
                                   style={{
-                                    ...getUnreadBadgeStyle(recoveryAttention === "exhausted" ? "important" : "question"),
+                                    ...getUnreadBadgeStyle(recoveryAttention.phase === "exhausted" ? "important" : "question"),
                                     color: "#0A0D12",
+                                    cursor: "pointer",
+                                    justifyContent: "center",
+                                    minWidth: 24,
+                                    minHeight: 24,
                                   }}
                                 >
                                   !
-                                </span>
+                                </button>
                               )}
                               {unreadCount > 0 && (
                                 <span

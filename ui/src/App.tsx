@@ -21,6 +21,7 @@ import {
 import { HubDrawer } from "./components/HubDrawer";
 import { NodesModal } from "./components/NodesModal";
 import { PairingModal } from "./components/PairingModal";
+import { RecoveryEvidenceDialog } from "./components/RecoveryEvidenceDialog";
 import { PHONE_MAX_VIEWPORT_PX, useDeviceLayout } from "./hooks/useDeviceLayout";
 import { useProjects } from "./hooks/useProjects";
 import { PhoneShell } from "./components/phone/PhoneShell";
@@ -96,7 +97,7 @@ import {
   type DecommissionMode,
   type DiscoveredSessionSummary,
   type EnrolledNode,
-  type HostedRecoveryAttention,
+  type HostedRecoveryAttentionTarget,
   type HostedSessionSummary,
   type HubAuthority,
   type HubStatsResponse,
@@ -1297,12 +1298,18 @@ export const App: React.FC<AppProps> = ({
   >({});
 
   const [recoveryAttentionByAgent, setRecoveryAttentionByAgent] = useState<
-    Record<string, HostedRecoveryAttention>
+    Record<string, HostedRecoveryAttentionTarget>
   >({});
+  const [recoveryEvidenceTarget, setRecoveryEvidenceTarget] = useState<{
+    agentKey: string;
+    sessionId: string;
+  } | null>(null);
+  const recoveryEvidenceOpener = useRef<HTMLElement | null>(null);
   const hostedRefreshRef = useRef({ requested: 0, applied: 0 });
 
   const advanceTranscriptAuth = () => {
     setRecoveryAttentionByAgent({});
+    setRecoveryEvidenceTarget(null);
     authIdentityRef.current = { apiClient, token: apiClient.getToken() };
     ownerRef.current = { ...ownerRef.current, authEpoch: ownerRef.current.authEpoch + 1 };
     transcriptGuard.invalidate();
@@ -1779,15 +1786,24 @@ export const App: React.FC<AppProps> = ({
         return;
       }
       hostedRefreshRef.current.applied = refreshId;
-      const attention: Record<string, HostedRecoveryAttention> = Object.create(null);
+      const attention: Record<string, HostedRecoveryAttentionTarget> = Object.create(null);
       for (const session of hostedRes.sessions) {
         const key = session.persona?.trim().toLowerCase();
         const phase = session.recovery_attention;
-        if (key && (phase === "recovery" || phase === "exhausted") && attention[key] !== "exhausted") {
-          attention[key] = phase;
+        const sessionId = session.session_id;
+        if (!key || !sessionId || (phase !== "recovery" && phase !== "exhausted")) continue;
+        const updatedAtMs = session.updated_at_ms ?? 0;
+        const existing = attention[key];
+        if (!existing ||
+            (phase === "exhausted" && existing.phase === "recovery") ||
+            (phase === existing.phase && updatedAtMs > existing.updatedAtMs)) {
+          attention[key] = { sessionId, phase, updatedAtMs };
         }
       }
       setRecoveryAttentionByAgent(attention);
+      setRecoveryEvidenceTarget((target) =>
+        target && attention[target.agentKey]?.sessionId === target.sessionId ? target : null,
+      );
       setHostedSessionsByAgent(
         selectPreferredHostedSessions(
           hostedRes.sessions,
@@ -2739,6 +2755,8 @@ export const App: React.FC<AppProps> = ({
 
   const handleLogout = async () => {
     loggedOutRef.current = true;
+    setRecoveryAttentionByAgent({});
+    setRecoveryEvidenceTarget(null);
     ownerRef.current = { ...ownerRef.current, authEpoch: ownerRef.current.authEpoch + 1 };
     transcriptGuard.invalidate(); refreshInFlightRef.current = false; refreshQueuedRef.current = null;
     setTranscriptSnapshot(null);
@@ -2764,7 +2782,6 @@ export const App: React.FC<AppProps> = ({
     setSessionQuotaUsage(null);
     setAgents([]);
     setAreas([]);
-    setRecoveryAttentionByAgent({});
     setSessions([]);
     setRoutes([]);
     setLiveness([]);
@@ -3818,6 +3835,11 @@ export const App: React.FC<AppProps> = ({
       unreadByAgent={unreadByAgent}
       unreadSeverityByAgent={unreadSeverityByAgent}
       recoveryAttentionByAgent={authority?.tier === "owner" ? recoveryAttentionByAgent : undefined}
+      onOpenRecoveryEvidence={(agentKey, sessionId, opener) => {
+        if (authority?.tier !== "owner" || loggedOutRef.current) return;
+        recoveryEvidenceOpener.current = opener;
+        setRecoveryEvidenceTarget({ agentKey, sessionId });
+      }}
       busyByAgent={effectiveBusyByAgent}
       contextUsageByAgent={effectiveContextUsageByAgent}
       quotaUsageByAgent={effectiveQuotaUsageByAgent}
@@ -4072,6 +4094,16 @@ export const App: React.FC<AppProps> = ({
             </div>
           </div>
         </>
+      )}
+
+      {authority?.tier === "owner" && recoveryEvidenceTarget && (
+        <RecoveryEvidenceDialog
+          key={recoveryEvidenceTarget.sessionId}
+          sessionId={recoveryEvidenceTarget.sessionId}
+          apiClient={apiClient}
+          returnFocusTo={recoveryEvidenceOpener}
+          onClose={() => setRecoveryEvidenceTarget(null)}
+        />
       )}
 
       <PairingModal
