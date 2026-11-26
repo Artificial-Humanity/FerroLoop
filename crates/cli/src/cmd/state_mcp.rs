@@ -31,10 +31,10 @@ use std::time::Duration;
 use crate::cmd::agent::now_at;
 use crate::cmd::state::{
     DEFAULT_RENDER_MAX_BYTES, StateEnv, code_search_response_json, effective_code_limit,
-    effective_search_limit, index_unavailable_line, parse_concern, parse_memory_basis,
-    parse_memory_category, parse_merge_mode, partial_index_line, rank_for_mode,
+    effective_search_limit, index_unavailable_line, list_visible_state, parse_concern,
+    parse_memory_basis, parse_memory_category, parse_merge_mode, partial_index_line, rank_for_mode,
     ranked_result_json_for, render_state_markdown, resolve_state_in_store, search_and_record,
-    search_and_record_in,
+    search_and_record_in, validate_runtime_key,
 };
 use crate::cmd::wire::{
     execute_ack, execute_read, execute_reply, execute_send, inbox_item_to_json, now_millis,
@@ -731,18 +731,17 @@ fn dispatch_tool(env: &StateEnv<'_>, name: &str, args: &Value) -> Result<String,
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
             let store = env.open_for_scope(parsed_scope.as_ref())?;
-            let entries: Vec<StateEntry> = store
-                .list_state(parsed_scope.as_ref(), parsed_concern)
-                .map_err(|e| e.to_string())?
-                .into_iter()
-                .filter(|e| match &e.payload {
-                    StatePayload::Memory(m) => {
-                        (include_retired || m.lifecycle == MemoryLifecycle::Active)
-                            && parsed_cat.is_none_or(|c| m.category == c)
-                    }
-                    _ => parsed_cat.is_none(),
-                })
-                .collect();
+            let entries: Vec<StateEntry> =
+                list_visible_state(&store, parsed_scope.as_ref(), parsed_concern)?
+                    .into_iter()
+                    .filter(|e| match &e.payload {
+                        StatePayload::Memory(m) => {
+                            (include_retired || m.lifecycle == MemoryLifecycle::Active)
+                                && parsed_cat.is_none_or(|c| m.category == c)
+                        }
+                        _ => parsed_cat.is_none(),
+                    })
+                    .collect();
             Ok(serde_json::to_string_pretty(&entries).unwrap())
         }
         "fl_state_checkpoint" => {
@@ -766,9 +765,7 @@ fn dispatch_tool(env: &StateEnv<'_>, name: &str, args: &Value) -> Result<String,
             let (query, parsed_scope, parsed_concern, limit) = parse_search_args(args)?;
             let mode = parse_search_mode(args)?;
             let store = env.open_for_scope(parsed_scope.as_ref())?;
-            let entries: Vec<StateEntry> = store
-                .list_state(parsed_scope.as_ref(), parsed_concern)
-                .map_err(|e| e.to_string())?;
+            let entries = list_visible_state(&store, parsed_scope.as_ref(), parsed_concern)?;
             let ranked = rank_for_mode(
                 &store,
                 mode,
@@ -911,7 +908,7 @@ fn dispatch_tool(env: &StateEnv<'_>, name: &str, args: &Value) -> Result<String,
         "state_set_runtime" => {
             let scope =
                 StateScope::from_wire(req_str(args, "scope")?).map_err(|e| e.to_string())?;
-            let key = req_str(args, "key")?.to_string();
+            let key = req_str(args, "key")?;
             let by = req_str(args, "by")?.to_string();
             let value = args
                 .get("value")
@@ -921,11 +918,12 @@ fn dispatch_tool(env: &StateEnv<'_>, name: &str, args: &Value) -> Result<String,
                 Some(m) => parse_merge_mode(m)?,
                 None => MergeMode::Conflict,
             };
+            let slug = validate_runtime_key(&scope, key)?;
             let store = env.open_for_scope(Some(&scope))?;
             let entry = store
                 .upsert_state(UpsertStateArgs {
                     scope,
-                    slug: key,
+                    slug,
                     sensitivity: parse_sensitivity(args),
                     payload: StatePayload::Runtime(RuntimeEntry { value, merge_mode }),
                     at: now_at(),

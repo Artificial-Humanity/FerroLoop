@@ -3923,7 +3923,10 @@ fn host_build_identity_is_opt_in() {
         | fl_host_proto::SESSION_OWNER_FEATURE
         | fl_host_proto::PTY_RETENTION_FEATURE;
     #[cfg(unix)]
-    let expected = expected | fl_host_proto::PTY_FEATURE | fl_host_proto::RENDERED_PTY_FEATURE;
+    let expected = expected
+        | fl_host_proto::PTY_FEATURE
+        | fl_host_proto::RENDERED_PTY_FEATURE
+        | fl_host_proto::HOSTED_EXIT_EVIDENCE_FEATURE;
     assert_eq!(features, expected);
     let request = serde_json::from_str(r#"{"op":"host_status"}"#).unwrap();
     let status = serde_json::to_value(extended(&mut rpc, request)).unwrap();
@@ -5510,6 +5513,132 @@ fn pipes_survive_completed_pty_compaction_and_sixty_four_slot_pressure() {
             "legacy output after churn: {out:?}"
         );
         thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn hosted_exit_evidence_is_exact_after_pty_eviction() {
+    use fl_host_proto::HostedExitEvidenceStatus::{Exited, Pending, Unavailable};
+
+    let daemon = Daemon::start(DaemonOpts { chunk: None });
+    let mut rpc = daemon.rpc();
+    let mut child = spec("owned-exit", &[]);
+    child.kind = SpawnKind::Pty;
+    child.argv = vec![
+        "/bin/sh".into(),
+        "-c".into(),
+        r"printf '\033[31mfixed exit-1 line\033[0m\n'; exit 1".into(),
+    ];
+    child
+        .env
+        .insert("FL_HOSTED_ID".into(), "owned-agent".into());
+    child.env_allow.insert("FL_HOSTED_ID".into());
+    let (stream, _) = rpc.inner.spawn_pty_session(child, None).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let snapshot = loop {
+        match rpc
+            .inner
+            .hosted_exit_evidence(stream.clone(), "owned-agent")
+            .unwrap()
+        {
+            Exited(evidence) => break evidence,
+            Pending => {}
+            Unavailable => panic!("owned exit evidence unavailable"),
+        }
+        assert!(Instant::now() < deadline, "PTY output did not reach EOF");
+        thread::sleep(Duration::from_millis(5));
+    };
+    assert_eq!(snapshot.stream, stream);
+    assert_eq!(
+        snapshot.exit,
+        ChildExit {
+            code: Some(1),
+            signal: None
+        }
+    );
+    assert_eq!(snapshot.terminal_tail, "fixed exit-1 line\n");
+    assert_eq!(
+        rpc.inner
+            .hosted_exit_evidence(stream.clone(), "other-agent")
+            .unwrap(),
+        Unavailable
+    );
+
+    for index in 0..9 {
+        let mut child = spec(&format!("evict-exit-{index}"), &["exit", "0"]);
+        child.kind = SpawnKind::Pty;
+        child
+            .env
+            .insert("FL_HOSTED_ID".into(), "churn-agent".into());
+        child.env_allow.insert("FL_HOSTED_ID".into());
+
+        rpc.inner.spawn_pty_session(child, None).unwrap();
+    }
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !rpc
+        .inner
+        .pty_retention_status()
+        .unwrap()
+        .unwrap()
+        .recent_evictions
+        .contains(&stream)
+    {
+        assert!(
+            Instant::now() < deadline,
+            "first completed PTY was not evicted"
+        );
+        thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(
+        rpc.inner
+            .hosted_exit_evidence(stream, "owned-agent")
+            .unwrap(),
+        Exited(snapshot)
+    );
+    assert!(!daemon.stderr_snapshot().contains("fixed exit-1 line"));
+}
+
+#[cfg(unix)]
+#[test]
+fn hosted_exit_evidence_reports_reliable_pipe_exit_with_empty_terminal_tail() {
+    use fl_host_proto::HostedExitEvidenceStatus::{Exited, Pending, Unavailable};
+
+    let daemon = Daemon::start(DaemonOpts { chunk: None });
+    let mut rpc = daemon.rpc();
+    let mut child = spec("owned-pipe", &["exit", "1"]);
+    child
+        .env
+        .insert("FL_HOSTED_ID".into(), "owned-agent".into());
+    child.env_allow.insert("FL_HOSTED_ID".into());
+    let (stream, _) = rpc.inner.spawn_reliable_session(child).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match rpc
+            .inner
+            .hosted_exit_evidence(stream.clone(), "owned-agent")
+            .unwrap()
+        {
+            Exited(evidence) => {
+                assert_eq!(evidence.stream, stream);
+                assert_eq!(
+                    evidence.exit,
+                    ChildExit {
+                        code: Some(1),
+                        signal: None
+                    }
+                );
+                assert!(evidence.terminal_tail.is_empty());
+                break;
+            }
+            Pending => {}
+            Unavailable => panic!("owned ReliablePipe exit evidence unavailable"),
+        }
+        assert!(
+            Instant::now() < deadline,
+            "ReliablePipe output did not reach EOF"
+        );
+        thread::sleep(Duration::from_millis(5));
     }
 }
 
