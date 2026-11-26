@@ -1993,6 +1993,28 @@ pub struct HubDispatchDiagnostics {
     pub diagnostics_partial: bool,
     pub omitted_evidence_total: u64,
     pub omitted_evidence_total_saturated: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fence_recovery_attempts: Vec<HubFenceRecoveryAttempt>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fence_recovery_attention: Vec<HubFenceRecoveryAttention>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HubFenceRecoveryAttempt {
+    pub recipient: String,
+    pub attempt: u32,
+    pub limit: u32,
+    pub at: fl_core::at::At,
+    pub outcome: fl_wire::dispatch_diagnostics::FenceRecoveryOutcome,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HubFenceRecoveryAttention {
+    pub recipient: String,
+    pub outcome: fl_wire::dispatch_diagnostics::FenceRecoveryOutcome,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub reason_label: String,
+    pub exhausted: bool,
 }
 
 /// Allowlist projection of [`fl_wire::dispatch_diagnostics::FenceDiagnostic`].
@@ -2173,6 +2195,8 @@ impl HubDispatchDiagnostics {
             diagnostics_partial,
             omitted_evidence_total,
             omitted_evidence_total_saturated,
+            fence_recovery_attempts,
+            fence_recovery_attention,
         } = diag;
         Self {
             schema_version,
@@ -2187,6 +2211,29 @@ impl HubDispatchDiagnostics {
             diagnostics_partial,
             omitted_evidence_total,
             omitted_evidence_total_saturated,
+            fence_recovery_attempts: fence_recovery_attempts
+                .into_iter()
+                .filter_map(|row| {
+                    Some(HubFenceRecoveryAttempt {
+                        recipient: normalize_persona(&row.recipient)?,
+                        attempt: row.attempt,
+                        limit: row.limit,
+                        at: row.at,
+                        outcome: row.outcome,
+                    })
+                })
+                .collect(),
+            fence_recovery_attention: fence_recovery_attention
+                .into_iter()
+                .filter_map(|row| {
+                    Some(HubFenceRecoveryAttention {
+                        recipient: normalize_persona(&row.recipient)?,
+                        outcome: row.outcome,
+                        reason_label: row.outcome.label().to_owned(),
+                        exhausted: row.exhausted,
+                    })
+                })
+                .collect(),
         }
     }
 }
@@ -13259,6 +13306,8 @@ mod council_guidance_tests {
                     diagnostics_partial: false,
                     omitted_evidence_total: 0,
                     omitted_evidence_total_saturated: false,
+                    fence_recovery_attempts: Vec::new(),
+                    fence_recovery_attention: Vec::new(),
                 }),
                 registration_diagnostics: vec![],
                 pending_recipients: vec![],
@@ -13335,7 +13384,8 @@ mod council_guidance_tests {
         use fl_wire::daemon::{DaemonStatus, LocalResponse, RecipientPendingSummary};
         use fl_wire::dispatch_diagnostics::{
             DiagnosticsScope, DispatchCallOutcome, DispatchDiagnostics, FailureStage,
-            FenceDiagnostic, FenceReason, RouteAdapter, RouteDispatchObservation, SuppressionPhase,
+            FenceDiagnostic, FenceReason, FenceRecoveryAttempt, FenceRecoveryAttention,
+            FenceRecoveryOutcome, RouteAdapter, RouteDispatchObservation, SuppressionPhase,
         };
         use fl_wire::identity::{RouteEntry, VendorRoute};
         use std::io::{BufRead, BufReader, Write};
@@ -13447,6 +13497,39 @@ mod council_guidance_tests {
                     diagnostics_partial: false,
                     omitted_evidence_total: 0,
                     omitted_evidence_total_saturated: false,
+                    fence_recovery_attempts: vec![
+                        FenceRecoveryAttempt {
+                            recipient: "felix".into(),
+                            attempt: 3,
+                            limit: 3,
+                            at: ts_for_status.clone(),
+                            outcome: FenceRecoveryOutcome::VendorSignIn,
+                        },
+                        FenceRecoveryAttempt {
+                            recipient: "/secret/recovery-diagnostic".into(),
+                            attempt: 1,
+                            limit: 3,
+                            at: ts_for_status.clone(),
+                            outcome: FenceRecoveryOutcome::Inconclusive,
+                        },
+                    ],
+                    fence_recovery_attention: vec![
+                        FenceRecoveryAttention {
+                            recipient: "felix".into(),
+                            outcome: FenceRecoveryOutcome::VendorSignIn,
+                            exhausted: true,
+                        },
+                        FenceRecoveryAttention {
+                            recipient: "ada".into(),
+                            outcome: FenceRecoveryOutcome::WaitingForWorker,
+                            exhausted: false,
+                        },
+                        FenceRecoveryAttention {
+                            recipient: "/secret/recovery-diagnostic".into(),
+                            outcome: FenceRecoveryOutcome::Inconclusive,
+                            exhausted: false,
+                        },
+                    ],
                 }),
                 registration_diagnostics: vec![
                     fl_wire::dispatch_diagnostics::RouteRegistrationDiagnostic {
@@ -13532,6 +13615,7 @@ mod council_guidance_tests {
             "active-secret-routes.sock",
             "/secret/key_path",
             "/secret/claude.sock",
+            "/secret/recovery-diagnostic",
         ] {
             assert!(
                 !raw_json.contains(forbidden),
@@ -13546,6 +13630,37 @@ mod council_guidance_tests {
         assert_eq!(rec["phase"], "retained_fence");
         assert_eq!(rec["decisive_reason"], "receipt_write_error");
         assert_eq!(rec["route_dispatch_calls"], 2);
+        let attempts = body["dispatch_diagnostics"]["fence_recovery_attempts"]
+            .as_array()
+            .unwrap();
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(
+            attempts[0],
+            json!({
+                "recipient": "felix",
+                "attempt": 3,
+                "limit": 3,
+                "at": ts,
+                "outcome": "vendor_sign_in",
+            })
+        );
+        assert_eq!(
+            body["dispatch_diagnostics"]["fence_recovery_attention"],
+            json!([
+                {
+                    "recipient": "felix",
+                    "outcome": "vendor_sign_in",
+                    "reason_label": "vendor sign-in screen",
+                    "exhausted": true,
+                },
+                {
+                    "recipient": "ada",
+                    "outcome": "waiting_for_worker",
+                    "reason_label": "waiting for a delivery worker slot",
+                    "exhausted": false,
+                },
+            ])
+        );
         let obs = rec["route_observations"].as_array().unwrap();
         assert_eq!(obs.len(), 2);
         assert_eq!(obs[0]["adapter"], "agy");

@@ -1301,6 +1301,7 @@ export const WireMailPane: React.FC<WireMailPaneProps> = ({
     effectiveWireStatus !== null
       ? (() => {
           const diag = effectiveWireStatus.dispatch_diagnostics;
+          const recoveryAttention = diag?.fence_recovery_attention ?? [];
           const pendingAvailable =
             effectiveWireStatus.pending_recipients_available !== false &&
             effectiveWireStatus.pending_recipients !== null;
@@ -1375,7 +1376,7 @@ export const WireMailPane: React.FC<WireMailPaneProps> = ({
                   >
                     {`Auto-push diagnostics: unavailable (${unavailableReason})`}
                   </div>
-                ) : isSupportedEmpty ? (
+                ) : isSupportedEmpty && recoveryAttention.length === 0 ? (
                   <span
                     data-testid="wire-diagnostics-available"
                     className="fd-badge fd-mono"
@@ -1388,6 +1389,27 @@ export const WireMailPane: React.FC<WireMailPaneProps> = ({
                     Auto-push diagnostics: 0 holds (daemon_lifetime)
                   </span>
                 ) : null}
+
+                {recoveryAttention.map(({ recipient, outcome, reason_label, exhausted }) => (
+                  <span
+                    key={recipient}
+                    data-testid={`wire-fence-recovery-attention-${recipient}`}
+                    className="fd-badge fd-mono"
+                    style={{
+                      color: "#fbbf24",
+                      borderColor: "rgba(251, 191, 36, 0.45)",
+                      backgroundColor: "rgba(251, 191, 36, 0.14)",
+                    }}
+                  >
+                    {`${recipient}: Wire recovery ${
+                      outcome === "waiting_for_delay" || outcome === "waiting_for_worker"
+                        ? "pending"
+                        : "needs attention"
+                    } (${reason_label ?? outcome.replace(/_/g, " ")}${
+                      exhausted ? ", attempt limit reached" : ""
+                    })`}
+                  </span>
+                ))}
 
                 {!pendingAvailable ? (
                   <span
@@ -1574,7 +1596,7 @@ export const WireMailPane: React.FC<WireMailPaneProps> = ({
                   })}
 
                   <div style={{ fontSize: "11px", color: "var(--text-muted)" }}>
-                    Daemon-lifetime hold suppresses automatic pushes; ACK and route registration do not clear it.
+                    Later automatic pushes wait until the fence clears.
                   </div>
                 </div>
               )}

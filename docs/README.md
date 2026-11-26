@@ -66,6 +66,21 @@ In addition to the guides above, `fl --help` documents the full command surface:
 * `fl agent` — agent identity registry, coverage areas, heartbeat liveness, `REGISTRY.md` rendering, and hosted session lifecycle (`spin-up`, two-phase `decommission`, and `remodel`: a move to another vendor that keeps the persona, project, role and worktree, restores the old vendor when the new one fails, and records a `remodel-<persona>` workspace handoff). The hub serves the same lifecycle at `POST /api/v1/sessions/spin-up`, `POST /api/v1/sessions/:id/decommission`, `POST /api/v1/sessions/:id/remodel`, `GET /api/v1/hosted-sessions`, and `POST /api/v1/hosted-sessions/:id/restart`; hosted sessions persist as `hosted-session-*` workspace runtime entries.
 * `fl state` — scoped memory, handoffs, and runtime state with owner sensitivity redaction and `MEMORY.md` / `STATE.md` rendering.
 * `fl wire` — FerroWire agent-to-agent messaging, receipts, native vendor push dispatch, and WebSocket relay.
+  When an unresolved route delivery causes a retained fence, the daemon runs a read-only
+  readiness check after `FL_WIRE_FENCE_RECOVERY_DELAY_SECS` (default 300 seconds). It checks at
+  most once per delay period, up to `FL_WIRE_FENCE_RECOVERY_MAX_ATTEMPTS` (default 3) per fence.
+  Set `FL_WIRE_FENCE_RECOVERY_MAX_ATTEMPTS=0` to disable timed recovery. The delay must be
+  positive. Invalid values use the defaults and log a warning.
+  After the daemon verifies readiness, it sends the first held message with a warning that an
+  earlier attempt may already have arrived. Once the submit is confirmed, normal dispatch
+  resumes in admission order. Previously attempted messages in that queue also carry the warning.
+  A dead, blocked, or unverified route stays fenced. `fl wire status` and the FerroDeck mail
+  view show the reason, including while recovery waits for the delay or a delivery worker.
+  Timed recovery supports hosted Claude, Codex, and Muse routes. Non-hosted, Antigravity, Grok,
+  and webhook routes stay fenced and report the reason. Fences caused by queue overflow,
+  receipt bookkeeping errors, or global capacity limits do not start timed recovery. If a replay
+  encounters a bookkeeping fault or cannot confirm a successful submission in the store, timed
+  recovery stops and the fence remains held with the failure reason.
 * `fl github pr` — pull-request review and merge policy evaluation, structured review markers, and gated merges.
 * `fl flow` — DAG workflow validation, import, step execution, review loops, and human approval sign-off.
 * `fl arch` — `.fl/architecture.toml` validation, Cargo workspace dependency/source conformance checks, and LikeC4 export.
