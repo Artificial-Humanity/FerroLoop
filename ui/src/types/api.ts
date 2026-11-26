@@ -1304,6 +1304,19 @@ export interface WireDispatchDiagnostics {
   diagnostics_partial: boolean;
   omitted_evidence_total: number;
   omitted_evidence_total_saturated: boolean;
+  fence_recovery_attempts?: {
+    recipient: string;
+    attempt: number;
+    limit: number;
+    at: string;
+    outcome: string;
+  }[];
+  fence_recovery_attention?: {
+    recipient: string;
+    outcome: string;
+    reason_label?: string;
+    exhausted: boolean;
+  }[];
 }
 
 export type WirePendingHoldReason = "dead_explicit_route" | "unsupported" | string;

@@ -41,9 +41,13 @@ pub use crate::codex_control::{
 };
 use crate::dispatch_diagnostics::{
     DiagnosticsState, DispatchCallOutcome, DispatchDiagnostics, DispatchReport, FailureStage,
-    FenceDiagnostic, FenceReason, RouteRegistrationDiagnostic, SuppressionPhase,
+    FenceDiagnostic, FenceReason, FenceRecoveryAttempt, FenceRecoveryOutcome,
+    RouteRegistrationDiagnostic, SuppressionPhase,
 };
-use crate::dispatcher::dispatch_message_for_recipient_with_report;
+use crate::dispatcher::{
+    RecoveryReadiness, RecoveryTarget, dispatch_message_for_recipient_on_recovery_target,
+    dispatch_message_for_recipient_with_report, probe_retained_fence_readiness,
+};
 use crate::identity::{RouteEntry, RouteTable, VendorRoute, normalize_persona};
 use crate::peer::{PeerFrame, handshake_peer_with_cursors};
 use crate::ws::{MAX_FRAME_PAYLOAD, WsError, WsStream};
@@ -359,6 +363,89 @@ fn extract_peer_cred(stream: &UnixStream) -> PeerCred {
 // Read the hosted reference from the daemon's store, never from a route or client claim.
 // Missing, unavailable, or pid-less records retain the existing unverified behavior.
 type HostedReference = (u32, Option<u64>);
+type RecoveryHostLookup<S> =
+    fn(&S, &str, &RouteEntry) -> Result<Option<RecoveryHostBinding>, FenceRecoveryOutcome>;
+
+#[derive(Debug, PartialEq, Eq)]
+struct RecoveryHostBinding {
+    session_id: String,
+    runtime_leader_pid: Option<u32>,
+    startup_confirmed: bool,
+}
+
+fn recovery_host_session<S: StateStore>(
+    store: &S,
+    recipient: &str,
+    route: &RouteEntry,
+) -> Result<Option<RecoveryHostBinding>, FenceRecoveryOutcome> {
+    use FenceRecoveryOutcome::HostedBindingUnavailable;
+
+    let vendor = route.route.canonical_vendor();
+    let slug = format!("hosted-session-{vendor}-{recipient}");
+    let state = store
+        .get_state_by_key(&StateScope::Workspace, StateConcern::Runtime, &slug)
+        .map_err(|_| HostedBindingUnavailable)?;
+    let claims_host = route.hosted_id.is_some() || route.hydration_generation.is_some();
+    let Some(state) = state else {
+        return if claims_host {
+            Err(HostedBindingUnavailable)
+        } else {
+            Ok(None)
+        };
+    };
+    let StatePayload::Runtime(runtime) = state.payload else {
+        return Err(HostedBindingUnavailable);
+    };
+    let value = &runtime.value;
+    if !claims_host && value["hosted"].as_bool() == Some(false) {
+        return Ok(None);
+    }
+    let matching_identity = |raw: Option<&str>| {
+        raw.and_then(|id| crate::identity::parse_hosted_identity(id).ok())
+            .is_some_and(|(v, p)| v == vendor && p == recipient)
+    };
+    let generation = value["hydration_generation"]
+        .as_str()
+        .filter(|g| !g.is_empty());
+    if !matching_identity(route.hosted_id.as_deref())
+        || !matching_identity(value["session_id"].as_str())
+        || !value["persona"]
+            .as_str()
+            .is_some_and(|name| name.eq_ignore_ascii_case(recipient))
+        || value["vendor"]
+            .as_str()
+            .map(crate::identity::canonical_vendor_id)
+            != Some(vendor)
+        || generation.is_none()
+        || generation != route.hydration_generation.as_deref()
+        || value["vendor_session_id"]
+            .as_str()
+            .filter(|id| crate::identity::is_native_session_id(id))
+            .is_some_and(|id| {
+                !route
+                    .route
+                    .session_identity()
+                    .is_some_and(|(_, registered)| registered == id)
+            })
+    {
+        return Err(HostedBindingUnavailable);
+    }
+    if value["status"].as_str() != Some("running") {
+        return Err(FenceRecoveryOutcome::DeadRoute);
+    }
+    let host_session_id = value["host_session_id"].as_str();
+    if !matching_identity(host_session_id) {
+        return Err(HostedBindingUnavailable);
+    }
+    Ok(host_session_id.map(|session_id| RecoveryHostBinding {
+        session_id: session_id.to_owned(),
+        runtime_leader_pid: value["runtime_leader_pid"]
+            .as_u64()
+            .and_then(|raw| u32::try_from(raw).ok())
+            .filter(|pid| *pid > 0),
+        startup_confirmed: value["hydration_status"].as_str() == Some("confirmed"),
+    }))
+}
 type HostedLookup<S> = fn(&S, &str, &str, Option<&str>, Option<&str>) -> Option<HostedReference>;
 
 fn hosted_reference<S: StateStore>(
@@ -976,6 +1063,121 @@ const MAX_DISPATCH_RECIPIENTS: usize = 128;
 const MAX_TRACKED_RECIPIENTS: usize = 512;
 const MAX_QUEUED_PER_RECIPIENT: usize = 1024;
 const MAX_OVERFLOW_RECIPIENTS: usize = 128;
+const DEFAULT_FENCE_RECOVERY_DELAY_SECS: u64 = 300;
+const DEFAULT_FENCE_RECOVERY_MAX_ATTEMPTS: u32 = 3;
+const MAX_FENCE_PROBES_PER_POLL: usize = 4;
+
+#[derive(Clone, Copy)]
+struct FenceRecoveryPolicy {
+    delay_ms: u64,
+    max_attempts: u32,
+}
+
+impl Default for FenceRecoveryPolicy {
+    fn default() -> Self {
+        Self {
+            delay_ms: DEFAULT_FENCE_RECOVERY_DELAY_SECS * 1_000,
+            max_attempts: DEFAULT_FENCE_RECOVERY_MAX_ATTEMPTS,
+        }
+    }
+}
+
+impl FenceRecoveryPolicy {
+    fn from_env() -> Self {
+        Self {
+            delay_ms: positive_env(
+                "FL_WIRE_FENCE_RECOVERY_DELAY_SECS",
+                DEFAULT_FENCE_RECOVERY_DELAY_SECS,
+            )
+            .saturating_mul(1_000),
+            max_attempts: positive_env(
+                "FL_WIRE_FENCE_RECOVERY_MAX_ATTEMPTS",
+                DEFAULT_FENCE_RECOVERY_MAX_ATTEMPTS,
+            ),
+        }
+    }
+}
+
+fn positive_env<T>(key: &str, default: T) -> T
+where
+    T: std::str::FromStr + PartialOrd + Default,
+{
+    match std::env::var(key) {
+        Ok(value) => match value.parse::<T>() {
+            Ok(parsed) if parsed > T::default() => parsed,
+            _ => {
+                warn(&format!(
+                    "{key} must be a positive integer; using the default"
+                ));
+                default
+            }
+        },
+        Err(std::env::VarError::NotPresent) => default,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            warn(&format!(
+                "{key} must be a positive integer; using the default"
+            ));
+            default
+        }
+    }
+}
+
+struct RouteFenceRelease {
+    winning: VendorRoute,
+    explicit: bool,
+    route_gone_before: bool,
+    at: At,
+}
+
+#[derive(Default)]
+struct DeferredFenceRelease {
+    route: Option<RouteFenceRelease>,
+    ack: Option<At>,
+}
+
+struct RetainedFenceRecovery {
+    token: Arc<()>,
+    route: Option<RouteEntry>,
+    pending: VecDeque<MessageId>,
+    /// No unrelated inbox item or pre-restart delivery is admitted to this queue.
+    pending_capacity_exhausted: bool,
+    since: At,
+    last_attempt: Option<At>,
+    attempts: u32,
+    in_progress: bool,
+    deferred_release: DeferredFenceRelease,
+}
+
+impl RetainedFenceRecovery {
+    fn hold(&mut self, id: MessageId) {
+        if self.pending.contains(&id) {
+            return;
+        }
+        if self.pending.len() < MAX_QUEUED_PER_RECIPIENT {
+            self.pending.push_back(id);
+        } else {
+            self.pending_capacity_exhausted = true;
+        }
+    }
+}
+
+#[derive(Clone)]
+struct FenceRecoveryRun {
+    token: Arc<()>,
+    route: Option<RouteEntry>,
+    attempt: u32,
+    at: At,
+}
+
+impl FenceRecoveryRun {
+    fn is_current(&self, recovery: &RetainedFenceRecovery) -> bool {
+        Arc::ptr_eq(&self.token, &recovery.token)
+            && self.attempt == recovery.attempts
+            && recovery.in_progress
+    }
+}
+
+const TIMED_FENCE_REDELIVERY_NOTICE: &str = "Note: this is a redelivery after timed fence recovery; an earlier delivery attempt was unconfirmed and may already have been received.";
 
 #[derive(Default)]
 struct RecipientDispatchQueue {
@@ -986,6 +1188,8 @@ struct RecipientDispatchQueue {
     waiting_for_capacity: bool,
     worker_active: bool,
     route_generation: u64,
+    recovery: Option<FenceRecoveryRun>,
+    recovery_redeliveries: BTreeSet<MessageId>,
 }
 
 #[derive(Clone, Copy)]
@@ -1061,6 +1265,38 @@ fn route_identity_changed(
         || (old.session_identity().is_none() && old != new)
 }
 
+fn readiness_result(
+    readiness: RecoveryReadiness,
+    startup_confirmed: bool,
+) -> Result<RecoveryTarget, FenceRecoveryOutcome> {
+    match readiness {
+        RecoveryReadiness::Hold(FenceRecoveryOutcome::VendorSignIn) => {
+            Err(FenceRecoveryOutcome::VendorSignIn)
+        }
+        _ if !startup_confirmed => Err(FenceRecoveryOutcome::UnconfirmedStartup),
+        RecoveryReadiness::Ready(target) => Ok(target),
+        RecoveryReadiness::Hold(outcome) => Err(outcome),
+    }
+}
+
+fn transport_fence_can_recover(row: &FenceDiagnostic) -> bool {
+    row.route_dispatch_calls > 0
+        && row.omitted_failure_stages == 0
+        && row.failure_stages.iter().all(|stage| {
+            matches!(
+                stage,
+                FailureStage::TransportError
+                    | FailureStage::DeadExplicitRoute
+                    | FailureStage::ComposerOccupiedByNonWireInput
+                    | FailureStage::UnresolvedReceiptStatus
+            )
+        })
+        && row
+            .route_observations
+            .iter()
+            .all(|observation| observation.outcome == DispatchCallOutcome::ReturnedError)
+}
+
 fn log_first_holds(rows: Vec<FenceDiagnostic>) {
     for row in rows {
         // All strings are bounded safe projections; JSON escapes control bytes.
@@ -1072,6 +1308,9 @@ fn log_first_holds(rows: Vec<FenceDiagnostic>) {
 
 #[cfg(test)]
 type RegistrationProbeHook = Box<dyn FnMut(&mut RouteTable) + Send>;
+
+#[cfg(test)]
+type FenceRecoveryProbeHook = Box<dyn FnMut() -> RecoveryReadiness + Send>;
 
 #[cfg(test)]
 type ComposerProbeHook = Box<dyn FnMut(&str, &VendorRoute) -> Option<bool> + Send>;
@@ -1116,6 +1355,11 @@ struct AwaitingDaemonEntry {
 struct DaemonInner<S> {
     store: Arc<S>,
     hosted_lookup: HostedLookup<S>,
+    recovery_host_lookup: RecoveryHostLookup<S>,
+    fence_recovery_policy: FenceRecoveryPolicy,
+    fence_recoveries: Mutex<BTreeMap<String, RetainedFenceRecovery>>,
+    #[cfg(test)]
+    fence_recovery_probe_hook: Mutex<Option<FenceRecoveryProbeHook>>,
     config: DaemonConfig,
     routes: Mutex<RouteTable>,
     /// Serializes only persistence and enqueue, never vendor execution.
@@ -1232,40 +1476,58 @@ where
         msg: &WireMessage,
         recipient: &str,
         now: At,
+        recovery: Option<(&RouteEntry, RecoveryTarget, Option<RecoveryHostBinding>)>,
         report: &mut DispatchReport,
-    ) -> DispatchOutcome {
-        let base = lock(&self.routes).clone();
-        let mut working = base.clone();
-        #[cfg(test)]
-        let dispatch = tests::dispatch_with_test_transport;
-        #[cfg(not(test))]
-        let dispatch = dispatch_message_for_recipient_with_report;
-        let (updated, attempted) = dispatch(
-            self.store.as_ref(),
-            &mut working,
-            self.config.home_override.as_deref(),
-            msg,
-            now.clone(),
-            recipient,
-            report,
-        );
-        // Discovery inside the dispatch also learns replaced sessions and prunes dead routes;
-        // carry both back, and persist them so a restart starts from the refreshed table.
-        let changed = !working.same_routes(&base);
-        let mut live = lock(&self.routes);
-        live.merge_daemon_dispatch_result(&base, working);
-        if changed {
-            let _ = live.save(self.config.routes_path.as_deref());
-        }
-        let winning_after_merge = live.get(recipient).map(|e| e.route.clone());
-        drop(live);
-        if let Some(winning) = winning_after_merge {
-            // Passive discovery: vendor change alone satisfies the S2 gate.
-            let gone = base.get(recipient).is_none();
-            if self.should_release_fence_for(recipient, &winning, false, gone) {
-                self.release_fence_for_new_route(recipient, now.clone());
-            }
-        }
+    ) -> Result<(DispatchOutcome, Option<RouteEntry>), FenceRecoveryOutcome> {
+        let (updated, attempted, route) = if let Some((entry, target, binding)) = recovery {
+            let (updated, attempted) = dispatch_message_for_recipient_on_recovery_target(
+                self.store.as_ref(),
+                msg,
+                now.clone(),
+                recipient,
+                report,
+                entry,
+                target,
+                || {
+                    let binding_check = if let Some(ref expected) = binding {
+                        (self.recovery_host_lookup)(self.store.as_ref(), recipient, entry).and_then(
+                            |current| match current {
+                                Some(current) if !current.startup_confirmed => {
+                                    Err(FenceRecoveryOutcome::UnconfirmedStartup)
+                                }
+                                Some(current) if &current == expected => Ok(()),
+                                _ => Err(FenceRecoveryOutcome::HostedBindingUnavailable),
+                            },
+                        )
+                    } else {
+                        Ok(())
+                    };
+                    // Acknowledgments can arrive during host capture or controller
+                    // acquisition. Read the receipt again before mutating the terminal.
+                    let receipt = self
+                        .store
+                        .list_wire_receipts(&msg.id)
+                        .map_err(|_| FenceRecoveryOutcome::InboxUnavailable)?
+                        .into_iter()
+                        .find(|receipt| receipt.recipient_name.eq_ignore_ascii_case(recipient))
+                        .ok_or(FenceRecoveryOutcome::InboxUnavailable)?;
+                    if receipt.status != DeliveryStatus::Pending {
+                        return Ok(false);
+                    }
+                    binding_check?;
+                    if receipt.attempts >= crate::dispatcher::MAX_DELIVER {
+                        return Err(FenceRecoveryOutcome::ReplayFailed);
+                    }
+                    if !self.recovery_route_is_current(recipient, entry) {
+                        return Err(FenceRecoveryOutcome::RouteChanged);
+                    }
+                    Ok(true)
+                },
+            )?;
+            (updated, attempted, Some(entry.clone()))
+        } else {
+            self.dispatch_and_refresh_route(msg, recipient, now.clone(), report)
+        };
         for rcpt in updated {
             self.notify_subscribers_receipt(&rcpt);
             self.broadcast_to_peers(None, &PeerFrame::ReceiptUpdate { receipt: rcpt });
@@ -1293,7 +1555,7 @@ where
         {
             self.clear_pending_receipt(&rcpt.recipient_name, &msg.id);
         }
-        match receipt {
+        let outcome = match receipt {
             Some(receipt)
                 if matches!(
                     receipt.status,
@@ -1333,7 +1595,60 @@ where
                 }
                 DispatchOutcome::Unconfirmed
             }
+        };
+        Ok((outcome, route))
+    }
+
+    fn dispatch_and_refresh_route(
+        self: &Arc<Self>,
+        msg: &WireMessage,
+        recipient: &str,
+        now: At,
+        report: &mut DispatchReport,
+    ) -> (Vec<DeliveryReceipt>, Option<bool>, Option<RouteEntry>) {
+        let base = lock(&self.routes).clone();
+        let mut working = base.clone();
+        #[cfg(test)]
+        let dispatch = tests::dispatch_with_test_transport;
+        #[cfg(not(test))]
+        let dispatch = dispatch_message_for_recipient_with_report;
+        let (updated, attempted) = dispatch(
+            self.store.as_ref(),
+            &mut working,
+            self.config.home_override.as_deref(),
+            msg,
+            now.clone(),
+            recipient,
+            report,
+        );
+        // Discovery inside the dispatch also learns replaced sessions and prunes dead routes;
+        // carry both back, and persist them so a restart starts from the refreshed table.
+        let attempted_route = working.get(recipient).cloned();
+        let changed = !working.same_routes(&base);
+        let mut live = lock(&self.routes);
+        live.merge_daemon_dispatch_result(&base, working);
+        if changed {
+            let _ = live.save(self.config.routes_path.as_deref());
         }
+        let winning_after_merge = live.get(recipient).map(|e| e.route.clone());
+        drop(live);
+        if let Some(winning) = winning_after_merge {
+            // Passive discovery: vendor change alone satisfies the S2 gate.
+            let gone = base.get(recipient).is_none();
+            if self.should_release_fence_for(recipient, &winning, false, gone) {
+                self.release_fence_for_new_route(
+                    recipient,
+                    RouteFenceRelease {
+                        winning,
+                        explicit: false,
+                        route_gone_before: gone,
+                        at: now,
+                    },
+                    None,
+                );
+            }
+        }
+        (updated, attempted, attempted_route)
     }
 
     fn admit_pending_receipts(&self, msg: &WireMessage, receipts: &[DeliveryReceipt]) {
@@ -1426,14 +1741,21 @@ where
         queue.waiting_for_route = false;
         queue.worker_active = true;
         if let Err(error) = self.spawn_recipient_worker(recipient.to_string()) {
+            let recovery = queue.recovery.take();
             let mut row = evidence.clone();
             row.phase = SuppressionPhase::RetainedFence;
             row.first_reason = FenceReason::WorkerSpawnFailure;
             row.decisive_reason = FenceReason::WorkerSpawnFailure;
-            if let Some(log) = self.retain_overflow_fence(recipient, row) {
+            if let Some(log) = self
+                .retain_overflow_fence_at(recipient, row, recovery.as_ref())
+                .0
+            {
                 first_holds.push(log);
             }
             queues.remove(recipient);
+            if let Some(run) = recovery {
+                self.finish_fence_recovery(recipient, &run, FenceRecoveryOutcome::ReplayFailed);
+            }
             return Err(format!("could not start delivery worker: {error}"));
         }
         Ok(())
@@ -1560,8 +1882,11 @@ where
                 #[cfg(not(test))]
                 let queue_limit = MAX_QUEUED_PER_RECIPIENT;
                 if queue.overflowed || queue.pending.len() >= queue_limit {
+                    self.track_fence_message(&name, msg.id.clone());
                     if !queue.overflowed {
-                        self.record_fence_route(&name);
+                        if queue.recovery.is_none() {
+                            self.record_fence_route(&name);
+                        }
                         let _blocked = lock(&self.overflow_recipients);
                         let mut diagnostics = lock(&self.dispatch_diagnostics);
                         let mut row = evidence.clone();
@@ -1582,6 +1907,9 @@ where
                     errors.push(name);
                     continue;
                 }
+                if queue.recovery.is_some() {
+                    self.track_fence_message(&name, msg.id.clone());
+                }
                 queue.pending.push_back((msg.id.clone(), now.clone()));
                 // An arrival during an in-flight no-route lookup is also a wake request.
                 // Otherwise the worker can exit after this arrival without observing it.
@@ -1599,6 +1927,7 @@ where
             if lock(&self.overflow_recipients).contains(&name)
                 || self.overflow_capacity_exhausted.load(Ordering::SeqCst)
             {
+                self.track_fence_message(&name, msg.id.clone());
                 errors.push(name);
                 continue;
             }
@@ -1650,7 +1979,7 @@ where
                 FenceReason::QueueOverflow,
                 &DispatchReport::default(),
             );
-            let job = {
+            let (message_id, enqueued_at, route_generation, recovery, redeliver) = {
                 let mut queues = lock(&self.dispatch_queues);
                 if self.shutdown.load(Ordering::SeqCst) {
                     queues.remove(&recipient);
@@ -1667,11 +1996,24 @@ where
                         let _ = entered.send(());
                         let _ = resume.recv_timeout(Duration::from_secs(5));
                     }
-                    let first_hold = if queue.overflowed {
-                        self.retain_overflow_fence(&recipient, empty_evidence)
+                    let recovery = queue.recovery.take();
+                    let overflowed = queue.overflowed;
+                    let first_hold = if overflowed {
+                        self.retain_overflow_fence_at(&recipient, empty_evidence, recovery.as_ref())
+                            .0
                     } else {
                         None
                     };
+                    if let Some(run) = recovery {
+                        let outcome = if overflowed {
+                            FenceRecoveryOutcome::ReplayFailed
+                        } else {
+                            lock(&self.fence_routes).remove(&recipient);
+                            lock(&self.overflow_recipients).remove(&recipient);
+                            FenceRecoveryOutcome::Released
+                        };
+                        self.finish_fence_recovery(&recipient, &run, outcome);
+                    }
                     queues.remove(&recipient);
                     drop(queues);
                     log_first_holds(first_hold.into_iter().collect());
@@ -1679,33 +2021,68 @@ where
                     return;
                 };
                 queue.in_flight = Some(id.clone());
-                (id, now, queue.route_generation)
+                let redeliver = queue.recovery_redeliveries.remove(&id);
+                (
+                    id,
+                    now,
+                    queue.route_generation,
+                    queue.recovery.clone(),
+                    redeliver,
+                )
             };
             let mut report = DispatchReport::default();
-            let outcome = match self.store.get_wire_message(&job.0) {
-                Ok(Some(msg)) => {
+            let mut failed_recovery = None;
+            let (mut outcome, attempted_route) = match self.store.get_wire_message(&message_id) {
+                Ok(Some(mut msg)) => {
+                    if redeliver {
+                        msg.body = format!("{TIMED_FENCE_REDELIVERY_NOTICE}\n\n{}", msg.body);
+                    }
                     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        self.dispatch_and_propagate(&msg, &recipient, job.1.clone(), &mut report)
+                        let target = if let Some(run) = &recovery {
+                            match self.probe_fence_recovery_route(&recipient, run.route.as_ref()) {
+                                Ok((target, binding)) => {
+                                    run.route.as_ref().map(|route| (route, target, binding))
+                                }
+                                Err(reason) => return Err(reason),
+                            }
+                        } else {
+                            None
+                        };
+                        self.dispatch_and_propagate(
+                            &msg,
+                            &recipient,
+                            enqueued_at.clone(),
+                            target,
+                            &mut report,
+                        )
                     })) {
-                        Ok(outcome) => outcome,
+                        Ok(Ok(outcome)) => outcome,
+                        Ok(Err(reason)) => {
+                            failed_recovery = Some(reason);
+                            (DispatchOutcome::Unconfirmed, None)
+                        }
                         Err(_) => {
                             report.record_failure(FailureStage::WorkerPanic);
-                            DispatchOutcome::Unconfirmed
+                            (DispatchOutcome::Unconfirmed, None)
                         }
                     }
                 }
                 Ok(None) => {
                     report.record_failure(FailureStage::MessageLookupMissing);
-                    DispatchOutcome::Unconfirmed
+                    (DispatchOutcome::Unconfirmed, None)
                 }
                 Err(_) => {
                     report.record_failure(FailureStage::MessageLookupError);
-                    DispatchOutcome::Unconfirmed
+                    (DispatchOutcome::Unconfirmed, None)
                 }
             };
+            if recovery.is_some() && matches!(outcome, DispatchOutcome::NoRoute) {
+                outcome = DispatchOutcome::Unconfirmed;
+                failed_recovery = Some(FenceRecoveryOutcome::RouteChanged);
+            }
             let evidence = hold_evidence(
                 &recipient,
-                Some(&job.0),
+                Some(&message_id),
                 SuppressionPhase::RetainedFence,
                 FenceReason::UnresolvedReceiptStatus,
                 &report,
@@ -1721,24 +2098,35 @@ where
             let mut evicted_no_route = false;
             let mut parked_no_route = false;
             let mut unresolved = false;
+            let mut prefix_overflowed = false;
+            let mut held_jobs = VecDeque::new();
             let is_composer_occupied_hold =
                 evidence.first_reason == FenceReason::ComposerOccupiedByNonWireInput;
             let recognised_payload = evidence
                 .recognised_composer_payload
                 .as_deref()
                 .and_then(crate::dispatcher::recognised_composer_payload);
-            let job_at = job.1.clone();
+            let job_at = enqueued_at.clone();
             let mut queues = lock(&self.dispatch_queues);
             if let Some(queue) = queues.get_mut(&recipient) {
                 queue.in_flight = None;
                 match outcome {
-                    DispatchOutcome::Resolved => {}
+                    DispatchOutcome::Resolved => {
+                        if let Some(run) = &recovery {
+                            let mut recoveries = lock(&self.fence_recoveries);
+                            if let Some(recovery) = recoveries.get_mut(&recipient)
+                                && run.is_current(recovery)
+                            {
+                                recovery.pending.retain(|id| id != &message_id);
+                            }
+                        }
+                    }
                     DispatchOutcome::NoRoute => {
-                        if queue.route_generation == job.2 {
+                        if queue.route_generation == route_generation {
                             if queue.overflowed {
                                 // The accepted prefix must remain ordered and wakeable; only
                                 // messages beyond the bound stay exclusively in the inbox.
-                                queue.pending.push_front((job.0.clone(), job.1));
+                                queue.pending.push_front((message_id.clone(), enqueued_at));
                                 queue.waiting_for_route = true;
                                 queue.worker_active = false;
                                 parked_no_route = true;
@@ -1749,12 +2137,13 @@ where
                         } else {
                             // Registration or a new arrival raced discovery. Retry the oldest
                             // message while still owning this recipient's worker.
-                            queue.pending.push_front((job.0.clone(), job.1));
+                            queue.pending.push_front((message_id.clone(), enqueued_at));
                         }
                     }
                     DispatchOutcome::Unconfirmed => {
                         // Never let a later message overtake an unconfirmed push.
-                        queue.pending.clear();
+                        held_jobs = std::mem::take(&mut queue.pending);
+                        prefix_overflowed = queue.overflowed;
                         queue.overflowed = true;
                         queue.worker_active = false;
                         unresolved = true;
@@ -1768,7 +2157,50 @@ where
             if unresolved {
                 // Fence and remove while holding the same map lock: no sender may create
                 // a replacement worker between those two actions.
-                first_hold = self.retain_overflow_fence(&recipient, evidence);
+                // A prefix overflow has already left untracked messages in the inbox.
+                let retryable_transport =
+                    !prefix_overflowed && transport_fence_can_recover(&evidence);
+                let since = self.retain_overflow_fence_at(&recipient, evidence, recovery.as_ref());
+                first_hold = since.0;
+                if let Some(run) = &recovery {
+                    let mut recoveries = lock(&self.fence_recoveries);
+                    if let Some(recovery) = recoveries.get_mut(&recipient)
+                        && run.is_current(recovery)
+                    {
+                        recovery.hold(message_id.clone());
+                        for (id, _) in held_jobs {
+                            recovery.hold(id);
+                        }
+                    }
+                    drop(recoveries);
+                    self.finish_fence_recovery(
+                        &recipient,
+                        run,
+                        failed_recovery.unwrap_or(FenceRecoveryOutcome::ReplayFailed),
+                    );
+                } else if retryable_transport
+                    && normalize_persona(&recipient).as_deref() == Some(recipient.as_str())
+                    && lock(&self.overflow_recipients).contains(&recipient)
+                {
+                    let mut recoveries = lock(&self.fence_recoveries);
+                    let recovery = recoveries.entry(recipient.clone()).or_insert_with(|| {
+                        RetainedFenceRecovery {
+                            token: Arc::new(()),
+                            route: attempted_route,
+                            pending: VecDeque::new(),
+                            pending_capacity_exhausted: false,
+                            since: since.1,
+                            last_attempt: None,
+                            attempts: 0,
+                            in_progress: false,
+                            deferred_release: DeferredFenceRelease::default(),
+                        }
+                    });
+                    recovery.hold(message_id.clone());
+                    for (id, _) in held_jobs {
+                        recovery.hold(id);
+                    }
+                }
                 queues.remove(&recipient);
             }
             drop(queues);
@@ -1781,7 +2213,7 @@ where
                 return;
             }
             if unresolved {
-                if is_composer_occupied_hold {
+                if is_composer_occupied_hold && recovery.is_none() {
                     self.schedule_composer_occupied_reprobe(
                         &recipient,
                         &job_at,
@@ -1790,7 +2222,7 @@ where
                 }
                 warn(&format!(
                     "delivery unresolved for message {}; later messages for {} remain pending",
-                    job.0,
+                    message_id,
                     sanitize_for_warning(&recipient)
                 ));
                 self.wake_capacity_waiters();
@@ -1816,9 +2248,22 @@ where
     fn retain_overflow_fence(
         &self,
         recipient: &str,
-        mut row: FenceDiagnostic,
+        row: FenceDiagnostic,
     ) -> Option<FenceDiagnostic> {
-        self.record_fence_route(recipient);
+        self.retain_overflow_fence_at(recipient, row, None).0
+    }
+
+    fn retain_overflow_fence_at(
+        &self,
+        recipient: &str,
+        mut row: FenceDiagnostic,
+        recovery: Option<&FenceRecoveryRun>,
+    ) -> (Option<FenceDiagnostic>, At) {
+        if let Some(entry) = recovery.and_then(|run| run.route.as_ref()) {
+            lock(&self.fence_routes).insert(recipient.to_string(), entry.route.clone());
+        } else {
+            self.record_fence_route(recipient);
+        }
         let mut blocked = lock(&self.overflow_recipients);
         let mut diagnostics = lock(&self.dispatch_diagnostics);
         row.hold_observed_at = now_at();
@@ -1834,7 +2279,320 @@ where
         }
         diagnostics.snapshot.global_capacity_exhausted =
             self.overflow_capacity_exhausted.load(Ordering::SeqCst);
-        diagnostics.retain(row)
+        let retained_at = row.hold_observed_at.clone();
+        (diagnostics.retain(row), retained_at)
+    }
+
+    fn track_fence_message(&self, recipient: &str, id: MessageId) {
+        if let Some(recovery) = lock(&self.fence_recoveries).get_mut(recipient) {
+            recovery.hold(id);
+        }
+    }
+
+    fn is_recipient_fenced(&self, recipient: &str) -> bool {
+        let queues = lock(&self.dispatch_queues);
+        lock(&self.overflow_recipients).contains(recipient)
+            || queues
+                .get(recipient)
+                .is_some_and(|queue| queue.overflowed && queue.recovery.is_none())
+    }
+
+    fn clear_recovery_fence(&self, recipient: &str) {
+        lock(&self.fence_recoveries).remove(recipient);
+    }
+
+    fn finish_fence_recovery(
+        &self,
+        recipient: &str,
+        run: &FenceRecoveryRun,
+        outcome: FenceRecoveryOutcome,
+    ) {
+        let mut recoveries = lock(&self.fence_recoveries);
+        let current = recoveries
+            .get_mut(recipient)
+            .filter(|state| run.is_current(state));
+        let mut diagnostics = lock(&self.dispatch_diagnostics);
+        let outcome = match current {
+            Some(_) if outcome == FenceRecoveryOutcome::Released => {
+                recoveries.remove(recipient);
+                diagnostics.clear_fence_recovery_attention(recipient);
+                outcome
+            }
+            Some(state) => {
+                state.in_progress = false;
+                diagnostics.set_fence_recovery_attention(
+                    recipient,
+                    outcome,
+                    run.attempt >= self.fence_recovery_policy.max_attempts,
+                );
+                outcome
+            }
+            None => FenceRecoveryOutcome::FenceSuperseded,
+        };
+        let attempt = FenceRecoveryAttempt {
+            recipient: recipient.to_string(),
+            attempt: run.attempt,
+            limit: self.fence_recovery_policy.max_attempts,
+            at: run.at.clone(),
+            outcome,
+        };
+        diagnostics.record_fence_recovery(attempt);
+    }
+
+    fn recovery_route_is_current(&self, recipient: &str, entry: &RouteEntry) -> bool {
+        lock(&self.routes)
+            .get(recipient)
+            .is_some_and(|current| entry.same_registration_identity(current))
+    }
+
+    fn probe_fence_recovery_route(
+        &self,
+        recipient: &str,
+        route: Option<&RouteEntry>,
+    ) -> Result<(RecoveryTarget, Option<RecoveryHostBinding>), FenceRecoveryOutcome> {
+        let Some(route) = route else {
+            return Err(FenceRecoveryOutcome::DeadRoute);
+        };
+        {
+            let routes = lock(&self.routes);
+            let current = routes
+                .get(recipient)
+                .ok_or(FenceRecoveryOutcome::DeadRoute)?;
+            if !route.same_registration_identity(current) {
+                return Err(FenceRecoveryOutcome::RouteChanged);
+            }
+        }
+        #[cfg(test)]
+        if let Some(hook) = lock(&self.fence_recovery_probe_hook).as_mut() {
+            return readiness_result(hook(), true).map(|target| (target, None));
+        }
+        if !matches!(
+            route.route.canonical_vendor(),
+            "claude" | "codex" | "muse" | "grok"
+        ) {
+            return Err(FenceRecoveryOutcome::UnsupportedRoute);
+        }
+        let binding = (self.recovery_host_lookup)(self.store.as_ref(), recipient, route)?
+            .ok_or(FenceRecoveryOutcome::NonHostedRoute)?;
+        let readiness = probe_retained_fence_readiness(
+            route,
+            recipient,
+            Some(&binding.session_id),
+            self.config.home_override.as_deref(),
+            binding.runtime_leader_pid,
+        );
+        readiness_result(readiness, binding.startup_confirmed).map(|target| (target, Some(binding)))
+    }
+
+    /// The caller holds the enqueue gate. Keep the triggering manual event until
+    /// the replay worker has relinquished its queue and restored any failed fence.
+    fn defer_fence_release(
+        &self,
+        recipient: &str,
+        update: impl FnOnce(&mut DeferredFenceRelease),
+    ) -> bool {
+        let queues = lock(&self.dispatch_queues);
+        let Some(run) = queues
+            .get(recipient)
+            .and_then(|queue| queue.recovery.as_ref())
+        else {
+            return false;
+        };
+        let mut recoveries = lock(&self.fence_recoveries);
+        let Some(state) = recoveries
+            .get_mut(recipient)
+            .filter(|state| run.is_current(state))
+        else {
+            return false;
+        };
+        update(&mut state.deferred_release);
+        true
+    }
+
+    fn recovery_fence_matches(&self, recipient: &str, expected: Option<&Arc<()>>) -> bool {
+        expected.is_none_or(|expected| {
+            lock(&self.fence_recoveries)
+                .get(recipient)
+                .is_some_and(|state| Arc::ptr_eq(expected, &state.token))
+        })
+    }
+
+    fn release_deferred_fences(self: &Arc<Self>) {
+        let ready: Vec<_> = lock(&self.fence_recoveries)
+            .iter_mut()
+            .filter(|(_, state)| {
+                !state.in_progress
+                    && (state.deferred_release.route.is_some()
+                        || state.deferred_release.ack.is_some())
+            })
+            .map(|(recipient, state)| {
+                (
+                    recipient.clone(),
+                    Arc::clone(&state.token),
+                    std::mem::take(&mut state.deferred_release),
+                )
+            })
+            .collect();
+        for (recipient, token, release) in ready {
+            if let Some(route) = release.route {
+                self.release_fence_for_new_route(&recipient, route, Some(&token));
+            }
+            if let Some(at) = release.ack {
+                self.unfence_after_ack(&recipient, at, Some(&token));
+            }
+        }
+    }
+
+    fn poll_retained_fences(self: &Arc<Self>, now: At) {
+        self.release_deferred_fences();
+        let policy = self.fence_recovery_policy;
+        let due: Vec<_> = lock(&self.fence_recoveries)
+            .iter_mut()
+            .filter(|(_, state)| {
+                !state.in_progress
+                    && state.attempts < policy.max_attempts
+                    && now.unix_millis()
+                        >= state
+                            .last_attempt
+                            .as_ref()
+                            .unwrap_or(&state.since)
+                            .unix_millis()
+                            .saturating_add(policy.delay_ms)
+            })
+            .take(MAX_FENCE_PROBES_PER_POLL)
+            .map(|(name, state)| {
+                state.in_progress = true;
+                state.attempts += 1;
+                state.last_attempt = Some(now.clone());
+                (
+                    name.clone(),
+                    FenceRecoveryRun {
+                        token: Arc::clone(&state.token),
+                        route: state.route.clone(),
+                        attempt: state.attempts,
+                        at: now.clone(),
+                    },
+                )
+            })
+            .collect();
+        for (recipient, run) in due {
+            let result = self
+                .probe_fence_recovery_route(&recipient, run.route.as_ref())
+                .and_then(|_| self.resume_retained_fence(&recipient, &run));
+            if let Err(reason) = result {
+                self.finish_fence_recovery(&recipient, &run, reason);
+            }
+        }
+    }
+
+    fn resume_retained_fence(
+        self: &Arc<Self>,
+        recipient: &str,
+        run: &FenceRecoveryRun,
+    ) -> Result<(), FenceRecoveryOutcome> {
+        use FenceRecoveryOutcome::{InboxUnavailable, ReplayFailed, RouteChanged};
+
+        let _order = lock(&self.enqueue_gate);
+        let unread = self
+            .store
+            .list_wire_inbox(&WireFilter {
+                recipient: Some(recipient.to_string()),
+                unread_only: true,
+                ..Default::default()
+            })
+            .map_err(|_| InboxUnavailable)?;
+        // Match route registration's lock order. No I/O while routes and queues
+        // are held together, and the worker revalidates its pin before each send.
+        let routes = lock(&self.routes);
+        if !run.route.as_ref().is_some_and(|expected| {
+            routes
+                .get(recipient)
+                .is_some_and(|current| expected.same_registration_identity(current))
+        }) {
+            return Err(RouteChanged);
+        }
+        let mut queues = lock(&self.dispatch_queues);
+        if queues.contains_key(recipient) || !lock(&self.overflow_recipients).contains(recipient) {
+            return Err(RouteChanged);
+        }
+        if queues.len() >= MAX_TRACKED_RECIPIENTS
+            || self.overflow_capacity_exhausted.load(Ordering::SeqCst)
+        {
+            return Err(ReplayFailed);
+        }
+        let recoveries = lock(&self.fence_recoveries);
+        let state = recoveries
+            .get(recipient)
+            .filter(|state| run.is_current(state))
+            .ok_or(RouteChanged)?;
+        if state.pending_capacity_exhausted {
+            return Err(ReplayFailed);
+        }
+        let mut queue = RecipientDispatchQueue {
+            recovery: Some(run.clone()),
+            ..Default::default()
+        };
+        let pending_ids: BTreeSet<_> = state.pending.iter().collect();
+        let unread_pending: BTreeMap<_, _> = unread
+            .into_iter()
+            .filter(|item| {
+                item.receipt.status == DeliveryStatus::Pending
+                    && pending_ids.contains(&item.message.id)
+            })
+            .map(|item| (item.message.id, item.receipt.attempts))
+            .collect();
+        for id in &state.pending {
+            let Some(&attempts) = unread_pending.get(id) else {
+                continue;
+            };
+            if attempts >= crate::dispatcher::MAX_DELIVER {
+                // Do not let later messages bypass a held receipt that cannot be attempted.
+                return Err(ReplayFailed);
+            }
+            if attempts > 0 {
+                queue.recovery_redeliveries.insert(id.clone());
+            }
+            queue.pending.push_back((id.clone(), run.at.clone()));
+        }
+        drop(recoveries);
+        drop(routes);
+
+        let evidence = hold_evidence(
+            recipient,
+            queue.pending.front().map(|(id, _)| id),
+            SuppressionPhase::RetainedFence,
+            FenceReason::WorkerSpawnFailure,
+            &DispatchReport::default(),
+        );
+        lock(&self.composer_occupied_reprobes).remove(recipient);
+        // Preserve the original fence identity while the timed worker owns the queue,
+        // so a concurrent winning registration can still satisfy the normal release gate.
+        if let Some(entry) = &run.route {
+            lock(&self.fence_routes).insert(recipient.to_string(), entry.route.clone());
+        }
+        lock(&self.dispatch_diagnostics)
+            .snapshot
+            .records
+            .retain(|row| row.recipient.as_deref() != Some(recipient));
+        // A replay worker still owns the fence's overflow slot in case the
+        // worker has to retain the fence again.
+        if queue.pending.is_empty() {
+            lock(&self.fence_routes).remove(recipient);
+            lock(&self.overflow_recipients).remove(recipient);
+            self.finish_fence_recovery(recipient, run, FenceRecoveryOutcome::Released);
+            return Ok(());
+        }
+        queues.insert(recipient.to_string(), queue);
+        let mut first_holds = Vec::new();
+        if let Err(error) =
+            self.start_queued_worker(&mut queues, recipient, &evidence, &mut first_holds)
+        {
+            // The worker-admission path has already restored and recorded the fence.
+            warn(&format!("{}: {error}", sanitize_for_warning(recipient)));
+        }
+        drop(queues);
+        log_first_holds(first_holds);
+        Ok(())
     }
 
     fn diagnostics_snapshot(&self) -> DispatchDiagnostics {
@@ -1866,20 +2624,37 @@ where
     /// identity recorded on the fence (remodel/vendor change). Redelivery after a
     /// release is at-least-once: a message with `attempts > 0` may already have been
     /// received, so it is redelivered with a notice line before the body.
-    fn release_fence_for_new_route(self: &Arc<Self>, recipient: &str, now: At) {
+    fn release_fence_for_new_route(
+        self: &Arc<Self>,
+        recipient: &str,
+        release: RouteFenceRelease,
+        expected: Option<&Arc<()>>,
+    ) {
         let name =
             normalize_persona(recipient).unwrap_or_else(|| recipient.trim().to_ascii_lowercase());
         if name.is_empty() {
             return;
         }
-        let is_fenced = lock(&self.overflow_recipients).contains(&name)
-            || lock(&self.dispatch_queues)
+        let _order = lock(&self.enqueue_gate);
+        if !self.recovery_fence_matches(&name, expected)
+            || !lock(&self.routes)
                 .get(&name)
-                .is_some_and(|q| q.overflowed);
-        if !is_fenced {
+                .is_some_and(|current| current.route == release.winning)
+            || !self.should_release_fence_for(
+                &name,
+                &release.winning,
+                release.explicit,
+                release.route_gone_before,
+            )
+        {
             return;
         }
-        let _order = lock(&self.enqueue_gate);
+        let at = release.at.clone();
+        if self.defer_fence_release(&name, |deferred| deferred.route = Some(release))
+            || !self.is_recipient_fenced(&name)
+        {
+            return;
+        }
         // Fallible store read first: do not drop re-probe/fence state before it succeeds.
         let Ok(unread) = self.store.list_wire_inbox(&WireFilter {
             recipient: Some(name.clone()),
@@ -1894,6 +2669,7 @@ where
         ));
         lock(&self.composer_occupied_reprobes).remove(&name);
         lock(&self.fence_routes).remove(&name);
+        self.clear_recovery_fence(&name);
         lock(&self.dispatch_diagnostics).clear_recipient(&name);
         let mut first_holds = Vec::new();
         lock(&self.overflow_recipients).remove(&name);
@@ -1911,7 +2687,7 @@ where
                     if let Err(message) = self.schedule_dispatch(
                         &msg,
                         std::slice::from_ref(&item.receipt),
-                        now.clone(),
+                        at.clone(),
                         &mut first_holds,
                     ) {
                         warn(&message);
@@ -1919,7 +2695,7 @@ where
                 } else if let Err(message) = self.schedule_dispatch(
                     &item.message,
                     std::slice::from_ref(&item.receipt),
-                    now.clone(),
+                    at.clone(),
                     &mut first_holds,
                 ) {
                     warn(&message);
@@ -1954,16 +2730,20 @@ where
     /// Clear `overflow_recipients` and resume queued/pending push delivery for `recipient`
     /// once all unconfirmed (`Pending` with `attempts > 0`) receipts have been acknowledged.
     fn maybe_unfence_and_resume(self: &Arc<Self>, recipient: &str, now: At) {
+        self.unfence_after_ack(recipient, now, None);
+    }
+
+    fn unfence_after_ack(self: &Arc<Self>, recipient: &str, now: At, expected: Option<&Arc<()>>) {
         let name =
             normalize_persona(recipient).unwrap_or_else(|| recipient.trim().to_ascii_lowercase());
         if name.is_empty() {
             return;
         }
-        let is_fenced = lock(&self.overflow_recipients).contains(&name)
-            || lock(&self.dispatch_queues)
-                .get(&name)
-                .is_some_and(|q| q.overflowed);
-        if !is_fenced {
+        let _order = lock(&self.enqueue_gate);
+        if !self.recovery_fence_matches(&name, expected)
+            || self.defer_fence_release(&name, |deferred| deferred.ack = Some(now.clone()))
+            || !self.is_recipient_fenced(&name)
+        {
             return;
         }
         {
@@ -2000,7 +2780,6 @@ where
                 return;
             }
         }
-        let _order = lock(&self.enqueue_gate);
         let Ok(unread) = self.store.list_wire_inbox(&WireFilter {
             recipient: Some(name.clone()),
             unread_only: true,
@@ -2015,6 +2794,7 @@ where
             return;
         }
         let mut first_holds = Vec::new();
+        self.clear_recovery_fence(&name);
         lock(&self.dispatch_diagnostics).clear_recipient(&name);
         lock(&self.fence_routes).remove(&name);
         lock(&self.overflow_recipients).remove(&name);
@@ -2404,7 +3184,7 @@ where
                     &DispatchReport::default(),
                 );
                 let mut first_holds = Vec::new();
-                let mut fence_release = false;
+                let mut fence_release = None;
                 let allow_probes =
                     crate::identity::host_probes_allowed(self.config.home_override.as_deref());
                 let started_at = Instant::now();
@@ -2602,7 +3382,12 @@ where
                                 explicit,
                                 gone,
                             ) {
-                                fence_release = true;
+                                fence_release = Some(RouteFenceRelease {
+                                    winning: new_entry.route.clone(),
+                                    explicit,
+                                    route_gone_before: gone,
+                                    at: now.clone(),
+                                });
                             }
                         }
                         // Route publication and the worker's wake generation must be observed
@@ -2618,8 +3403,8 @@ where
                     break;
                 }
                 log_first_holds(first_holds);
-                if fence_release {
-                    self.release_fence_for_new_route(&norm, now.clone());
+                if let Some(release) = fence_release {
+                    self.release_fence_for_new_route(&norm, release, None);
                 }
                 self.drain_awaiting_daemon_messages(true);
                 (LocalResponse::RouteRegistered, None)
@@ -3379,6 +4164,11 @@ where
     let inner = Arc::new(DaemonInner {
         store,
         hosted_lookup: hosted_reference::<S>,
+        recovery_host_lookup: recovery_host_session::<S>,
+        fence_recovery_policy: FenceRecoveryPolicy::from_env(),
+        fence_recoveries: Mutex::new(BTreeMap::new()),
+        #[cfg(test)]
+        fence_recovery_probe_hook: Mutex::new(None),
         config: config.clone(),
         routes: Mutex::new(initial_routes),
         enqueue_gate: Mutex::new(()),
@@ -3449,7 +4239,9 @@ where
                 if last_poll.elapsed() >= AWAITING_DAEMON_POLL_INTERVAL {
                     last_poll = Instant::now();
                     inner_poll.drain_awaiting_daemon_messages(false);
-                    inner_poll.poll_composer_occupied_holds(now_at());
+                    let now = now_at();
+                    inner_poll.poll_composer_occupied_holds(now.clone());
+                    inner_poll.poll_retained_fences(now);
                 } else {
                     std::thread::sleep(Duration::from_millis(10));
                 }
@@ -3626,6 +4418,10 @@ mod tests {
         Arc::new(DaemonInner {
             store,
             hosted_lookup,
+            recovery_host_lookup: |_, _, _| Ok(None),
+            fence_recovery_policy: FenceRecoveryPolicy::default(),
+            fence_recoveries: Mutex::new(BTreeMap::new()),
+            fence_recovery_probe_hook: Mutex::new(None),
             config: DaemonConfig {
                 node_id: "node-b".into(),
                 host: "host-b".into(),
@@ -4290,6 +5086,351 @@ mod tests {
             );
             assert!(inner.diagnostics_snapshot().records.is_empty());
         });
+    }
+
+    fn timed_recovery_fixture() -> (
+        TempDir,
+        Arc<DaemonInner<FaultStore>>,
+        crate::test_isolation::RegisteredUnixListener,
+        MessageId,
+        At,
+    ) {
+        let (tmp, inner) = fault_rig();
+        let socket = tmp.path().join("timed-replay.sock");
+        let listener = crate::test_isolation::bind_unix_fixture(&socket).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        lock(&inner.routes).upsert_explicit(
+            "held",
+            VendorRoute::Webhook {
+                socket_path: socket,
+            },
+            now_at(),
+        );
+        let first = with_transport(Err("initial delivery uncertain".into()), || {
+            run_fault_job(&inner, "held")
+        });
+        let since = inner.diagnostics_snapshot().records[0]
+            .hold_observed_at
+            .clone();
+        (tmp, inner, listener, first, since)
+    }
+
+    #[test]
+    fn timed_fence_recovery_resumes_admitted_unread_in_order_with_notice() {
+        let (_tmp, inner, listener, first, since) = timed_recovery_fixture();
+        let (not_admitted, _) = inner.store.send_wire(mail("held", "unrelated")).unwrap();
+        let (response, _) = inner.handle_local_request(LocalRequest::Send {
+            args: SendWireArgs {
+                id: Some(MessageId(fl_core::ids::seq_iri(1))),
+                ..mail("held", "later")
+            },
+        });
+        let LocalResponse::Sent { message, .. } = response else {
+            panic!("held input was not stored: {response:?}");
+        };
+        let second = message.id;
+        assert!(
+            second < first,
+            "store ID order differs from admission order"
+        );
+        *lock(&inner.fence_recovery_probe_hook) = Some(Box::new(|| {
+            RecoveryReadiness::Ready(crate::dispatcher::RecoveryTarget::FixtureWebhook)
+        }));
+        let due = since.unix_millis() + 300_000;
+        inner.poll_retained_fences(At::from_unix_millis(due - 1));
+        assert!(lock(&inner.overflow_recipients).contains("held"));
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        inner.poll_retained_fences(At::from_unix_millis(due));
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut received = Vec::<WireMessage>::new();
+        while received.len() < 2 && Instant::now() < deadline {
+            if let Ok((stream, _)) = listener.accept() {
+                let mut line = String::new();
+                BufReader::new(stream).read_line(&mut line).unwrap();
+                received.push(serde_json::from_str(&line).unwrap());
+            } else {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+        assert_eq!(
+            received.iter().map(|msg| &msg.id).collect::<Vec<_>>(),
+            vec![&first, &second]
+        );
+        assert!(
+            received[0]
+                .body
+                .contains("redelivery after timed fence recovery")
+        );
+        assert_eq!(received[1].body, "body");
+        assert_eq!(
+            inner.store.get_wire_message(&first).unwrap().unwrap().body,
+            "body"
+        );
+        assert_eq!(
+            inner.store.list_wire_receipts(&not_admitted.id).unwrap()[0].attempts,
+            0
+        );
+        while lock(&inner.overflow_recipients).contains("held") && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!lock(&inner.overflow_recipients).contains("held"));
+    }
+
+    #[test]
+    fn timed_fence_recovery_bounds_dead_route_probes_and_sends_nothing() {
+        let (_tmp, inner, listener, first, since) = timed_recovery_fixture();
+        let probes = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&probes);
+        *lock(&inner.fence_recovery_probe_hook) = Some(Box::new(move || {
+            count.fetch_add(1, Ordering::SeqCst);
+            RecoveryReadiness::Hold(FenceRecoveryOutcome::DeadRoute)
+        }));
+        for period in 1..=5 {
+            let tick = At::from_unix_millis(since.unix_millis() + period * 300_000);
+            inner.poll_retained_fences(tick.clone());
+            inner.poll_retained_fences(tick);
+        }
+
+        assert_eq!(probes.load(Ordering::SeqCst), 3);
+        assert!(lock(&inner.overflow_recipients).contains("held"));
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        assert_eq!(
+            inner.store.list_wire_receipts(&first).unwrap()[0].attempts,
+            1
+        );
+        let diagnostics = serde_json::to_value(inner.diagnostics_snapshot()).unwrap();
+        assert!(diagnostics.to_string().contains("dead_route"));
+        assert!(diagnostics.to_string().contains("\"exhausted\":true"));
+    }
+
+    #[test]
+    fn timed_fence_recovery_discards_probe_when_registration_identity_changes() {
+        let (tmp, inner, listener, first, since) = timed_recovery_fixture();
+        let replacement_path = tmp.path().join("timed-replay-replacement.sock");
+        let replacement = crate::test_isolation::bind_unix_fixture(&replacement_path).unwrap();
+        replacement.set_nonblocking(true).unwrap();
+        let daemon = Arc::downgrade(&inner);
+        *lock(&inner.fence_recovery_probe_hook) = Some(Box::new(move || {
+            let inner = daemon.upgrade().unwrap();
+            lock(&inner.routes).upsert_explicit(
+                "held",
+                VendorRoute::Webhook {
+                    socket_path: replacement_path.clone(),
+                },
+                now_at(),
+            );
+            RecoveryReadiness::Ready(crate::dispatcher::RecoveryTarget::FixtureWebhook)
+        }));
+        inner.poll_retained_fences(At::from_unix_millis(since.unix_millis() + 300_000));
+
+        assert!(lock(&inner.overflow_recipients).contains("held"));
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        assert_eq!(
+            replacement.accept().unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        assert_eq!(
+            inner.store.list_wire_receipts(&first).unwrap()[0].attempts,
+            1
+        );
+    }
+
+    #[test]
+    fn timed_fence_recovery_yields_to_winning_registration_during_replay() {
+        let (tmp, inner, listener, first, since) = timed_recovery_fixture();
+        let replacement_path = tmp.path().join("timed-replay-winner.sock");
+        let replacement = crate::test_isolation::bind_unix_fixture(&replacement_path).unwrap();
+        replacement.set_nonblocking(true).unwrap();
+        let (replaying_tx, replaying_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let mut probes = 0;
+        *lock(&inner.fence_recovery_probe_hook) = Some(Box::new(move || {
+            probes += 1;
+            if probes == 2 {
+                replaying_tx.send(()).unwrap();
+                resume_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            }
+            RecoveryReadiness::Ready(crate::dispatcher::RecoveryTarget::FixtureWebhook)
+        }));
+        let due = At::from_unix_millis(since.unix_millis() + 300_000);
+        inner.poll_retained_fences(due.clone());
+        replaying_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(lock(&inner.overflow_recipients).contains("held"));
+
+        let (response, _) = inner.handle_local_request(LocalRequest::RegisterRoute {
+            persona: "held".into(),
+            route: VendorRoute::Webhook {
+                socket_path: replacement_path,
+            },
+            explicit: true,
+            replace: true,
+            hosted_id: None,
+            hydration_generation: None,
+            hosted_session_verified: false,
+            unverified_process: false,
+        });
+        assert!(matches!(response, LocalResponse::RouteRegistered));
+        resume_tx.send(()).unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let stream = loop {
+            inner.poll_retained_fences(due.clone());
+            match replacement.accept() {
+                Ok((stream, _)) => break stream,
+                Err(error)
+                    if error.kind() == io::ErrorKind::WouldBlock && Instant::now() < deadline =>
+                {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("winning registration did not resume dispatch: {error}"),
+            }
+        };
+        let mut line = String::new();
+        BufReader::new(stream).read_line(&mut line).unwrap();
+        let delivered: WireMessage = serde_json::from_str(&line).unwrap();
+        assert_eq!(delivered.id, first);
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+    }
+
+    #[test]
+    fn timed_fence_recovery_keeps_budget_after_an_unsuccessful_replay() {
+        let (_tmp, inner, listener, first, since) = timed_recovery_fixture();
+        drop(listener);
+        *lock(&inner.fence_recovery_probe_hook) = Some(Box::new(|| {
+            RecoveryReadiness::Ready(crate::dispatcher::RecoveryTarget::FixtureWebhook)
+        }));
+        for attempt in 1..=3 {
+            inner.poll_retained_fences(At::from_unix_millis(
+                since.unix_millis() + attempt * 300_000,
+            ));
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while inner.diagnostics_snapshot().fence_recovery_attempts.len() < attempt as usize
+                && Instant::now() < deadline
+            {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let snapshot = inner.diagnostics_snapshot();
+            let row = snapshot
+                .fence_recovery_attempts
+                .last()
+                .expect("replay result");
+            assert_eq!(u64::from(row.attempt), attempt);
+            assert_eq!(row.outcome, FenceRecoveryOutcome::ReplayFailed);
+            assert!(lock(&inner.overflow_recipients).contains("held"));
+        }
+
+        inner.poll_retained_fences(At::from_unix_millis(since.unix_millis() + 1_200_000));
+        let snapshot = inner.diagnostics_snapshot();
+        assert_eq!(snapshot.fence_recovery_attempts.len(), 3);
+        assert!(snapshot.fence_recovery_attention[0].exhausted);
+        assert_eq!(
+            inner.store.list_wire_receipts(&first).unwrap()[0].attempts,
+            4
+        );
+    }
+
+    #[test]
+    fn timed_fence_recovery_validates_hosted_generation_and_hydration() {
+        use fl_core::state::{MergeMode, RuntimeEntry, SensitivityPatch, UpsertStateArgs};
+        let rig = rig();
+        let store = rig.inner.store.as_ref();
+        let route = RouteEntry {
+            persona: "held".into(),
+            route: VendorRoute::Codex {
+                thread_id: "018f1e22-9b8b-761c-8c07-b95a99913201".into(),
+                cwd: None,
+            },
+            updated_at: At::from_unix_millis(1),
+            identity_at: None,
+            explicit: true,
+            hosted_id: Some("codex:held".into()),
+            hydration_generation: Some("gen-2".into()),
+            pid_start_time: None,
+        };
+        let write_record = |at, generation, hydration| {
+            store
+                .upsert_state(UpsertStateArgs {
+                    scope: StateScope::Workspace,
+                    slug: "hosted-session-codex-held".into(),
+                    sensitivity: SensitivityPatch::Inherit,
+                    payload: StatePayload::Runtime(RuntimeEntry {
+                        value: serde_json::json!({
+                            "session_id": "codex:held",
+                            "persona": "Held",
+                            "vendor": "codex",
+                            "hosted": true,
+                            "host_session_id": "Held.codex",
+                            "status": "running",
+                            "hydration_generation": generation,
+                            "hydration_status": hydration,
+                            "runtime_leader_pid": 42,
+                            "vendor_session_id": "018f1e22-9b8b-761c-8c07-b95a99913201"
+                        }),
+                        merge_mode: MergeMode::LastWriter,
+                    }),
+                    at: At::from_unix_millis(at),
+                    by: "test".into(),
+                })
+                .unwrap();
+        };
+
+        write_record(1, "gen-1", "confirmed");
+        assert_eq!(
+            recovery_host_session(store, "held", &route),
+            Err(FenceRecoveryOutcome::HostedBindingUnavailable)
+        );
+        write_record(2, "gen-2", "unconfirmed");
+        assert_eq!(
+            recovery_host_session(store, "held", &route),
+            Ok(Some(RecoveryHostBinding {
+                session_id: "Held.codex".into(),
+                runtime_leader_pid: Some(42),
+                startup_confirmed: false,
+            }))
+        );
+        write_record(3, "gen-2", "confirmed");
+        assert_eq!(
+            recovery_host_session(store, "held", &route),
+            Ok(Some(RecoveryHostBinding {
+                session_id: "Held.codex".into(),
+                runtime_leader_pid: Some(42),
+                startup_confirmed: true,
+            }))
+        );
+    }
+
+    #[test]
+    fn retained_fence_recovery_only_reports_proven_sign_in_before_startup_confirmation() {
+        use FenceRecoveryOutcome::{Inconclusive, UnconfirmedStartup, VendorSignIn};
+
+        assert_eq!(
+            readiness_result(RecoveryReadiness::Hold(VendorSignIn), false),
+            Err(VendorSignIn)
+        );
+        assert_eq!(
+            readiness_result(RecoveryReadiness::Hold(Inconclusive), false),
+            Err(UnconfirmedStartup)
+        );
+        assert_eq!(
+            readiness_result(
+                RecoveryReadiness::Ready(RecoveryTarget::FixtureWebhook),
+                false
+            ),
+            Err(UnconfirmedStartup)
+        );
     }
 
     #[test]

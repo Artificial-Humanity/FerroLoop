@@ -10,6 +10,8 @@ use crate::identity::{RouteEntry, VendorRoute, normalize_persona};
 const MAX_FAILURE_STAGES: usize = 4;
 const MAX_ROUTE_OBSERVATIONS: usize = 2;
 pub const MAX_REGISTRATION_DIAGNOSTICS: usize = 64;
+const MAX_FENCE_DIAGNOSTICS: usize = 128;
+const MAX_FENCE_RECOVERY_ATTEMPTS: usize = 128;
 
 /// Read-only evidence from this daemon instance. Restart loses this evidence;
 /// that loss does not establish that retrying a delivery would be safe.
@@ -28,12 +30,75 @@ pub struct DispatchDiagnostics {
     pub diagnostics_partial: bool,
     pub omitted_evidence_total: u64,
     pub omitted_evidence_total_saturated: bool,
+    /// Most recent attempts, including attempts for fences that have cleared.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fence_recovery_attempts: Vec<FenceRecoveryAttempt>,
+    /// Recipient fences still held after timed recovery ran.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fence_recovery_attention: Vec<FenceRecoveryAttention>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DiagnosticsScope {
     DaemonLifetime,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FenceRecoveryOutcome {
+    Released,
+    DeadRoute,
+    VendorSignIn,
+    UnconfirmedStartup,
+    HostedBindingUnavailable,
+    HostedCaptureUnavailable,
+    NonHostedRoute,
+    UnsupportedRoute,
+    Inconclusive,
+    RouteChanged,
+    FenceSuperseded,
+    InboxUnavailable,
+    ReplayFailed,
+    #[serde(other)]
+    Unsupported,
+}
+
+impl FenceRecoveryOutcome {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Released => "fence released",
+            Self::DeadRoute => "dead route",
+            Self::VendorSignIn => "vendor sign-in screen",
+            Self::UnconfirmedStartup => "hosted startup unconfirmed",
+            Self::HostedBindingUnavailable => "no hosted stream binding",
+            Self::HostedCaptureUnavailable => "hosted screen capture unavailable",
+            Self::NonHostedRoute => "non-hosted route",
+            Self::UnsupportedRoute => "timed recovery unsupported for this route",
+            Self::Inconclusive => "route readiness unverified",
+            Self::RouteChanged => "route changed during recovery",
+            Self::FenceSuperseded => "fence superseded during recovery",
+            Self::InboxUnavailable => "inbox unavailable",
+            Self::ReplayFailed => "replay failed",
+            Self::Unsupported => "unrecognized recovery outcome",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FenceRecoveryAttempt {
+    pub recipient: String,
+    pub attempt: u32,
+    pub limit: u32,
+    pub at: At,
+    pub outcome: FenceRecoveryOutcome,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FenceRecoveryAttention {
+    pub recipient: String,
+    pub outcome: FenceRecoveryOutcome,
+    pub exhausted: bool,
 }
 
 /// An observation of the existing suppression phase, not a scheduling state.
@@ -452,6 +517,8 @@ impl DiagnosticsState {
                 diagnostics_partial: false,
                 omitted_evidence_total: 0,
                 omitted_evidence_total_saturated: false,
+                fence_recovery_attempts: Vec::new(),
+                fence_recovery_attention: Vec::new(),
             },
         }
     }
@@ -460,6 +527,56 @@ impl DiagnosticsState {
         self.snapshot
             .records
             .retain(|r| r.recipient.as_deref() != Some(recipient));
+        self.clear_fence_recovery_attention(recipient);
+    }
+
+    pub(crate) fn record_fence_recovery(&mut self, mut attempt: FenceRecoveryAttempt) {
+        let Some(recipient) = normalize_persona(&attempt.recipient) else {
+            return;
+        };
+        attempt.recipient = recipient;
+        let history = &mut self.snapshot.fence_recovery_attempts;
+        if history.len() == MAX_FENCE_RECOVERY_ATTEMPTS {
+            history.remove(0);
+        }
+        history.push(attempt);
+    }
+
+    pub(crate) fn set_fence_recovery_attention(
+        &mut self,
+        recipient: &str,
+        outcome: FenceRecoveryOutcome,
+        exhausted: bool,
+    ) {
+        let Some(recipient) = normalize_persona(recipient) else {
+            return;
+        };
+        let attention = &mut self.snapshot.fence_recovery_attention;
+        let row = FenceRecoveryAttention {
+            recipient,
+            outcome,
+            exhausted,
+        };
+        if let Some(existing) = attention
+            .iter_mut()
+            .find(|item| item.recipient == row.recipient)
+        {
+            *existing = row;
+        } else if attention.len() < MAX_FENCE_DIAGNOSTICS {
+            attention.push(row);
+        } else {
+            self.snapshot.diagnostics_partial = true;
+            increment_saturating(
+                &mut self.snapshot.omitted_evidence_total,
+                &mut self.snapshot.omitted_evidence_total_saturated,
+            );
+        }
+    }
+
+    pub(crate) fn clear_fence_recovery_attention(&mut self, recipient: &str) {
+        self.snapshot
+            .fence_recovery_attention
+            .retain(|row| row.recipient != recipient);
     }
 
     /// Called with the diagnostics lock paired with the authoritative marker.
@@ -507,7 +624,7 @@ impl DiagnosticsState {
             }
             return None;
         }
-        if self.snapshot.records.len() == 128 {
+        if self.snapshot.records.len() == MAX_FENCE_DIAGNOSTICS {
             self.snapshot.diagnostics_partial = true;
             increment_saturating(
                 &mut self.snapshot.omitted_evidence_total,
@@ -1104,6 +1221,70 @@ mod tests {
     }
 
     #[test]
+    fn diagnostic_snapshot_round_trips_retained_fence_recovery() {
+        let mut json =
+            serde_json::to_value(DiagnosticsState::new(At::from_unix_millis(123), None).snapshot)
+                .unwrap();
+        json["fence_recovery_attempts"] = serde_json::json!([{
+            "recipient": "feira",
+            "attempt": 2,
+            "limit": 3,
+            "at": At::from_unix_millis(456),
+            "outcome": "vendor_sign_in",
+        }]);
+        json["fence_recovery_attention"] = serde_json::json!([{
+            "recipient": "feira",
+            "outcome": "vendor_sign_in",
+            "exhausted": false,
+        }]);
+        let snapshot = serde_json::from_value::<DispatchDiagnostics>(json.clone()).unwrap();
+        assert_eq!(serde_json::to_value(snapshot).unwrap(), json);
+    }
+
+    #[test]
+    fn recovery_history_is_bounded_and_survives_clearing_attention() {
+        let mut state = DiagnosticsState::new(At::from_unix_millis(0), None);
+        let last_attempt = MAX_FENCE_RECOVERY_ATTEMPTS as u32 + 1;
+        for attempt in 1..=last_attempt {
+            state.record_fence_recovery(FenceRecoveryAttempt {
+                recipient: "Feira".into(),
+                attempt,
+                limit: last_attempt,
+                at: At::from_unix_millis(u64::from(attempt)),
+                outcome: FenceRecoveryOutcome::DeadRoute,
+            });
+        }
+        let history = &state.snapshot.fence_recovery_attempts;
+        assert_eq!(history.len(), MAX_FENCE_RECOVERY_ATTEMPTS);
+        assert_eq!(history.first().unwrap().attempt, 2);
+        assert_eq!(history.last().unwrap().attempt, last_attempt);
+        assert_eq!(history.last().unwrap().recipient, "feira");
+
+        state.set_fence_recovery_attention("Feira", FenceRecoveryOutcome::DeadRoute, false);
+        state.set_fence_recovery_attention("feira", FenceRecoveryOutcome::VendorSignIn, true);
+        state.set_fence_recovery_attention(
+            "/private/invalid",
+            FenceRecoveryOutcome::Inconclusive,
+            false,
+        );
+        assert_eq!(
+            state.snapshot.fence_recovery_attention,
+            vec![FenceRecoveryAttention {
+                recipient: "feira".into(),
+                outcome: FenceRecoveryOutcome::VendorSignIn,
+                exhausted: true,
+            }]
+        );
+
+        state.clear_recipient("feira");
+        assert!(state.snapshot.fence_recovery_attention.is_empty());
+        assert_eq!(
+            state.snapshot.fence_recovery_attempts.len(),
+            MAX_FENCE_RECOVERY_ATTEMPTS
+        );
+    }
+
+    #[test]
     fn diagnostic_snapshot_serde_preserves_explicit_unknowns() {
         let snapshot = DispatchDiagnostics {
             schema_version: 1,
@@ -1115,10 +1296,14 @@ mod tests {
             diagnostics_partial: false,
             omitted_evidence_total: 0,
             omitted_evidence_total_saturated: false,
+            fence_recovery_attempts: Vec::new(),
+            fence_recovery_attention: Vec::new(),
         };
         let json = serde_json::to_value(&snapshot).unwrap();
         assert_eq!(json["scope"], "daemon_lifetime");
         assert!(json["instance_nonce"].is_null());
+        assert!(json.get("fence_recovery_attempts").is_none());
+        assert!(json.get("fence_recovery_attention").is_none());
         assert_eq!(json["records"][0]["phase"], "retained_fence");
         assert_eq!(
             json["records"][0]["first_reason"],

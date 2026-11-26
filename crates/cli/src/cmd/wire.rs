@@ -2856,13 +2856,29 @@ fn dispatch_diagnostics_summary(
             .entry(label.as_str().unwrap().to_owned())
             .or_default() += 1;
     }
+    let attention = diagnostics
+        .fence_recovery_attention
+        .iter()
+        .filter_map(|row| {
+            let recipient = fl_wire::identity::normalize_persona(&row.recipient)?;
+            let reason = row.outcome.label();
+            let exhausted = if row.exhausted { ":exhausted" } else { "" };
+            Some(format!("{recipient}:{reason}{exhausted}"))
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    let attention = if attention.is_empty() {
+        String::new()
+    } else {
+        format!("\tfence_recovery_needs_attention={attention}")
+    };
     let reasons = reasons
         .into_iter()
         .map(|(reason, count)| format!("{reason}={count}"))
         .collect::<Vec<_>>()
         .join(",");
     format!(
-        "dispatch_diagnostics=available\tholds={}\tglobal_capacity_exhausted={}\tomitted_evidence={}\tdiagnostics_partial={}\tomitted_evidence_saturated={}\tdecisive_reasons={}",
+        "dispatch_diagnostics=available\tholds={}\tglobal_capacity_exhausted={}\tomitted_evidence={}\tdiagnostics_partial={}\tomitted_evidence_saturated={}\tdecisive_reasons={}{attention}",
         diagnostics.records.len(),
         diagnostics.global_capacity_exhausted,
         diagnostics.omitted_evidence_total,
@@ -3005,6 +3021,34 @@ fn codex_queues_summary(queues: &[fl_wire::daemon::CodexRouteQueueStatus]) -> St
 
 #[cfg(test)]
 pub(crate) mod tests {
+    #[test]
+    fn wire_status_text_shows_retained_fence_recovery_attention() {
+        let diagnostics = serde_json::from_value(json!({
+            "schema_version": 1,
+            "instance_nonce": null,
+            "instance_started_at": At::from_unix_millis(0),
+            "scope": "daemon_lifetime",
+            "records": [],
+            "global_capacity_exhausted": false,
+            "diagnostics_partial": false,
+            "omitted_evidence_total": 0,
+            "omitted_evidence_total_saturated": false,
+            "fence_recovery_attention": [
+                {"recipient": "feira", "outcome": "vendor_sign_in", "exhausted": true},
+                {"recipient": "ada", "outcome": "dead_route", "exhausted": false},
+                {"recipient": "ferris", "outcome": "hosted_binding_unavailable", "exhausted": false},
+                {"recipient": "jarvis", "outcome": "hosted_capture_unavailable", "exhausted": false},
+                {"recipient": "/private/path", "outcome": "inconclusive", "exhausted": false},
+            ],
+        }))
+        .unwrap();
+        let summary = dispatch_diagnostics_summary(Some(&diagnostics));
+        assert!(summary.ends_with(
+            "\tfence_recovery_needs_attention=feira:vendor sign-in screen:exhausted,ada:dead route,ferris:no hosted stream binding,jarvis:hosted screen capture unavailable"
+        ));
+        assert!(!summary.contains("/private/path"));
+    }
+
     fn test_send_args() -> SendWireArgs {
         SendWireArgs {
             id: None,
