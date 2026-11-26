@@ -2857,7 +2857,9 @@ fn dispatch_diagnostics_summary(
             .entry(label.as_str().unwrap().to_owned())
             .or_default() += 1;
     }
-    use fl_wire::dispatch_diagnostics::FenceRecoveryOutcome::{WaitingForDelay, WaitingForWorker};
+    use fl_wire::dispatch_diagnostics::FenceRecoveryOutcome::{
+        SeatBusy, WaitingForDelay, WaitingForWorker,
+    };
     let mut waiting = Vec::new();
     let mut needs_attention = Vec::new();
     for row in &diagnostics.fence_recovery_attention {
@@ -2865,12 +2867,17 @@ fn dispatch_diagnostics_summary(
             continue;
         };
         let reason = row.outcome.label();
+        let since = row
+            .busy_since
+            .as_ref()
+            .map_or_else(String::new, |at| format!(" since {at}"));
         let exhausted = if row.exhausted { ":exhausted" } else { "" };
         let group = match row.outcome {
             WaitingForDelay | WaitingForWorker => &mut waiting,
+            SeatBusy if !row.exhausted => &mut waiting,
             _ => &mut needs_attention,
         };
-        group.push(format!("{recipient}:{reason}{exhausted}"));
+        group.push(format!("{recipient}:{reason}{since}{exhausted}"));
     }
     let recovery_status = [
         ("fence_recovery_needs_attention", needs_attention),
@@ -3049,12 +3056,15 @@ pub(crate) mod tests {
                 {"recipient": "ari", "outcome": "waiting_for_delay", "exhausted": false},
                 {"recipient": "bea", "outcome": "waiting_for_worker", "exhausted": false},
                 {"recipient": "cal", "outcome": "recovery_disabled", "exhausted": false},
-                {"recipient": "den", "outcome": "seat_busy", "exhausted": false},
+                {"recipient": "den", "outcome": "seat_busy", "exhausted": false, "busy_since": "2026-11-26T00:00:00.000Z"},
+                {"recipient": "eve", "outcome": "seat_busy_prolonged", "exhausted": false, "busy_since": "2026-11-26T01:00:00.000Z"},
                 {"recipient": "eli", "outcome": "dialog_waiting", "exhausted": false},
                 {"recipient": "gia", "outcome": "composer_draft", "exhausted": false},
                 {"recipient": "hal", "outcome": "blank_screen", "exhausted": false},
                 {"recipient": "ira", "outcome": "host_probes_disabled", "exhausted": false},
                 {"recipient": "jan", "outcome": "hosted_leader_pid_unavailable", "exhausted": false},
+                {"recipient": "kim", "outcome": "receipt_bookkeeping_failed", "exhausted": false},
+                {"recipient": "lee", "outcome": "replay_worker_failed", "exhausted": false},
                 {"recipient": "/private/path", "outcome": "inconclusive", "exhausted": false},
             ],
         }))
@@ -3063,17 +3073,29 @@ pub(crate) mod tests {
         assert!(summary.contains(
             "\tfence_recovery_needs_attention=feira:vendor sign-in screen:exhausted,ada:dead route,ferris:no hosted stream binding,jarvis:hosted screen capture unavailable"
         ));
-        assert!(summary.ends_with(
-            "\tfence_recovery_waiting=ari:waiting for the recovery delay,bea:waiting for a delivery worker slot"
+        let (attention, waiting) = summary.split_once("\tfence_recovery_waiting=").unwrap();
+        assert_eq!(
+            waiting,
+            "ari:waiting for the recovery delay,bea:waiting for a delivery worker slot,den:seat is in a turn since 2026-11-26T00:00:00.000Z"
+        );
+        assert!(attention.contains(
+            "eve:seat is still in a turn after 12 consecutive probes since 2026-11-26T01:00:00.000Z"
         ));
         for entry in [
             "cal:timed recovery is disabled",
-            "den:seat is in a turn",
             "eli:a dialog waits for input",
             "gia:the composer holds a draft",
             "hal:hosted screen is blank",
             "ira:host probes are disabled",
             "jan:no recorded hosted leader PID",
+            concat!(
+                "kim:receipt bookkeeping failed. Timed replay stopped. ",
+                "ACK leaves the fence in place. Change the route identity or restart the Wire daemon."
+            ),
+            concat!(
+                "lee:replay worker failed. Timed replay stopped. ",
+                "ACK leaves the fence in place. Change the route identity or restart the Wire daemon."
+            ),
         ] {
             assert!(summary.contains(entry), "{summary}");
         }
