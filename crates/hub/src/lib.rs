@@ -116,6 +116,8 @@ pub struct SavedPromptAttachment {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QueuedOperatorPrompt {
     pub id: String,
+    #[serde(skip)]
+    admission_seq: u64,
     pub session_id: String,
     /// Captured at admission; persona rediscovery must never retarget an explicit Codex send.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -248,6 +250,20 @@ pub(crate) struct QueuedPromptTooLarge;
 pub(crate) const PARKED_PROMPT_REPLACED: &str =
     "The original conversation changed. Review the retained draft before resubmitting.";
 
+#[derive(Debug)]
+struct DirectParkReservation {
+    persona: String,
+    admission_seq: u64,
+    invalidated: bool,
+}
+
+enum QueuedPromptCompletion {
+    Delivered,
+    NotConnected(String),
+    Held(String),
+    Unconfirmed(String),
+}
+
 #[derive(Debug, Default)]
 struct PromptQueueState {
     queues: BTreeMap<String, Vec<QueuedOperatorPrompt>>,
@@ -255,8 +271,8 @@ struct PromptQueueState {
     active_queue_sends: std::collections::BTreeSet<String>,
     active_claude_clears: std::collections::BTreeSet<String>,
     // An ordinary direct Claude dispatch may turn into a zero-key hold.
-    // Reserve room up front. The flag records a concurrent lifecycle invalidation.
-    direct_park_reservations: BTreeMap<String, bool>,
+    // Reserve room and admission order up front, before the wire call can hold.
+    direct_park_reservations: BTreeMap<String, DirectParkReservation>,
     next_seq: u64,
     targets: BTreeMap<String, PromptQueueTarget>,
     /// Per-prompt `(probes_run, next_probe_at_ms)` for composer-occupied holds.
@@ -285,13 +301,13 @@ impl SessionDispatchGuard<'_> {
             .prompt_queues
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let invalidated = queues
+        let reservation = queues
             .direct_park_reservations
             .remove(&self.canonical)
             .expect("direct Claude park has reserved capacity");
-        let mut item = queues.make_item(&self.canonical, input);
+        let mut item = queues.make_item(&self.canonical, input, reservation.admission_seq);
         item.claude_stream = Some(stream);
-        if invalidated {
+        if reservation.invalidated {
             item.refuse(PARKED_PROMPT_REPLACED.into(), Some("session_replaced"));
         } else {
             item.hold(reason);
@@ -395,9 +411,29 @@ impl QueuedOperatorPrompt {
         self.delivery_error = Some(error);
         self.retries_exhausted = false;
     }
+
+    fn invalidate_claude_target(&mut self) -> bool {
+        match self.delivery_state {
+            QueuedDeliveryState::Pending => {
+                self.refuse(PARKED_PROMPT_REPLACED.into(), Some("session_replaced"));
+                api::operator_prompt_log(&self.session_id, "refused", "session_replaced");
+                true
+            }
+            QueuedDeliveryState::Sending => {
+                self.claude_invalidated = true;
+                false
+            }
+            QueuedDeliveryState::Unconfirmed | QueuedDeliveryState::Refused => false,
+        }
+    }
 }
 
 impl PromptQueueState {
+    fn next_admission_seq(&mut self) -> u64 {
+        self.next_seq += 1;
+        self.next_seq
+    }
+
     fn has_room(&self, session_key: &str) -> bool {
         self.queues.get(session_key).map_or(0, Vec::len)
             + usize::from(self.direct_park_reservations.contains_key(session_key))
@@ -421,18 +457,24 @@ impl PromptQueueState {
         session_key: &str,
         input: DirectPromptInput,
     ) -> (QueuedOperatorPrompt, Vec<QueuedOperatorPrompt>) {
-        let item = self.make_item(session_key, input);
+        let admission_seq = self.next_admission_seq();
+        let item = self.make_item(session_key, input, admission_seq);
         let queue = self.queues.entry(session_key.to_string()).or_default();
         queue.push(item.clone());
         (item, queue.clone())
     }
 
-    fn make_item(&mut self, session_key: &str, input: DirectPromptInput) -> QueuedOperatorPrompt {
+    fn make_item(
+        &mut self,
+        session_key: &str,
+        input: DirectPromptInput,
+        admission_seq: u64,
+    ) -> QueuedOperatorPrompt {
         self.remember_target(input.queue_target);
         let now = stamp::now();
-        self.next_seq += 1;
         QueuedOperatorPrompt {
-            id: format!("qp-{}-{}", now.unix_millis(), self.next_seq),
+            id: format!("qp-{}-{admission_seq}", now.unix_millis()),
+            admission_seq,
             session_id: session_key.to_string(),
             intended_codex_thread_id: input.intended_codex_thread_id,
             claude_terminal: input.claude_terminal,
@@ -1095,13 +1137,19 @@ impl HubState {
             let (item, queue) = guard.enqueue(canonical, input);
             return DirectPromptDecision::Queued(Box::new(item), queue);
         }
-        if !force && input.claude_binding.is_some() {
+        if !force && let Some(binding) = &input.claude_binding {
             if !guard.has_room(canonical) {
                 return DirectPromptDecision::QueueFull;
             }
-            guard
-                .direct_park_reservations
-                .insert(canonical.into(), false);
+            let admission_seq = guard.next_admission_seq();
+            guard.direct_park_reservations.insert(
+                canonical.into(),
+                DirectParkReservation {
+                    persona: binding.persona_name().to_owned(),
+                    admission_seq,
+                    invalidated: false,
+                },
+            );
         }
         guard.remember_target(input.queue_target);
         guard.active_queue_sends.insert(canonical.into());
@@ -1148,6 +1196,42 @@ impl HubState {
         prompt_id: &str,
         result: Result<(), fl_wire::dispatcher::PushError>,
     ) -> Vec<QueuedOperatorPrompt> {
+        let completion = match result {
+            Ok(()) => QueuedPromptCompletion::Delivered,
+            Err(fl_wire::dispatcher::PushError::NotConnected(error)) => {
+                QueuedPromptCompletion::NotConnected(error)
+            }
+            Err(fl_wire::dispatcher::PushError::Failed(error))
+                if is_composer_occupied_error(&error) =>
+            {
+                QueuedPromptCompletion::Held(error)
+            }
+            Err(fl_wire::dispatcher::PushError::Failed(error)) => {
+                QueuedPromptCompletion::Unconfirmed(error)
+            }
+        };
+        self.complete_queued_prompt(session_key, prompt_id, completion)
+    }
+
+    pub(crate) fn finish_unconfirmed_queued_prompt(
+        &self,
+        session_key: &str,
+        prompt_id: &str,
+        error: String,
+    ) -> Vec<QueuedOperatorPrompt> {
+        self.complete_queued_prompt(
+            session_key,
+            prompt_id,
+            QueuedPromptCompletion::Unconfirmed(error),
+        )
+    }
+
+    fn complete_queued_prompt(
+        &self,
+        session_key: &str,
+        prompt_id: &str,
+        completion: QueuedPromptCompletion,
+    ) -> Vec<QueuedOperatorPrompt> {
         let mut guard = self.prompt_queues.lock().unwrap_or_else(|e| e.into_inner());
         let Some(queue) = guard.queues.get_mut(session_key) else {
             return Vec::new();
@@ -1157,23 +1241,22 @@ impl HubState {
             .iter()
             .position(|q| q.id == prompt_id && q.delivery_state == QueuedDeliveryState::Sending)
         {
-            match result {
-                Ok(()) => {
+            match completion {
+                QueuedPromptCompletion::Delivered => {
                     queue.remove(pos);
                     finished_ok = true;
                 }
-                Err(fl_wire::dispatcher::PushError::NotConnected(error)) => {
+                QueuedPromptCompletion::NotConnected(error) => {
                     queue[pos].delivery_state = QueuedDeliveryState::Pending;
                     queue[pos].delivery_error = Some(error);
                 }
-                Err(fl_wire::dispatcher::PushError::Failed(error)) => {
-                    if is_composer_occupied_error(&error) {
-                        queue[pos].hold(error);
-                    } else {
-                        queue[pos].delivery_state = QueuedDeliveryState::Unconfirmed;
-                        queue[pos].delivery_error = Some(error);
-                        queue[pos].hold_reason = None;
-                    }
+                QueuedPromptCompletion::Held(error) => {
+                    queue[pos].hold(error);
+                }
+                QueuedPromptCompletion::Unconfirmed(error) => {
+                    queue[pos].delivery_state = QueuedDeliveryState::Unconfirmed;
+                    queue[pos].delivery_error = Some(error);
+                    queue[pos].hold_reason = None;
                 }
             }
         }
@@ -1366,30 +1449,64 @@ impl HubState {
         remaining
     }
 
+    /// Capture the queue admission boundary before starting a hosted restart.
+    pub(crate) fn queued_prompt_admission_watermark(&self) -> u64 {
+        self.prompt_queues
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .next_seq
+    }
+
+    /// A hosted restart invalidates the old registration's queued drafts. A newer
+    /// registration may reuse the same native ID, so leave later admissions alone.
+    pub(crate) fn invalidate_restarted_claude_prompts(&self, persona: &str, watermark: u64) {
+        let mut guard = self.prompt_queues.lock().unwrap_or_else(|e| e.into_inner());
+        for reservation in guard.direct_park_reservations.values_mut() {
+            if reservation.admission_seq <= watermark
+                && reservation.persona.eq_ignore_ascii_case(persona)
+            {
+                reservation.invalidated = true;
+            }
+        }
+        let mut invalidated = Vec::new();
+        for queue in guard.queues.values_mut() {
+            for item in queue {
+                if item.admission_seq <= watermark
+                    && item
+                        .claude_binding
+                        .as_ref()
+                        .is_some_and(|binding| binding.persona_name().eq_ignore_ascii_case(persona))
+                    && item.invalidate_claude_target()
+                {
+                    invalidated.push(item.id.clone());
+                }
+            }
+        }
+        for id in invalidated {
+            guard.composer_hold_probes.remove(&id);
+        }
+    }
+
     /// Clearing a session cannot erase an in-progress or uncertain delivery.
     pub fn clear_session_prompt_queue(&self, session_key: &str) {
         let mut guard = self.prompt_queues.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(invalidated) = guard.direct_park_reservations.get_mut(session_key) {
-            *invalidated = true;
+        if let Some(reservation) = guard.direct_park_reservations.get_mut(session_key) {
+            reservation.invalidated = true;
         }
         if let Some(queue) = guard.queues.get_mut(session_key) {
             let mut invalidated = Vec::new();
             queue.retain_mut(|item| {
-                if item.delivery_state == QueuedDeliveryState::Sending
-                    && item.claude_binding.is_some()
-                {
-                    item.claude_invalidated = true;
-                }
-                if item.delivery_state != QueuedDeliveryState::Pending {
-                    return true;
-                }
-                invalidated.push(item.id.clone());
                 if item.claude_binding.is_some() {
-                    item.refuse(PARKED_PROMPT_REPLACED.into(), Some("session_replaced"));
-                    api::operator_prompt_log(session_key, "refused", "session_replaced");
+                    if item.invalidate_claude_target() {
+                        invalidated.push(item.id.clone());
+                    }
                     return true;
                 }
-                false
+                if item.delivery_state == QueuedDeliveryState::Pending {
+                    invalidated.push(item.id.clone());
+                    return false;
+                }
+                true
             });
             if queue.is_empty() {
                 guard.queues.remove(session_key);

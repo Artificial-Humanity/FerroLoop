@@ -6276,6 +6276,10 @@ enum OperatorPromptError {
     Push(PushError),
     #[error("{0}")]
     Steer(CodexSteerError),
+    #[error("Claude terminal delivery refused: {0}; re-register and resubmit")]
+    ClaudeRefused(String),
+    #[error("{0}")]
+    ClaudeUnconfirmed(String),
     #[error("{reason}")]
     Held {
         reason: String,
@@ -6330,9 +6334,7 @@ fn dispatch_operator_prompt_with_intent_for_session(
     });
     if claude_terminal {
         let binding = claude_binding.ok_or_else(|| {
-            OperatorPromptError::Push(PushError::NotConnected(
-                "Claude registration is unbound; re-register and resubmit".into(),
-            ))
+            OperatorPromptError::ClaudeRefused("Claude registration is unbound".into())
         })?;
         let dispatch = || {
             if let Some(stream) = claude_stream {
@@ -6364,13 +6366,9 @@ fn dispatch_operator_prompt_with_intent_for_session(
         return result
             .map(|()| OperatorPromptOutcome::TransportAccepted)
             .map_err(|error| match error {
-                ClaudeBoundError::Refused(message) => {
-                    OperatorPromptError::Push(PushError::NotConnected(format!(
-                        "Claude terminal delivery refused: {message}; re-register and resubmit"
-                    )))
-                }
+                ClaudeBoundError::Refused(message) => OperatorPromptError::ClaudeRefused(message),
                 ClaudeBoundError::Delivery(message) => {
-                    OperatorPromptError::Push(PushError::Failed(message))
+                    OperatorPromptError::ClaudeUnconfirmed(message)
                 }
                 ClaudeBoundError::Held { reason, stream } => {
                     OperatorPromptError::Held { reason, stream }
@@ -6546,7 +6544,8 @@ fn with_operator_delivery(
         }
         Err(error) => {
             let stage = match error {
-                OperatorPromptError::Steer(CodexSteerError::Refused { .. }) => "refused",
+                OperatorPromptError::Steer(CodexSteerError::Refused { .. })
+                | OperatorPromptError::ClaudeRefused(_) => "refused",
                 OperatorPromptError::Push(PushError::NotConnected(message))
                     if message.contains("re-register and resubmit") =>
                 {
@@ -6564,7 +6563,12 @@ fn with_operator_delivery(
             let mut fields = json!({"delivery_stage":stage, "delivered":false, "delivery_error":error.to_string()});
             if stage == "held" {
                 fields["hold_reason"] = json!(crate::composer_hold_reason(&error.to_string()));
-            } else if stage == "refused" && matches!(error, OperatorPromptError::Push(_)) {
+            } else if stage == "refused"
+                && matches!(
+                    error,
+                    OperatorPromptError::Push(_) | OperatorPromptError::ClaudeRefused(_)
+                )
+            {
                 fields["refusal_reason"] = json!("target_unverified");
             }
             if let OperatorPromptError::Steer(error) = error {
@@ -6621,15 +6625,16 @@ fn complete_operator_queue_item(
         Err(OperatorPromptError::Held { reason, stream }) => {
             state.finish_bound_claude_hold(key, id, reason.clone(), stream.clone())
         }
+        Err(error @ OperatorPromptError::ClaudeRefused(_)) => {
+            state.hold_refused_queued_prompt(key, id, error.to_string(), Some("target_unverified"))
+        }
+        Err(OperatorPromptError::ClaudeUnconfirmed(message)) => {
+            state.finish_unconfirmed_queued_prompt(key, id, message.clone())
+        }
         Err(OperatorPromptError::Push(
             PushError::NotConnected(message) | PushError::Failed(message),
         )) if message.contains("re-register and resubmit") => {
-            let reason = if item.claude_binding.is_some() {
-                "session_replaced"
-            } else {
-                "target_unverified"
-            };
-            state.hold_refused_queued_prompt(key, id, message.clone(), Some(reason))
+            state.hold_refused_queued_prompt(key, id, message.clone(), Some("target_unverified"))
         }
         Err(OperatorPromptError::Steer(error @ CodexSteerError::Refused { .. })) => {
             state.hold_refused_queued_prompt(key, id, error.to_string(), None)
@@ -6883,20 +6888,27 @@ pub fn drain_ready_session_queues(state: &HubState) {
             if !zero_key_hold
                 && !matches!(
                     delivery_res,
-                    Err(OperatorPromptError::Push(PushError::NotConnected(_)))
+                    Err(OperatorPromptError::ClaudeRefused(_)
+                        | OperatorPromptError::Push(PushError::NotConnected(_)))
                 )
             {
-                let after = transcript_observation_from_sessions(
-                    &canonical_id,
-                    &sessions,
-                    &snap,
-                    home,
-                    &mut files,
-                );
+                let after =
+                    if matches!(delivery_res, Err(OperatorPromptError::ClaudeUnconfirmed(_))) {
+                        None
+                    } else {
+                        transcript_observation_from_sessions(
+                            &canonical_id,
+                            &sessions,
+                            &snap,
+                            home,
+                            &mut files,
+                        )
+                    };
                 state.mark_session_in_flight_from_observation(&canonical_id, after.as_deref());
                 if matches!(
                     delivery_res,
-                    Err(OperatorPromptError::Push(PushError::Failed(_)))
+                    Err(OperatorPromptError::ClaudeUnconfirmed(_)
+                        | OperatorPromptError::Push(PushError::Failed(_)))
                 ) {
                     state.associate_unconfirmed_queue(&canonical_id, &session_id, &item.id);
                 }
@@ -7060,7 +7072,8 @@ fn handle_post_queued_prompt_send_now(
     };
     let refused = matches!(
         delivery_res,
-        Err(OperatorPromptError::Steer(CodexSteerError::Refused { .. }))
+        Err(OperatorPromptError::ClaudeRefused(_)
+            | OperatorPromptError::Steer(CodexSteerError::Refused { .. }))
     ) || matches!(&delivery_res, Err(OperatorPromptError::Push(PushError::NotConnected(message) | PushError::Failed(message))) if message.contains("re-register and resubmit"));
     let queue = complete_operator_queue_item(state, &item, &delivery_res);
     // Owner Send Now can renew the bounded retry budget of an exact held target.
@@ -7077,9 +7090,8 @@ fn handle_post_queued_prompt_send_now(
     {
         if matches!(
             delivery_res,
-            Err(OperatorPromptError::Steer(
-                CodexSteerError::Unconfirmed { .. }
-            ))
+            Err(OperatorPromptError::ClaudeUnconfirmed(_)
+                | OperatorPromptError::Steer(CodexSteerError::Unconfirmed { .. }))
         ) {
             state.mark_session_in_flight_from_observation(&canonical_id, None);
         } else {
@@ -7680,6 +7692,7 @@ fn handle_post_session_prompt(
     match &delivery_res {
         Err(
             OperatorPromptError::Held { .. }
+            | OperatorPromptError::ClaudeRefused(_)
             | OperatorPromptError::Steer(CodexSteerError::Refused { .. }),
         ) => {
             cleanup_undelivered_attachments();
@@ -7696,8 +7709,12 @@ fn handle_post_session_prompt(
         Err(OperatorPromptError::Push(PushError::NotConnected(_))) if retained_target.is_some() => {
         }
         Ok(OperatorPromptOutcome::AppServerAccepted { .. })
-        | Err(OperatorPromptError::Steer(CodexSteerError::Unconfirmed { .. })) => {
-            // Steering uses app-server truth; never infer its active turn from a rollout.
+        | Err(
+            OperatorPromptError::ClaudeUnconfirmed(_)
+            | OperatorPromptError::Steer(CodexSteerError::Unconfirmed { .. }),
+        ) => {
+            // A post-dispatch transcript cannot establish completion of an uncertain write.
+            // Steering also uses app-server truth rather than the rollout.
             state.mark_session_in_flight_from_observation(&canonical_session_id, None);
         }
         _ => {
@@ -7735,7 +7752,10 @@ fn handle_post_session_prompt(
     let legacy_not_connected =
         claude_binding.is_none() && data["delivery_stage"] == "not_connected";
     if (rejected && !legacy_not_connected)
-        || matches!(delivery_res, Err(OperatorPromptError::Steer(_)))
+        || matches!(
+            delivery_res,
+            Err(OperatorPromptError::Steer(_) | OperatorPromptError::ClaudeUnconfirmed(_))
+        )
     {
         data["status"] = json!("delivery_failed");
     } else {
@@ -9415,13 +9435,19 @@ fn handle_post_hosted_session_restart(
                 "restart target changed during selection".into(),
             ));
         }
-        lifecycle::restart_hosted_session_with_store(
+        let queue_watermark =
+            (current.vendor == "claude").then(|| state.queued_prompt_admission_watermark());
+        let out = lifecycle::restart_hosted_session_with_store(
             store,
             || state.open_store().map_err(LifecycleError::from),
             env,
             &current.session_id,
             authority.actor_name(),
-        )
+        )?;
+        if let Some(watermark) = queue_watermark {
+            state.invalidate_restarted_claude_prompts(&current.persona, watermark);
+        }
+        Ok(out)
     });
     match result {
         Ok(out) => {
@@ -14298,6 +14324,154 @@ mod claude_registration_binding_tests {
         }
     }
 
+    const CLAUDE_CHANGED_AFTER_KEYS: &str =
+        "prompt submission unconfirmed: Claude conversation changed; re-register and resubmit";
+
+    fn owner_post_with_attachment(state: &HubState, owner: &HubAuthority) -> HttpResponse {
+        let request = HttpRequest::new("POST", "/unused").with_json_body(&json!({
+            "prompt": "check this file",
+            "attachments": [{"name": "evidence.txt", "data_base64": "aGVsbG8="}]
+        }));
+        handle_post_session_prompt(state, owner, "claude:ada", &request)
+    }
+
+    #[test]
+    fn direct_claude_conversation_change_after_keys_keeps_attachment_and_fence() {
+        let (_tmp, state, native, _stream) = parking_fixture();
+        let owner = HubAuthority::Owner {
+            login: "owner".into(),
+        };
+        let _dispatch = stub_claude_dispatch(|_, body| {
+            assert!(body.starts_with("check this file"));
+            Err(ClaudeBoundError::Delivery(CLAUDE_CHANGED_AFTER_KEYS.into()))
+        });
+        let response = owner_post_with_attachment(&state, &owner);
+        assert_eq!(response.status, 200);
+        let receipt = response.json_value().unwrap();
+        assert_eq!(receipt["delivery_stage"], "unconfirmed");
+        assert!(receipt["refusal_reason"].is_null());
+        assert_eq!(receipt["delivery_error"], CLAUDE_CHANGED_AFTER_KEYS);
+        assert_eq!(receipt["in_flight_unconfirmed"], true);
+        let path = receipt["attachments"][0]["path"].as_str().unwrap();
+        assert_eq!(std::fs::read(path).unwrap(), b"hello");
+        assert!(state.session_queue(&native).is_empty());
+
+        let later = owner_post(&state, "later").json_value().unwrap();
+        assert_eq!(later["queued"], true);
+        drain_ready_session_queues(&state);
+        assert_eq!(state.session_queue(&native)[0].prompt, "later");
+    }
+
+    #[test]
+    fn parked_claude_conversation_change_after_keys_keeps_queue_evidence() {
+        let owner = HubAuthority::Owner {
+            login: "owner".into(),
+        };
+        for send_now in [false, true] {
+            let (_tmp, state, native, stream) = parking_fixture();
+            let mut first = true;
+            let _dispatch = stub_claude_dispatch(move |pinned, _| {
+                if std::mem::take(&mut first) {
+                    return Err(busy_hold(&stream));
+                }
+                assert_eq!(pinned, Some(&stream));
+                Err(ClaudeBoundError::Delivery(CLAUDE_CHANGED_AFTER_KEYS.into()))
+            });
+            let receipt = owner_post_with_attachment(&state, &owner)
+                .json_value()
+                .unwrap();
+            assert_eq!(receipt["delivery_stage"], "held");
+            let id = receipt["queued_prompt"]["id"].as_str().unwrap();
+            if send_now {
+                let response = handle_post_queued_prompt_send_now(&state, &owner, &native, id);
+                assert_eq!(response.status, 200);
+                let result = response.json_value().unwrap();
+                assert_eq!(result["delivery_stage"], "unconfirmed");
+                assert!(result["refusal_reason"].is_null());
+            } else {
+                let _probes = stub_composer_probes(vec![Some(true)]);
+                drain_ready_session_queues(&state);
+            }
+
+            let queue = state.session_queue(&native);
+            assert_eq!(queue.len(), 1);
+            assert_eq!(queue[0].id, id);
+            assert_eq!(
+                queue[0].delivery_state,
+                crate::QueuedDeliveryState::Unconfirmed
+            );
+            assert_eq!(
+                queue[0].delivery_error.as_deref(),
+                Some(CLAUDE_CHANGED_AFTER_KEYS)
+            );
+            assert!(queue[0].refusal_reason.is_none());
+            assert_eq!(
+                std::fs::read(&queue[0].attachments[0].path).unwrap(),
+                b"hello"
+            );
+            assert!(state.session_in_flight_unconfirmed(&native));
+            assert_eq!(
+                handle_post_queued_prompt_send_now(&state, &owner, &native, id).status,
+                409
+            );
+            let _no_replay = stub_claude_dispatch(|_, _| panic!("unconfirmed prompt replayed"));
+            drain_ready_session_queues(&state);
+            assert_eq!(
+                state.session_queue(&native)[0].delivery_state,
+                crate::QueuedDeliveryState::Unconfirmed
+            );
+        }
+    }
+
+    #[test]
+    fn hosted_claude_restart_refuses_exhausted_hold_by_original_native_id() {
+        let (_tmp, state, native, stream) = parking_fixture();
+        let owner = HubAuthority::Owner {
+            login: "owner".into(),
+        };
+        let spin_up = HttpRequest::new("POST", "/unused").with_json_body(&json!({
+            "persona": "ada", "project": "FerroLoop", "role": "assistant", "vendor": "claude"
+        }));
+        let response = handle_post_session_spin_up(&state, &owner, &spin_up);
+        assert_eq!(response.status, 200, "{:?}", response.json_value());
+        {
+            let store = state.open_store().unwrap();
+            let mut hosted = lifecycle::get_hosted_session_by_id(&*store, "claude:ada")
+                .unwrap()
+                .unwrap();
+            hosted.vendor_session_id = Some("fbb4d293-6208-4370-875a-07da136f4f3d".into());
+            lifecycle::persist_hosted_session(&*store, &hosted, "owner").unwrap();
+        }
+        let _dispatch = stub_claude_dispatch(move |_, _| Err(busy_hold(&stream)));
+        let response = owner_post_with_attachment(&state, &owner);
+        assert_eq!(response.status, 200, "{:?}", response.json_value());
+        let receipt = response.json_value().unwrap();
+        let id = receipt["queued_prompt"]["id"].as_str().unwrap();
+        let now = stamp::now().unix_millis() as i64;
+        for index in 0..crate::COMPOSER_HELD_MAX_PROBES {
+            assert_eq!(
+                state.note_composer_hold_probe(id, now + i64::from(index) * 120_000),
+                Some(index + 1)
+            );
+        }
+        state.mark_hold_retries_exhausted(&native, id);
+        drain_ready_session_queues(&state);
+        assert!(state.session_queue(&native)[0].retries_exhausted);
+
+        let response = handle_post_hosted_session_restart(&state, &owner, "claude:ada");
+        assert_eq!(response.status, 200, "{:?}", response.json_value());
+        let queue = state.session_queue(&native);
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue[0].id, id);
+        assert_eq!(queue[0].delivery_state, crate::QueuedDeliveryState::Refused);
+        assert_eq!(queue[0].refusal_reason.as_deref(), Some("session_replaced"));
+        assert_eq!(queue[0].prompt, "check this file");
+        assert_eq!(
+            std::fs::read(&queue[0].attachments[0].path).unwrap(),
+            b"hello"
+        );
+    }
+
     #[test]
     fn direct_claude_zero_key_hold_drains_once_when_idle_and_in_admission_order() {
         let (_tmp, state, native, stream) = parking_fixture();
@@ -14636,7 +14810,7 @@ mod claude_registration_binding_tests {
                 false,
             );
             assert!(
-                matches!(direct, Err(OperatorPromptError::Push(PushError::NotConnected(ref error))) if error.contains("session record is unavailable") || error.contains("conversation changed"))
+                matches!(direct, Err(OperatorPromptError::ClaudeRefused(ref error)) if error.contains("session record is unavailable") || error.contains("conversation changed"))
             );
             let queued = dispatch_queued_operator_prompt_with_intent_for_session(
                 &state,
@@ -14652,7 +14826,7 @@ mod claude_registration_binding_tests {
                 None,
             );
             assert!(
-                matches!(queued, Err(OperatorPromptError::Push(PushError::NotConnected(ref error))) if error.contains("session record is unavailable") || error.contains("conversation changed"))
+                matches!(queued, Err(OperatorPromptError::ClaudeRefused(ref error)) if error.contains("session record is unavailable") || error.contains("conversation changed"))
             );
         }
     }
@@ -14727,9 +14901,7 @@ mod claude_registration_binding_tests {
             None,
             false,
         );
-        assert!(
-            matches!(result, Err(OperatorPromptError::Push(PushError::NotConnected(ref error))) if error.contains("re-register and resubmit"))
-        );
+        assert!(matches!(result, Err(OperatorPromptError::ClaudeRefused(_))));
     }
     #[test]
     fn queued_and_send_now_revalidate_original_registration() {
@@ -14752,9 +14924,7 @@ mod claude_registration_binding_tests {
                 None,
                 None,
             );
-            assert!(
-                matches!(result, Err(OperatorPromptError::Push(PushError::NotConnected(ref error))) if error.contains("re-register and resubmit"))
-            );
+            assert!(matches!(result, Err(OperatorPromptError::ClaudeRefused(_))));
         }
     }
     fn enqueue_bound(
@@ -14976,9 +15146,7 @@ mod claude_registration_binding_tests {
             None,
             restored.intended_vendor.as_deref(),
         );
-        assert!(
-            matches!(result, Err(OperatorPromptError::Push(PushError::NotConnected(ref error))) if error.contains("re-register and resubmit"))
-        );
+        assert!(matches!(result, Err(OperatorPromptError::ClaudeRefused(_))));
     }
 }
 
