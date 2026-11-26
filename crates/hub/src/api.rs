@@ -2015,6 +2015,8 @@ pub struct HubFenceRecoveryAttention {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub reason_label: String,
     pub exhausted: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub busy_since: Option<fl_core::at::At>,
 }
 
 /// Allowlist projection of [`fl_wire::dispatch_diagnostics::FenceDiagnostic`].
@@ -2231,6 +2233,7 @@ impl HubDispatchDiagnostics {
                         outcome: row.outcome,
                         reason_label: row.outcome.label().to_owned(),
                         exhausted: row.exhausted,
+                        busy_since: row.busy_since,
                     })
                 })
                 .collect(),
@@ -13518,16 +13521,19 @@ mod council_guidance_tests {
                             recipient: "felix".into(),
                             outcome: FenceRecoveryOutcome::VendorSignIn,
                             exhausted: true,
+                            busy_since: None,
                         },
                         FenceRecoveryAttention {
                             recipient: "ada".into(),
-                            outcome: FenceRecoveryOutcome::WaitingForWorker,
+                            outcome: FenceRecoveryOutcome::SeatBusy,
                             exhausted: false,
+                            busy_since: Some(ts_for_status.clone()),
                         },
                         FenceRecoveryAttention {
                             recipient: "/secret/recovery-diagnostic".into(),
                             outcome: FenceRecoveryOutcome::Inconclusive,
                             exhausted: false,
+                            busy_since: None,
                         },
                     ],
                 }),
@@ -13655,9 +13661,10 @@ mod council_guidance_tests {
                 },
                 {
                     "recipient": "ada",
-                    "outcome": "waiting_for_worker",
-                    "reason_label": "waiting for a delivery worker slot",
+                    "outcome": "seat_busy",
+                    "reason_label": "seat is in a turn",
                     "exhausted": false,
+                    "busy_since": ts,
                 },
             ])
         );
