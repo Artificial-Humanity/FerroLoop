@@ -9,7 +9,7 @@ use fl_core::agent::{
 };
 use fl_core::at::At;
 use fl_core::ids::{AgentId, Kind, RecordId};
-use fl_core::state::{StateConcern, StatePayload, StateScope, validate_slug};
+use fl_core::state::validate_slug;
 use fl_core::store::{AgentRegistry, Catalog, Handles, StateStore, StoreError};
 use fl_core::telemetry::{
     AttemptHeartbeat, DEFAULT_STALE_AFTER_MS, LivenessVerdict, evaluate_liveness,
@@ -19,6 +19,7 @@ use fl_hub::lifecycle::{
     self, DecommissionMode, LifecycleEnv, LifecycleError, RemodelMode, RemodelRequest,
     SessionTarget, SpinUpRequest,
 };
+use fl_watch::{HostedBlock, WatchHostedSession};
 use serde::Serialize;
 
 use crate::refs::Ref;
@@ -197,7 +198,7 @@ pub enum AgentCmd {
     },
     /// Report wrapper-observed liveness (`live`, `unverifiable`, or `exited`) for an agent or record.
     Liveness {
-        /// Optional agent persona (`ferris`) or record handle/IRI (`1`, `urn:uuid:...`).
+        /// Optional agent persona, hosted session ID, or record handle/IRI.
         target: Option<String>,
         /// Maximum heartbeat age in milliseconds before a `live` status becomes `unverifiable (stale_status)`.
         #[arg(long, default_value_t = DEFAULT_STALE_AFTER_MS)]
@@ -390,7 +391,56 @@ struct LivenessReportItem {
     #[serde(skip_serializing_if = "Option::is_none")]
     agent: Option<String>,
     #[serde(flatten)]
+    hosted_block: HostedLivenessBlock,
+    #[serde(flatten)]
     verdict: LivenessVerdict,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize)]
+struct HostedLivenessBlock {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    block: Option<HostedBlock>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stop_reason: Option<&'static str>,
+}
+
+impl HostedLivenessBlock {
+    fn from_session(seat: &WatchHostedSession) -> Self {
+        Self {
+            block: seat.block,
+            stop_reason: seat
+                .is_stopped_while_blocked()
+                .then_some(lifecycle::STOP_REASON_STARTUP_BLOCKED),
+        }
+    }
+
+    fn append_to(self, mut line: String) -> String {
+        if let Some(block) = self.block {
+            line.push_str("\tblock=");
+            line.push_str(block.reason.as_str());
+        }
+        if let Some(reason) = self.stop_reason {
+            line.push_str("\tstop_reason=");
+            line.push_str(reason);
+        }
+        line
+    }
+}
+
+fn blocked_seat_for<'a>(
+    seats: &'a [WatchHostedSession],
+    target: &str,
+    vendor: Option<&str>,
+) -> Option<&'a WatchHostedSession> {
+    let target = target.trim();
+    seats
+        .iter()
+        .filter(|seat| {
+            seat.session_id.eq_ignore_ascii_case(target)
+                || (seat.persona.eq_ignore_ascii_case(target)
+                    && vendor.is_none_or(|vendor| seat.vendor.eq_ignore_ascii_case(vendor)))
+        })
+        .max_by_key(|seat| (seat.is_running(), seat.updated_at_ms))
 }
 
 fn format_verdict_label(verdict: &LivenessVerdict) -> String {
@@ -1048,20 +1098,15 @@ pub fn run<S: AgentRegistry + Handles + StateStore + Catalog + fl_core::MessageS
             stale_after_ms,
             json,
         } => {
-            let entries = store
-                .list_state(Some(&StateScope::Workspace), Some(StateConcern::Runtime))
-                .map_err(|e| (1, e.to_string()))?;
-            let mut heartbeats: Vec<(String, AttemptHeartbeat)> = Vec::new();
-            for entry in entries {
-                if !entry.slug.starts_with("liveness-") {
-                    continue;
-                }
-                if let StatePayload::Runtime(rt) = entry.payload
-                    && let Ok(hb) = serde_json::from_value::<AttemptHeartbeat>(rt.value)
-                {
-                    heartbeats.push((entry.slug, hb));
-                }
-            }
+            let runtime = fl_watch::read_runtime(store).map_err(|e| (1, e.to_string()))?;
+            let heartbeats = runtime.heartbeats;
+            let blocked_seats: Vec<_> = runtime
+                .hosted_sessions
+                .into_iter()
+                .filter(|seat| {
+                    (seat.is_running() && seat.block.is_some()) || seat.is_stopped_while_blocked()
+                })
+                .collect();
             let now = now_at();
             let host = fl_exec::adapters::harness::detect_host();
 
@@ -1078,7 +1123,9 @@ pub fn run<S: AgentRegistry + Handles + StateStore + Catalog + fl_core::MessageS
 
                 let matched_hb = heartbeats
                     .into_iter()
-                    .filter(|(slug, hb)| {
+                    .filter(|entry| {
+                        let slug = &entry.slug;
+                        let hb = &entry.heartbeat;
                         slug == &t
                             || Some(slug.as_str()) == target_rec_slug.as_deref()
                             || slug == &target_ag_slug
@@ -1091,11 +1138,13 @@ pub fn run<S: AgentRegistry + Handles + StateStore + Catalog + fl_core::MessageS
                                 .as_ref()
                                 .is_some_and(|iri| hb.record.iri() == iri)
                     })
-                    .max_by(|(_, a), (_, b)| {
+                    .max_by(|a, b| {
+                        let a = &a.heartbeat;
+                        let b = &b.heartbeat;
                         (a.heartbeat_at.as_str(), a.attempt_id.as_str())
                             .cmp(&(b.heartbeat_at.as_str(), b.attempt_id.as_str()))
                     })
-                    .map(|(_, hb)| hb);
+                    .map(|entry| entry.heartbeat);
 
                 let (adapter, agent, verdict) = if let Some(ref hb) = matched_hb {
                     let v = evaluate_liveness(Some(hb), &now, stale_after_ms, &host, pid_is_alive);
@@ -1117,6 +1166,17 @@ pub fn run<S: AgentRegistry + Handles + StateStore + Catalog + fl_core::MessageS
                         (None, None, v)
                     }
                 };
+                let seat = blocked_seat_for(&blocked_seats, &t, adapter.as_deref()).or_else(|| {
+                    if matched_hb.is_some() {
+                        return None;
+                    }
+                    blocked_seat_for(&blocked_seats, agent.as_deref()?, adapter.as_deref())
+                });
+                let hosted_block = seat
+                    .map(HostedLivenessBlock::from_session)
+                    .unwrap_or_default();
+                let adapter = adapter.or_else(|| seat.map(|seat| seat.vendor.clone()));
+                let agent = agent.or_else(|| seat.map(|seat| seat.persona.clone()));
                 if json {
                     let item = LivenessReportItem {
                         target: t,
@@ -1124,19 +1184,21 @@ pub fn run<S: AgentRegistry + Handles + StateStore + Catalog + fl_core::MessageS
                         record: matched_hb.as_ref().map(|h| h.record.clone()),
                         adapter,
                         agent,
+                        hosted_block,
                         verdict,
                     };
                     println!("{}", serde_json::to_string_pretty(&item).unwrap());
                 } else {
-                    println!(
-                        "{}",
-                        format_liveness_line(&t, matched_hb.as_ref(), adapter.as_deref(), &verdict,)
-                    );
+                    let line =
+                        format_liveness_line(&t, matched_hb.as_ref(), adapter.as_deref(), &verdict);
+                    println!("{}", hosted_block.append_to(line));
                 }
                 Ok(())
             } else {
                 let mut dedup: BTreeMap<String, (String, AttemptHeartbeat)> = BTreeMap::new();
-                for (slug, hb) in heartbeats {
+                for entry in heartbeats {
+                    let slug = entry.slug;
+                    let hb = entry.heartbeat;
                     let key = hb.attempt_id.as_str().to_string();
                     match dedup.get(&key) {
                         Some((_, prev))
@@ -1160,6 +1222,7 @@ pub fn run<S: AgentRegistry + Handles + StateStore + Catalog + fl_core::MessageS
                             record: Some(hb.record),
                             adapter: Some(hb.adapter),
                             agent: hb.agent,
+                            hosted_block: HostedLivenessBlock::default(),
                             verdict,
                         });
                     } else {
@@ -1175,6 +1238,7 @@ pub fn run<S: AgentRegistry + Handles + StateStore + Catalog + fl_core::MessageS
                     }
                 }
                 let host_sessions = discover_live_host_sessions_for_liveness();
+                let mut reported_blocks = std::collections::BTreeSet::new();
                 for summary in &host_sessions {
                     if !matches!(summary.state, fl_host_proto::ChildState::Running(_)) {
                         continue;
@@ -1191,6 +1255,13 @@ pub fn run<S: AgentRegistry + Handles + StateStore + Catalog + fl_core::MessageS
                         if !seen_agents.insert(agent.to_ascii_lowercase()) {
                             continue;
                         }
+                        let hosted_block = blocked_seat_for(&blocked_seats, &agent, Some(&adapter))
+                            .filter(|seat| seat.is_running())
+                            .map(|seat| {
+                                reported_blocks.insert(seat.session_id.as_str());
+                                HostedLivenessBlock::from_session(seat)
+                            })
+                            .unwrap_or_default();
                         if json {
                             items.push(LivenessReportItem {
                                 target: agent.clone(),
@@ -1198,19 +1269,40 @@ pub fn run<S: AgentRegistry + Handles + StateStore + Catalog + fl_core::MessageS
                                 record: None,
                                 adapter: Some(adapter),
                                 agent: Some(agent),
+                                hosted_block,
                                 verdict,
                             });
                         } else {
-                            println!(
-                                "{}",
-                                format_liveness_line(
-                                    &agent,
-                                    None,
-                                    Some(adapter.as_str()),
-                                    &verdict
-                                )
-                            );
+                            let line = format_liveness_line(&agent, None, Some(&adapter), &verdict);
+                            println!("{}", hosted_block.append_to(line));
                         }
+                    }
+                }
+                for seat in &blocked_seats {
+                    if reported_blocks.contains(seat.session_id.as_str()) {
+                        continue;
+                    }
+                    let verdict =
+                        evaluate_liveness(None, &now, stale_after_ms, &host, pid_is_alive);
+                    let hosted_block = HostedLivenessBlock::from_session(seat);
+                    if json {
+                        items.push(LivenessReportItem {
+                            target: seat.session_id.clone(),
+                            attempt_id: None,
+                            record: None,
+                            adapter: Some(seat.vendor.clone()),
+                            agent: Some(seat.persona.clone()),
+                            hosted_block,
+                            verdict,
+                        });
+                    } else {
+                        let line = format_liveness_line(
+                            &seat.session_id,
+                            None,
+                            Some(&seat.vendor),
+                            &verdict,
+                        );
+                        println!("{}", hosted_block.append_to(line));
                     }
                 }
                 if json {

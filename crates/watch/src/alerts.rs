@@ -529,17 +529,48 @@ pub(crate) fn evaluate_watch_alerts_with_hosted_sessions(
         );
     }
 
-    let mut blocked_counts = BTreeMap::<String, u64>::new();
+    let mut blocked_counts = BTreeMap::<String, (u64, u64)>::new();
     for seat in hosted_sessions {
         let vendor = seat.vendor.trim();
-        if seat.is_running() && seat.block.is_some() && !vendor.is_empty() {
-            *blocked_counts
+        if vendor.is_empty() {
+            continue;
+        }
+        let running = seat.is_running() && seat.block.is_some();
+        let stopped = seat.is_stopped_while_blocked();
+        if running || stopped {
+            let counts = blocked_counts
                 .entry(vendor.to_ascii_lowercase())
-                .or_default() += 1;
+                .or_default();
+            counts.0 += u64::from(running);
+            counts.1 += u64::from(stopped);
         }
     }
-    for (vendor, count) in blocked_counts {
-        let seats = if count == 1 { "seat" } else { "seats" };
+    for (vendor, (running, stopped)) in blocked_counts {
+        let seat_word = |count| if count == 1 { "seat" } else { "seats" };
+        let (message, hint) = match (running, stopped) {
+            (0, _) => (
+                format!(
+                    "{vendor} has {stopped} hosted {} stopped while blocked",
+                    seat_word(stopped)
+                ),
+                "Restart the stopped seats after the block is cleared.",
+            ),
+            (_, 0) => (
+                format!(
+                    "{vendor} has {running} blocked hosted {}",
+                    seat_word(running)
+                ),
+                "Inspect the affected hosted sessions for sign-in, a prompt that needs a decision, or overdue hydration.",
+            ),
+            (_, _) => (
+                format!(
+                    "{vendor} has {running} blocked hosted {} and {stopped} hosted {} stopped while blocked",
+                    seat_word(running),
+                    seat_word(stopped),
+                ),
+                "Inspect the affected hosted sessions and restart the stopped seats after the block is cleared.",
+            ),
+        };
         push(
             WatchAlertRule::HostedBlock,
             Severity::Warning,
@@ -549,11 +580,11 @@ pub(crate) fn evaluate_watch_alerts_with_hosted_sessions(
                 label: None,
             },
             format!("vendor:{vendor}"),
-            format!("{vendor} has {count} blocked hosted {seats}"),
-            count as f64,
+            message,
+            (running + stopped) as f64,
             1.0,
             None,
-            "Inspect the affected hosted sessions for sign-in, a prompt that needs a decision, or overdue hydration.".into(),
+            hint.into(),
         );
     }
 

@@ -323,7 +323,11 @@ mod tests {
         use serde_json::json;
 
         let store: AnyStore = fl_store::FerroStore::in_memory().into();
-        let set_seat = |vendor: &str, persona: &str, status: &str, block: serde_json::Value| {
+        let set_seat = |vendor: &str,
+                        persona: &str,
+                        status: &str,
+                        stop_reason: Option<&str>,
+                        block: serde_json::Value| {
             put_runtime(
                 &store,
                 &format!("hosted-session-{vendor}-{persona}"),
@@ -332,17 +336,25 @@ mod tests {
                     "persona": persona,
                     "vendor": vendor,
                     "status": status,
+                    "stop_reason": stop_reason,
                     "block": block,
                 }),
             );
         };
         let sign_in = json!({"reason": "vendor_sign_in", "observed_at_ms": 123});
         let dialog = json!({"reason": "blocking_dialog", "observed_at_ms": 124});
-        set_seat("codex", "ada", "running", sign_in.clone());
-        set_seat("codex", "bo", "running", sign_in.clone());
-        set_seat("codex", "stopped", "stopped", sign_in);
-        set_seat("muse", "ada", "running", dialog);
-        set_seat("muse", "legacy", "running", serde_json::Value::Null);
+        set_seat("codex", "ada", "running", None, sign_in.clone());
+        set_seat("codex", "bo", "running", None, sign_in.clone());
+        set_seat("codex", "crashed", "stopped", Some("runtime_gone"), sign_in);
+        set_seat(
+            "codex",
+            "stopped",
+            "stopped",
+            Some("startup_blocked"),
+            serde_json::Value::Null,
+        );
+        set_seat("muse", "ada", "running", None, dialog);
+        set_seat("muse", "legacy", "running", None, serde_json::Value::Null);
 
         let summary = || {
             build_summary(
@@ -365,11 +377,16 @@ mod tests {
         assert_eq!(
             ids_and_counts,
             [
-                ("hosted_block:vendor:codex", 2.0),
+                ("hosted_block:vendor:codex", 3.0),
                 ("hosted_block:vendor:muse", 1.0)
             ]
         );
         assert!(first.alerts[0].message.contains("2 blocked hosted seats"));
+        assert!(
+            first.alerts[0]
+                .message
+                .contains("1 hosted seat stopped while blocked")
+        );
         assert!(first.alerts[1].message.contains("1 blocked hosted seat"));
         let codex = first
             .health
@@ -381,11 +398,24 @@ mod tests {
         assert_eq!(block["hosted_session"]["block"]["reason"], "vendor_sign_in");
         assert_eq!(block["hosted_session"]["block"]["observed_at_ms"], 123);
 
-        set_seat("codex", "ada", "running", serde_json::Value::Null);
+        set_seat("codex", "ada", "running", None, serde_json::Value::Null);
         let fewer = summary();
         assert_eq!(fewer.alerts[0].id, first.alerts[0].id);
-        assert_eq!(fewer.alerts[0].observed, 1.0);
-        set_seat("codex", "bo", "running", serde_json::Value::Null);
+        assert_eq!(fewer.alerts[0].observed, 2.0);
+        set_seat("codex", "bo", "running", None, serde_json::Value::Null);
+        let stopped_only = summary();
+        assert_eq!(stopped_only.alerts[0].id, first.alerts[0].id);
+        assert_eq!(stopped_only.alerts[0].observed, 1.0);
+        assert_eq!(
+            stopped_only.alerts[0].message,
+            "codex has 1 hosted seat stopped while blocked"
+        );
+        assert_eq!(
+            stopped_only.alerts[0].remediation,
+            "Restart the stopped seats after the block is cleared."
+        );
+
+        set_seat("codex", "stopped", "running", None, serde_json::Value::Null);
         let recovered = summary();
         assert_eq!(recovered.alerts.len(), 1);
         assert_eq!(recovered.alerts[0].id, first.alerts[1].id);

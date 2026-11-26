@@ -40,6 +40,16 @@ pub enum HostedBlockReason {
     HydrationOverdue,
 }
 
+impl HostedBlockReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::VendorSignIn => "vendor_sign_in",
+            Self::BlockingDialog => "blocking_dialog",
+            Self::HydrationOverdue => "hydration_overdue",
+        }
+    }
+}
+
 /// An operator-actionable observation about a hosted session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostedBlock {
@@ -120,6 +130,12 @@ impl WatchHostedSession {
     /// Whether the hub reports this session up.
     pub fn is_running(&self) -> bool {
         self.status.eq_ignore_ascii_case(HOSTED_STATUS_RUNNING)
+    }
+
+    /// Whether the hub stopped this seat while it was blocked.
+    pub fn is_stopped_while_blocked(&self) -> bool {
+        self.status.eq_ignore_ascii_case("stopped")
+            && self.stop_reason.as_deref() == Some("startup_blocked")
     }
 }
 
