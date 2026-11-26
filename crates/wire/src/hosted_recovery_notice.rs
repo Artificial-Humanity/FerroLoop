@@ -81,22 +81,24 @@ pub fn prepare(
     Ok(id)
 }
 
-/// Append private excerpts only to the results of a local named inbox read.
+/// Append private excerpts only to a local inbox read scoped to one recipient.
 /// Call after ACK and publication so only a response to that read holds a tail.
 pub fn attach_to_local_inbox(
     store: &(impl StateStore + AgentRegistry),
     filter: &WireFilter,
     items: &mut [WireInboxItem],
 ) {
-    let Some(name) = filter
-        .recipient
-        .as_deref()
-        .and_then(crate::identity::normalize_persona)
-    else {
+    let Some(recipient) = filter.recipient.as_deref().map(str::trim) else {
         return;
     };
+    let name = crate::identity::normalize_persona(recipient);
     for item in items {
-        if let Some(tail) = load_tail(store, item, &name)
+        if item.receipt.recipient_id.as_str() != recipient
+            && name.as_deref() != Some(item.receipt.recipient_name.as_str())
+        {
+            continue;
+        }
+        if let Some(tail) = load_tail(store, item)
             && item.message.body.len() + TAIL_HEADING.len() + tail.len() <= MAX_WIRE_BODY_BYTES
         {
             item.message.body.push_str(TAIL_HEADING);
@@ -105,22 +107,17 @@ pub fn attach_to_local_inbox(
     }
 }
 
-fn load_tail(
-    store: &(impl StateStore + AgentRegistry),
-    item: &WireInboxItem,
-    name: &str,
-) -> Option<String> {
+fn load_tail(store: &(impl StateStore + AgentRegistry), item: &WireInboxItem) -> Option<String> {
     let message = &item.message;
     let WireAddress::AgentId(recipient) = &message.to else {
         return None;
     };
+    // The store can infer a sender ID from an active system registration.
     if message.sender_name != "system"
-        || message.sender_id.is_some()
         || message.kind != MessageKind::Mail
         || !message.durable
         || item.receipt.message_id != message.id
         || &item.receipt.recipient_id != recipient.iri()
-        || item.receipt.recipient_name != name
     {
         return None;
     }
@@ -152,7 +149,7 @@ fn load_tail(
     }
     let agent = store.get_agent(recipient).ok()??;
     if &agent.id != recipient
-        || agent.name_key != name
+        || agent.name_key != item.receipt.recipient_name
         || agent.status != AgentStatus::Active
         || !(agent.role == AgentRole::LabManager
             || (agent.role == AgentRole::Lead && agent.covers_area(&attachment.project)))

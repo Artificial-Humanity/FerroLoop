@@ -8141,6 +8141,19 @@ mod tests {
         let rig = rig();
         let store = rig.inner.store.as_ref();
         let at = At::from_unix_millis(10);
+        let system = store
+            .register_agent(RegisterAgentArgs {
+                display_name: "system".into(),
+                email: None,
+                project: "ferroloop".into(),
+                role: AgentRole::Assistant,
+                extra_areas: vec![],
+                create_area: true,
+                replace: false,
+                at: at.clone(),
+                by: "system".into(),
+            })
+            .unwrap();
         let lead = store
             .register_agent(RegisterAgentArgs {
                 display_name: "Notice-Lead".into(),
@@ -8173,6 +8186,8 @@ mod tests {
             })
             .unwrap();
 
+        assert_eq!(notice.sender_id.as_ref(), Some(&system.id));
+
         let read = |recipient: Option<&str>, ack| {
             let (LocalResponse::Inbox { items }, _) =
                 rig.inner.handle_local_request(LocalRequest::Read {
@@ -8188,14 +8203,17 @@ mod tests {
             items
         };
         assert_eq!(read(None, false)[0].message.body, SAFE);
-        assert!(read(Some("another-agent"), false).is_empty());
-        assert!(
-            read(Some(&lead.name_key), false)[0]
-                .message
-                .body
-                .contains(TAIL)
+        for recipient in ["", "*", "another-agent"] {
+            assert!(read(Some(recipient), false).is_empty());
+        }
+        let direct_recipient = lead.id.as_str();
+        assert_eq!(
+            [" Notice-Lead ", direct_recipient]
+                .map(|recipient| read(Some(recipient), false)[0].message.body.contains(TAIL)),
+            [true, true],
+            "named and ID-scoped inbox reads should include the excerpt"
         );
-        let acked = &read(Some(&lead.name_key), true)[0];
+        let acked = &read(Some(direct_recipient), true)[0];
         assert!(acked.message.body.contains(TAIL));
         assert_eq!(acked.receipt.status, DeliveryStatus::Acked);
         assert_eq!(
@@ -8204,7 +8222,9 @@ mod tests {
         );
 
         store.retire_agent(&lead.id, at, "system").unwrap();
-        assert_eq!(read(Some(&lead.name_key), false)[0].message.body, SAFE);
+        for recipient in [lead.name_key.as_str(), direct_recipient] {
+            assert_eq!(read(Some(recipient), false)[0].message.body, SAFE);
+        }
     }
 
     #[test]
