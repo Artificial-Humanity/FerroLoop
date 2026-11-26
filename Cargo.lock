@@ -685,6 +685,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "uuid",
+ "vt100",
  "webpki-roots",
 ]
 

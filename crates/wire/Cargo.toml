@@ -33,3 +33,4 @@ fl-wire = { path = ".", features = ["wire-test-isolation"] }
 fl-host-proto = { path = "../host-proto", features = ["hub-test-isolation"] }
 tempfile.workspace = true
 tokio.workspace = true
+vt100 = "=0.18.1"
