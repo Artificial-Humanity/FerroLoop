@@ -3,6 +3,10 @@
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
+use fl_core::state::{
+    HOSTED_VERSION_BASELINE_PREFIX, HOSTED_VERSION_GENERATION_PREFIX, HOSTED_VERSION_LAUNCH_PREFIX,
+    HOSTED_VERSION_QUEUE_PREFIX,
+};
 use fl_core::vendor_adapter::VendorDaemonLaunchEvidence;
 use fl_core::{RevisionId, VendorVersionRegistry};
 use fl_host_proto::StreamId;
@@ -11,10 +15,6 @@ use sha2::{Digest, Sha256};
 
 use super::*;
 
-const LAUNCH_PREFIX: &str = "hosted-vendor-launch-";
-const BASELINE_PREFIX: &str = "hosted-vendor-baseline-";
-const GENERATION_PREFIX: &str = "hosted-version-gen-";
-const QUEUE_PREFIX: &str = "hosted-version-queue-";
 const ACTOR: &str = "hub-vendor-versions";
 const OBSERVATIONS_PER_PASS: usize = 8;
 const MAX_PENDING_LAUNCHES: usize = 64;
@@ -343,21 +343,27 @@ fn digest(bytes: &[u8]) -> String {
 }
 
 fn stream_slug(stream: &StreamId) -> String {
-    format!("{LAUNCH_PREFIX}{}", digest(stream.to_string().as_bytes()))
+    format!(
+        "{HOSTED_VERSION_LAUNCH_PREFIX}{}",
+        digest(stream.to_string().as_bytes())
+    )
 }
 
 fn generation_slug(session_id: &str, generation: &str) -> String {
     let key = format!("{session_id}/{generation}");
-    format!("{GENERATION_PREFIX}{}", digest(key.as_bytes()))
+    format!(
+        "{HOSTED_VERSION_GENERATION_PREFIX}{}",
+        digest(key.as_bytes())
+    )
 }
 
 fn baseline_slug(receipt: &LaunchReceipt) -> String {
     let key = format!("{}/{}", receipt.host, receipt.vendor);
-    format!("{BASELINE_PREFIX}{}", digest(key.as_bytes()))
+    format!("{HOSTED_VERSION_BASELINE_PREFIX}{}", digest(key.as_bytes()))
 }
 
 fn queue_slug() -> String {
-    format!("{QUEUE_PREFIX}{}", local_host_key())
+    format!("{HOSTED_VERSION_QUEUE_PREFIX}{}", local_host_key())
 }
 
 fn read<S: StateStore, T: serde::de::DeserializeOwned>(
@@ -540,6 +546,9 @@ fn observe(receipt: &LaunchReceipt, adapters: &VendorVersionRegistry) -> HostedV
         daemon_expected: receipt.daemon_expected,
         ..Default::default()
     };
+    if receipt.host != local_host_key() {
+        return versions;
+    }
     let Some(evidence) = &receipt.evidence else {
         return versions;
     };
@@ -576,10 +585,10 @@ fn save_versions<S: StateStore>(
 ) -> Result<(), LifecycleError> {
     receipt.evidence = None;
     receipt.versions = Some(versions);
-    let receipt_slug = receipt
-        .stream
-        .as_ref()
-        .map_or_else(|| format!("{LAUNCH_PREFIX}{}", receipt.id), stream_slug);
+    let receipt_slug = receipt.stream.as_ref().map_or_else(
+        || format!("{HOSTED_VERSION_LAUNCH_PREFIX}{}", receipt.id),
+        stream_slug,
+    );
     write(store, receipt_slug, &receipt)?;
     let slug = generation_slug(&receipt.session_id, &receipt.generation);
     for _ in 0..STATE_UPDATE_ATTEMPTS {
@@ -995,7 +1004,7 @@ mod tests {
         second.stream = None;
         second.generation.clone_from(&first.generation);
         let generation = generation_slug(&second.session_id, &second.generation);
-        let first_slug = format!("{LAUNCH_PREFIX}{}", first.id);
+        let first_slug = format!("{HOSTED_VERSION_LAUNCH_PREFIX}{}", first.id);
         let second_id = second.id;
         let old = sample(Some("1.0.0"), None);
         let new = sample(Some("2.0.0"), None);
@@ -1103,12 +1112,18 @@ mod tests {
         let automatic = observe(&launch, &adapters);
         let automatic_probes = probes.load(Ordering::Relaxed);
         launch.evidence.as_mut().unwrap().automatic = false;
+        let mut foreign_launch = launch.clone();
+        foreign_launch.host = "another-host".into();
+        let foreign = observe(&foreign_launch, &adapters);
+        let foreign_probes = probes.load(Ordering::Relaxed);
         let manual = observe(&launch, &adapters);
 
         child.kill().unwrap();
         child.wait().unwrap();
         assert_eq!(automatic.cli, None);
         assert_eq!(automatic_probes, 0);
+        assert_eq!(foreign.cli, None);
+        assert_eq!(foreign_probes, 0);
         assert_eq!(manual.cli.as_deref(), Some("1.2.3"));
         assert_eq!(probes.load(Ordering::Relaxed), 1);
     }

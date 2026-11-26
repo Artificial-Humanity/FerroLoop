@@ -34,7 +34,7 @@ use fl_core::log::{AttemptStatus, GateRun};
 use fl_core::state::{
     HandoffEntry, MemoryBasis, MemoryCategory, MemoryEntry, MemoryLifecycle, MergeMode,
     RuntimeEntry, SensitivityPatch, StateConcern, StateEntry, StatePayload, StateScope,
-    StateSearchHit, UpsertStateArgs,
+    StateSearchHit, UpsertStateArgs, is_hosted_version_state_slug,
 };
 use fl_core::store::{
     AgentRegistry, Catalog, Handles, Ledger, MessageStore, StateStore, WorkflowStore,
@@ -2819,6 +2819,7 @@ fn is_reserved_hub_slug(slug: &str) -> bool {
         || slug.starts_with("hub-node-")
         || slug.starts_with(crate::lifecycle::HOSTED_RESPAWN_STATE_SLUG_PREFIX)
         || slug.starts_with(NOTICE_STATE_SLUG_PREFIX)
+        || is_hosted_version_state_slug(slug)
 }
 
 fn is_internal_hub_entry(entry: &StateEntry) -> bool {

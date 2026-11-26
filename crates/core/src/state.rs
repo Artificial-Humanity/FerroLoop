@@ -19,6 +19,24 @@ pub const HOSTED_RESPAWN_STATE_SLUG_PREFIX: &str = "hosted-respawn-state-";
 /// Workspace runtime key prefix for sensitive hosted recovery notice excerpts.
 pub const NOTICE_STATE_SLUG_PREFIX: &str = "hosted-recovery-notice-";
 
+/// Workspace runtime key prefixes for the private hosted vendor version observer.
+pub const HOSTED_VERSION_LAUNCH_PREFIX: &str = "hosted-vendor-launch-";
+pub const HOSTED_VERSION_BASELINE_PREFIX: &str = "hosted-vendor-baseline-";
+pub const HOSTED_VERSION_GENERATION_PREFIX: &str = "hosted-version-gen-";
+pub const HOSTED_VERSION_QUEUE_PREFIX: &str = "hosted-version-queue-";
+pub const HOSTED_VERSION_STATE_SLUG_PREFIXES: [&str; 4] = [
+    HOSTED_VERSION_LAUNCH_PREFIX,
+    HOSTED_VERSION_BASELINE_PREFIX,
+    HOSTED_VERSION_GENERATION_PREFIX,
+    HOSTED_VERSION_QUEUE_PREFIX,
+];
+
+pub fn is_hosted_version_state_slug(slug: &str) -> bool {
+    HOSTED_VERSION_STATE_SLUG_PREFIXES
+        .iter()
+        .any(|prefix| slug.starts_with(prefix))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum StateError {
     #[error(
@@ -168,7 +186,7 @@ pub enum StateConcern {
     Runtime,
 }
 
-/// Whether the state key belongs to local-only hosted recovery data.
+/// Whether the state key belongs to local-only hosted lifecycle data.
 pub fn is_internal_hosted_runtime_key(
     scope: &StateScope,
     concern: StateConcern,
@@ -177,7 +195,8 @@ pub fn is_internal_hosted_runtime_key(
     scope == &StateScope::Workspace
         && concern == StateConcern::Runtime
         && (slug.starts_with(HOSTED_RESPAWN_STATE_SLUG_PREFIX)
-            || slug.starts_with(NOTICE_STATE_SLUG_PREFIX))
+            || slug.starts_with(NOTICE_STATE_SLUG_PREFIX)
+            || is_hosted_version_state_slug(slug))
 }
 
 crate::wire::wire_names!(StateConcern as state_concern_wire {
