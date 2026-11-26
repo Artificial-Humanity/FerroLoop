@@ -340,6 +340,9 @@ impl HubServer {
         hosted_reconcile_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let hosted_reconcile_in_flight =
             std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let hosted_blocker_sampler = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::lifecycle::blockers::Sampler::default(),
+        ));
         // The first tick fires at once: one attachment sweep when the hub starts, then hourly.
         let mut attachment_sweep_tick =
             tokio::time::interval(crate::attachments::ATTACHMENT_SWEEP_INTERVAL);
@@ -415,9 +418,13 @@ impl HubServer {
                     let flight_guard = ReconcileFlightGuard(hosted_reconcile_in_flight.clone());
                     // Not awaited: hosted session reconcile and respawn never holds up the accept loop.
                     let state = state.clone();
+                    let hosted_blocker_sampler = hosted_blocker_sampler.clone();
                     drop(tokio::task::spawn_blocking(move || {
                         let _flight_guard = flight_guard;
                         let _ = crate::lifecycle::reconcile_and_respawn_hosted_sessions_in_hub(&state);
+                        if let Ok(mut sampler) = hosted_blocker_sampler.lock() {
+                            sampler.reconcile(&state);
+                        }
                     }));
                 }
                 _ = attachment_sweep_tick.tick() => {

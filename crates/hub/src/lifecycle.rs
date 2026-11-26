@@ -34,6 +34,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::api::{reforge_role_label, route_matches_session_id, synthesize_decommission_prompt};
 
+pub(crate) mod blockers;
 #[cfg(test)]
 mod fence_tests;
 mod lock;
@@ -105,6 +106,7 @@ pub const STATUS_STOPPED: &str = "stopped";
 
 pub const STOP_REASON_RUNTIME_GONE: &str = "runtime_gone";
 pub const STOP_REASON_CLEAN_EXIT: &str = "clean_exit";
+pub const STOP_REASON_STARTUP_BLOCKED: &str = "startup_blocked";
 pub const STOP_REASON_CRASH_LOOP: &str = "crash_loop";
 pub const STOP_REASON_PREREQUISITE_UNAVAILABLE: &str = "prerequisite_unavailable";
 pub const LAUNCH_PREREQUISITE_RETRY_MS: u64 = 60_000;
@@ -3336,6 +3338,9 @@ pub struct HostedSessionRecord {
     /// `running`, `decommissioning`, `decommissioned`, or `stopped`.
     /// `stopped` means the tmux window was confirmed gone; the agent stays.
     pub status: String,
+    /// A live seat awaiting operator action or overdue startup hydration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub block: Option<fl_watch::HostedBlock>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stop_reason: Option<String>,
     /// Bounded socket path and probe result for an unavailable launch prerequisite.
@@ -3390,6 +3395,15 @@ pub struct HostedSessionRecord {
     pub created_at_ms: u64,
     pub updated_at_ms: u64,
     pub decommission_prepared_at_ms: Option<u64>,
+}
+
+impl HostedSessionRecord {
+    fn active_block(&self) -> Option<fl_watch::HostedBlock> {
+        self.block.filter(|block| {
+            block.reason != fl_watch::HostedBlockReason::HydrationOverdue
+                || self.hydration_status == HydrationStatus::Unconfirmed
+        })
+    }
 }
 
 /// Compute the `fl-host` session identifier for an optional `tmux_target` (`<Persona>.<vendor>`,
@@ -4108,6 +4122,11 @@ pub fn persist_hosted_session<S: StateStore>(
             "fl-hub: warning: failed to promote hydration receipt for `{}`: {e}",
             record.session_id
         );
+    }
+    if !normalized.status.eq_ignore_ascii_case(STATUS_RUNNING)
+        || normalized.active_block().is_none()
+    {
+        normalized.block = None;
     }
     let value =
         serde_json::to_value(&normalized).map_err(|e| LifecycleError::Store(e.to_string()))?;
@@ -6286,6 +6305,12 @@ where
         node_id: v.node_id.clone(),
         hosted: v.hosted,
         status: STATUS_RUNNING.to_string(),
+        block: previous
+            .as_ref()
+            .filter(|r| {
+                v.hosted && !will_spawn && is_live_hosted(r) && r.tmux_target == tmux_target
+            })
+            .and_then(|r| r.block),
         stop_reason: None,
         launch_prerequisite_detail: None,
         restart_policy: "on-failure".to_string(),
@@ -6839,6 +6864,7 @@ fn record_for_target<S: AgentRegistry>(
         node_id: DEFAULT_NODE_ID.to_string(),
         hosted: false,
         status: STATUS_RUNNING.to_string(),
+        block: None,
         stop_reason: None,
         launch_prerequisite_detail: None,
         // A session this lifecycle never started is not restarted by it.
@@ -7798,20 +7824,20 @@ fn reconcile_dead_hosted_session_fenced<S: StateStore>(
                         let _ = sync_claude_vendor_session_id_from_route(store, env, &mut record);
                     }
                 }
-                let clean_exit = env
+                let stop_reason = if record.active_block().is_some() {
+                    STOP_REASON_STARTUP_BLOCKED
+                } else if env
                     .runtime
                     .recorded_exit_code(&target, record.runtime_leader_pid.or(record.pid))
-                    == Some(0);
+                    == Some(0)
+                {
+                    STOP_REASON_CLEAN_EXIT
+                } else {
+                    STOP_REASON_RUNTIME_GONE
+                };
                 record.status = STATUS_STOPPED.to_string();
                 record.launch_prerequisite_detail = None;
-                record.stop_reason = Some(
-                    if clean_exit {
-                        STOP_REASON_CLEAN_EXIT
-                    } else {
-                        STOP_REASON_RUNTIME_GONE
-                    }
-                    .to_string(),
-                );
+                record.stop_reason = Some(stop_reason.into());
                 record.updated_at_ms = now_ms();
                 if let Err(err) = persist_hosted_session(store, &record, by) {
                     eprintln!(
@@ -8733,6 +8759,7 @@ where
         record.hydration_dispatched = true;
     }
     if will_spawn {
+        record.block = None;
         record.pid = None;
         record.runtime_leader_pid = None;
         record.pid_start_time = None;
@@ -15567,6 +15594,7 @@ mod tests {
             node_id: DEFAULT_NODE_ID.into(),
             hosted: true,
             status: status.into(),
+            block: None,
             stop_reason: None,
             launch_prerequisite_detail: None,
             restart_policy: "on-failure".into(),
@@ -20711,6 +20739,47 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(after_decomm.status, STATUS_DECOMMISSIONED);
+    }
+
+    #[test]
+    fn blocked_hosted_exit_stops_without_crash_attempt_or_respawn() {
+        let home = TempDir::new().unwrap();
+        let store = MemStore::default();
+        let fake = FakeRuntime::default();
+        let env = fake.env(home.path());
+        let mut record = hosted_record("muse", "waiting", STATUS_RUNNING, true);
+        record.block = Some(fl_watch::HostedBlock {
+            reason: fl_watch::HostedBlockReason::BlockingDialog,
+            observed_at_ms: 1,
+        });
+        let unit = record.tmux_target.as_ref().unwrap().clone();
+        fake.presence_of
+            .borrow_mut()
+            .insert(unit.clone(), RuntimePresence::Gone);
+        fake.exit_codes.borrow_mut().insert(unit, 1);
+        persist_hosted_session(&store, &record, "test").unwrap();
+        for _ in 0..3 {
+            assert!(
+                reconcile_and_respawn_hosted_sessions(&store, &env)
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+        let stopped = get_hosted_session_by_id(&store, &record.session_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stopped.status, STATUS_STOPPED);
+        assert_eq!(
+            stopped.stop_reason.as_deref(),
+            Some(STOP_REASON_STARTUP_BLOCKED)
+        );
+        assert_eq!(stopped.block, None);
+        assert_eq!(stopped.restart_count, 0);
+        assert!(fake.launches.borrow().is_empty());
+        assert_eq!(
+            load_hosted_respawn_state(&store, &record.session_id).unwrap(),
+            HostedRespawnState::default()
+        );
     }
 
     #[test]
