@@ -10,6 +10,7 @@ pub mod daemon;
 pub mod dispatch_diagnostics;
 pub mod dispatcher;
 pub mod host_runtime;
+pub mod hosted_recovery_notice;
 pub mod identity;
 pub mod peer;
 mod registration_evidence;

@@ -1284,6 +1284,7 @@ pub fn execute_read(
             }
         }
     }
+    fl_wire::hosted_recovery_notice::attach_to_local_inbox(&store, &filter, &mut items);
     Ok(items)
 }
 
