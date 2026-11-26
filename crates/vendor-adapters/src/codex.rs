@@ -27,8 +27,8 @@ use fl_core::vendor_adapter::{
     AdapterIdentityBinding, AdapterReadiness, AttachOrResumeOutcome, AttachOrResumeRequest,
     ConfigEffectiveScope, LaunchPrerequisiteRefusal, LaunchSignInIssue, NormalizedSessionTurn,
     TeardownOutcome, TeardownTarget, TranscriptNormalizeReport, TurnDeliveryOutcome,
-    TurnDeliveryRequest, VendorAdapterError, VendorConfigSpec, VendorHostAdapter, VendorLaunchPlan,
-    VendorLaunchRequest, VendorStartupPromptRule,
+    TurnDeliveryRequest, VendorAdapterError, VendorConfigSpec, VendorDaemonLaunchEvidence,
+    VendorHostAdapter, VendorLaunchPlan, VendorLaunchRequest, VendorStartupPromptRule,
 };
 #[cfg(unix)]
 use ring::rand::{SecureRandom, SystemRandom};
@@ -256,11 +256,121 @@ fn codex_prerequisite_refusal(socket: &Path, result: &str) -> LaunchPrerequisite
     }
 }
 
+impl fl_core::VendorVersionAdapter for CodexHostAdapter {
+    fn vendor_id(&self) -> &'static str {
+        "codex"
+    }
+
+    fn version_from_executable(&self, executable: &Path) -> Option<String> {
+        let (package, version) = installed_package_version(executable)?;
+        (package == "standalone").then(|| version.to_owned())
+    }
+
+    fn daemon_version_from_executable(&self, executable: &Path) -> Option<String> {
+        // Older app-server daemons used the standalone package. The caller already bound
+        // this path to the running daemon, so either release layout can identify it.
+        installed_package_version(executable).map(|(_, version)| version.to_owned())
+    }
+
+    #[cfg(unix)]
+    fn observe_daemon_version(&self, config_home: &Path) -> Option<String> {
+        if !config_home.is_absolute() {
+            return None;
+        }
+        let socket = codex_launch_control_socket(config_home);
+        let deadline = Instant::now() + Duration::from_millis(500);
+        // Codex exempts this internal identity from changing the daemon's originator
+        // and starting gateway login. The probe needs only the initialize result.
+        let (_, result) =
+            Conn::connect_and_read_initialize(&socket, deadline, "codex_app_server_daemon").ok()?;
+        initialize_server_version(&result).map(str::to_owned)
+    }
+
+    #[cfg(unix)]
+    fn observe_launched_daemon_version(
+        &self,
+        config_home: &Path,
+        expected_peer_pid: u32,
+    ) -> Option<String> {
+        let socket = codex_launch_control_socket(config_home);
+        let deadline = Instant::now() + Duration::from_millis(500);
+        let (_, result) = Conn::connect_and_read_initialize_with_peer(
+            &socket,
+            deadline,
+            "codex_app_server_daemon",
+            Some(expected_peer_pid),
+        )
+        .ok()?;
+        initialize_server_version(&result).map(str::to_owned)
+    }
+}
+
+fn installed_package_version(executable: &Path) -> Option<(&str, &str)> {
+    if !executable.is_absolute()
+        || !matches!(executable.file_name()?.to_str()?, "codex" | "codex.exe")
+    {
+        return None;
+    }
+    let parent = executable.parent()?;
+    let release = if parent.ends_with("bin") {
+        parent.parent()?
+    } else {
+        parent
+    };
+    let releases = release.parent()?;
+    let package = releases.parent()?;
+    if !releases.ends_with("releases") || !package.parent()?.ends_with("packages") {
+        return None;
+    }
+    let package = package.file_name()?.to_str()?;
+    if !matches!(package, "standalone" | "app-server-daemon") {
+        return None;
+    }
+    let name = release.file_name()?.to_str()?;
+    let version = [
+        "-aarch64-apple-darwin",
+        "-x86_64-apple-darwin",
+        "-aarch64-unknown-linux-gnu",
+        "-x86_64-unknown-linux-gnu",
+        "-aarch64-unknown-linux-musl",
+        "-x86_64-unknown-linux-musl",
+        "-aarch64-pc-windows-msvc",
+        "-x86_64-pc-windows-msvc",
+    ]
+    .into_iter()
+    .find_map(|target| name.strip_suffix(target))?;
+    Some((package, crate::valid_release_version(version)?))
+}
+
+#[cfg(unix)]
+fn initialize_server_version(result: &Value) -> Option<&str> {
+    let version = if let Some(user_agent) = result.get("userAgent") {
+        // The product name follows the first client, but the product version identifies
+        // the daemon. The client version can appear later in the user-agent comment.
+        let product = user_agent.as_str()?.split_whitespace().next()?;
+        let (name, version) = product.split_once('/')?;
+        if name.is_empty() {
+            return None;
+        }
+        version
+    } else {
+        result.get("serverInfo")?.get("version")?.as_str()?
+    };
+    crate::valid_release_version(version)
+}
+
 impl VendorHostAdapter for CodexHostAdapter {
     fn preflight_launch(
         &self,
         config_home: Option<&Path>,
     ) -> Result<(), LaunchPrerequisiteRefusal> {
+        self.preflight_launch_with_daemon(config_home).map(drop)
+    }
+
+    fn preflight_launch_with_daemon(
+        &self,
+        config_home: Option<&Path>,
+    ) -> Result<Option<VendorDaemonLaunchEvidence>, LaunchPrerequisiteRefusal> {
         let config_home = config_home.ok_or_else(|| {
             codex_prerequisite_refusal(
                 Path::new("<unresolved CODEX_HOME>"),
@@ -270,9 +380,19 @@ impl VendorHostAdapter for CodexHostAdapter {
         let socket = codex_launch_control_socket(config_home);
         #[cfg(unix)]
         {
-            connect_unix_with_deadline(&socket, Instant::now() + LAUNCH_CONNECT_TIMEOUT)
-                .map(|_| ())
-                .map_err(|e| codex_prerequisite_refusal(&socket, &format!("{:?}", e.kind())))
+            let socket_identity = VendorDaemonLaunchEvidence::socket_identity(&socket);
+            let stream =
+                connect_unix_with_deadline(&socket, Instant::now() + LAUNCH_CONNECT_TIMEOUT)
+                    .map_err(|e| codex_prerequisite_refusal(&socket, &format!("{:?}", e.kind())))?;
+            let socket_identity = socket_identity.filter(|identity| {
+                VendorDaemonLaunchEvidence::socket_identity(&socket).as_ref() == Some(identity)
+            });
+            Ok(Some(VendorDaemonLaunchEvidence {
+                config_home: config_home.to_owned(),
+                socket,
+                socket_identity,
+                peer_pid: unix_peer_pid(&stream),
+            }))
         }
         #[cfg(not(unix))]
         {
@@ -763,9 +883,12 @@ impl RpcStage {
 #[cfg(unix)]
 fn launch_account_sign_in_issue(stream: UnixStream, cwd: &str) -> Option<LaunchSignInIssue> {
     let deadline = Instant::now() + LAUNCH_AUTH_PROBE_TIMEOUT;
-    let Ok((mut conn, initialize)) = Conn::initialize_stream(stream, deadline) else {
+    let Ok((mut conn, initialize)) = Conn::initialize_stream(stream, deadline, "ferroloop") else {
         return Some(LaunchSignInIssue::Inconclusive);
     };
+    if conn.send_initialized().is_err() {
+        return Some(LaunchSignInIssue::Inconclusive);
+    }
     // The first initialize can latch the originator for the daemon's lifetime. Allow any
     // existing originator and check the version in the first userAgent product token.
     let product_and_version = initialize["userAgent"]
@@ -1554,6 +1677,38 @@ struct Conn {
 }
 
 #[cfg(unix)]
+fn unix_peer_pid(stream: &UnixStream) -> Option<u32> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+
+        let mut cred = std::mem::MaybeUninit::<libc::ucred>::uninit();
+        let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+        // getsockopt writes the peer credentials into a correctly sized buffer.
+        let rc = unsafe {
+            libc::getsockopt(
+                stream.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_PEERCRED,
+                cred.as_mut_ptr().cast(),
+                &mut len,
+            )
+        };
+        if rc != 0 || len as usize != std::mem::size_of::<libc::ucred>() {
+            return None;
+        }
+        u32::try_from(unsafe { cred.assume_init() }.pid)
+            .ok()
+            .filter(|pid| *pid > 0)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = stream;
+        None
+    }
+}
+
+#[cfg(unix)]
 enum RpcReplyError {
     Protocol(String),
     Rejected(Value),
@@ -1562,6 +1717,25 @@ enum RpcReplyError {
 #[cfg(unix)]
 impl Conn {
     fn connect_and_initialize(sock: &Path, deadline: Instant) -> Result<Self, (RpcStage, String)> {
+        let (mut conn, _) = Self::connect_and_read_initialize(sock, deadline, "ferroloop")?;
+        conn.send_initialized()?;
+        Ok(conn)
+    }
+
+    fn connect_and_read_initialize(
+        sock: &Path,
+        deadline: Instant,
+        client_name: &str,
+    ) -> Result<(Self, Value), (RpcStage, String)> {
+        Self::connect_and_read_initialize_with_peer(sock, deadline, client_name, None)
+    }
+
+    fn connect_and_read_initialize_with_peer(
+        sock: &Path,
+        deadline: Instant,
+        client_name: &str,
+        expected_peer_pid: Option<u32>,
+    ) -> Result<(Self, Value), (RpcStage, String)> {
         let stream = connect_unix_with_deadline(sock, deadline).map_err(|e| {
             (
                 RpcStage::Connect,
@@ -1571,12 +1745,21 @@ impl Conn {
                 ),
             )
         })?;
-        Self::initialize_stream(stream, deadline).map(|(conn, _)| conn)
+        if let Some(expected_pid) = expected_peer_pid
+            && unix_peer_pid(&stream) != Some(expected_pid)
+        {
+            return Err((
+                RpcStage::Connect,
+                "app-server peer changed since launch".into(),
+            ));
+        }
+        Self::initialize_stream(stream, deadline, client_name)
     }
 
     fn initialize_stream(
         stream: UnixStream,
         deadline: Instant,
+        client_name: &str,
     ) -> Result<(Self, Value), (RpcStage, String)> {
         let mut conn = Self {
             stream,
@@ -1585,19 +1768,21 @@ impl Conn {
             deadline,
         };
         conn.handshake().map_err(|msg| (RpcStage::Handshake, msg))?;
-        // Keep the same client identity as Wire's managed-daemon control connection.
         conn.send_json(&json!({
             "id": 1,
             "method": "initialize",
-            "params": { "clientInfo": { "name": "ferroloop", "version": "0.1.0" } },
+            "params": { "clientInfo": { "name": client_name, "version": "0.1.0" } },
         }))
         .map_err(|msg| (RpcStage::Initialize, msg))?;
-        let initialize = conn
+        let result = conn
             .await_rpc_result(1, "initialize", RpcStage::Initialize)
             .map_err(|(_, msg)| (RpcStage::Initialize, msg))?;
-        conn.send_json(&json!({ "method": "initialized", "params": {} }))
-            .map_err(|msg| (RpcStage::Initialize, msg))?;
-        Ok((conn, initialize))
+        Ok((conn, result))
+    }
+
+    fn send_initialized(&mut self) -> Result<(), (RpcStage, String)> {
+        self.send_json(&json!({ "method": "initialized", "params": {} }))
+            .map_err(|msg| (RpcStage::Initialize, msg))
     }
 
     fn io_budget(&self) -> Result<Duration, String> {
@@ -2226,6 +2411,58 @@ mod tests {
     }
 
     #[test]
+    fn initialize_version_uses_server_product_instead_of_client_comment() {
+        assert_eq!(
+            initialize_server_version(&json!({
+                "userAgent": "codex_cli_rs/0.172.0-beta.2 (ferroloop; 0.1.0)"
+            })),
+            Some("0.172.0-beta.2")
+        );
+        assert_eq!(
+            initialize_server_version(&json!({"serverInfo": {"version": "0.167.0"}})),
+            Some("0.167.0")
+        );
+        assert_eq!(
+            initialize_server_version(&json!({"userAgent": "codex/test"})),
+            None
+        );
+    }
+
+    #[test]
+    fn daemon_version_observation_reads_only_the_initialize_exchange() {
+        let home = tempfile::tempdir().unwrap();
+        let socket = codex_launch_control_socket(home.path());
+        std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+        let (fake, server) = spawn_fake_server(home.path(), |conn| {
+            conn.handshake();
+            assert_eq!(
+                conn.expect_json(),
+                json!({
+                    "id": 1,
+                    "method": "initialize",
+                    "params": {
+                        "clientInfo": { "name": "codex_app_server_daemon", "version": "0.1.0" }
+                    }
+                })
+            );
+            conn.send_text(
+                r#"{"id":1,"result":{"userAgent":"codex_cli_rs/0.172.0 (codex_app_server_daemon; 0.1.0)"}}"#,
+            );
+            conn.drain_until_eof();
+        });
+        std::os::unix::fs::symlink(fake, socket).unwrap();
+        assert_eq!(
+            fl_core::VendorVersionAdapter::observe_daemon_version(
+                &CodexHostAdapter::new(),
+                home.path()
+            )
+            .as_deref(),
+            Some("0.172.0")
+        );
+        assert_eq!(server.join().unwrap().len(), 1);
+    }
+
+    #[test]
     fn prepare_launch_builds_expected_argv_and_omits_agent_persona() {
         let adapter = CodexHostAdapter::new();
         let req = VendorLaunchRequest {
@@ -2339,7 +2576,14 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let (sock, server) = spawn_fake_server(tmp.path(), |c| {
             c.handshake();
-            assert_eq!(c.expect_json()["method"], "initialize");
+            assert_eq!(
+                c.expect_json(),
+                json!({
+                    "id": 1,
+                    "method": "initialize",
+                    "params": { "clientInfo": { "name": "ferroloop", "version": "0.1.0" } }
+                })
+            );
             c.send_text(r#"{"id":1,"result":{}}"#);
             assert_eq!(c.expect_json()["method"], "initialized");
             let read_req = c.expect_json();

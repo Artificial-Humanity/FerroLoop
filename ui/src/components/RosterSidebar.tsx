@@ -428,6 +428,7 @@ export interface RosterSidebarProps {
   unreadByAgent: Record<string, number | AgentUnreadSummary>;
   unreadSeverityByAgent?: Record<string, UnreadSeverity>;
   recoveryAttentionByAgent?: Record<string, HostedRecoveryAttentionTarget>;
+  vendorVersionChangedAgents?: ReadonlySet<string>;
   onOpenRecoveryEvidence?: (agentKey: string, sessionId: string, opener: HTMLButtonElement) => void;
   busyByAgent?: Record<string, boolean>;
   transcriptsByAgent?: Record<string, TranscriptTurn[]>;
@@ -728,6 +729,7 @@ export const RosterSidebar: React.FC<RosterSidebarProps> = ({
   unreadByAgent = {},
   unreadSeverityByAgent,
   recoveryAttentionByAgent,
+  vendorVersionChangedAgents,
   onOpenRecoveryEvidence,
   busyByAgent,
   transcriptsByAgent,
@@ -1579,6 +1581,16 @@ export const RosterSidebar: React.FC<RosterSidebarProps> = ({
                             </div>
 
                             <div style={{ display: "flex", alignItems: "center", gap: "4px" }}>
+                              {vendorVersionChangedAgents?.has(key) && (
+                                <span
+                                  role="img"
+                                  aria-label={`Hosted vendor version changed for ${record.display_name}`}
+                                  title="Hosted vendor version changed"
+                                  className="fd-hosted-vendor-version-warning"
+                                >
+                                  ⚠
+                                </span>
+                              )}
                               {recoveryAttention && onOpenRecoveryEvidence && (
                                 <button
                                   type="button"

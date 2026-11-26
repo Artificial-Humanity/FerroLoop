@@ -559,6 +559,7 @@ export interface DiscoveredSessionSummary {
   thinking_level?: string | null;
   available_models?: string[] | null;
   persona?: string | null;
+  hosted_launch?: { session_id: string; hydration_generation: string };
   status: string;
   updated_at?: string | null;
   cwd?: string | null;
@@ -789,8 +790,17 @@ export interface HostedRecoveryEvidenceResponse {
   } | null;
 }
 
+export interface HostedVendorVersions {
+  cli: string | null;
+  daemon: string | null;
+  daemon_expected: boolean;
+  changes: Array<{ component: "cli" | "daemon"; previous: string; current: string }>;
+}
+
 export interface HostedSessionSummary {
   session_id: string;
+  vendor_session_id?: string | null;
+  hosted?: boolean;
   persona: string;
   project: string;
   role: string;
@@ -799,6 +809,7 @@ export interface HostedSessionSummary {
   posture?: PermissionPosture;
   hydration_dispatched: boolean;
   hydration_status?: HydrationStatus;
+  hydration_generation?: string;
   node_id: string;
   status: string;
   stop_reason?: string | null;
@@ -807,6 +818,7 @@ export interface HostedSessionSummary {
   restart_count?: number;
   updated_at_ms?: number;
   recovery_attention?: HostedRecoveryAttention;
+  vendor_versions?: HostedVendorVersions | null;
 }
 
 export interface SpinUpSessionRequest {

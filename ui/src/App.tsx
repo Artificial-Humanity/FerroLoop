@@ -11,7 +11,7 @@ import { HubWsClient } from "./api/ws";
 import { clearParkedPromptDrafts } from "./lib/parkedPromptDrafts";
 import { createTranscriptReadGuard, isObservedTranscriptTurns, isTransientTranscriptReadError, type TranscriptReadOwner, type TranscriptReadTicket } from "./lib/transcriptReadGuard";
 import { ArtifactPreviewPane } from "./components/ArtifactPreviewPane";
-import { ChatPane, coalesceTurnsWithToolOutputs } from "./components/ChatPane";
+import { ChatPane, canonicalAdapter, coalesceTurnsWithToolOutputs } from "./components/ChatPane";
 import { ContextHeader, RightPanelHeader } from "./components/ContextHeader";
 import { GitPrPane } from "./components/GitPrPane";
 import {
@@ -260,24 +260,24 @@ export {
   type ThemeMode,
 };
 
+function visibleHostedSessions(records: HostedSessionSummary[], tornDown?: Set<string>) {
+  return records.filter((hs) => {
+    const pKey = (hs.persona ?? "").trim().toLowerCase();
+    const sessionKey = (hs.session_id ?? "").trim().toLowerCase();
+    const status = (hs.status ?? "").trim().toLowerCase();
+    return Boolean(pKey && status !== "decommissioned" &&
+      !tornDown?.has(pKey) && !tornDown?.has(sessionKey));
+  });
+}
+
 export function selectPreferredHostedSessions(
   records: HostedSessionSummary[],
   tornDown?: Set<string>,
 ): Record<string, HostedSessionSummary> {
   const nextHosted: Record<string, HostedSessionSummary> = {};
-  for (const hs of records) {
-    const pKey = (hs.persona ?? "").trim().toLowerCase();
-    const sessionKey = (hs.session_id ?? "").trim().toLowerCase();
+  for (const hs of visibleHostedSessions(records, tornDown)) {
+    const pKey = hs.persona.trim().toLowerCase();
     const status = (hs.status ?? "").trim().toLowerCase();
-    if (!pKey || status === "decommissioned") {
-      continue;
-    }
-    if (
-      tornDown &&
-      (tornDown.has(pKey) || (sessionKey && tornDown.has(sessionKey)))
-    ) {
-      continue;
-    }
     const candidate: HostedSessionSummary = {
       ...hs,
       hydration_status: normalizeHydrationStatus(hs.hydration_status),
@@ -1308,10 +1308,21 @@ export const App: React.FC<AppProps> = ({
   } | null>(null);
   const recoveryEvidenceOpener = useRef<HTMLElement | null>(null);
   const hostedRefreshRef = useRef({ requested: 0, applied: 0 });
+  const [hostedVersionRecords, setHostedVersionRecords] = useState<HostedSessionSummary[]>([]);
+  const invalidateHostedVersions = useCallback((personaKey: string, ...sessionIds: unknown[]) => {
+    // GETs started before an authoritative launch or teardown can describe an old
+    // launch with the same session id. Advance the barrier before clearing it.
+    hostedRefreshRef.current.applied = ++hostedRefreshRef.current.requested;
+    const ids = sessionIds.filter((id): id is string => typeof id === "string" && id.trim() !== "");
+    setHostedVersionRecords((prev) => prev.filter((session) =>
+      session.persona.trim().toLowerCase() !== personaKey ||
+      (ids.length > 0 && !ids.includes(session.session_id))));
+  }, []);
 
   const advanceTranscriptAuth = () => {
     setRecoveryAttentionByAgent({});
     setRecoveryEvidenceTarget(null);
+    setHostedVersionRecords([]);
     authIdentityRef.current = { apiClient, token: apiClient.getToken() };
     ownerRef.current = { ...ownerRef.current, authEpoch: ownerRef.current.authEpoch + 1 };
     transcriptGuard.invalidate();
@@ -1822,6 +1833,10 @@ export const App: React.FC<AppProps> = ({
           tornDownTargetsRef.current,
         ),
       );
+      setHostedVersionRecords(
+        visibleHostedSessions(hostedRes.sessions, tornDownTargetsRef.current)
+          .filter((session) => session.hosted !== false),
+      );
     } catch {
       // Ignore hosted-sessions fetch errors
     }
@@ -2187,6 +2202,7 @@ export const App: React.FC<AppProps> = ({
             frame.event === "session.restarted") &&
           data.mode !== "prepare"
         ) {
+          invalidateHostedVersions(personaKey, data.session_id, data.previous_session_id);
           const hydrationStatus = normalizeHydrationStatus(
             data.hydration_status,
           );
@@ -2257,6 +2273,7 @@ export const App: React.FC<AppProps> = ({
                     : existing?.role ?? "",
                 vendor,
                 model,
+                hosted: typeof data.hosted === "boolean" ? data.hosted : undefined,
                 posture: existing?.posture,
                 hydration_dispatched:
                   hydrationDispatched ?? existing?.hydration_dispatched ?? false,
@@ -2279,6 +2296,7 @@ export const App: React.FC<AppProps> = ({
           frame.event === "session.decommission" &&
           (data.status === "decommissioned" || data.mode === "teardown")
         ) {
+          invalidateHostedVersions(personaKey);
           setSpunUpByAgent((prev) => {
             if (!(personaKey in prev)) return prev;
             const next = { ...prev };
@@ -2332,7 +2350,7 @@ export const App: React.FC<AppProps> = ({
       unsubSettings();
       wsClient.disconnect();
     };
-  }, [wsClient, apiClient, refreshWireAndRoster, refreshSessionsAndTranscript, refreshWorkflows, adoptPromptMetadata]);
+  }, [wsClient, apiClient, refreshWireAndRoster, refreshSessionsAndTranscript, refreshWorkflows, adoptPromptMetadata, invalidateHostedVersions]);
 
   // Load worktree diff when selectedWorktreeId changes
   useEffect(() => {
@@ -2520,6 +2538,36 @@ export const App: React.FC<AppProps> = ({
   const activeHostedSession = activeAgentKey
     ? hostedSessionsByAgent[activeAgentKey]
     : undefined;
+  const versionSessionId = activeSession?.id ?? selectedSessionId;
+  const versionLaunch = activeSession?.hosted_launch;
+  const matchesVersionSession = (session: HostedSessionSummary) =>
+    session.hosted !== false && session.persona.trim().toLowerCase() === activeAgentKey &&
+    (!activeSession || canonicalAdapter(session.vendor) === canonicalAdapter(activeSession.adapter)) &&
+    (!versionSessionId || session.session_id === versionSessionId ||
+      session.vendor_session_id === versionSessionId ||
+      (versionLaunch?.session_id === session.session_id &&
+        versionLaunch.hydration_generation === session.hydration_generation &&
+        activeSession?.persona?.trim().toLowerCase() === activeAgentKey));
+  const preferredVersionRecords = useMemo(
+    () => selectPreferredHostedSessions(hostedVersionRecords),
+    [hostedVersionRecords],
+  );
+  const versionRecord = versionSessionId
+    ? hostedVersionRecords.find(matchesVersionSession)
+    : preferredVersionRecords[activeAgentKey];
+  const hostedVendorVersions = versionRecord
+    ? versionRecord.vendor_versions ?? null
+    : activeHostedSession && matchesVersionSession(activeHostedSession) ? null : undefined;
+  const activeVersionChanged = Boolean(versionRecord?.vendor_versions?.changes.length);
+  // Flag only the record that the Chat version row shows: the selected session's launch
+  // for the active persona, and the preferred hosted record for each other persona.
+  const vendorVersionChangedAgents = useMemo(() => {
+    const changed = new Set(Object.entries(preferredVersionRecords)
+      .filter(([key, session]) => key !== activeAgentKey && session.vendor_versions?.changes.length)
+      .map(([key]) => key));
+    if (activeAgentKey && activeVersionChanged) changed.add(activeAgentKey);
+    return changed;
+  }, [preferredVersionRecords, activeAgentKey, activeVersionChanged]);
   const activeHydrationStatus = useMemo<HydrationStatus | null>(() => {
     const raw =
       activeSession?.hydration_status ??
@@ -2944,6 +2992,7 @@ export const App: React.FC<AppProps> = ({
     };
     const personaKey = (res.persona || req.persona || "").trim().toLowerCase();
     if (personaKey) {
+      invalidateHostedVersions(personaKey, res.session_id);
       setSpunUpByAgent((prev) => ({
         ...prev,
         [personaKey]: {
@@ -2971,6 +3020,7 @@ export const App: React.FC<AppProps> = ({
             project: res.project || req.project || existing?.project || "",
             role: res.role || req.role || existing?.role || "",
             vendor: res.vendor || req.vendor || existing?.vendor || "unknown",
+            hosted: res.hosted,
             model: res.model ?? req.model ?? existing?.model ?? null,
             posture: res.posture ?? req.posture ?? existing?.posture,
             hydration_dispatched: Boolean(res.hydration_dispatched),
@@ -3094,6 +3144,7 @@ export const App: React.FC<AppProps> = ({
       tornDownTargetsRef.current.add(reset.resetOwner.agentKey);
       if (reset.resetOwner.agentKey) {
         const keyToDelete = reset.resetOwner.agentKey;
+        invalidateHostedVersions(keyToDelete);
         setSpunUpByAgent((prev) => {
           if (!(keyToDelete in prev)) return prev;
           const next = { ...prev };
@@ -3266,6 +3317,7 @@ export const App: React.FC<AppProps> = ({
             onAfterRemodel={(res: RemodelSessionResponse) => {
               const personaKey = (res.persona || "").trim().toLowerCase();
               if (personaKey && res.mode !== "prepare") {
+                invalidateHostedVersions(personaKey, res.session_id, res.previous_session_id);
                 const hydrationStatus = normalizeHydrationStatus(
                   res.hydration_status,
                 );
@@ -3298,6 +3350,7 @@ export const App: React.FC<AppProps> = ({
                       project: res.project || existing?.project || "",
                       role: res.role || existing?.role || "",
                       vendor: res.vendor || existing?.vendor || "unknown",
+                      hosted: res.hosted,
                       model: res.model ?? existing?.model ?? null,
                       posture: res.posture ?? existing?.posture,
                       hydration_dispatched: Boolean(res.hydration_dispatched),
@@ -3777,6 +3830,7 @@ export const App: React.FC<AppProps> = ({
       hydrationStatus={activeHydrationStatus}
       hydrationDispatched={activeHydrationDispatched}
       hydrationWarnings={activeHydrationWarnings}
+      hostedVendorVersions={hostedVendorVersions}
       sessionId={activeSession?.id ?? activeSpunUp?.sessionId ?? null}
       turns={transcriptTurns}
       transcriptRefreshState={transcriptRefreshState}
@@ -3852,6 +3906,7 @@ export const App: React.FC<AppProps> = ({
       unreadByAgent={unreadByAgent}
       unreadSeverityByAgent={unreadSeverityByAgent}
       recoveryAttentionByAgent={authority?.tier === "owner" ? recoveryAttentionByAgent : undefined}
+      vendorVersionChangedAgents={vendorVersionChangedAgents}
       onOpenRecoveryEvidence={(agentKey, sessionId, opener) => {
         if (authority?.tier !== "owner" || loggedOutRef.current) return;
         recoveryEvidenceOpener.current = opener;

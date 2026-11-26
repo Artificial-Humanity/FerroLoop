@@ -220,6 +220,7 @@ fn teardown_that_stops_nothing_leaves_the_restore_source_alone() {
         log_hydration_warnings: true,
         lifecycle_fence: None,
         blocker_evidence: None,
+        direct_version_receipts: None,
         home_override: Some(home.path()),
         spawn_runtime: false,
         runtime: &TmuxRuntime,

@@ -329,6 +329,7 @@ mod tests {
             source: "route".to_string(),
             adapter: "claude".to_string(),
             persona: persona.map(str::to_string),
+            hosted_launch: None,
             status: "active".to_string(),
             updated_at: None,
             cwd: None,

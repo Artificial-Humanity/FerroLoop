@@ -642,6 +642,7 @@ dependencies = [
  "fl-core",
  "libc",
  "ring",
+ "semver",
  "serde",
  "serde_json",
  "socket2",

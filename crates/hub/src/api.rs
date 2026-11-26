@@ -34,7 +34,7 @@ use fl_core::log::{AttemptStatus, GateRun};
 use fl_core::state::{
     HandoffEntry, MemoryBasis, MemoryCategory, MemoryEntry, MemoryLifecycle, MergeMode,
     RuntimeEntry, SensitivityPatch, StateConcern, StateEntry, StatePayload, StateScope,
-    StateSearchHit, UpsertStateArgs,
+    StateSearchHit, UpsertStateArgs, is_hosted_version_state_slug,
 };
 use fl_core::store::{
     AgentRegistry, Catalog, Handles, Ledger, MessageStore, StateStore, WorkflowStore,
@@ -2819,6 +2819,7 @@ fn is_reserved_hub_slug(slug: &str) -> bool {
         || slug.starts_with("hub-node-")
         || slug.starts_with(crate::lifecycle::HOSTED_RESPAWN_STATE_SLUG_PREFIX)
         || slug.starts_with(NOTICE_STATE_SLUG_PREFIX)
+        || is_hosted_version_state_slug(slug)
 }
 
 fn is_internal_hub_entry(entry: &StateEntry) -> bool {
@@ -9576,6 +9577,8 @@ fn handle_get_hosted_sessions(state: &HubState, authority: &HubAuthority) -> Htt
         record: lifecycle::HostedSessionRecord,
         #[serde(skip_serializing_if = "Option::is_none")]
         recovery_attention: Option<lifecycle::HostedRecoveryAttention>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        vendor_versions: Option<lifecycle::HostedVendorVersions>,
     }
 
     let Ok(store) = open_store_response(state) else {
@@ -9601,9 +9604,12 @@ fn handle_get_hosted_sessions(state: &HubState, authority: &HubAuthority) -> Htt
             } else {
                 None
             };
+            let vendor_versions =
+                lifecycle::launch_versions::hosted_vendor_versions_for_record(&*store, &record);
             HostedSessionView {
                 record,
                 recovery_attention,
+                vendor_versions,
             }
         })
         .collect();
@@ -12357,6 +12363,66 @@ mod tests {
     }
 
     #[test]
+    fn discovery_exposes_the_registered_route_for_a_fresh_hosted_launch() {
+        use fl_wire::identity::{RegisterRouteCheckArgs, RouteTable, VendorRoute};
+
+        let (_tmp, state) = roles_test_state();
+        let generation = lifecycle::next_hydration_generation();
+        let record: lifecycle::HostedSessionRecord = serde_json::from_value(json!({
+            "session_id":"codex:ada", "persona":"ada", "project":"ferroloop", "role":"assistant",
+            "vendor":"codex", "model":null, "node_id":"ai-lab-0", "hosted":true, "status":"running",
+            "restart_policy":"on-failure", "restart_count":0, "tmux_target":null, "cwd":null,
+            "hydration_dispatched":true, "hydration_generation":generation,
+            "created_at_ms":1, "updated_at_ms":1, "decommission_prepared_at_ms":null
+        }))
+        .unwrap();
+        lifecycle::persist_hosted_session(&*state.open_store().unwrap(), &record, "test").unwrap();
+        let (_, hosted) = roles_call(
+            &state,
+            "GET",
+            "/api/v1/hosted-sessions",
+            "owner-test-tok",
+            None,
+        );
+        assert!(hosted["sessions"][0].get("vendor_session_id").is_none());
+        assert_eq!(hosted["sessions"][0]["hydration_generation"], generation);
+
+        let route = |thread: &str| VendorRoute::Codex {
+            thread_id: thread.into(),
+            cwd: None,
+        };
+        let mut routes = RouteTable::default();
+        routes
+            .register_route_checked(RegisterRouteCheckArgs {
+                persona: "ada".into(),
+                route: route("native-hosted"),
+                at: stamp::now(),
+                explicit: true,
+                replace: true,
+                hosted_id: Some(record.session_id.clone()),
+                hydration_generation: Some(generation.clone()),
+                hosted_session_verified: true,
+                unverified_process: false,
+                allow_host_probes: false,
+                incumbent_dead_override: None,
+            })
+            .unwrap();
+        routes.upsert_explicit("outside", route("native-external"), stamp::now());
+        let path = crate::discovery::route_table_path(state.config.home_override.as_deref());
+        routes.save(path.as_deref()).unwrap();
+
+        let (status, body) = roles_call(&state, "GET", "/api/v1/sessions", "owner-test-tok", None);
+        assert_eq!(status, 200);
+        let sessions = body["sessions"].as_array().unwrap();
+        let session = |id: &str| sessions.iter().find(|session| session["id"] == id).unwrap();
+        assert_eq!(
+            session("native-hosted")["hosted_launch"],
+            json!({ "session_id": record.session_id, "hydration_generation": generation })
+        );
+        assert!(session("native-external").get("hosted_launch").is_none());
+    }
+
+    #[test]
     fn hosted_sessions_http_recovery_attention_is_owner_only() {
         let (_tmp, state) = roles_test_state();
         let record: lifecycle::HostedSessionRecord = serde_json::from_value(json!({
@@ -14209,6 +14275,7 @@ mod council_guidance_tests {
                         explicit: true,
                         hosted_id: Some("antigravity:felix".into()),
                         hydration_generation: Some("gen-1".into()),
+                        registered_hosted_native_id: None,
                         pid_start_time: None,
                     },
                     RouteEntry {
@@ -14224,6 +14291,7 @@ mod council_guidance_tests {
                         explicit: false,
                         hosted_id: None,
                         hydration_generation: None,
+                        registered_hosted_native_id: None,
                         pid_start_time: None,
                     },
                 ],
@@ -14727,6 +14795,7 @@ mod claude_registration_binding_tests {
             explicit: true,
             hosted_id: Some("claude:ada".into()),
             hydration_generation: Some("one".into()),
+            registered_hosted_native_id: None,
             pid_start_time: proc_start_time_ticks(pid),
         };
         write(&path, &entry);
