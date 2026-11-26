@@ -271,7 +271,21 @@ impl HostedExitIncident {
         let Some(launch) = self.matching_launch(record) else {
             return false;
         };
-        self.push_counted_exit(CountedExit::new(launch, status, now))
+        let suppress_pending = record.active_block().is_some()
+            && matches!(status, HostedExitEvidenceStatus::Unavailable);
+        let exit = CountedExit::new(launch, status, now);
+        // A prior reconcile can have saved Pending before the stopped record.
+        // Finalize it before recovery can fetch a flagged launch's terminal tail.
+        if suppress_pending
+            && let Some(previous) = self
+                .exits
+                .iter_mut()
+                .find(|entry| entry.stream == exit.stream && entry.pending)
+        {
+            previous.pending = false;
+            return true;
+        }
+        self.push_counted_exit(exit)
     }
 
     fn push_counted_exit(&mut self, exit: CountedExit) -> bool {

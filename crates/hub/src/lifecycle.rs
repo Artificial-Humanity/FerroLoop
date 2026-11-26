@@ -21538,8 +21538,11 @@ mod tests {
             SessionEpoch, SessionId, SessionMode, SessionSummary, SpawnKind, StreamId,
         };
 
-        for (exit_code, stop_reason) in [(1, STOP_REASON_RUNTIME_GONE), (0, STOP_REASON_CLEAN_EXIT)]
-        {
+        for (exit_code, stop_reason, pending_at_ms) in [
+            (1, STOP_REASON_RUNTIME_GONE, None),
+            (1, STOP_REASON_RUNTIME_GONE, Some(1_001)),
+            (0, STOP_REASON_CLEAN_EXIT, None),
+        ] {
             let _reset = RecoveryFixtureReset;
             let home = TempDir::new().unwrap();
             let _trusted = trusted_codex_home(home.path(), home.path());
@@ -21591,6 +21594,22 @@ mod tests {
                 .unwrap()
             );
             assert_eq!(respawn.exit_evidence.bound_stream(&record), Some(&stream));
+            // Older builds could save Pending before a failed write of the stopped record.
+            let prior_exit = pending_at_ms.map(|observed_at_ms| {
+                exit_evidence::save_counted_exit(
+                    &store,
+                    &record,
+                    &mut respawn,
+                    fl_host_proto::HostedExitEvidenceStatus::Pending,
+                    observed_at_ms,
+                    "test",
+                )
+                .unwrap();
+                let incident = serde_json::to_value(&respawn.exit_evidence).unwrap();
+                let mut entry = incident["exits"][0].as_object().unwrap().clone();
+                assert_eq!(entry.remove("pending"), Some(serde_json::Value::Bool(true)));
+                serde_json::Value::Object(entry)
+            });
 
             fake.clear();
             fake.launches.borrow_mut().clear();
@@ -21640,6 +21659,9 @@ mod tests {
                 assert_eq!(exits[0]["stream"], serde_json::to_value(stream).unwrap());
                 assert_eq!(exits[0].get("evidence"), Some(&serde_json::Value::Null));
                 assert!(exits[0].get("pending").is_none());
+                if let Some(prior_exit) = prior_exit {
+                    assert_eq!(exits[0], prior_exit);
+                }
                 assert_eq!(recovered.len(), 1);
                 assert_eq!(recovered[0].record.status, STATUS_RUNNING);
                 assert_eq!(fake.launches.borrow().len(), 1);
