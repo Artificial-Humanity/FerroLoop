@@ -242,6 +242,88 @@ fn codex_prerequisite_refusal(socket: &Path, result: &str) -> LaunchPrerequisite
     }
 }
 
+impl fl_core::VendorVersionAdapter for CodexHostAdapter {
+    fn vendor_id(&self) -> &'static str {
+        "codex"
+    }
+
+    fn version_from_executable(&self, executable: &Path) -> Option<String> {
+        let (package, version) = installed_package_version(executable)?;
+        (package == "standalone").then(|| version.to_owned())
+    }
+
+    fn daemon_version_from_executable(&self, executable: &Path) -> Option<String> {
+        // Older app-server daemons used the standalone package. The caller already bound
+        // this path to the running daemon, so either release layout can identify it.
+        installed_package_version(executable).map(|(_, version)| version.to_owned())
+    }
+
+    #[cfg(unix)]
+    fn observe_daemon_version(&self, config_home: &Path) -> Option<String> {
+        if !config_home.is_absolute() {
+            return None;
+        }
+        let socket = codex_launch_control_socket(config_home);
+        let deadline = Instant::now() + Duration::from_millis(500);
+        let (_, result) = Conn::connect_and_read_initialize(&socket, deadline).ok()?;
+        initialize_server_version(&result).map(str::to_owned)
+    }
+}
+
+fn installed_package_version(executable: &Path) -> Option<(&str, &str)> {
+    if !executable.is_absolute()
+        || !matches!(executable.file_name()?.to_str()?, "codex" | "codex.exe")
+    {
+        return None;
+    }
+    let parent = executable.parent()?;
+    let release = if parent.ends_with("bin") {
+        parent.parent()?
+    } else {
+        parent
+    };
+    let releases = release.parent()?;
+    let package = releases.parent()?;
+    if !releases.ends_with("releases") || !package.parent()?.ends_with("packages") {
+        return None;
+    }
+    let package = package.file_name()?.to_str()?;
+    if !matches!(package, "standalone" | "app-server-daemon") {
+        return None;
+    }
+    let name = release.file_name()?.to_str()?;
+    let version = [
+        "-aarch64-apple-darwin",
+        "-x86_64-apple-darwin",
+        "-aarch64-unknown-linux-gnu",
+        "-x86_64-unknown-linux-gnu",
+        "-aarch64-unknown-linux-musl",
+        "-x86_64-unknown-linux-musl",
+        "-aarch64-pc-windows-msvc",
+        "-x86_64-pc-windows-msvc",
+    ]
+    .into_iter()
+    .find_map(|target| name.strip_suffix(target))?;
+    Some((package, crate::valid_release_version(version)?))
+}
+
+#[cfg(unix)]
+fn initialize_server_version(result: &Value) -> Option<&str> {
+    let version = if let Some(user_agent) = result.get("userAgent") {
+        // The product name follows the first client, but the product version identifies
+        // the daemon. The client version can appear later in the user-agent comment.
+        let product = user_agent.as_str()?.split_whitespace().next()?;
+        let (name, version) = product.split_once('/')?;
+        if name.is_empty() {
+            return None;
+        }
+        version
+    } else {
+        result.get("serverInfo")?.get("version")?.as_str()?
+    };
+    crate::valid_release_version(version)
+}
+
 impl VendorHostAdapter for CodexHostAdapter {
     fn preflight_launch(
         &self,
@@ -1395,6 +1477,13 @@ struct Conn {
 #[cfg(unix)]
 impl Conn {
     fn connect_and_initialize(sock: &Path, deadline: Instant) -> Result<Self, (RpcStage, String)> {
+        Self::connect_and_read_initialize(sock, deadline).map(|(conn, _)| conn)
+    }
+
+    fn connect_and_read_initialize(
+        sock: &Path,
+        deadline: Instant,
+    ) -> Result<(Self, Value), (RpcStage, String)> {
         let stream = connect_unix_with_deadline(sock, deadline).map_err(|e| {
             (
                 RpcStage::Connect,
@@ -1417,11 +1506,12 @@ impl Conn {
             "params": { "clientInfo": { "name": "ferroloop", "version": "0.1.0" } },
         }))
         .map_err(|msg| (RpcStage::Initialize, msg))?;
-        conn.await_rpc_result(1, "initialize", RpcStage::Initialize)
+        let result = conn
+            .await_rpc_result(1, "initialize", RpcStage::Initialize)
             .map_err(|(_, msg)| (RpcStage::Initialize, msg))?;
         conn.send_json(&json!({ "method": "initialized", "params": {} }))
             .map_err(|msg| (RpcStage::Initialize, msg))?;
-        Ok(conn)
+        Ok((conn, result))
     }
 
     fn io_budget(&self) -> Result<Duration, String> {
@@ -2027,6 +2117,50 @@ mod tests {
 
     fn sample_binding() -> AdapterIdentityBinding {
         AdapterIdentityBinding::new("codex:feira", 3, "Feira.codex", Some((4242, 999)))
+    }
+
+    #[test]
+    fn initialize_version_uses_server_product_instead_of_client_comment() {
+        assert_eq!(
+            initialize_server_version(&json!({
+                "userAgent": "codex_cli_rs/0.172.0-beta.2 (ferroloop; 0.1.0)"
+            })),
+            Some("0.172.0-beta.2")
+        );
+        assert_eq!(
+            initialize_server_version(&json!({"serverInfo": {"version": "0.167.0"}})),
+            Some("0.167.0")
+        );
+        assert_eq!(
+            initialize_server_version(&json!({"userAgent": "codex/test"})),
+            None
+        );
+    }
+
+    #[test]
+    fn daemon_version_observation_reads_only_the_initialize_exchange() {
+        let home = tempfile::tempdir().unwrap();
+        let socket = codex_launch_control_socket(home.path());
+        std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+        let (fake, server) = spawn_fake_server(home.path(), |conn| {
+            conn.handshake();
+            assert_eq!(conn.expect_json()["method"], "initialize");
+            conn.send_text(
+                r#"{"id":1,"result":{"userAgent":"ferroloop/0.172.0 (ferroloop; 0.1.0)"}}"#,
+            );
+            assert_eq!(conn.expect_json()["method"], "initialized");
+            conn.drain_until_eof();
+        });
+        std::os::unix::fs::symlink(fake, socket).unwrap();
+        assert_eq!(
+            fl_core::VendorVersionAdapter::observe_daemon_version(
+                &CodexHostAdapter::new(),
+                home.path()
+            )
+            .as_deref(),
+            Some("0.172.0")
+        );
+        assert_eq!(server.join().unwrap().len(), 2);
     }
 
     #[test]

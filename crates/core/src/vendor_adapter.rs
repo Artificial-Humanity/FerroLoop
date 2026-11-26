@@ -604,6 +604,45 @@ impl VendorHostAdapterRegistry {
     }
 }
 
+/// Version evidence for one hosted vendor. Concrete install and protocol knowledge stays in the
+/// vendor adapter crate. Unknown evidence is `None`.
+pub trait VendorVersionAdapter: fmt::Debug + Send + Sync {
+    fn vendor_id(&self) -> &'static str;
+
+    /// Read passive evidence for an executable the caller has already resolved to its absolute,
+    /// canonical path. This may read install metadata but must not start a process.
+    fn version_from_executable(&self, executable: &Path) -> Option<String>;
+
+    /// Decode an exact, observed running daemon image path. This must not resolve a mutable
+    /// install symlink, inspect a different process, or choose the newest installed release.
+    fn daemon_version_from_executable(&self, _executable: &Path) -> Option<String> {
+        None
+    }
+
+    /// Ask an existing daemon for its version through a bounded local connection. The caller
+    /// must run this away from the launch path and pass the vendor configuration directory pinned
+    /// into the launch. This must never start a daemon or vendor CLI.
+    fn observe_daemon_version(&self, _config_home: &Path) -> Option<String> {
+        None
+    }
+}
+
+/// Vendor version adapters composed at the application boundary.
+#[derive(Clone, Debug, Default)]
+pub struct VendorVersionRegistry {
+    adapters: BTreeMap<&'static str, Arc<dyn VendorVersionAdapter>>,
+}
+
+impl VendorVersionRegistry {
+    pub fn register(&mut self, adapter: impl VendorVersionAdapter + 'static) {
+        self.adapters.insert(adapter.vendor_id(), Arc::new(adapter));
+    }
+
+    pub fn lookup(&self, vendor_id: &str) -> Option<&dyn VendorVersionAdapter> {
+        self.adapters.get(vendor_id).map(Arc::as_ref)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Shared Claude JSONL transcript & session-ID helpers
 // ---------------------------------------------------------------------------
