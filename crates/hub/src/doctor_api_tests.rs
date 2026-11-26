@@ -1,11 +1,12 @@
-//! `GET /api/v1/doctor`: Owner only, the seven `G7.*` checks in order, the contract FerroDeck
-//! reads, and nothing written.
+//! `GET /api/v1/doctor`: Owner only, stable check IDs, the contract FerroDeck reads, and
+//! nothing written.
 
 use std::collections::BTreeMap;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
+use fl_core::doctor::ids::{VENDOR_UPDATE_POLICY, VENDOR_VERSION_DRIFT};
 use fl_core::pr_policy::ReviewerApps;
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -191,7 +192,14 @@ fn the_body_is_the_check_ids_in_order_in_the_shape_ferrodeck_reads() {
         .iter()
         .map(|c| c["id"].as_str().unwrap())
         .collect();
-    assert_eq!(ids, IDS);
+    assert_eq!(
+        ids,
+        [
+            IDS.as_slice(),
+            &[VENDOR_VERSION_DRIFT, VENDOR_UPDATE_POLICY]
+        ]
+        .concat()
+    );
     let allowed = ["pass", "warn", "fail", "not-installed", "unsupported"];
     for c in v["checks"].as_array().unwrap() {
         let mut keys: Vec<&str> = c.as_object().unwrap().keys().map(String::as_str).collect();

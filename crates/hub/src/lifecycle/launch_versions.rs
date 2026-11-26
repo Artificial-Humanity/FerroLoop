@@ -362,8 +362,8 @@ fn generation_slug(session_id: &str, generation: &str) -> String {
     )
 }
 
-fn baseline_slug(receipt: &LaunchReceipt) -> String {
-    let key = format!("{}/{}", receipt.host, receipt.vendor);
+fn baseline_slug(host: &str, vendor: &str) -> String {
+    let key = format!("{host}/{vendor}");
     format!("{HOSTED_VERSION_BASELINE_PREFIX}{}", digest(key.as_bytes()))
 }
 
@@ -538,6 +538,42 @@ pub fn read_hosted_vendor_versions(
         .collect())
 }
 
+/// Read the most recent known hosted versions for vendors on this machine from one snapshot.
+/// A store that cannot be read, or an invalid or absent baseline, supplies no version.
+pub(crate) fn read_local_vendor_baselines(
+    path: Option<&Path>,
+    backend: Option<fl_store::BackendKind>,
+    vendors: impl IntoIterator<Item = &'static str>,
+) -> Vec<(Option<String>, Option<String>)> {
+    let keys: Vec<_> = vendors
+        .into_iter()
+        .map(|vendor| baseline_slug(local_host_key(), vendor))
+        .collect();
+    let entries = path
+        .and_then(|path| {
+            fl_store::health::read_state_keys(
+                path,
+                backend,
+                &StateScope::Workspace,
+                StateConcern::Runtime,
+                &keys,
+                0,
+            )
+            .ok()
+        })
+        .unwrap_or_else(|| vec![None; keys.len()]);
+    entries
+        .into_iter()
+        .map(|entry| {
+            let baseline: VendorBaseline = entry.and_then(decode).unwrap_or_default();
+            (
+                baseline.cli.map(|known| known.version),
+                baseline.daemon.map(|known| known.version),
+            )
+        })
+        .collect()
+}
+
 fn versions_for_stream(
     receipt: Option<LaunchReceipt>,
     stream: &StreamId,
@@ -657,7 +693,7 @@ fn compare_versions<S: StateStore>(
     receipt: &LaunchReceipt,
     versions: HostedVendorVersions,
 ) -> Result<HostedVendorVersions, LifecycleError> {
-    let slug = baseline_slug(receipt);
+    let slug = baseline_slug(&receipt.host, &receipt.vendor);
     for _ in 0..STATE_UPDATE_ATTEMPTS {
         let (mut baseline, revision): (VendorBaseline, _) = load_revision(store, &slug)?;
         if let Some((id, versions)) = baseline.last_applied.as_ref()
@@ -1042,7 +1078,7 @@ mod tests {
         let first = receipt(1);
         let second = receipt(2);
         seed(&store, &second);
-        let baseline_slug = baseline_slug(&second);
+        let baseline_slug = baseline_slug(&second.host, &second.vendor);
         let mut baseline = VendorBaseline::default();
         baseline.apply(first.id, sample(Some("1.0.0"), None));
         let expected = baseline.apply(second.id, sample(Some("2.0.0"), None));

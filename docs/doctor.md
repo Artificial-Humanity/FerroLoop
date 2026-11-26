@@ -1,7 +1,8 @@
 # `fl doctor` and `GET /api/v1/doctor`
 
-`fl doctor` observes this install and reports seven checks. It changes nothing. The Hub serves
-the same report to the Owner at `GET /api/v1/doctor`, and FerroDeck renders it.
+`fl doctor` observes this install, including hosted vendor versions and update settings. It
+changes nothing. The Hub serves the same report to the Owner at `GET /api/v1/doctor`, and
+FerroDeck renders it.
 
 Code: `fl_core::doctor` (the pure engine: facts in, report out; no I/O), `fl_install::observe`
 (the file-system gatherer: reads only), `fl_store::health` (read-only store verification),
@@ -20,6 +21,8 @@ fl doctor --fix <check-id>
   root, as for `fl install`. A prefix that cannot be an install exits 3.
 * `--db PATH` (or `$FL_DB`) names the one store to verify. Without it doctor verifies the
   workspace state store and every project store the config binds, each once, at most 64.
+  Vendor history comes from one store. Doctor uses the explicit path first, then
+  `[state].store`, the current directory's bound project store, or the default workspace store.
 * `--fix <check-id>` is parsed and refused: exit 3, `repairs are not implemented in this
   release`. A repair is an explicit, separate action with its own plan.
 
@@ -46,7 +49,7 @@ fl doctor --fix <check-id>
 
 ## The checks
 
-The report lists exactly these seven, in this order.
+The seven install checks appear first in the following order.
 
 **`G7.release-identity`.** The running binary's build stamp (`fl` for the CLI, `fl-hub` for the
 Hub). `pass` only for a known commit built from a clean tree. `warn`: the commit is unknown, the
@@ -117,31 +120,50 @@ cannot be listed, or a `~/` path with no home directory, is `unsupported`. No `f
 file is `not-installed`. Comments and the same keys in the wrong section do not count. Other
 unit names in the directory are not read.
 
+**`vendor.version-drift`.** Compares passively identified installed versions with the most
+recent known hosted launch version for each vendor component on this machine. The Codex CLI
+and shared daemon have independent baselines. The installed daemon version comes from the
+selected package, and the hosted baseline records the daemon observed at launch. A known
+version difference is `warn`. An opaque installation or missing, unreadable, or writer-locked
+history is shown as `unknown`. Doctor reads selected files and package paths and makes no
+vendor CLI call or daemon connection.
+
+**`vendor.update-policy`.** Shows the update setting observed in this invocation's environment
+or the vendor's user configuration, alongside the policy applied to hosted CLI launches.
+A documented enabled setting on an available runtime is `warn`. The Codex client startup
+setting and the shared daemon's own updater setting are independent. The hosted CLI policy
+applies to the client; the shared daemon reads its own settings. Doctor reports settings on
+disk, so the running daemon may still have different settings. Settings that cannot be proven
+passively are shown as `unknown`.
+
 ## JSON contract
 
 ```json
 {
   "schema_version": 1,
   "overall": "warn",
-  "summary": { "pass": 0, "warn": 1, "fail": 0, "not_installed": 6, "unsupported": 0 },
+  "summary": { "pass": 0, "warn": 1, "fail": 0, "not_installed": 8, "unsupported": 0 },
   "checks": [
     { "id": "G7.release-identity", "title": "Release identity", "status": "warn", "detail": "..." }
   ]
 }
 ```
 
-* `checks` has the seven ids above, in that order, each with exactly `id`, `title`, `status` and
-  `detail`. `status` is one of `pass`, `warn`, `fail`, `not-installed`, `unsupported`.
+* `checks` starts with the seven `G7.*` IDs, followed by `vendor.version-drift` and
+  `vendor.update-policy`. Each check has exactly `id`, `title`, `status` and `detail`.
+  `status` is one of `pass`, `warn`, `fail`, `not-installed`, `unsupported`.
 * The report has no timestamp. Equal inputs give equal bytes; lists are sorted and bounded.
-* A field is only ever added at the top level. A reader ignores fields it does not know.
+* Schema version 1 supports additional checks in the `checks` list. A reader can render each
+  check by its fields, including checks with unfamiliar IDs.
 
 ## `GET /api/v1/doctor`
 
 Owner only: a Peer gets 403 `{"error":"owner authority required"}`, an unauthenticated caller
 401. The answer names filesystem paths and permissions. The Hub reports on its own context: its
 build stamp, the receipt under `$FL_INSTALL_ROOT` or its home directory, its configured store,
-its vault files and the UI directory it serves. The store is verified without the Hub's store
-lock, so no other request waits behind it.
+its vault files and the UI directory it serves. Vendor evidence uses the Hub process's
+environment, home directory and configured store. Store verification and vendor history reads
+run without the Hub's store lock, so no other request waits behind them.
 
 ## What doctor never does
 

@@ -17,6 +17,7 @@ mod context_window;
 mod direct_quota;
 pub mod discovery;
 mod doctor_api;
+mod doctor_vendors;
 pub mod github_pr;
 mod hydration;
 pub mod lifecycle;
@@ -85,6 +86,7 @@ pub use discovery::{
     read_session_transcript, read_session_transcript_with_home, read_worktree_diff,
     scan_cargo_architecture_conformance, scan_workspace_for_arch,
 };
+pub use doctor_vendors::with_vendor_doctor_checks;
 pub use nodes::{
     DispatchTask, FederatedTask, TaskFail, TaskResult, dispatch_task, list_node_tasks,
     record_task_result,
