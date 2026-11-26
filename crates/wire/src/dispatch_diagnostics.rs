@@ -1,6 +1,8 @@
 //! Bounded, volatile observations of dispatch fences. These snapshots confer no
 //! delivery, recovery, liveness or authorization authority.
 
+use std::borrow::Cow;
+
 use fl_core::{at::At, ids::MessageId};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -30,7 +32,8 @@ pub struct DispatchDiagnostics {
     pub diagnostics_partial: bool,
     pub omitted_evidence_total: u64,
     pub omitted_evidence_total_saturated: bool,
-    /// Most recent attempts, including attempts for fences that have cleared.
+    /// Most recently observed attempts, including attempts for fences that have cleared.
+    /// Consecutive busy probes for a fence share one entry.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub fence_recovery_attempts: Vec<FenceRecoveryAttempt>,
     /// Retained fences waiting for timed recovery or held for an operator-visible reason.
@@ -94,7 +97,7 @@ impl FenceRecoveryOutcome {
             Self::NonHostedRoute => "non-hosted route",
             Self::UnsupportedRoute => "timed recovery unsupported for this route",
             Self::SeatBusy => "seat is in a turn",
-            Self::SeatBusyProlonged => "seat is still in a turn after 12 consecutive probes",
+            Self::SeatBusyProlonged => "seat is still in a turn",
             Self::DialogWaiting => "a dialog waits for input",
             Self::ComposerDraft => "the composer holds a draft",
             Self::BlankScreen => "hosted screen is blank",
@@ -125,8 +128,12 @@ pub struct FenceRecoveryAttempt {
     /// Reserved attempt number. A zero-write busy probe returns this slot to the budget.
     pub attempt: u32,
     pub limit: u32,
+    /// Time of the most recent probe represented by this row.
     pub at: At,
     pub outcome: FenceRecoveryOutcome,
+    /// Consecutive timed busy probes on this fence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub busy_probe_count: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -136,6 +143,27 @@ pub struct FenceRecoveryAttention {
     pub exhausted: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub busy_since: Option<At>,
+    /// Observed duration at the latest busy probe once escalation is reached.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub busy_elapsed_ms: Option<u64>,
+}
+
+impl FenceRecoveryAttention {
+    pub fn reason_label(&self) -> Cow<'static, str> {
+        if let (FenceRecoveryOutcome::SeatBusyProlonged, Some(elapsed_ms)) =
+            (self.outcome, self.busy_elapsed_ms)
+        {
+            let seconds = elapsed_ms / 1000;
+            let minutes = seconds / 60;
+            let elapsed = match minutes {
+                0 => format!("{seconds}s"),
+                1..=59 => format!("{minutes}m {}s", seconds % 60),
+                _ => format!("{}h {}m {}s", minutes / 60, minutes % 60, seconds % 60),
+            };
+            return format!("seat has been in a turn for {elapsed}").into();
+        }
+        self.outcome.label().into()
+    }
 }
 
 /// An observation of the existing suppression phase, not a scheduling state.
@@ -153,6 +181,7 @@ pub enum FailureStage {
     MessageLookupError,
     InitialReceiptReadError,
     InitialReceiptReadMissing,
+    InitialReceiptReadAmbiguous,
     TransportError,
     DeadExplicitRoute,
     ComposerOccupiedByNonWireInput,
@@ -175,6 +204,7 @@ pub enum FenceReason {
     MessageLookupError,
     InitialReceiptReadError,
     InitialReceiptReadMissing,
+    InitialReceiptReadAmbiguous,
     TransportError,
     DeadExplicitRoute,
     ComposerOccupiedByNonWireInput,
@@ -581,6 +611,16 @@ impl DiagnosticsState {
         };
         attempt.recipient = recipient;
         let history = &mut self.snapshot.fence_recovery_attempts;
+        // A continuing streak replaces its most recent busy row. A new
+        // fence starts at one, even when it has the same recipient. If the
+        // previous row was evicted, older rows for that recipient are gone too.
+        if attempt.busy_probe_count.is_some_and(|count| count > 1)
+            && let Some(index) = history.iter().rposition(|row| {
+                row.recipient == attempt.recipient && row.outcome == FenceRecoveryOutcome::SeatBusy
+            })
+        {
+            history.remove(index);
+        }
         if history.len() == MAX_FENCE_RECOVERY_ATTEMPTS {
             history.remove(0);
         }
@@ -593,7 +633,7 @@ impl DiagnosticsState {
         outcome: FenceRecoveryOutcome,
         exhausted: bool,
     ) {
-        self.set_fence_recovery_status(recipient, outcome, exhausted, None);
+        self.set_fence_recovery_status(recipient, outcome, exhausted, None, None);
     }
 
     pub(crate) fn set_busy_fence_recovery_status(
@@ -601,8 +641,20 @@ impl DiagnosticsState {
         recipient: &str,
         outcome: FenceRecoveryOutcome,
         busy_since: At,
+        observed_at: &At,
     ) {
-        self.set_fence_recovery_status(recipient, outcome, false, Some(busy_since));
+        let busy_elapsed_ms = (outcome == FenceRecoveryOutcome::SeatBusyProlonged).then(|| {
+            observed_at
+                .unix_millis()
+                .saturating_sub(busy_since.unix_millis())
+        });
+        self.set_fence_recovery_status(
+            recipient,
+            outcome,
+            false,
+            Some(busy_since),
+            busy_elapsed_ms,
+        );
     }
 
     fn set_fence_recovery_status(
@@ -611,6 +663,7 @@ impl DiagnosticsState {
         outcome: FenceRecoveryOutcome,
         exhausted: bool,
         busy_since: Option<At>,
+        busy_elapsed_ms: Option<u64>,
     ) {
         let Some(recipient) = normalize_persona(recipient) else {
             return;
@@ -621,6 +674,7 @@ impl DiagnosticsState {
             outcome,
             exhausted,
             busy_since,
+            busy_elapsed_ms,
         };
         if let Some(existing) = attention
             .iter_mut()
@@ -1319,6 +1373,72 @@ mod tests {
     }
 
     #[test]
+    fn fence_recovery_busy_elapsed_saturates_on_clock_rollback() {
+        let mut state = DiagnosticsState::new(At::from_unix_millis(0), None);
+        state.set_busy_fence_recovery_status(
+            "feira",
+            FenceRecoveryOutcome::SeatBusyProlonged,
+            At::from_unix_millis(31_000),
+            &At::from_unix_millis(30_000),
+        );
+        assert_eq!(
+            state.snapshot.fence_recovery_attention[0].busy_elapsed_ms,
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn fence_recovery_history_coalesces_interleaved_busy_streaks() {
+        use FenceRecoveryOutcome::{Inconclusive, SeatBusy, VendorSignIn};
+
+        let mut state = DiagnosticsState::new(At::from_unix_millis(0), None);
+        let mut record = |recipient: &str, outcome, busy_probe_count, millis| {
+            state.record_fence_recovery(FenceRecoveryAttempt {
+                recipient: recipient.into(),
+                attempt: 1,
+                limit: 3,
+                at: At::from_unix_millis(millis),
+                outcome,
+                busy_probe_count,
+            });
+        };
+        record("felix", VendorSignIn, None, 1);
+        for count in 1..=300 {
+            record("Ada", SeatBusy, Some(count), u64::from(count) * 2);
+            record("Feira", SeatBusy, Some(count), u64::from(count) * 2 + 1);
+        }
+        // A replacement fence can start without a preceding non-busy entry.
+        record("feira", SeatBusy, Some(1), 602);
+        record("feira", SeatBusy, Some(2), 603);
+        record("feira", Inconclusive, None, 604);
+        record("feira", SeatBusy, Some(1), 605);
+        let history: Vec<_> = state
+            .snapshot
+            .fence_recovery_attempts
+            .iter()
+            .map(|row| {
+                (
+                    row.recipient.as_str(),
+                    row.outcome,
+                    row.busy_probe_count,
+                    row.at.unix_millis(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            history,
+            [
+                ("felix", VendorSignIn, None, 1),
+                ("ada", SeatBusy, Some(300), 600),
+                ("feira", SeatBusy, Some(300), 601),
+                ("feira", SeatBusy, Some(2), 603),
+                ("feira", Inconclusive, None, 604),
+                ("feira", SeatBusy, Some(1), 605),
+            ]
+        );
+    }
+
+    #[test]
     fn recovery_history_is_bounded_and_survives_clearing_attention() {
         let mut state = DiagnosticsState::new(At::from_unix_millis(0), None);
         let last_attempt = MAX_FENCE_RECOVERY_ATTEMPTS as u32 + 1;
@@ -1329,6 +1449,7 @@ mod tests {
                 limit: last_attempt,
                 at: At::from_unix_millis(u64::from(attempt)),
                 outcome: FenceRecoveryOutcome::DeadRoute,
+                busy_probe_count: None,
             });
         }
         let history = &state.snapshot.fence_recovery_attempts;
@@ -1351,6 +1472,7 @@ mod tests {
                 outcome: FenceRecoveryOutcome::VendorSignIn,
                 exhausted: true,
                 busy_since: None,
+                busy_elapsed_ms: None,
             }]
         );
 

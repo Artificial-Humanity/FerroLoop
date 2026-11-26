@@ -1341,6 +1341,7 @@ export interface WireDispatchDiagnostics {
     limit: number;
     at: string;
     outcome: string;
+    busy_probe_count?: number;
   }[];
   fence_recovery_attention?: {
     recipient: string;

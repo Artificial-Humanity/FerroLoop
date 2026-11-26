@@ -1404,7 +1404,7 @@ export const WireMailPane: React.FC<WireMailPaneProps> = ({
                     {`${recipient}: Wire recovery ${
                       outcome === "waiting_for_delay" ||
                       outcome === "waiting_for_worker" ||
-                      (outcome === "seat_busy" && !exhausted)
+                      outcome === "seat_busy"
                         ? "pending"
                         : "needs attention"
                     } (${reason_label ?? outcome.replace(/_/g, " ")}${busy_since ? ` since ${busy_since}` : ""}${
