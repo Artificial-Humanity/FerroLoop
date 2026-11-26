@@ -665,6 +665,78 @@ fn no_metered_api_vendor_is_ever_a_target() {
 }
 
 #[test]
+fn balance_excludes_unusable_codex_sign_in_and_releases_the_store_for_the_probe() {
+    use crate::lifecycle::{Caller, FakeRuntime, SpinUpRequest, TEST_LAUNCH_AUTH};
+    use fl_core::LaunchSignInIssue;
+    let tmp = TempDir::new().unwrap();
+    let _trusted = lifecycle::trusted_codex_home(tmp.path(), tmp.path());
+    let state = hub(&tmp);
+    quota(&state, "claude", 95.0);
+    quota(&state, "codex", 10.0);
+
+    let fake = FakeRuntime::default();
+    let env = fake.env(tmp.path());
+    {
+        let store = state.open_store().unwrap();
+        for persona in ["ada", "bo"] {
+            lifecycle::spin_up(
+                &*store,
+                &env,
+                &SpinUpRequest {
+                    persona: persona.into(),
+                    project: "FerroLoop".into(),
+                    role: "assistant".into(),
+                    vendor: "claude".into(),
+                    cwd: Some(tmp.path().display().to_string()),
+                    ..SpinUpRequest::default()
+                },
+                "owner",
+                Caller::Owner,
+            )
+            .unwrap();
+        }
+    }
+    fake.calls.borrow_mut().clear();
+    let probe_state = state.clone();
+    let probes = std::rc::Rc::new(std::cell::Cell::new(0));
+    let seen = probes.clone();
+    TEST_LAUNCH_AUTH.with(|slot| {
+        *slot.borrow_mut() = Some(Box::new(move |_| {
+            assert!(
+                probe_state.try_open_lifecycle_store().is_ok(),
+                "balance auth held the store"
+            );
+            seen.set(seen.get() + 1);
+            Some(LaunchSignInIssue::NotSignedIn)
+        }))
+    });
+
+    let policy = serde_json::from_value(json!({"allowed_target_vendors": ["codex"]})).unwrap();
+    let (plan, _) = crate::balance_api::checked_plan_with_auth(
+        &state,
+        &env,
+        &[],
+        Caller::Owner,
+        Some(&policy),
+        &[],
+        1_000,
+    )
+    .unwrap_or_else(|_| panic!("the plan failed"));
+    assert!(plan.switches.is_empty(), "{plan:#?}");
+    assert_eq!(plan.skipped.len(), 2, "{plan:#?}");
+    assert!(plan.skipped.iter().all(|seat| {
+        seat.detail
+            .contains(LaunchSignInIssue::NotSignedIn.message())
+    }));
+    assert_eq!(
+        probes.get(),
+        1,
+        "identical Codex targets share one verdict in a batch"
+    );
+    assert!(fake.calls.borrow().is_empty());
+}
+
+#[test]
 fn a_switch_its_remodel_would_refuse_is_skipped_and_the_next_agent_moves() {
     use crate::lifecycle::{Caller, FakeRuntime, SpinUpRequest};
     let tmp = TempDir::new().unwrap();
@@ -713,6 +785,7 @@ fn a_switch_its_remodel_would_refuse_is_skipped_and_the_next_agent_moves() {
         &inputs,
         &[],
         1_000,
+        &mut |_| Ok(None),
     )
     .unwrap_or_else(|_| panic!("the plan failed"));
     drop(store);

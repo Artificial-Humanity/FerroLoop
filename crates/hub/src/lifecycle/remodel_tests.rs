@@ -445,9 +445,10 @@ fn failing_spin<'a>(
     &SpinUpRequest,
     &str,
     Caller,
+    LaunchAuth<'_>,
 ) -> Result<SpinUpResponse, LifecycleError>
 + 'a {
-    move |store, env, req, by, caller| {
+    move |store, env, req, by, caller, auth| {
         calls.borrow_mut().push(req.vendor.clone());
         if failing.contains(&req.vendor.as_str()) {
             return Err(LifecycleError::Store(format!(
@@ -455,7 +456,7 @@ fn failing_spin<'a>(
                 req.vendor
             )));
         }
-        spin_up(store, env, req, by, caller)
+        spin_up_fenced(store, || Ok(store), env, req, by, caller, auth)
     }
 }
 
@@ -903,7 +904,7 @@ fn an_old_runtime_the_teardown_cannot_stop_is_refused_before_anything_changes() 
 }
 
 #[test]
-fn confirmed_codex_auth_warning_is_reported_once_and_remodel_continues() {
+fn blocked_codex_sign_in_refuses_before_remodel_teardown_unless_overridden() {
     let home = TempDir::new().unwrap();
     let _trusted = trusted_codex_home(home.path(), home.path());
     let fake = FakeRuntime::default();
@@ -919,24 +920,72 @@ fn confirmed_codex_auth_warning_is_reported_once_and_remodel_continues() {
         Some(home.path()),
     );
 
-    TEST_LAUNCH_PREREQUISITE
-        .with(|slot| *slot.borrow_mut() = Some(Ok(Some(TEST_CODEX_AUTH_WARNING))));
-    let out = remodel(
-        &store,
-        &env,
-        "claude:ada",
-        &remodel_req("codex"),
-        Caller::Owner,
-    )
-    .unwrap();
+    for issue in [LaunchSignInIssue::Rejected, LaunchSignInIssue::NotSignedIn] {
+        TEST_LAUNCH_AUTH.with(|slot| *slot.borrow_mut() = Some(Box::new(move |_| Some(issue))));
+        fake.calls.borrow_mut().clear();
+        let err = remodel(
+            &store,
+            &env,
+            "claude:ada",
+            &remodel_req("codex"),
+            Caller::Owner,
+        )
+        .unwrap_err();
+        assert_eq!(err.status(), 409);
+        assert!(err.to_string().contains(issue.message()), "{err}");
+        assert!(err.to_string().contains("--allow-blocked-sign-in"), "{err}");
+        assert!(
+            fake.calls.borrow().is_empty(),
+            "a runtime effect preceded the refusal"
+        );
+        assert!(fake.is_live("Ada"));
+        assert_eq!(record(&store, "claude:ada").status, STATUS_RUNNING);
+        assert!(
+            find_hosted_session(&store, &["codex:ada"])
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    let prepare = RemodelRequest {
+        mode: Some("prepare".into()),
+        ..remodel_req("codex")
+    };
+    let prepared = remodel(&store, &env, "claude:ada", &prepare, Caller::Owner).unwrap();
+    assert!(
+        prepared
+            .warnings
+            .iter()
+            .any(|warning| warning == LaunchSignInIssue::NotSignedIn.message())
+    );
+    assert!(fake.is_live("Ada"));
+
+    let probes = std::rc::Rc::new(std::cell::Cell::new(0));
+    let called = probes.clone();
+    TEST_LAUNCH_AUTH.with(|slot| {
+        *slot.borrow_mut() = Some(Box::new(move |_| {
+            called.set(called.get() + 1);
+            Some(LaunchSignInIssue::NotSignedIn)
+        }))
+    });
+    let request = RemodelRequest {
+        allow_blocked_sign_in: true,
+        ..remodel_req("codex")
+    };
+    let out = remodel(&store, &env, "claude:ada", &request, Caller::Owner).unwrap();
     assert_eq!(out.session_id, "codex:ada");
     assert!(out.runtime_stopped);
     assert_eq!(record(&store, "codex:ada").status, STATUS_RUNNING);
     assert_eq!(record(&store, "claude:ada").status, STATUS_DECOMMISSIONED);
     assert_eq!(
+        probes.get(),
+        1,
+        "activation must reuse the destination verdict"
+    );
+    assert_eq!(
         out.warnings
             .iter()
-            .filter(|warning| warning.as_str() == TEST_CODEX_AUTH_WARNING)
+            .filter(|warning| warning.as_str() == LaunchSignInIssue::NotSignedIn.message())
             .count(),
         1
     );
@@ -947,7 +996,14 @@ fn the_precheck_refuses_what_a_remodel_refuses_and_touches_nothing() {
     let home = TempDir::new().unwrap();
     let _trusted = trusted_codex_home(home.path(), &std::env::current_dir().unwrap());
     let precheck = |store: &MemStore, env: &LifecycleEnv<'_>, id: &str, caller: Caller| {
-        remodel_precheck(store, env, &target(store, id), &remodel_req("grok"), caller)
+        remodel_precheck(
+            store,
+            env,
+            &target(store, id),
+            &remodel_req("grok"),
+            caller,
+            |_| Ok(None),
+        )
     };
 
     // A runtime another live session shares.
@@ -1861,9 +1917,9 @@ fn a_failed_remodel_refreshes_tombstones_when_it_undoes_the_new_record() {
         "owner",
         Caller::Owner,
         |_| {},
-        &mut |store, env, req, by, caller| {
+        &mut |store, env, req, by, caller, auth| {
             if req.vendor == "grok" {
-                return spin_up(store, env, req, by, caller);
+                return spin_up_fenced(store, || Ok(store), env, req, by, caller, auth);
             }
             Err(LifecycleError::Store(
                 "restore refused before spin-up".into(),
@@ -1929,7 +1985,6 @@ fn recast_remodel_uses_bound_current_registration_over_hosted_assignment() {
         &target,
         &remodel_req("codex"),
         Caller::Owner,
-        true,
     )
     .unwrap();
     assert_eq!(plan.to.project, "sonora");
@@ -1955,6 +2010,7 @@ fn recast_deleted_catalog_role_is_refused_by_remodel_before_any_writes() {
         &target(&store, "claude:ada"),
         &remodel_req("codex"),
         Caller::Owner,
+        |_| panic!("an invalid destination must not reach the probe"),
     )
     .unwrap_err();
     assert_eq!(error.status(), 400);
@@ -2057,7 +2113,6 @@ fn remodel_resolves_project_cwd_from_workspace_root_when_old_cwd_is_none_or_work
         &target(&store, "antigravity:kayla"),
         &remodel_req("claude"),
         Caller::Owner,
-        true,
     )
     .unwrap();
     let want_proj = proj_dir.display().to_string();
@@ -2110,7 +2165,6 @@ fn remodel_resolves_project_cwd_from_workspace_root_when_old_cwd_is_none_or_work
         &target(&store, "codex:kayla"),
         &remodel_req("claude"),
         Caller::Owner,
-        true,
     )
     .unwrap();
     assert_eq!(plan3.to.cwd.as_deref(), Some(wt_str.as_str()));

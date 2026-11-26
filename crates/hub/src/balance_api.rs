@@ -49,11 +49,13 @@
 //! for the caller and the chosen vendor: one that a remodel would refuse (a runtime other
 //! sessions share, a `tmux_target` naming another tmux session, a vendor that cannot be restored
 //! for a peer, a missing directory, ...) is a `not_remodelable` skip with the refusal, and the
-//! next triggered agent takes its run slot.
+//! next triggered agent takes its run slot. Managed Codex sign-in is observed outside the store
+//! guard and checked against each candidate's resolved configuration home and working directory.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
+use fl_core::LaunchSignInIssue;
 use fl_core::store::StoreError;
 use fl_exec::stamp;
 use fl_store::AnyStore;
@@ -79,8 +81,8 @@ use crate::discovery::{
     quota_for_resolved_route_at,
 };
 use crate::lifecycle::{
-    self, Caller, HostedSessionRecord, LifecycleEnv, RemodelRequest, STATUS_DECOMMISSIONED,
-    STATUS_RUNNING, SessionTarget,
+    self, Caller, HostedSessionRecord, LaunchAuthObservations, LaunchAuthTarget, LifecycleEnv,
+    LifecycleError, RemodelRequest, STATUS_DECOMMISSIONED, STATUS_RUNNING, SessionTarget,
 };
 use crate::watch_api::{discovered_quotas, quota_windows, refuse_unknown_keys};
 use crate::{HttpRequest, HttpResponse, HubState};
@@ -324,6 +326,7 @@ pub(crate) fn checked_plan(
     inputs: &StoreInputs,
     live: &[WatchQuotaWindow],
     now_ms: u64,
+    observe: &mut impl FnMut(&LaunchAuthTarget) -> Result<Option<LaunchSignInIssue>, LifecycleError>,
 ) -> Result<(BalancePlan, BTreeMap<String, SessionTarget>), HttpResponse> {
     let mut readings = live.to_vec();
     readings.extend(inputs.stored_quotas.iter().cloned());
@@ -342,8 +345,15 @@ pub(crate) fn checked_plan(
             let discovered = resolve_session_target_in(sessions, &agent.session_id);
             let target = SessionTarget::resolve(store, &agent.session_id, Some(discovered))
                 .map_err(|e| format!("{e} ({})", e.status()))?;
-            lifecycle::remodel_precheck(store, env, &target, &switch_request(to_vendor), caller)
-                .map_err(|e| format!("{e} ({})", e.status()))?;
+            lifecycle::remodel_precheck(
+                store,
+                env,
+                &target,
+                &switch_request(to_vendor),
+                caller,
+                &mut *observe,
+            )
+            .map_err(|e| format!("{e} ({})", e.status()))?;
             targets.insert(agent.session_id.clone(), target);
             Ok(())
         },
@@ -357,6 +367,58 @@ pub(crate) fn checked_plan(
 struct PlanBody {
     #[serde(default)]
     policy: Option<Map<String, Value>>,
+}
+
+/// Collect daemon destinations as provisional refusals. They use no switch slot, so the
+/// planner visits later candidates if the first one's sign-in is unusable. Only candidates
+/// passing the ordinary remodel checks are probed, once per config home and cwd.
+pub(crate) fn checked_plan_with_auth(
+    state: &HubState,
+    env: &LifecycleEnv<'_>,
+    sessions: &[DiscoveredSessionSummary],
+    caller: Caller,
+    policy_patch: Option<&Map<String, Value>>,
+    live: &[WatchQuotaWindow],
+    now_ms: u64,
+) -> Result<(BalancePlan, LaunchAuthObservations), HttpResponse> {
+    let evaluate = |observations: &LaunchAuthObservations,
+                    mut missing: Option<&mut BTreeSet<LaunchAuthTarget>>| {
+        let store = state.open_store().map_err(store_error)?;
+        let inputs = read_store_inputs(&store)?;
+        let policy = match policy_patch {
+            Some(patch) => overlay(&inputs.policy, patch).map_err(|e| error(400, e))?,
+            None => inputs.policy.clone(),
+        };
+        checked_plan(
+            &store,
+            env,
+            sessions,
+            caller,
+            &policy,
+            &inputs,
+            live,
+            now_ms,
+            &mut |target| {
+                if let Some(missing) = &mut missing {
+                    missing.insert(target.clone());
+                }
+                lifecycle::observed_launch_auth(observations, target)
+            },
+        )
+        .map(|(plan, _)| plan)
+    };
+    let mut missing = BTreeSet::new();
+    let mut observations = LaunchAuthObservations::new();
+    let plan = evaluate(&observations, Some(&mut missing))?;
+    if missing.is_empty() {
+        return Ok((plan, observations));
+    }
+    for target in missing {
+        let issue = target.probe(env);
+        observations.insert(target, issue);
+    }
+    let plan = evaluate(&observations, None)?;
+    Ok((plan, observations))
 }
 
 fn handle_plan(state: &HubState, authority: &HubAuthority, req: &HttpRequest) -> HttpResponse {
@@ -373,32 +435,15 @@ fn handle_plan(state: &HubState, authority: &HubAuthority, req: &HttpRequest) ->
     let sessions =
         discover_route_sessions_without_model_info(&load_discovery_snapshot(state), home);
     let env = crate::api::lifecycle_env(state);
-    let Ok(store) = state.open_store() else {
-        return store_open_failure();
-    };
-    let inputs = match read_store_inputs(&store) {
-        Ok(i) => i,
-        Err(resp) => return resp,
-    };
-    let policy = match &body.policy {
-        Some(patch) => match overlay(&inputs.policy, patch) {
-            Ok(p) => p,
-            Err(e) => return error(400, e),
-        },
-        None => inputs.policy.clone(),
-    };
-    // The prechecks read the store, so the guard is held through the evaluation (and only that).
-    let result = checked_plan(
-        &store,
+    let result = checked_plan_with_auth(
+        state,
         &env,
         &sessions,
         caller_of(authority),
-        &policy,
-        &inputs,
+        body.policy.as_ref(),
         &live,
         stamp::now().unix_millis(),
     );
-    drop(store);
     match result {
         Ok((plan, _)) => HttpResponse::json(200, json!(plan)),
         Err(resp) => resp,
@@ -543,27 +588,12 @@ fn handle_apply(state: &HubState, authority: &HubAuthority, req: &HttpRequest) -
         discover_route_sessions_without_model_info(&load_discovery_snapshot(state), home);
     let env = crate::api::lifecycle_env(state);
 
-    let Ok(store) = state.open_store() else {
-        return store_open_failure();
-    };
-    let inputs = match read_store_inputs(&store) {
-        Ok(i) => i,
-        Err(resp) => return resp,
-    };
     let now_ms = stamp::now().unix_millis();
-    let (plan, _) = match checked_plan(
-        &store,
-        &env,
-        &sessions,
-        caller,
-        &inputs.policy,
-        &inputs,
-        &live,
-        now_ms,
-    ) {
-        Ok(p) => p,
-        Err(resp) => return resp,
-    };
+    let (plan, observations) =
+        match checked_plan_with_auth(state, &env, &sessions, caller, None, &live, now_ms) {
+            Ok(p) => p,
+            Err(resp) => return resp,
+        };
     if let Some(why) = &plan.blocked {
         return HttpResponse::json(
             409,
@@ -577,7 +607,6 @@ fn handle_apply(state: &HubState, authority: &HubAuthority, req: &HttpRequest) -
         );
     }
 
-    drop(store);
     #[cfg(test)]
     BEFORE_APPLY_FENCE.with(|slot| {
         if let Some(hook) = slot.borrow_mut().take() {
@@ -612,6 +641,7 @@ fn handle_apply(state: &HubState, authority: &HubAuthority, req: &HttpRequest) -
                 &current,
                 &live,
                 stamp::now().unix_millis(),
+                &mut |target| lifecycle::observed_launch_auth(&observations, target),
             ) {
                 Ok(plan) => plan,
                 Err(e) => return e,
@@ -632,6 +662,7 @@ fn handle_apply(state: &HubState, authority: &HubAuthority, req: &HttpRequest) -
             let validated_history = current.history.clone();
             drop(store);
             let mut results: Vec<SwitchResult> = Vec::new();
+            let mut warnings = Vec::new();
             let mut down = false;
             let mut grant_checked = false;
             for sw in &plan.switches {
@@ -689,6 +720,9 @@ fn handle_apply(state: &HubState, authority: &HubAuthority, req: &HttpRequest) -
                                 &current,
                                 &live,
                                 stamp::now().unix_millis(),
+                                &mut |target| {
+                                    lifecycle::observed_launch_auth(&observations, target)
+                                },
                             )
                             .map_err(|response| {
                                 crate::lifecycle::LifecycleError::Conflict(
@@ -715,6 +749,7 @@ fn handle_apply(state: &HubState, authority: &HubAuthority, req: &HttpRequest) -
                             &target,
                             &switch_request(&sw.to_vendor),
                             caller,
+                            |target| lifecycle::observed_launch_auth(&observations, target),
                         )?;
                         // A single-use grant is spent only now, under the guard, just before the first remodel.
                         if !grant_checked {
@@ -741,6 +776,7 @@ fn handle_apply(state: &HubState, authority: &HubAuthority, req: &HttpRequest) -
                             &switch_request(&sw.to_vendor),
                             by,
                             caller,
+                            &observations,
                         ))
                     },
                 );
@@ -749,6 +785,10 @@ fn handle_apply(state: &HubState, authority: &HubAuthority, req: &HttpRequest) -
                 }
                 match run.unwrap_or_else(RemodelRun::Refused) {
                     RemodelRun::Done { out, .. } => {
+                        let unverified = LaunchSignInIssue::Inconclusive.message();
+                        if out.warnings.iter().any(|warning| warning == unverified) {
+                            warnings.push(format!("{}: {unverified}", out.session_id));
+                        }
                         result.status = SwitchStatus::Ok;
                         result.new_session_id = Some(out.session_id);
                         result.outcome = Some("remodeled".into());
@@ -775,7 +815,6 @@ fn handle_apply(state: &HubState, authority: &HubAuthority, req: &HttpRequest) -
             let Ok(store) = state.open_store() else {
                 return store_open_failure();
             };
-            let mut warnings = Vec::new();
             let mut history = match read_history(&*store) {
                 Ok(history) => history,
                 Err(error) => return balance_error(error),

@@ -21,7 +21,9 @@ use fl_core::state::{
     StateScope, UpsertStateArgs, validate_slug,
 };
 use fl_core::store::{AgentRegistry, Catalog, MessageStore, StateStore, StoreError};
-use fl_core::{VendorDescriptor, VendorRegistry, VendorTransport, lookup_vendor};
+use fl_core::{
+    LaunchSignInIssue, VendorDescriptor, VendorRegistry, VendorTransport, lookup_vendor,
+};
 use fl_exec::stamp;
 use fl_wire::dispatcher::{
     OperatorPromptError, OperatorPromptIntent, OperatorPromptOutcome, PushError,
@@ -939,15 +941,13 @@ pub(crate) use fl_wire::vendor_adapter::{
     resolve_vendor_bin, split_window_tag, with_local_bin,
 };
 
-/// Read-only launch checks run independently of adapter selection. Return the checked
-/// configuration directory so a daemon child cannot inherit a different CODEX_HOME.
-fn preflight_vendor_launch(
+/// Validate Codex project trust and pin the same configuration home and working directory
+/// for the sign-in observation and the child.
+fn prepare_vendor_launch(
     env: &LifecycleEnv<'_>,
     vendor: &str,
     hosted: bool,
     cwd: &mut Option<String>,
-    probe_auth: bool,
-    warnings: &mut Vec<String>,
 ) -> Result<Option<PathBuf>, LifecycleError> {
     if vendor != "codex" || !hosted || !env.spawn_runtime {
         return Ok(None);
@@ -980,27 +980,78 @@ fn preflight_vendor_launch(
             .ok_or_else(|| invalid_field("cwd", "must be valid UTF-8"))?
             .to_string(),
     );
-    if env
-        .vendor_launch_options_for_vendor(vendor, fl_core::permissions::Posture::Auto)
-        .remote_control
-        && let Some(warning) = check_vendor_launch_prerequisite(
-            env,
-            vendor,
-            Some(&config_home),
-            probe_auth.then_some(checked.cwd.as_path()),
-        )?
-    {
-        warnings.push(warning.into());
-    }
     Ok(Some(config_home))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct LaunchAuthTarget {
+    config_home: PathBuf,
+    pub(crate) cwd: PathBuf,
+}
+
+impl LaunchAuthTarget {
+    pub(crate) fn probe(&self, env: &LifecycleEnv<'_>) -> Option<LaunchSignInIssue> {
+        #[cfg(test)]
+        if let Some(issue) = TEST_LAUNCH_AUTH.with_borrow(|probe| probe.as_ref().map(|f| f(self))) {
+            return issue;
+        }
+        env.host_vendor_adapter("codex")
+            .and_then(|adapter| adapter.probe_launch_auth(&self.config_home, &self.cwd))
+    }
+}
+
+fn uses_codex_daemon(env: &LifecycleEnv<'_>, vendor: &str) -> bool {
+    vendor == "codex"
+        && env
+            .vendor_launch_options_for_vendor(vendor, fl_core::permissions::Posture::Auto)
+            .remote_control
+}
+
+fn launch_auth_target(
+    env: &LifecycleEnv<'_>,
+    vendor: &str,
+    config_home: Option<&Path>,
+    cwd: Option<&str>,
+) -> Option<LaunchAuthTarget> {
+    if !uses_codex_daemon(env, vendor) {
+        return None;
+    }
+    Some(LaunchAuthTarget {
+        config_home: config_home?.to_path_buf(),
+        cwd: PathBuf::from(cwd?),
+    })
+}
+
+enum LaunchAuth<'a> {
+    Skip,
+    Observe,
+    Observed(&'a LaunchAuthTarget, Option<LaunchSignInIssue>),
+}
+
+impl LaunchAuth<'_> {
+    fn warning(&self, target: Option<&LaunchAuthTarget>) -> Result<Option<String>, LifecycleError> {
+        match self {
+            Self::Observed(checked, issue) if target == Some(*checked) => {
+                Ok(issue.map(|issue| issue.message().into()))
+            }
+            Self::Observed(..) => Err(launch_auth_target_changed()),
+            Self::Skip | Self::Observe => Ok(None),
+        }
+    }
+}
+
+fn launch_auth_target_changed() -> LifecycleError {
+    LifecycleError::Conflict(
+        "the managed Codex launch target changed during sign-in verification; retry the operation"
+            .into(),
+    )
 }
 
 fn check_vendor_launch_prerequisite(
     env: &LifecycleEnv<'_>,
     vendor: &str,
     config_home: Option<&Path>,
-    cwd: Option<&Path>,
-) -> Result<Option<&'static str>, LifecycleError> {
+) -> Result<(), LifecycleError> {
     #[cfg(test)]
     TEST_LAUNCH_PREREQUISITE_CALLS.with(|calls| calls.set(calls.get() + 1));
     #[cfg(test)]
@@ -1008,12 +1059,10 @@ fn check_vendor_launch_prerequisite(
         .with(|slot| slot.borrow_mut().pop_front())
         .or_else(|| TEST_LAUNCH_PREREQUISITE.with(|slot| slot.borrow().clone()))
     {
-        return result
-            .map(|warning| warning.filter(|_| cwd.is_some()))
-            .map_err(|r| LifecycleError::PrerequisiteUnavailable {
-                code: r.code,
-                detail: r.detail,
-            });
+        return result.map_err(|r| LifecycleError::PrerequisiteUnavailable {
+            code: r.code,
+            detail: r.detail,
+        });
     }
     // Production hosted Codex launch must never silently fall back around its prerequisite.
     let adapter =
@@ -1022,12 +1071,12 @@ fn check_vendor_launch_prerequisite(
                 code: "codex_app_server_unavailable".into(),
                 detail: "launch adapter unavailable".into(),
             })?;
-    adapter.preflight_launch(config_home, cwd).map_err(|r| {
-        LifecycleError::PrerequisiteUnavailable {
+    adapter
+        .preflight_launch(config_home)
+        .map_err(|r| LifecycleError::PrerequisiteUnavailable {
             code: r.code,
             detail: bounded_prerequisite_detail(&r.detail),
-        }
-    })
+        })
 }
 
 fn bounded_prerequisite_detail(detail: &str) -> String {
@@ -1064,14 +1113,14 @@ fn codex_config_home(
 }
 
 #[cfg(test)]
-type LaunchPrerequisiteCheck = Result<Option<&'static str>, fl_core::LaunchPrerequisiteRefusal>;
+type LaunchPrerequisiteCheck = Result<(), fl_core::LaunchPrerequisiteRefusal>;
 
 #[cfg(test)]
-const TEST_CODEX_AUTH_WARNING: &str =
-    "The managed Codex app-server's account check returned HTTP 401.";
+type LaunchAuthTestProbe = Box<dyn Fn(&LaunchAuthTarget) -> Option<LaunchSignInIssue>>;
 
 #[cfg(test)]
 thread_local! {
+    pub(crate) static TEST_LAUNCH_AUTH: std::cell::RefCell<Option<LaunchAuthTestProbe>> = const { std::cell::RefCell::new(None) };
     // Scoped ambient input replacement, not a trust bypass or process environment edit.
     static TEST_LAUNCH_PREREQUISITE: std::cell::RefCell<Option<LaunchPrerequisiteCheck>> = const { std::cell::RefCell::new(None) };
     static TEST_LAUNCH_PREREQUISITE_SEQUENCE: std::cell::RefCell<std::collections::VecDeque<LaunchPrerequisiteCheck>> = const { std::cell::RefCell::new(std::collections::VecDeque::new()) };
@@ -1087,13 +1136,15 @@ thread_local! {
 pub(crate) struct IsolatedCodexHome(
     Option<Option<std::ffi::OsString>>,
     Option<LaunchPrerequisiteCheck>,
+    Option<LaunchAuthTestProbe>,
 );
 #[cfg(test)]
 impl IsolatedCodexHome {
     pub(crate) fn new() -> Self {
         Self(
             TEST_CODEX_HOME.with(|slot| slot.replace(Some(None))),
-            TEST_LAUNCH_PREREQUISITE.with(|slot| slot.replace(Some(Ok(None)))),
+            TEST_LAUNCH_PREREQUISITE.with(|slot| slot.replace(Some(Ok(())))),
+            TEST_LAUNCH_AUTH.with(|slot| slot.replace(Some(Box::new(|_| None)))),
         )
     }
 }
@@ -1102,6 +1153,7 @@ impl Drop for IsolatedCodexHome {
     fn drop(&mut self) {
         TEST_CODEX_HOME.with(|slot| *slot.borrow_mut() = self.0.take());
         TEST_LAUNCH_PREREQUISITE.with(|slot| *slot.borrow_mut() = self.1.take());
+        TEST_LAUNCH_AUTH.with(|slot| *slot.borrow_mut() = self.2.take());
     }
 }
 
@@ -6036,8 +6088,8 @@ pub fn spin_up<S: AgentRegistry + StateStore + Catalog + MessageStore>(
     spin_up_with_store(store, || Ok(store), env, req, by, caller)
 }
 
-/// Like [`spin_up`], but releases `store_guard` across [`resume_launch_survived`] and re-opens it
-/// via `reopen_store` afterward so hub-wide store locks are never held during the survival watch.
+/// Like [`spin_up`], but releases `store_guard` for the daemon sign-in check and
+/// [`resume_launch_survived`], reopening it through `reopen_store` afterward.
 pub fn spin_up_with_store<S, G, F>(
     store_guard: G,
     mut reopen_store: F,
@@ -6053,12 +6105,28 @@ where
 {
     let persona = req.validate()?.persona;
     if env.lifecycle_fence.is_some_and(|f| f.covers(&persona)) {
-        return spin_up_fenced(store_guard, &mut reopen_store, env, req, by, caller, true);
+        return spin_up_fenced(
+            store_guard,
+            &mut reopen_store,
+            env,
+            req,
+            by,
+            caller,
+            LaunchAuth::Observe,
+        );
     }
     drop(store_guard);
     with_lifecycle_fence(env, &persona, "spin-up", |env| {
         let store_guard = reopen_store()?;
-        spin_up_fenced(store_guard, &mut reopen_store, env, req, by, caller, true)
+        spin_up_fenced(
+            store_guard,
+            &mut reopen_store,
+            env,
+            req,
+            by,
+            caller,
+            LaunchAuth::Observe,
+        )
     })
 }
 
@@ -6069,7 +6137,7 @@ fn spin_up_fenced<S, G, F>(
     req: &SpinUpRequest,
     by: &str,
     caller: Caller,
-    probe_auth: bool,
+    launch_auth: LaunchAuth<'_>,
 ) -> Result<SpinUpResponse, LifecycleError>
 where
     S: AgentRegistry + StateStore + Catalog + MessageStore,
@@ -6141,15 +6209,29 @@ where
     if let Some(record) = &previous {
         load_hosted_respawn_state_policy(store, &record.session_id, true)?;
     }
-    let mut warnings = Vec::new();
-    let config_home = preflight_vendor_launch(
-        env,
-        &v.vendor,
-        v.hosted,
-        &mut v.cwd,
-        probe_auth,
-        &mut warnings,
-    )?;
+    let config_home = prepare_vendor_launch(env, &v.vendor, v.hosted, &mut v.cwd)?;
+    let auth_target = launch_auth_target(env, &v.vendor, config_home.as_deref(), v.cwd.as_deref());
+    if let (LaunchAuth::Observe, Some(target)) = (&launch_auth, auth_target.as_ref()) {
+        check_registration(store, &v, OwnAgent::AsIs)?;
+        drop(store_guard);
+        let issue = target.probe(env);
+        return spin_up_fenced(
+            reopen_store()?,
+            reopen_store,
+            env,
+            req,
+            by,
+            caller,
+            LaunchAuth::Observed(target, issue),
+        );
+    }
+    let mut warnings: Vec<_> = launch_auth
+        .warning(auth_target.as_ref())?
+        .into_iter()
+        .collect();
+    if auth_target.is_some() {
+        check_vendor_launch_prerequisite(env, &v.vendor, config_home.as_deref())?;
+    }
     let tmux_target = has_runtime.then(|| hosted_tmux_target(&v.vendor, &v.persona));
     let host_session_id = host_session_id_for_target(tmux_target.as_deref());
     let unit = tmux_target
@@ -8310,9 +8392,8 @@ pub fn restart_hosted_session<S: StateStore + AgentRegistry + Catalog + MessageS
     restart_hosted_session_with_store(store, || Ok(store), env, id, by)
 }
 
-/// Like [`restart_hosted_session`], but releases `store_guard` across [`resume_launch_survived`]
-/// and re-opens it via `reopen_store` afterward so hub-wide store locks are never held during the
-/// survival watch.
+/// Like [`restart_hosted_session`], but releases `store_guard` for explicit daemon sign-in
+/// checks and [`resume_launch_survived`], reopening it through `reopen_store` afterward.
 pub fn restart_hosted_session_with_store<S, G, F>(
     store_guard: G,
     reopen_store: F,
@@ -8356,6 +8437,11 @@ where
             &initial_record.session_id,
             by,
             strict_target,
+            if by == AUTO_RESPAWN_ACTOR {
+                LaunchAuth::Skip
+            } else {
+                LaunchAuth::Observe
+            },
         );
     }
     drop(store_guard);
@@ -8368,6 +8454,11 @@ where
             &initial_record.session_id,
             by,
             strict_target,
+            if by == AUTO_RESPAWN_ACTOR {
+                LaunchAuth::Skip
+            } else {
+                LaunchAuth::Observe
+            },
         )
     })
 }
@@ -8379,6 +8470,7 @@ fn restart_hosted_session_fenced<S, G, F>(
     id: &str,
     by: &str,
     strict_target: Option<&str>,
+    launch_auth: LaunchAuth<'_>,
 ) -> Result<RestartResponse, LifecycleError>
 where
     S: StateStore + AgentRegistry + Catalog + MessageStore,
@@ -8487,12 +8579,11 @@ where
     }
     let prior_stop_reason = record.stop_reason.clone();
     let retry_prerequisite = prerequisite_retry_allowed(by, prior_stop_reason.as_deref());
-    let mut recast_staged = false;
-    let mut warnings = Vec::new();
-    // Classify every preparation error under the same lock as its attempt reservation.
-    let preparation = (|| {
+    // Derive the same config home and working directory used by the hosted child. On an
+    // explicit restart, reopen the store and resolve the settings again after probing.
+    let launch = (|| -> Result<_, LifecycleError> {
         let recast_assignment = current_recast_assignment(store, &record.persona)?;
-        recast_staged = recast_assignment.is_some();
+        let recast_staged = recast_assignment.is_some();
         if let Some(agent) = recast_assignment {
             record.project = agent.project;
             record.role = role_label_of(&agent.role);
@@ -8505,14 +8596,38 @@ where
                 env.home_override,
             )?;
         }
-        let config_home = preflight_vendor_launch(
+        let config_home =
+            prepare_vendor_launch(env, &record.vendor, record.hosted, &mut record.cwd)?;
+        Ok((config_home, recast_staged))
+    })();
+    let auth_target = launch.as_ref().ok().and_then(|(home, _)| {
+        launch_auth_target(env, &record.vendor, home.as_deref(), record.cwd.as_deref())
+    });
+    if let (LaunchAuth::Observe, Some(target)) = (&launch_auth, auth_target.as_ref()) {
+        drop(store_guard);
+        let issue = target.probe(env);
+        return restart_hosted_session_fenced(
+            reopen_store()?,
+            reopen_store,
             env,
-            &record.vendor,
-            record.hosted,
-            &mut record.cwd,
-            true,
-            &mut warnings,
-        )?;
+            id,
+            by,
+            strict_target,
+            LaunchAuth::Observed(target, issue),
+        );
+    }
+    let mut warnings: Vec<_> = launch_auth
+        .warning(auth_target.as_ref())?
+        .into_iter()
+        .collect();
+    let mut recast_staged = false;
+    // Classify every preparation error under the same lock as its attempt reservation.
+    let preparation = (|| {
+        let (config_home, staged) = launch?;
+        recast_staged = staged;
+        if auth_target.is_some() {
+            check_vendor_launch_prerequisite(env, &record.vendor, config_home.as_deref())?;
+        }
         if record.hosted && vendor_has_runtime(&record.vendor) && env.spawn_runtime {
             env.runtime.preflight_spawn(&record.session_id)?;
         }
@@ -9016,7 +9131,7 @@ where
             .vendor_launch_options_for_vendor(&record.vendor, record.posture)
             .remote_control
         && let Err(err @ LifecycleError::PrerequisiteUnavailable { .. }) =
-            check_vendor_launch_prerequisite(env, &record.vendor, config_home.as_deref(), None)
+            check_vendor_launch_prerequisite(env, &record.vendor, config_home.as_deref())
     {
         if retry_prerequisite {
             if !raw_spawned {
@@ -9699,6 +9814,9 @@ pub struct RemodelRequest {
     /// `prepare` or `execute` (the default).
     #[serde(default)]
     pub mode: Option<String>,
+    /// Allow an execute remodel even when the destination daemon rejects sign-in or has none.
+    #[serde(default)]
+    pub allow_blocked_sign_in: bool,
     #[serde(default)]
     pub cwd: Option<String>,
     #[serde(default)]
@@ -9778,7 +9896,7 @@ struct RemodelPlan {
     from_model: Option<String>,
     /// The new session, validated.
     to: ValidSpinUp,
-    warnings: Vec<String>,
+    auth_target: Option<LaunchAuthTarget>,
     /// The spin-up that puts the old session back, when its vendor is one spin-up can start.
     restore: Option<SpinUpRequest>,
 }
@@ -9893,34 +10011,81 @@ fn check_old_runtime_stoppable<S: StateStore>(
     Ok(())
 }
 
-/// Whether [`remodel_session`] would refuse this remodel before its first side effect, with
-/// nothing done: the same checks, error texts and statuses (see `plan_remodel`, whose result this
-/// drops, so the two cannot drift). It only reads: the store, the runtime directory, the key
-/// probe and, when runtime calls are on, whether a tmux session of the persona's name runs.
-/// The connectivity check still runs. Sign-in observations are reported by the remodel itself.
+/// Managed daemon sign-in observations scoped to one launch operation or balance batch.
+pub(crate) type LaunchAuthObservations = BTreeMap<LaunchAuthTarget, Option<LaunchSignInIssue>>;
+
+/// Resolve the exact destination before releasing the store for the daemon request.
+pub(crate) fn remodel_auth_target<S: AgentRegistry + StateStore + Catalog>(
+    store: &S,
+    env: &LifecycleEnv<'_>,
+    target: &SessionTarget,
+    req: &RemodelRequest,
+    caller: Caller,
+) -> Result<Option<LaunchAuthTarget>, LifecycleError> {
+    if !uses_codex_daemon(env, &req.vendor.trim().to_ascii_lowercase()) || !env.spawn_runtime {
+        return Ok(None);
+    }
+    let target = reload_lifecycle_target(store, target)?;
+    Ok(plan_remodel(store, env, &target, req, caller)?.auth_target)
+}
+
+pub(crate) fn observed_launch_auth(
+    observations: &LaunchAuthObservations,
+    target: &LaunchAuthTarget,
+) -> Result<Option<LaunchSignInIssue>, LifecycleError> {
+    observations
+        .get(target)
+        .copied()
+        .ok_or_else(launch_auth_target_changed)
+}
+
+/// Apply the execute remodel's refusals using a sign-in observation from outside the store guard.
 pub(crate) fn remodel_precheck<S: AgentRegistry + StateStore + Catalog>(
     store: &S,
     env: &LifecycleEnv<'_>,
     target: &SessionTarget,
     req: &RemodelRequest,
     caller: Caller,
+    observe: impl FnOnce(&LaunchAuthTarget) -> Result<Option<LaunchSignInIssue>, LifecycleError>,
 ) -> Result<(), LifecycleError> {
-    plan_remodel(store, env, target, req, caller, false).map(drop)
+    let plan = plan_remodel(store, env, target, req, caller)?;
+    check_remodel_launch(env, &plan, req, observe).map(drop)
 }
 
-/// Every check a remodel can make before its first side effect, in the order the siblings make
+fn check_remodel_launch(
+    env: &LifecycleEnv<'_>,
+    plan: &RemodelPlan,
+    req: &RemodelRequest,
+    observe: impl FnOnce(&LaunchAuthTarget) -> Result<Option<LaunchSignInIssue>, LifecycleError>,
+) -> Result<Vec<String>, LifecycleError> {
+    let Some(target) = &plan.auth_target else {
+        return Ok(Vec::new());
+    };
+    check_vendor_launch_prerequisite(env, &plan.to.vendor, Some(&target.config_home))?;
+    let Some(issue) = observe(target)? else {
+        return Ok(Vec::new());
+    };
+    if plan.mode == RemodelMode::Execute && issue.blocks_remodel() && !req.allow_blocked_sign_in {
+        return Err(LifecycleError::Conflict(format!(
+            "{} To proceed anyway, use --allow-blocked-sign-in (API: allow_blocked_sign_in).",
+            issue.message()
+        )));
+    }
+    Ok(vec![issue.message().into()])
+}
+
+/// Store-dependent checks before a remodel's first side effect, in the order the siblings make
 /// them: the teardown gate (403), a decommissioned record (409), no record at all (404), the
 /// request fields as spin-up validates them (400), the runtime directory (400), the registry
 /// checks spin-up makes with the persona's own agent counted as retired (409), a non-Owner
 /// remodel that could not be restored (409), and an old runtime the teardown cannot stop (409).
-/// It has no side effect: [`remodel_precheck`] is this, with the plan dropped.
+/// This has no side effect. [`remodel_precheck`] also validates the destination daemon.
 fn plan_remodel<S: AgentRegistry + StateStore + Catalog>(
     store: &S,
     env: &LifecycleEnv<'_>,
     target: &SessionTarget,
     req: &RemodelRequest,
     caller: Caller,
-    probe_auth: bool,
 ) -> Result<RemodelPlan, LifecycleError> {
     let mode = RemodelMode::parse(req.mode.as_deref())?;
     authorize_teardown(store, target, caller)?;
@@ -10056,15 +10221,9 @@ fn plan_remodel<S: AgentRegistry + StateStore + Catalog>(
         preflight_teardown_runtime(store, env, target, caller)?;
         check_old_runtime_stoppable(store, env, target, &to)?;
     }
-    let mut warnings = Vec::new();
-    preflight_vendor_launch(
-        env,
-        &to.vendor,
-        to.hosted,
-        &mut to.cwd,
-        probe_auth,
-        &mut warnings,
-    )?;
+    let config_home = prepare_vendor_launch(env, &to.vendor, to.hosted, &mut to.cwd)?;
+    let auth_target =
+        launch_auth_target(env, &to.vendor, config_home.as_deref(), to.cwd.as_deref());
     Ok(RemodelPlan {
         mode,
         persona: target.persona.clone(),
@@ -10072,7 +10231,7 @@ fn plan_remodel<S: AgentRegistry + StateStore + Catalog>(
         from_vendor,
         from_model,
         to,
-        warnings,
+        auth_target,
         restore,
     })
 }
@@ -10217,6 +10376,7 @@ type SpinUpFn<'f, S> = dyn FnMut(
         &SpinUpRequest,
         &str,
         Caller,
+        LaunchAuth<'_>,
     ) -> Result<SpinUpResponse, LifecycleError>
     + 'f;
 
@@ -10246,15 +10406,44 @@ pub fn remodel_session<S: AgentRegistry + StateStore + Catalog + MessageStore>(
     caller: Caller,
     clear_queue: impl FnMut(&str),
 ) -> Result<RemodelResponse, LifecycleError> {
-    remodel_with(
+    let mut observations = LaunchAuthObservations::new();
+    if let Some(target) = remodel_auth_target(store, env, target, req, caller)? {
+        let issue = target.probe(env);
+        observations.insert(target, issue);
+    }
+    remodel_session_with_auth(
         store,
         env,
         target,
         req,
         by,
         caller,
+        &observations,
         clear_queue,
-        &mut |store, env, req, by, caller| {
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn remodel_session_with_auth<S: AgentRegistry + StateStore + Catalog + MessageStore>(
+    store: &S,
+    env: &LifecycleEnv<'_>,
+    target: &SessionTarget,
+    req: &RemodelRequest,
+    by: &str,
+    caller: Caller,
+    observations: &LaunchAuthObservations,
+    clear_queue: impl FnMut(&str),
+) -> Result<RemodelResponse, LifecycleError> {
+    remodel_with_auth(
+        store,
+        env,
+        target,
+        req,
+        by,
+        caller,
+        observations,
+        clear_queue,
+        &mut |store, env, req, by, caller, launch_auth| {
             #[cfg(test)]
             if FAIL_SPIN_UP_VENDORS.with_borrow(|v| v.contains(&req.vendor)) {
                 return Err(LifecycleError::Store(format!(
@@ -10262,9 +10451,9 @@ pub fn remodel_session<S: AgentRegistry + StateStore + Catalog + MessageStore>(
                     req.vendor
                 )));
             }
-            // The remodel already holds the persona fence and probed the destination.
-            // Activation and rollback still need to verify socket availability.
-            spin_up_fenced(store, || Ok(store), env, req, by, caller, false)
+            // The remodel already holds the persona fence. Activation uses the verified
+            // destination key and both launch paths still check socket availability.
+            spin_up_fenced(store, || Ok(store), env, req, by, caller, launch_auth)
         },
     )
 }
@@ -10277,6 +10466,7 @@ thread_local! {
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn remodel_with<S: AgentRegistry + StateStore + Catalog + MessageStore>(
     store: &S,
@@ -10288,9 +10478,49 @@ fn remodel_with<S: AgentRegistry + StateStore + Catalog + MessageStore>(
     clear_queue: impl FnMut(&str),
     spin: &mut SpinUpFn<'_, S>,
 ) -> Result<RemodelResponse, LifecycleError> {
+    let mut observations = LaunchAuthObservations::new();
+    if let Some(target) = remodel_auth_target(store, env, target, req, caller)? {
+        let issue = target.probe(env);
+        observations.insert(target, issue);
+    }
+    remodel_with_auth(
+        store,
+        env,
+        target,
+        req,
+        by,
+        caller,
+        &observations,
+        clear_queue,
+        spin,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn remodel_with_auth<S: AgentRegistry + StateStore + Catalog + MessageStore>(
+    store: &S,
+    env: &LifecycleEnv<'_>,
+    target: &SessionTarget,
+    req: &RemodelRequest,
+    by: &str,
+    caller: Caller,
+    observations: &LaunchAuthObservations,
+    clear_queue: impl FnMut(&str),
+    spin: &mut SpinUpFn<'_, S>,
+) -> Result<RemodelResponse, LifecycleError> {
     with_lifecycle_fence(env, &target.persona, "remodel", |env| {
         let target = reload_lifecycle_target(store, target)?;
-        remodel_fenced(store, env, &target, req, by, caller, clear_queue, spin)
+        remodel_fenced(
+            store,
+            env,
+            &target,
+            req,
+            by,
+            caller,
+            observations,
+            clear_queue,
+            spin,
+        )
     })
 }
 
@@ -10302,10 +10532,14 @@ fn remodel_fenced<S: AgentRegistry + StateStore + Catalog + MessageStore>(
     req: &RemodelRequest,
     by: &str,
     caller: Caller,
+    observations: &LaunchAuthObservations,
     clear_queue: impl FnMut(&str),
     spin: &mut SpinUpFn<'_, S>,
 ) -> Result<RemodelResponse, LifecycleError> {
-    let plan = plan_remodel(store, env, target, req, caller, true)?;
+    let plan = plan_remodel(store, env, target, req, caller)?;
+    let mut warnings = check_remodel_launch(env, &plan, req, |target| {
+        observed_launch_auth(observations, target)
+    })?;
     let to = &plan.to;
     if plan.mode == RemodelMode::Prepare {
         let out = prepare_decommission(store, env, target, by, caller)?;
@@ -10338,7 +10572,7 @@ fn remodel_fenced<S: AgentRegistry + StateStore + Catalog + MessageStore>(
             host_session_id,
             prompt: out.prompt,
             handoff: None,
-            warnings: plan.warnings,
+            warnings,
             posture: to.posture,
             permission_receipts: to.permission_receipts.clone(),
         });
@@ -10359,10 +10593,17 @@ fn remodel_fenced<S: AgentRegistry + StateStore + Catalog + MessageStore>(
     // The last step that can fail with nothing changed: if it does, the session still runs.
     let handoff = record_remodel_handoff(store, &plan, RemodelOutcome::InProgress, &report, by)?;
 
+    let launch_auth = plan
+        .auth_target
+        .as_ref()
+        .map_or(LaunchAuth::Skip, |target| {
+            // The warning was added to the remodel response during the precheck.
+            LaunchAuth::Observed(target, None)
+        });
     let spun = teardown_session(store, env, target, by, caller, clear_queue)
         .map_err(|e| format!("teardown of `{}` failed: {e}", plan.from_session_id))
         .and_then(|torn| {
-            spin(store, env, &plan.spin_up_request(), by, caller)
+            spin(store, env, &plan.spin_up_request(), by, caller, launch_auth)
                 .and_then(|out| require_runtime(env, out))
                 .map(|out| (torn, out))
                 .map_err(|e| format!("spin-up on {} failed: {e}", to.vendor))
@@ -10372,7 +10613,6 @@ fn remodel_fenced<S: AgentRegistry + StateStore + Catalog + MessageStore>(
 
     let error = match spun {
         Ok((torn, out)) => {
-            let mut warnings = plan.warnings.clone();
             if plan.restore.is_none() {
                 warnings.push(format!(
                     "no restore was possible: spin-up cannot start vendor `{}`, so a failure \
@@ -10419,7 +10659,13 @@ fn remodel_fenced<S: AgentRegistry + StateStore + Catalog + MessageStore>(
                 permission_receipts: out.permission_receipts,
             });
         }
-        Err(error) => error,
+        Err(error) => {
+            if warnings.is_empty() {
+                error
+            } else {
+                format!("{error}\n{}", warnings.join("\n"))
+            }
+        }
     };
 
     // A spin-up that failed after its first persist left the new session's record `running`
@@ -10444,10 +10690,17 @@ fn remodel_fenced<S: AgentRegistry + StateStore + Catalog + MessageStore>(
         ..*env
     };
     let restored = match &plan.restore {
-        Some(restore) => spin(store, &restore_env, restore, by, Caller::Owner)
-            .and_then(|out| require_runtime(env, out))
-            .map(|out| out.session_id)
-            .map_err(|e| e.to_string()),
+        Some(restore) => spin(
+            store,
+            &restore_env,
+            restore,
+            by,
+            Caller::Owner,
+            LaunchAuth::Skip,
+        )
+        .and_then(|out| require_runtime(env, out))
+        .map(|out| out.session_id)
+        .map_err(|e| e.to_string()),
         None => Err(format!(
             "vendor `{}` is not one spin-up can start",
             plan.from_vendor
@@ -21945,7 +22198,7 @@ mod tests {
                 .next_allowed_at_ms,
             Some(61_000)
         );
-        TEST_LAUNCH_PREREQUISITE.with(|slot| *slot.borrow_mut() = Some(Ok(None)));
+        TEST_LAUNCH_PREREQUISITE.with(|slot| *slot.borrow_mut() = Some(Ok(())));
         TEST_RESPAWN_NOW_MS.with(|clock| clock.set(Some(61_000)));
         let out = reconcile_and_respawn_hosted_sessions(&store, &env).unwrap();
         assert_eq!(out.len(), 1);
@@ -22300,7 +22553,7 @@ mod tests {
             .is_empty()
         );
         assert_eq!(TEST_LAUNCH_PREREQUISITE_CALLS.with(|calls| calls.get()), 0);
-        TEST_LAUNCH_PREREQUISITE.with(|slot| *slot.borrow_mut() = Some(Ok(None)));
+        TEST_LAUNCH_PREREQUISITE.with(|slot| *slot.borrow_mut() = Some(Ok(())));
         TEST_RESPAWN_NOW_MS.with(|clock| clock.set(Some(661_000)));
         assert_eq!(
             reconcile_and_respawn_hosted_sessions_with_store(
@@ -22353,7 +22606,7 @@ mod tests {
             load_hosted_respawn_state(&store, &record.session_id).unwrap(),
             incident
         );
-        TEST_LAUNCH_PREREQUISITE.with(|slot| *slot.borrow_mut() = Some(Ok(None)));
+        TEST_LAUNCH_PREREQUISITE.with(|slot| *slot.borrow_mut() = Some(Ok(())));
         fake.fail_windows.borrow_mut().push("codex".into());
         let failed = restart_hosted_session(&store, &env, &record.session_id, "owner").unwrap();
         assert!(!failed.record.runtime_spawned);
@@ -22410,7 +22663,7 @@ mod tests {
         };
         save_hosted_respawn_state(&store, &record.session_id, &incident, "owner").unwrap();
         TEST_RESPAWN_NOW_MS.with(|clock| clock.set(Some(1_000)));
-        TEST_LAUNCH_PREREQUISITE.with(|slot| *slot.borrow_mut() = Some(Ok(None)));
+        TEST_LAUNCH_PREREQUISITE.with(|slot| *slot.borrow_mut() = Some(Ok(())));
         fake.fail_windows.borrow_mut().push("codex".into());
 
         restart_hosted_session(&store, &env, &record.session_id, "owner").unwrap();
@@ -22686,14 +22939,74 @@ mod tests {
     }
 
     #[test]
+    fn explicit_codex_auth_checks_release_the_store_and_report_inconclusive() {
+        use std::rc::Rc;
+        use std::sync::Mutex;
+
+        let home = TempDir::new().unwrap();
+        let _trusted = trusted_codex_home(home.path(), home.path());
+        let fake = FakeRuntime::default();
+        let env = fake.env(home.path());
+        let store = Rc::new(Mutex::new(MemStore::default()));
+        let check_store = store.clone();
+        let probes = Rc::new(std::cell::Cell::new(0));
+        let observed = probes.clone();
+        let expected = home.path().canonicalize().unwrap();
+        TEST_LAUNCH_AUTH.with(|probe| {
+            *probe.borrow_mut() = Some(Box::new(move |target| {
+                assert_eq!(target.cwd, expected);
+                assert!(
+                    check_store.try_lock().is_ok(),
+                    "auth probe held the store mutex"
+                );
+                observed.set(observed.get() + 1);
+                Some(LaunchSignInIssue::Inconclusive)
+            }))
+        });
+
+        let req = SpinUpRequest {
+            persona: "uncertain".into(),
+            vendor: "codex".into(),
+            project: "ferroloop".into(),
+            role: "assistant".into(),
+            cwd: Some(home.path().display().to_string()),
+            ..SpinUpRequest::default()
+        };
+        let spun = spin_up_with_store(
+            store.lock().unwrap(),
+            || Ok(store.lock().unwrap()),
+            &env,
+            &req,
+            "owner",
+            Caller::Owner,
+        )
+        .unwrap();
+        let warning = LaunchSignInIssue::Inconclusive.message();
+        assert!(spun.warnings.iter().any(|line| line == warning));
+        assert!(spun.runtime_spawned);
+        assert_eq!(probes.get(), 1);
+
+        let out = restart_hosted_session_with_store(
+            store.lock().unwrap(),
+            || Ok(store.lock().unwrap()),
+            &env,
+            &spun.session_id,
+            "owner",
+        )
+        .unwrap();
+        assert!(out.warnings.iter().any(|line| line == warning));
+        assert_eq!(probes.get(), 2);
+    }
+
+    #[test]
     fn codex_auth_warning_allows_spin_up_and_manual_restart() {
         let home = TempDir::new().unwrap();
         let _trusted = trusted_codex_home(home.path(), home.path());
         let fake = FakeRuntime::default();
         let env = fake.env(home.path());
         let store = MemStore::default();
-        TEST_LAUNCH_PREREQUISITE.with(|slot| {
-            *slot.borrow_mut() = Some(Ok(Some(TEST_CODEX_AUTH_WARNING)));
+        TEST_LAUNCH_AUTH.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(|_| Some(LaunchSignInIssue::Rejected)));
         });
         let req = SpinUpRequest {
             persona: "warned".into(),
@@ -22708,7 +23021,7 @@ mod tests {
         assert!(
             spun.warnings
                 .iter()
-                .any(|warning| warning == TEST_CODEX_AUTH_WARNING)
+                .any(|warning| warning == LaunchSignInIssue::Rejected.message())
         );
 
         let mut stopped = get_hosted_session_by_id(&store, &spun.session_id)
@@ -22738,7 +23051,7 @@ mod tests {
             restarted
                 .warnings
                 .iter()
-                .any(|warning| warning == TEST_CODEX_AUTH_WARNING)
+                .any(|warning| warning == LaunchSignInIssue::Rejected.message())
         );
         assert_eq!(
             load_hosted_respawn_state(&store, &spun.session_id).unwrap(),
@@ -22806,6 +23119,11 @@ mod tests {
         {
             let home = TempDir::new().unwrap();
             let _trusted = trusted_codex_home(home.path(), home.path());
+            TEST_LAUNCH_AUTH.with(|probe| {
+                *probe.borrow_mut() = Some(Box::new(|_| {
+                    panic!("automatic recovery must not ask the daemon for sign-in")
+                }))
+            });
             let store = MemStore::default();
             let fake = FakeRuntime::default();
             if spawn_fails {
@@ -22831,14 +23149,14 @@ mod tests {
             TEST_RESPAWN_NOW_MS.with(|clock| clock.set(Some(1_000)));
             TEST_LAUNCH_PREREQUISITE_SEQUENCE.with(|slot| {
                 *slot.borrow_mut() = [
-                    Ok(None),
+                    Ok(()),
                     if daemon_disappears {
                         Err(fl_core::LaunchPrerequisiteRefusal {
                             code: "codex_app_server_unavailable".into(),
                             detail: "/private/control.sock: ConnectionRefused".into(),
                         })
                     } else {
-                        Ok(None)
+                        Ok(())
                     },
                 ]
                 .into_iter()
@@ -23062,7 +23380,7 @@ mod tests {
                 TEST_RESPAWN_NOW_MS.with(|clock| clock.set(Some(1_000)));
                 TEST_LAUNCH_PREREQUISITE_SEQUENCE.with(|slot| {
                     *slot.borrow_mut() = [
-                        Ok(None),
+                        Ok(()),
                         Err(fl_core::LaunchPrerequisiteRefusal {
                             code: "codex_app_server_unavailable".into(),
                             detail: "/private/control.sock: NotFound".into(),
@@ -23181,7 +23499,7 @@ mod tests {
             TEST_RESPAWN_NOW_MS.with(|clock| clock.set(Some(601_000)));
             TEST_LAUNCH_PREREQUISITE_SEQUENCE.with(|slot| {
                 *slot.borrow_mut() = [
-                    Ok(None),
+                    Ok(()),
                     Err(fl_core::LaunchPrerequisiteRefusal {
                         code: "codex_app_server_unavailable".into(),
                         detail: "/private/control.sock: ConnectionRefused".into(),
