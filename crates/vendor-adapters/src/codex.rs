@@ -265,7 +265,10 @@ impl fl_core::VendorVersionAdapter for CodexHostAdapter {
         }
         let socket = codex_launch_control_socket(config_home);
         let deadline = Instant::now() + Duration::from_millis(500);
-        let (_, result) = Conn::connect_and_read_initialize(&socket, deadline).ok()?;
+        // Codex exempts this internal identity from changing the daemon's originator
+        // and starting gateway login. The probe needs only the initialize result.
+        let (_, result) =
+            Conn::connect_and_read_initialize(&socket, deadline, "codex_app_server_daemon").ok()?;
         initialize_server_version(&result).map(str::to_owned)
     }
 }
@@ -1477,12 +1480,16 @@ struct Conn {
 #[cfg(unix)]
 impl Conn {
     fn connect_and_initialize(sock: &Path, deadline: Instant) -> Result<Self, (RpcStage, String)> {
-        Self::connect_and_read_initialize(sock, deadline).map(|(conn, _)| conn)
+        let (mut conn, _) = Self::connect_and_read_initialize(sock, deadline, "ferroloop")?;
+        conn.send_json(&json!({ "method": "initialized", "params": {} }))
+            .map_err(|msg| (RpcStage::Initialize, msg))?;
+        Ok(conn)
     }
 
     fn connect_and_read_initialize(
         sock: &Path,
         deadline: Instant,
+        client_name: &str,
     ) -> Result<(Self, Value), (RpcStage, String)> {
         let stream = connect_unix_with_deadline(sock, deadline).map_err(|e| {
             (
@@ -1503,14 +1510,12 @@ impl Conn {
         conn.send_json(&json!({
             "id": 1,
             "method": "initialize",
-            "params": { "clientInfo": { "name": "ferroloop", "version": "0.1.0" } },
+            "params": { "clientInfo": { "name": client_name, "version": "0.1.0" } },
         }))
         .map_err(|msg| (RpcStage::Initialize, msg))?;
         let result = conn
             .await_rpc_result(1, "initialize", RpcStage::Initialize)
             .map_err(|(_, msg)| (RpcStage::Initialize, msg))?;
-        conn.send_json(&json!({ "method": "initialized", "params": {} }))
-            .map_err(|msg| (RpcStage::Initialize, msg))?;
         Ok((conn, result))
     }
 
@@ -2144,11 +2149,19 @@ mod tests {
         std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
         let (fake, server) = spawn_fake_server(home.path(), |conn| {
             conn.handshake();
-            assert_eq!(conn.expect_json()["method"], "initialize");
-            conn.send_text(
-                r#"{"id":1,"result":{"userAgent":"ferroloop/0.172.0 (ferroloop; 0.1.0)"}}"#,
+            assert_eq!(
+                conn.expect_json(),
+                json!({
+                    "id": 1,
+                    "method": "initialize",
+                    "params": {
+                        "clientInfo": { "name": "codex_app_server_daemon", "version": "0.1.0" }
+                    }
+                })
             );
-            assert_eq!(conn.expect_json()["method"], "initialized");
+            conn.send_text(
+                r#"{"id":1,"result":{"userAgent":"codex_cli_rs/0.172.0 (codex_app_server_daemon; 0.1.0)"}}"#,
+            );
             conn.drain_until_eof();
         });
         std::os::unix::fs::symlink(fake, socket).unwrap();
@@ -2160,7 +2173,7 @@ mod tests {
             .as_deref(),
             Some("0.172.0")
         );
-        assert_eq!(server.join().unwrap().len(), 2);
+        assert_eq!(server.join().unwrap().len(), 1);
     }
 
     #[test]
@@ -2277,7 +2290,14 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let (sock, server) = spawn_fake_server(tmp.path(), |c| {
             c.handshake();
-            assert_eq!(c.expect_json()["method"], "initialize");
+            assert_eq!(
+                c.expect_json(),
+                json!({
+                    "id": 1,
+                    "method": "initialize",
+                    "params": { "clientInfo": { "name": "ferroloop", "version": "0.1.0" } }
+                })
+            );
             c.send_text(r#"{"id":1,"result":{}}"#);
             assert_eq!(c.expect_json()["method"], "initialized");
             let read_req = c.expect_json();

@@ -102,6 +102,37 @@ mod version_evidence_tests {
         let registry = default_vendor_version_registry();
         let adapter = registry.lookup("muse").unwrap();
         let launcher = executable(root.path(), "muse");
+        fs::write(
+            &launcher,
+            r#"#!/usr/bin/env bash
+set -euo pipefail
+
+channel="${MUSE_CHANNEL:-muse-stable}"
+channel_url="https://api.meta.ai/muse-code/channels/$channel"
+
+resolve_install_dir() {
+  parent_directory "$(resolve_self)"
+}
+
+active_binary() {
+  local dir="$1"
+  local version
+  version=""
+  [[ ! -r "$dir/.muse-version" ]] || version="$(<"$dir/.muse-version")"
+  [[ "$version" =~ $version_pattern ]] || return 1
+  printf '%s/muse-bin-%s\n' "$dir" "$version"
+}
+
+main() {
+  dir="$(resolve_install_dir)"
+  binary="$(active_binary "$dir" 2>/dev/null || true)"
+  exec "$binary" "$@"
+}
+
+main "$@"
+"#,
+        )
+        .unwrap();
         let state = root.path().join(".muse-version");
         executable(root.path(), "muse-bin-1.4.26-R9999.1");
         fs::write(&state, "1.4.25-R9361.1\n").unwrap();
@@ -114,6 +145,27 @@ mod version_evidence_tests {
         );
         fs::write(&state, "1.4.25-R9361.1\n".repeat(128)).unwrap();
         assert_eq!(adapter.version_from_executable(&launcher), None);
+    }
+
+    #[test]
+    fn muse_override_with_stale_launcher_metadata_has_no_version() {
+        let root = tempfile::tempdir().unwrap();
+        let registry = default_vendor_version_registry();
+        let adapter = registry.lookup("muse").unwrap();
+        let override_path = executable(root.path(), "muse");
+        fs::write(
+            &override_path,
+            "#!/usr/bin/env bash\nexec /other/muse \"$@\"\n",
+        )
+        .unwrap();
+        fs::write(root.path().join(".muse-version"), "1.4.25-R9361.1\n").unwrap();
+        let runtime = executable(root.path(), "muse-bin-1.4.25-R9361.1");
+
+        assert_eq!(adapter.version_from_executable(&override_path), None);
+        assert_eq!(
+            adapter.version_from_executable(&runtime).as_deref(),
+            Some("1.4.25-R9361.1")
+        );
     }
 
     #[test]
