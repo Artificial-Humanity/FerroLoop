@@ -6334,15 +6334,7 @@ fn dispatch_operator_prompt_with_intent_for_session(
                 "Claude registration is unbound; re-register and resubmit".into(),
             ))
         })?;
-        #[cfg(test)]
-        let stubbed = CLAUDE_DISPATCH_STUB.with(|stub| {
-            stub.borrow_mut()
-                .as_mut()
-                .map(|dispatch| dispatch(claude_stream, body))
-        });
-        #[cfg(not(test))]
-        let stubbed: Option<Result<(), ClaudeBoundError>> = None;
-        let result = stubbed.unwrap_or_else(|| {
+        let dispatch = || {
             if let Some(stream) = claude_stream {
                 fl_wire::dispatcher::dispatch_parked_claude_operator_prompt(
                     binding,
@@ -6358,7 +6350,17 @@ fn dispatch_operator_prompt_with_intent_for_session(
                     body,
                 )
             }
-        });
+        };
+        #[cfg(not(test))]
+        let result = dispatch();
+        #[cfg(test)]
+        let result = CLAUDE_DISPATCH_STUB
+            .with(|stub| {
+                stub.borrow_mut()
+                    .as_mut()
+                    .map(|dispatch| dispatch(claude_stream, body))
+            })
+            .unwrap_or_else(dispatch);
         return result
             .map(|()| OperatorPromptOutcome::TransportAccepted)
             .map_err(|error| match error {
