@@ -10,6 +10,7 @@ mod authority;
 mod child;
 mod daemon;
 mod env;
+mod exit_evidence;
 mod identity;
 mod input;
 mod limits;
@@ -105,6 +106,7 @@ pub(crate) struct HostInner {
     joins: Mutex<Vec<ThreadJoin>>,
     spawn_gate: Mutex<()>,
     retention: Mutex<retention::Retention>,
+    exit_evidence: Mutex<exit_evidence::ExitEvidenceCache>,
     pub(crate) listener: Mutex<Option<HostListener>>,
     pub(crate) handle: tokio::runtime::Handle,
     pub(crate) stop: AtomicBool,
@@ -370,6 +372,8 @@ impl Host {
                 .map_err(|_| HostError::Protocol("authority admission".into()))?;
         let retention = retention::Retention::new(&reliable_budget)
             .map_err(|_| HostError::Protocol("retention admission".into()))?;
+        let exit_evidence = exit_evidence::ExitEvidenceCache::new(&reliable_budget)
+            .map_err(|_| HostError::Protocol("exit evidence admission".into()))?;
         let host = Self {
             runtime: Some(runtime),
             inner: Arc::new(HostInner {
@@ -383,6 +387,7 @@ impl Host {
                 joins: Mutex::new(Vec::new()),
                 spawn_gate: Mutex::new(()),
                 retention: Mutex::new(retention),
+                exit_evidence: Mutex::new(exit_evidence),
                 listener: Mutex::new(Some(listener)),
                 handle,
                 stop: AtomicBool::new(false),
@@ -1095,6 +1100,10 @@ impl HostInner {
             {
                 continue;
             }
+            self.exit_evidence
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remember(outputs[&key].session());
             outputs.remove(&key);
             let mut sessions = self.sessions.lock().unwrap_or_else(|err| err.into_inner());
             if sessions
@@ -1145,6 +1154,10 @@ impl HostInner {
             let Some(key) = oldest else {
                 break;
             };
+            self.exit_evidence
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remember(outputs[&key].session());
             self.authority.evict_completed_pty(&key);
             let output = outputs.remove(&key).expect("selected completed PTY");
             let stream = output
@@ -1168,6 +1181,37 @@ impl HostInner {
                 .evict(stream, notices);
             self.hub.forget_epoch(&key);
         }
+    }
+
+    // Exact owned reads need no controller lease. Hold inventory through handoff
+    // to the cache, so concurrent retirement cannot make a launch disappear.
+    pub(crate) fn hosted_exit_evidence(
+        &self,
+        stream: &fl_host_proto::StreamId,
+        hosted_id: &str,
+    ) -> fl_host_proto::HostedExitEvidenceStatus {
+        use fl_host_proto::HostedExitEvidenceStatus::Unavailable;
+        if stream.host != *self.authority.instance() || hosted_id.is_empty() {
+            return Unavailable;
+        }
+        let outputs = self.outputs.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(output) = outputs.values().find(|output| {
+            output
+                .session()
+                .reliable()
+                .is_some_and(|j| j.stream() == stream)
+        }) {
+            let session = output.session();
+            return if session.owned_by(hosted_id) {
+                session.capture_hosted_exit()
+            } else {
+                Unavailable
+            };
+        }
+        self.exit_evidence
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(stream, hosted_id)
     }
 
     // All maintenance/admission callers share this gate and log boundary.
@@ -2812,6 +2856,20 @@ mod deadline_tests {
         Arc<super::reliable::ReliableJournal>,
         Arc<super::input::WriterHandle>,
     ) {
+        retained_output_fixture(host, name, epoch, true, None)
+    }
+
+    fn retained_output_fixture(
+        host: &Host,
+        name: &str,
+        epoch: u64,
+        pty: bool,
+        owner: Option<&str>,
+    ) -> (
+        Arc<Session>,
+        Arc<super::reliable::ReliableJournal>,
+        Arc<super::input::WriterHandle>,
+    ) {
         let stream = fl_host_proto::StreamId {
             host: host.inner.authority.instance().clone(),
             session: SessionId::new(name).unwrap(),
@@ -2819,23 +2877,26 @@ mod deadline_tests {
         };
         let journal = host
             .inner
-            .reserve_reliable_journal_with_mode(stream.clone(), true)
+            .reserve_reliable_journal_with_mode(stream.clone(), pty)
             .unwrap();
-        let session = Arc::new(Session::with_reliable(
-            SessionParts {
-                session: stream.session.clone(),
-                epoch,
-                vendor_pid: 0,
-                vendor_start: 0,
-                supervisor_pid: 0,
-                supervisor_start: 0,
-                pgid: 0,
-                control_inode: 0,
-                control: None,
-                stdin: None,
-            },
-            Some(Arc::clone(&journal)),
-        ));
+        let session = Arc::new(
+            Session::with_reliable(
+                SessionParts {
+                    session: stream.session.clone(),
+                    epoch,
+                    vendor_pid: 0,
+                    vendor_start: 0,
+                    supervisor_pid: 0,
+                    supervisor_start: 0,
+                    pgid: 0,
+                    control_inode: 0,
+                    control: None,
+                    stdin: None,
+                },
+                Some(Arc::clone(&journal)),
+            )
+            .with_hosted_owner(owner),
+        );
         let output =
             super::output::OutputSession::open(Arc::clone(&session), Arc::clone(&host.inner.hub));
         let writer = super::input::WriterHandle::start(Arc::clone(&session), None);
@@ -2858,6 +2919,329 @@ mod deadline_tests {
             .unwrap()
             .insert(name.to_owned(), Arc::clone(&session));
         (session, journal, writer)
+    }
+
+    fn evidence_host(dir: &tempfile::TempDir) -> Host {
+        Host::open(OpenOptions::new(HostConfig::new(unresolved_endpoint(
+            dir.path(),
+        ))))
+        .unwrap()
+    }
+
+    fn fixture_evidence(
+        host: &Host,
+        stream: &fl_host_proto::StreamId,
+        owner: &str,
+    ) -> fl_host_proto::HostedExitEvidenceStatus {
+        host.inner.hosted_exit_evidence(stream, owner)
+    }
+
+    fn pump_evidence_fixture(
+        host: &Host,
+        session: &Session,
+        journal: &super::reliable::ReliableJournal,
+        chunks: &[&[u8]],
+        eof: std::io::Result<usize>,
+    ) {
+        let mut chunks = chunks.iter();
+        let mut eof = Some(eof);
+        let key = (session.session.as_str().to_owned(), session.epoch);
+        let output = Arc::clone(&host.inner.outputs.lock().unwrap()[&key]);
+        super::session::pump_reliable_stdout_with(session, output.as_ref(), journal, |buffer| {
+            let Some(chunk) = chunks.next() else {
+                return eof.take().unwrap();
+            };
+            buffer[..chunk.len()].copy_from_slice(chunk);
+            Ok(chunk.len())
+        });
+    }
+
+    #[test]
+    fn hosted_exit_evidence_binds_owner_epoch_and_terminal_eof() {
+        use fl_host_proto::HostedExitEvidenceStatus::{Exited, Pending, Unavailable};
+        let dir = tempfile::tempdir().unwrap();
+        let host = evidence_host(&dir);
+        let (session, journal, writer) =
+            retained_output_fixture(&host, "owned", 19, true, Some("agent"));
+        let stream = journal.stream();
+        let exit = fl_host_proto::ChildExit {
+            code: Some(1),
+            signal: None,
+        };
+        session.note_leader(exit.clone());
+        session.note_cleanup(CleanupReport { complete: true });
+        assert_eq!(fixture_evidence(&host, stream, "agent"), Pending);
+        assert_eq!(fixture_evidence(&host, stream, "other"), Unavailable);
+        let mut wrong = stream.clone();
+        wrong.epoch.0 -= 1;
+        assert_eq!(fixture_evidence(&host, &wrong, "agent"), Unavailable);
+        wrong = stream.clone();
+        wrong.host = fl_host_proto::HostInstance::new([17; 16]);
+        assert_eq!(fixture_evidence(&host, &wrong, "agent"), Unavailable);
+        pump_evidence_fixture(
+            &host,
+            &session,
+            &journal,
+            &[b"fixed exit-1 line\r\n"],
+            Ok(0),
+        );
+        let Exited(evidence) = fixture_evidence(&host, stream, "agent") else {
+            panic!("expected an exact terminal snapshot");
+        };
+        assert_eq!(evidence.stream, *stream);
+        assert_eq!(evidence.exit, exit);
+        assert_eq!(evidence.started_at_ms, session.started_at_ms);
+        assert!(evidence.captured_at_ms >= evidence.started_at_ms);
+        assert_eq!(evidence.terminal_tail, "fixed exit-1 line\n");
+        assert!(!format!("{evidence:?}").contains("fixed exit-1 line"));
+        writer.shutdown();
+        host.shutdown().unwrap();
+    }
+
+    #[test]
+    fn hosted_exit_evidence_requires_ownership_and_real_eof() {
+        use fl_host_proto::HostedExitEvidenceStatus::Unavailable;
+        let dir = tempfile::tempdir().unwrap();
+        let host = evidence_host(&dir);
+        for (epoch, owner, eof) in [
+            (34, None, Ok(0)),
+            (35, Some("agent"), Err(std::io::ErrorKind::Other.into())),
+        ] {
+            let (session, journal, writer) =
+                retained_output_fixture(&host, "owned", epoch, true, owner);
+            session.note_leader(fl_host_proto::ChildExit {
+                code: Some(1),
+                signal: None,
+            });
+            session.note_cleanup(CleanupReport { complete: true });
+            pump_evidence_fixture(&host, &session, &journal, &[b"private-line"], eof);
+            assert_eq!(
+                fixture_evidence(&host, journal.stream(), "agent"),
+                Unavailable
+            );
+            writer.shutdown();
+            host.inner.maintain_completed();
+        }
+        host.shutdown().unwrap();
+    }
+
+    #[test]
+    fn hosted_exit_evidence_strips_escapes_split_across_reads_and_truncated_prefix() {
+        use fl_host_proto::HostedExitEvidenceStatus::Exited;
+        let dir = tempfile::tempdir().unwrap();
+        let host = evidence_host(&dir);
+        let (session, journal, writer) =
+            retained_output_fixture(&host, "owned", 1, true, Some("agent"));
+        session.push_stdout_tail(b"\x1b]0;title", 64 * 1024);
+        session.push_stdout_tail(&vec![b'z'; 64 * 1024], 64 * 1024);
+        pump_evidence_fixture(
+            &host,
+            &session,
+            &journal,
+            &[
+                b"\x1b",
+                b"\\pre\x1b[",
+                b"31mred\x1b[0m",
+                b"\xc2",
+                b"\x90ignored\xc2\x9c\x1bPmore",
+                b"\x1b",
+                b"\\post\x07\r\n",
+            ],
+            Ok(0),
+        );
+        session.note_leader(fl_host_proto::ChildExit {
+            code: Some(1),
+            signal: None,
+        });
+        let Exited(evidence) = fixture_evidence(&host, journal.stream(), "agent") else {
+            panic!("expected sanitized terminal evidence");
+        };
+        assert_eq!(evidence.terminal_tail, "preredpost\n");
+        session.note_cleanup(CleanupReport { complete: true });
+        writer.shutdown();
+        host.shutdown().unwrap();
+    }
+
+    #[test]
+    fn hosted_exit_evidence_preserves_visible_output_through_long_terminal_strings() {
+        use fl_host_proto::HostedExitEvidenceStatus::Exited;
+        let dir = tempfile::tempdir().unwrap();
+        let host = evidence_host(&dir);
+        let hidden = [b'z'; 512];
+        for (epoch, introducer, terminator) in [
+            (1, b"]0;".as_slice(), Some(b"\x07".as_slice())),
+            (2, b"P".as_slice(), None),
+        ] {
+            let (session, journal, writer) =
+                retained_output_fixture(&host, "owned", epoch, true, Some("agent"));
+            let mut chunks = vec![b"fatal: child failed\r\n".as_slice(), b"\x1b", introducer];
+            chunks.extend(std::iter::repeat_n(
+                hidden.as_slice(),
+                70 * 1024 / hidden.len(),
+            ));
+            chunks.extend(terminator);
+            pump_evidence_fixture(&host, &session, &journal, &chunks, Ok(0));
+            session.note_leader(fl_host_proto::ChildExit {
+                code: Some(1),
+                signal: None,
+            });
+            let Exited(evidence) = fixture_evidence(&host, journal.stream(), "agent") else {
+                panic!("expected sanitized terminal evidence");
+            };
+            assert_eq!(evidence.terminal_tail, "fatal: child failed\n");
+            session.note_cleanup(CleanupReport { complete: true });
+            writer.shutdown();
+        }
+        host.shutdown().unwrap();
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn hosted_exit_evidence_dispatch_refuses_unsupported_platform() {
+        use fl_host_proto::{ConnId, ExtensionRefusal, ExtensionRequest, StreamId};
+
+        let dir = tempfile::tempdir().unwrap();
+        let host = evidence_host(&dir);
+        let result = host.inner.handle.block_on(super::daemon::extended(
+            &host.inner,
+            ConnId(1),
+            ExtensionRequest::HostedExitEvidence {
+                stream: StreamId {
+                    host: host.inner.authority.instance().clone(),
+                    session: SessionId::new("owned").unwrap(),
+                    epoch: fl_host_proto::SessionEpoch(1),
+                },
+                hosted_id: "agent".into(),
+            },
+            &mut None,
+        ));
+        assert!(matches!(result, Err(ExtensionRefusal::Unsupported)));
+        host.shutdown().unwrap();
+    }
+
+    #[test]
+    fn hosted_exit_evidence_keeps_latest_lines_and_utf8_within_both_limits() {
+        use fl_host_proto::HostedExitEvidenceStatus::Exited;
+        let dir = tempfile::tempdir().unwrap();
+        let host = evidence_host(&dir);
+        for (epoch, raw, want) in [
+            (
+                1,
+                "first\n".to_owned() + &"next\n".repeat(39) + "last\n",
+                "next\n".repeat(39) + "last\n",
+            ),
+            (2, "é".repeat(3000) + "end", "é".repeat(2046) + "end"),
+        ] {
+            let (session, journal, writer) =
+                retained_output_fixture(&host, "owned", epoch, true, Some("agent"));
+            let chunks = raw.as_bytes().chunks(512).collect::<Vec<_>>();
+            pump_evidence_fixture(&host, &session, &journal, &chunks, Ok(0));
+            session.note_leader(fl_host_proto::ChildExit {
+                code: Some(1),
+                signal: None,
+            });
+            let Exited(evidence) = fixture_evidence(&host, journal.stream(), "agent") else {
+                panic!("expected bounded terminal evidence");
+            };
+            assert_eq!(evidence.terminal_tail, want);
+            session.note_cleanup(CleanupReport { complete: true });
+            writer.shutdown();
+        }
+        host.shutdown().unwrap();
+    }
+
+    #[test]
+    fn hosted_exit_evidence_survives_reliable_pipe_retirement() {
+        use fl_host_proto::HostedExitEvidenceStatus::Exited;
+        let dir = tempfile::tempdir().unwrap();
+        let host = evidence_host(&dir);
+        let (session, journal, writer) =
+            retained_output_fixture(&host, "pipe", 1, false, Some("agent"));
+        session.note_leader(fl_host_proto::ChildExit {
+            code: Some(7),
+            signal: None,
+        });
+        session.note_cleanup(CleanupReport { complete: true });
+        pump_evidence_fixture(&host, &session, &journal, &[], Ok(0));
+        let observed = fixture_evidence(&host, journal.stream(), "agent");
+        let Exited(evidence) = &observed else {
+            panic!("expected ReliablePipe exit evidence");
+        };
+        assert_eq!(evidence.exit.code, Some(7));
+        assert!(evidence.terminal_tail.is_empty());
+        writer.shutdown();
+        host.inner.maintain_completed();
+        assert!(
+            !host
+                .inner
+                .outputs
+                .lock()
+                .unwrap()
+                .contains_key(&("pipe".into(), 1))
+        );
+        assert_eq!(fixture_evidence(&host, journal.stream(), "agent"), observed);
+        host.shutdown().unwrap();
+    }
+
+    fn complete_evidence_fixture(host: &Host, name: &str, epoch: u64) -> fl_host_proto::StreamId {
+        let (session, journal, writer) =
+            retained_output_fixture(host, name, epoch, true, Some("agent"));
+        session.note_leader(fl_host_proto::ChildExit {
+            code: None,
+            signal: Some(9),
+        });
+        session.note_cleanup(CleanupReport { complete: true });
+        pump_evidence_fixture(host, &session, &journal, &[b"private-line\n"], Ok(0));
+        writer.shutdown();
+        host.inner
+            .with_spawn_gate_log(&mut std::io::sink(), |notices| {
+                host.inner.reclaim_completed(notices);
+            });
+        journal.stream().clone()
+    }
+
+    #[test]
+    fn hosted_exit_evidence_survives_pty_eviction_with_bounded_retention() {
+        use fl_host_proto::HostedExitEvidenceStatus::{Exited, Unavailable};
+        let dir = tempfile::tempdir().unwrap();
+        let host = evidence_host(&dir);
+        let first = complete_evidence_fixture(&host, "shared", 1);
+        let second = complete_evidence_fixture(&host, "shared", 2);
+        let third = complete_evidence_fixture(&host, "shared", 3);
+
+        let observed = fixture_evidence(&host, &third, "agent");
+        let Exited(evidence) = &observed else {
+            panic!("expected signal evidence before eviction");
+        };
+        assert_eq!((evidence.exit.code, evidence.exit.signal), (None, Some(9)));
+        for epoch in 4..15 {
+            complete_evidence_fixture(&host, &format!("other-{epoch}"), epoch);
+        }
+        assert!(
+            !host
+                .inner
+                .outputs
+                .lock()
+                .unwrap()
+                .contains_key(&("shared".into(), 3))
+        );
+        assert_eq!(fixture_evidence(&host, &first, "agent"), Unavailable);
+        assert!(matches!(
+            fixture_evidence(&host, &second, "agent"),
+            Exited(_)
+        ));
+        assert_eq!(fixture_evidence(&host, &third, "agent"), observed);
+        assert_eq!(fixture_evidence(&host, &third, "other"), Unavailable);
+
+        for epoch in 15..69 {
+            complete_evidence_fixture(&host, &format!("other-{epoch}"), epoch);
+        }
+        assert_eq!(fixture_evidence(&host, &third, "agent"), observed);
+        for epoch in 69..140 {
+            complete_evidence_fixture(&host, &format!("other-{epoch}"), epoch);
+        }
+        assert_eq!(fixture_evidence(&host, &third, "agent"), Unavailable);
+        host.shutdown().unwrap();
     }
 
     #[test]

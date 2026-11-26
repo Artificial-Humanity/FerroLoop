@@ -1161,6 +1161,86 @@ fn reliable_eof_preserves_unterminated_tail_without_lf() {
 }
 
 #[cfg(unix)]
+fn pty_cursor_query(attached: bool) {
+    let f = Fixture::new();
+    runtime().block_on(async {
+        let gate = f.root.path().join("cursor-query-go");
+        let mut args = vec!["cursor-query"];
+        if attached {
+            args.push(gate.to_str().unwrap());
+        }
+        let mut request = spec("pty-cursor-query", &args);
+        request.kind = SpawnKind::Pty;
+        let mut client = AsyncHostClient::connect(&f.endpoint).await.unwrap();
+        let (stream, _) = client.spawn_pty_session(request, None).await.unwrap();
+
+        let mut events = if attached {
+            let grant = client.claim_controller(stream.clone()).await.unwrap();
+            let mut events = client
+                .subscribe_reliable(stream.clone(), grant.lease, Some(0))
+                .await
+                .unwrap();
+            let spawned = tokio::time::timeout(Duration::from_secs(5), events.next_event())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(spawned.kind, ReliableKind::Lifecycle);
+            std::fs::write(&gate, b"go").unwrap();
+            Some(events)
+        } else {
+            None
+        };
+
+        if let Some(events) = events.as_mut() {
+            // The host owns terminal replies. Raw subscribers can observe the query.
+            tokio::time::timeout(Duration::from_secs(5), async {
+                let mut bytes = Vec::new();
+                loop {
+                    let event = events.next_event().await.unwrap();
+                    assert_ne!(event.kind, ReliableKind::Lifecycle);
+                    bytes.extend_from_slice(&event.bytes);
+                    if bytes.windows(4).any(|bytes| bytes == b"\x1b[6n") {
+                        break;
+                    }
+                }
+            })
+            .await
+            .expect("attached client did not receive PTY output");
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let state = client
+                .list_sessions()
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|summary| summary.stream == stream)
+                .expect("cursor-query session")
+                .state;
+            if !matches!(state, ChildState::Running(_)) {
+                assert_eq!(record(&state).exit.as_ref().unwrap().code, Some(0));
+                break;
+            }
+            assert!(Instant::now() < deadline, "cursor-query child did not exit");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn pty_cursor_query_gets_one_report_without_client() {
+    pty_cursor_query(false);
+}
+
+#[cfg(unix)]
+#[test]
+fn pty_cursor_query_gets_one_report_with_client() {
+    pty_cursor_query(true);
+}
+
+#[cfg(unix)]
 #[test]
 fn first_class_pty_mode_reports_truthful_kind_delivers_input_and_survives_stalled_observer_flood() {
     let f = Fixture::new();

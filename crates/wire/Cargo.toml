@@ -19,6 +19,7 @@ libc.workspace = true
 ring.workspace = true
 rustls.workspace = true
 rustls-pki-types.workspace = true
+semver.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
@@ -32,3 +33,4 @@ fl-wire = { path = ".", features = ["wire-test-isolation"] }
 fl-host-proto = { path = "../host-proto", features = ["hub-test-isolation"] }
 tempfile.workspace = true
 tokio.workspace = true
+vt100 = "=0.18.1"

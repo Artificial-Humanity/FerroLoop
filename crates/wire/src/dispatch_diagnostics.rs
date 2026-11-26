@@ -1,6 +1,8 @@
 //! Bounded, volatile observations of dispatch fences. These snapshots confer no
 //! delivery, recovery, liveness or authorization authority.
 
+use std::borrow::Cow;
+
 use fl_core::{at::At, ids::MessageId};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -10,6 +12,8 @@ use crate::identity::{RouteEntry, VendorRoute, normalize_persona};
 const MAX_FAILURE_STAGES: usize = 4;
 const MAX_ROUTE_OBSERVATIONS: usize = 2;
 pub const MAX_REGISTRATION_DIAGNOSTICS: usize = 64;
+const MAX_FENCE_DIAGNOSTICS: usize = 128;
+const MAX_FENCE_RECOVERY_ATTEMPTS: usize = 128;
 
 /// Read-only evidence from this daemon instance. Restart loses this evidence;
 /// that loss does not establish that retrying a delivery would be safe.
@@ -28,12 +32,138 @@ pub struct DispatchDiagnostics {
     pub diagnostics_partial: bool,
     pub omitted_evidence_total: u64,
     pub omitted_evidence_total_saturated: bool,
+    /// Most recently observed attempts, including attempts for fences that have cleared.
+    /// Consecutive busy probes for a fence share one entry.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fence_recovery_attempts: Vec<FenceRecoveryAttempt>,
+    /// Retained fences waiting for timed recovery or held for an operator-visible reason.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fence_recovery_attention: Vec<FenceRecoveryAttention>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DiagnosticsScope {
     DaemonLifetime,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FenceRecoveryOutcome {
+    Released,
+    WaitingForDelay,
+    WaitingForWorker,
+    RecoveryDisabled,
+    DeadRoute,
+    VendorSignIn,
+    UnconfirmedStartup,
+    HostedBindingUnavailable,
+    HostedCaptureUnavailable,
+    HostedLeaderPidUnavailable,
+    NonHostedRoute,
+    UnsupportedRoute,
+    SeatBusy,
+    SeatBusyProlonged,
+    DialogWaiting,
+    ComposerDraft,
+    BlankScreen,
+    HostProbesDisabled,
+    Inconclusive,
+    RouteChanged,
+    FenceSuperseded,
+    InboxUnavailable,
+    ReplayFailed,
+    Resolved,
+    ReceiptBookkeepingFailed,
+    ReplayWorkerFailed,
+    PrefixOverflow,
+    #[serde(other)]
+    Unsupported,
+}
+
+impl FenceRecoveryOutcome {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Released => "fence released",
+            Self::WaitingForDelay => "waiting for the recovery delay",
+            Self::WaitingForWorker => "waiting for a delivery worker slot",
+            Self::RecoveryDisabled => "timed recovery is disabled",
+            Self::DeadRoute => "dead route",
+            Self::VendorSignIn => "vendor sign-in screen",
+            Self::UnconfirmedStartup => "hosted startup unconfirmed",
+            Self::HostedBindingUnavailable => "no hosted stream binding",
+            Self::HostedCaptureUnavailable => "hosted screen capture unavailable",
+            Self::HostedLeaderPidUnavailable => "no recorded hosted leader PID",
+            Self::NonHostedRoute => "non-hosted route",
+            Self::UnsupportedRoute => "timed recovery unsupported for this route",
+            Self::SeatBusy => "seat is in a turn",
+            Self::SeatBusyProlonged => "seat is still in a turn",
+            Self::DialogWaiting => "a dialog waits for input",
+            Self::ComposerDraft => "the composer holds a draft",
+            Self::BlankScreen => "hosted screen is blank",
+            Self::HostProbesDisabled => "host probes are disabled",
+            Self::Inconclusive => "route readiness unverified",
+            Self::RouteChanged => "route changed during recovery",
+            Self::FenceSuperseded => "fence superseded during recovery",
+            Self::InboxUnavailable => "inbox unavailable",
+            Self::ReplayFailed => "replay failed",
+            Self::Resolved => "held receipts already resolved",
+            Self::ReceiptBookkeepingFailed => concat!(
+                "receipt bookkeeping failed. Timed replay stopped. ",
+                "ACK leaves the fence in place. Change the route identity or restart the Wire daemon."
+            ),
+            Self::ReplayWorkerFailed => concat!(
+                "replay worker failed. Timed replay stopped. ",
+                "ACK leaves the fence in place. Change the route identity or restart the Wire daemon."
+            ),
+            Self::PrefixOverflow => "backlog exceeded the admitted delivery queue",
+            Self::Unsupported => "unrecognized recovery outcome",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FenceRecoveryAttempt {
+    pub recipient: String,
+    /// Reserved attempt number. A zero-write busy probe returns this slot to the budget.
+    pub attempt: u32,
+    pub limit: u32,
+    /// Time of the most recent probe represented by this row.
+    pub at: At,
+    pub outcome: FenceRecoveryOutcome,
+    /// Consecutive timed busy probes on this fence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub busy_probe_count: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FenceRecoveryAttention {
+    pub recipient: String,
+    pub outcome: FenceRecoveryOutcome,
+    pub exhausted: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub busy_since: Option<At>,
+    /// Observed duration at the latest busy probe once escalation is reached.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub busy_elapsed_ms: Option<u64>,
+}
+
+impl FenceRecoveryAttention {
+    pub fn reason_label(&self) -> Cow<'static, str> {
+        if let (FenceRecoveryOutcome::SeatBusyProlonged, Some(elapsed_ms)) =
+            (self.outcome, self.busy_elapsed_ms)
+        {
+            let seconds = elapsed_ms / 1000;
+            let minutes = seconds / 60;
+            let elapsed = match minutes {
+                0 => format!("{seconds}s"),
+                1..=59 => format!("{minutes}m {}s", seconds % 60),
+                _ => format!("{}h {}m {}s", minutes / 60, minutes % 60, seconds % 60),
+            };
+            return format!("seat has been in a turn for {elapsed}").into();
+        }
+        self.outcome.label().into()
+    }
 }
 
 /// An observation of the existing suppression phase, not a scheduling state.
@@ -50,6 +180,8 @@ pub enum FailureStage {
     MessageLookupMissing,
     MessageLookupError,
     InitialReceiptReadError,
+    InitialReceiptReadMissing,
+    InitialReceiptReadAmbiguous,
     TransportError,
     DeadExplicitRoute,
     ComposerOccupiedByNonWireInput,
@@ -58,6 +190,7 @@ pub enum FailureStage {
     FinalReceiptReadError,
     FinalReceiptReadMissing,
     UnresolvedReceiptStatus,
+    UnconfirmedReceiptAfterSubmit,
     WorkerPanic,
     #[serde(other)]
     Unsupported,
@@ -70,6 +203,8 @@ pub enum FenceReason {
     MessageLookupMissing,
     MessageLookupError,
     InitialReceiptReadError,
+    InitialReceiptReadMissing,
+    InitialReceiptReadAmbiguous,
     TransportError,
     DeadExplicitRoute,
     ComposerOccupiedByNonWireInput,
@@ -78,9 +213,11 @@ pub enum FenceReason {
     FinalReceiptReadError,
     FinalReceiptReadMissing,
     UnresolvedReceiptStatus,
+    UnconfirmedReceiptAfterSubmit,
     WorkerPanic,
     QueueOverflow,
     WorkerSpawnFailure,
+    ReplayStateUnavailable,
     GlobalMetadataCap,
     #[serde(other)]
     Unsupported,
@@ -310,11 +447,14 @@ pub(crate) struct DispatchReport {
     pub(crate) route_dispatch_calls: u64,
     pub(crate) route_dispatch_calls_saturated: bool,
     pub(crate) recognised_composer_payload: Option<&'static str>,
+    /// A dispatch reported known session activity and sent no keys in that call.
+    pub(crate) composer_busy: bool,
 }
 
 impl DispatchReport {
     pub(crate) fn record_composer_occupied(&mut self, err: &str) {
         self.record_failure(FailureStage::ComposerOccupiedByNonWireInput);
+        self.composer_busy |= crate::dispatcher::is_composer_session_busy_error(err);
         if let Some(payload) = crate::dispatcher::recognised_payload_from_error(err) {
             self.recognised_composer_payload = Some(payload);
         }
@@ -452,6 +592,8 @@ impl DiagnosticsState {
                 diagnostics_partial: false,
                 omitted_evidence_total: 0,
                 omitted_evidence_total_saturated: false,
+                fence_recovery_attempts: Vec::new(),
+                fence_recovery_attention: Vec::new(),
             },
         }
     }
@@ -460,14 +602,120 @@ impl DiagnosticsState {
         self.snapshot
             .records
             .retain(|r| r.recipient.as_deref() != Some(recipient));
+        self.clear_fence_recovery_attention(recipient);
+    }
+
+    pub(crate) fn record_fence_recovery(&mut self, mut attempt: FenceRecoveryAttempt) {
+        let Some(recipient) = normalize_persona(&attempt.recipient) else {
+            return;
+        };
+        attempt.recipient = recipient;
+        let history = &mut self.snapshot.fence_recovery_attempts;
+        // A continuing streak replaces its most recent busy row. A new
+        // fence starts at one, even when it has the same recipient. If the
+        // previous row was evicted, older rows for that recipient are gone too.
+        if attempt.busy_probe_count.is_some_and(|count| count > 1)
+            && let Some(index) = history.iter().rposition(|row| {
+                row.recipient == attempt.recipient && row.outcome == FenceRecoveryOutcome::SeatBusy
+            })
+        {
+            history.remove(index);
+        }
+        if history.len() == MAX_FENCE_RECOVERY_ATTEMPTS {
+            history.remove(0);
+        }
+        history.push(attempt);
+    }
+
+    pub(crate) fn set_fence_recovery_attention(
+        &mut self,
+        recipient: &str,
+        outcome: FenceRecoveryOutcome,
+        exhausted: bool,
+    ) {
+        self.set_fence_recovery_status(recipient, outcome, exhausted, None, None);
+    }
+
+    pub(crate) fn set_busy_fence_recovery_status(
+        &mut self,
+        recipient: &str,
+        outcome: FenceRecoveryOutcome,
+        busy_since: At,
+        observed_at: &At,
+    ) {
+        let busy_elapsed_ms = (outcome == FenceRecoveryOutcome::SeatBusyProlonged).then(|| {
+            observed_at
+                .unix_millis()
+                .saturating_sub(busy_since.unix_millis())
+        });
+        self.set_fence_recovery_status(
+            recipient,
+            outcome,
+            false,
+            Some(busy_since),
+            busy_elapsed_ms,
+        );
+    }
+
+    fn set_fence_recovery_status(
+        &mut self,
+        recipient: &str,
+        outcome: FenceRecoveryOutcome,
+        exhausted: bool,
+        busy_since: Option<At>,
+        busy_elapsed_ms: Option<u64>,
+    ) {
+        let Some(recipient) = normalize_persona(recipient) else {
+            return;
+        };
+        let attention = &mut self.snapshot.fence_recovery_attention;
+        let row = FenceRecoveryAttention {
+            recipient,
+            outcome,
+            exhausted,
+            busy_since,
+            busy_elapsed_ms,
+        };
+        if let Some(existing) = attention
+            .iter_mut()
+            .find(|item| item.recipient == row.recipient)
+        {
+            *existing = row;
+        } else if attention.len() < MAX_FENCE_DIAGNOSTICS {
+            attention.push(row);
+        } else {
+            self.snapshot.diagnostics_partial = true;
+            increment_saturating(
+                &mut self.snapshot.omitted_evidence_total,
+                &mut self.snapshot.omitted_evidence_total_saturated,
+            );
+        }
+    }
+
+    pub(crate) fn clear_fence_recovery_attention(&mut self, recipient: &str) {
+        self.snapshot
+            .fence_recovery_attention
+            .retain(|row| row.recipient != recipient);
     }
 
     /// Called with the diagnostics lock paired with the authoritative marker.
     /// Return only the first retained hold, for logging after all guards drop.
     pub(crate) fn retain(&mut self, row: FenceDiagnostic) -> Option<FenceDiagnostic> {
+        self.retain_with_replacement(row, false)
+    }
+
+    pub(crate) fn retain_with_replacement(
+        &mut self,
+        row: FenceDiagnostic,
+        replace: bool,
+    ) -> Option<FenceDiagnostic> {
         if let Some(first) = self.snapshot.records.iter_mut().find(|first| {
             first.recipient == row.recipient && first.recipient_digest == row.recipient_digest
         }) {
+            if replace {
+                *first = row.clone();
+                return Some(row);
+            }
             if first.phase == SuppressionPhase::PrefixDraining
                 && row.phase == SuppressionPhase::RetainedFence
             {
@@ -507,7 +755,7 @@ impl DiagnosticsState {
             }
             return None;
         }
-        if self.snapshot.records.len() == 128 {
+        if self.snapshot.records.len() == MAX_FENCE_DIAGNOSTICS {
             self.snapshot.diagnostics_partial = true;
             increment_saturating(
                 &mut self.snapshot.omitted_evidence_total,
@@ -1104,6 +1352,139 @@ mod tests {
     }
 
     #[test]
+    fn diagnostic_snapshot_round_trips_retained_fence_recovery() {
+        let mut json =
+            serde_json::to_value(DiagnosticsState::new(At::from_unix_millis(123), None).snapshot)
+                .unwrap();
+        json["fence_recovery_attempts"] = serde_json::json!([{
+            "recipient": "feira",
+            "attempt": 2,
+            "limit": 3,
+            "at": At::from_unix_millis(456),
+            "outcome": "vendor_sign_in",
+        }]);
+        json["fence_recovery_attention"] = serde_json::json!([{
+            "recipient": "feira",
+            "outcome": "vendor_sign_in",
+            "exhausted": false,
+        }]);
+        let snapshot = serde_json::from_value::<DispatchDiagnostics>(json.clone()).unwrap();
+        assert_eq!(serde_json::to_value(snapshot).unwrap(), json);
+    }
+
+    #[test]
+    fn fence_recovery_busy_elapsed_saturates_on_clock_rollback() {
+        let mut state = DiagnosticsState::new(At::from_unix_millis(0), None);
+        state.set_busy_fence_recovery_status(
+            "feira",
+            FenceRecoveryOutcome::SeatBusyProlonged,
+            At::from_unix_millis(31_000),
+            &At::from_unix_millis(30_000),
+        );
+        assert_eq!(
+            state.snapshot.fence_recovery_attention[0].busy_elapsed_ms,
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn fence_recovery_history_coalesces_interleaved_busy_streaks() {
+        use FenceRecoveryOutcome::{Inconclusive, SeatBusy, VendorSignIn};
+
+        let mut state = DiagnosticsState::new(At::from_unix_millis(0), None);
+        let mut record = |recipient: &str, outcome, busy_probe_count, millis| {
+            state.record_fence_recovery(FenceRecoveryAttempt {
+                recipient: recipient.into(),
+                attempt: 1,
+                limit: 3,
+                at: At::from_unix_millis(millis),
+                outcome,
+                busy_probe_count,
+            });
+        };
+        record("felix", VendorSignIn, None, 1);
+        for count in 1..=300 {
+            record("Ada", SeatBusy, Some(count), u64::from(count) * 2);
+            record("Feira", SeatBusy, Some(count), u64::from(count) * 2 + 1);
+        }
+        // A replacement fence can start without a preceding non-busy entry.
+        record("feira", SeatBusy, Some(1), 602);
+        record("feira", SeatBusy, Some(2), 603);
+        record("feira", Inconclusive, None, 604);
+        record("feira", SeatBusy, Some(1), 605);
+        let history: Vec<_> = state
+            .snapshot
+            .fence_recovery_attempts
+            .iter()
+            .map(|row| {
+                (
+                    row.recipient.as_str(),
+                    row.outcome,
+                    row.busy_probe_count,
+                    row.at.unix_millis(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            history,
+            [
+                ("felix", VendorSignIn, None, 1),
+                ("ada", SeatBusy, Some(300), 600),
+                ("feira", SeatBusy, Some(300), 601),
+                ("feira", SeatBusy, Some(2), 603),
+                ("feira", Inconclusive, None, 604),
+                ("feira", SeatBusy, Some(1), 605),
+            ]
+        );
+    }
+
+    #[test]
+    fn recovery_history_is_bounded_and_survives_clearing_attention() {
+        let mut state = DiagnosticsState::new(At::from_unix_millis(0), None);
+        let last_attempt = MAX_FENCE_RECOVERY_ATTEMPTS as u32 + 1;
+        for attempt in 1..=last_attempt {
+            state.record_fence_recovery(FenceRecoveryAttempt {
+                recipient: "Feira".into(),
+                attempt,
+                limit: last_attempt,
+                at: At::from_unix_millis(u64::from(attempt)),
+                outcome: FenceRecoveryOutcome::DeadRoute,
+                busy_probe_count: None,
+            });
+        }
+        let history = &state.snapshot.fence_recovery_attempts;
+        assert_eq!(history.len(), MAX_FENCE_RECOVERY_ATTEMPTS);
+        assert_eq!(history.first().unwrap().attempt, 2);
+        assert_eq!(history.last().unwrap().attempt, last_attempt);
+        assert_eq!(history.last().unwrap().recipient, "feira");
+
+        state.set_fence_recovery_attention("Feira", FenceRecoveryOutcome::DeadRoute, false);
+        state.set_fence_recovery_attention("feira", FenceRecoveryOutcome::VendorSignIn, true);
+        state.set_fence_recovery_attention(
+            "/private/invalid",
+            FenceRecoveryOutcome::Inconclusive,
+            false,
+        );
+        assert_eq!(
+            state.snapshot.fence_recovery_attention,
+            vec![FenceRecoveryAttention {
+                recipient: "feira".into(),
+                outcome: FenceRecoveryOutcome::VendorSignIn,
+                exhausted: true,
+                busy_since: None,
+                busy_elapsed_ms: None,
+            }]
+        );
+
+        state.clear_recipient("feira");
+        assert!(state.snapshot.fence_recovery_attention.is_empty());
+        assert_eq!(
+            state.snapshot.fence_recovery_attempts.len(),
+            MAX_FENCE_RECOVERY_ATTEMPTS
+        );
+    }
+
+    #[test]
     fn diagnostic_snapshot_serde_preserves_explicit_unknowns() {
         let snapshot = DispatchDiagnostics {
             schema_version: 1,
@@ -1115,10 +1496,14 @@ mod tests {
             diagnostics_partial: false,
             omitted_evidence_total: 0,
             omitted_evidence_total_saturated: false,
+            fence_recovery_attempts: Vec::new(),
+            fence_recovery_attention: Vec::new(),
         };
         let json = serde_json::to_value(&snapshot).unwrap();
         assert_eq!(json["scope"], "daemon_lifetime");
         assert!(json["instance_nonce"].is_null());
+        assert!(json.get("fence_recovery_attempts").is_none());
+        assert!(json.get("fence_recovery_attention").is_none());
         assert_eq!(json["records"][0]["phase"], "retained_fence");
         assert_eq!(
             json["records"][0]["first_reason"],

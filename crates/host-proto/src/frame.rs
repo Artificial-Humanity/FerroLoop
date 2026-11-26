@@ -42,10 +42,19 @@ impl FrameKind {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Frame {
     pub kind: FrameKind,
     pub payload: Vec<u8>,
+}
+
+impl std::fmt::Debug for Frame {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Frame")
+            .field("kind", &self.kind)
+            .field("payload_len", &self.payload.len())
+            .finish()
+    }
 }
 
 /// `len` is the on-wire length field: 1 type byte plus the payload.
@@ -173,23 +182,28 @@ pub fn encode_response_for_minor(minor: u16, response: &HostResponse) -> Result<
         crate::extension::require_minor(minor)?;
         response.validate()?;
     }
-    let payload = if matches!(
-        response,
+    let bounded = match response {
         HostResponse::Extended {
-            response: crate::ExtensionResponse::Sessions { .. }
+            response:
+                crate::ExtensionResponse::Sessions { .. }
                 | crate::ExtensionResponse::RenderedCapture { .. }
                 | crate::ExtensionResponse::RenderedCursorStyleCapture { .. },
             ..
-        }
-    ) {
-        // List admission precharges this exact capacity. Serialize into a slice:
-        // an oversized response fails without Vec's amortized growth or a second
-        // JSON allocation. Truncation retains the charged capacity through write.
-        let mut payload = vec![0u8; MAX_FRAME_PAYLOAD];
+        } => Some(MAX_FRAME_PAYLOAD),
+        HostResponse::Extended {
+            response: crate::ExtensionResponse::HostedExitEvidence { .. },
+            ..
+        } => Some(crate::HOSTED_EXIT_EVIDENCE_FRAME_BYTES),
+        _ => None,
+    };
+    let payload = if let Some(capacity) = bounded {
+        // Host admission precharges these buffers. A fixed slice bounds JSON
+        // serialization without amortized Vec growth.
+        let mut payload = vec![0u8; capacity];
         let mut remaining = payload.as_mut_slice();
         serde_json::to_writer(&mut remaining, response)
-            .map_err(|err| HostError::Protocol(err.to_string()))?;
-        let len = MAX_FRAME_PAYLOAD - remaining.len();
+            .map_err(|_| HostError::Protocol("response encoding failed".into()))?;
+        let len = capacity - remaining.len();
         payload.truncate(len);
         payload
     } else {
@@ -215,8 +229,15 @@ pub fn decode_response_for_minor(minor: u16, frame: &Frame) -> Result<HostRespon
     if frame.payload.len() > MAX_FRAME_PAYLOAD {
         return Err(HostError::FrameLength);
     }
-    let response = serde_json::from_slice(&frame.payload)
-        .map_err(|err| HostError::Protocol(err.to_string()))?;
+    // Serde's diagnostic can quote values and field names from private response
+    // payloads. Retain the position without copying any part of the frame.
+    let response = serde_json::from_slice(&frame.payload).map_err(|err| {
+        HostError::Protocol(format!(
+            "invalid response payload (line {}, column {})",
+            err.line(),
+            err.column()
+        ))
+    })?;
     if let HostResponse::Extended { response, .. } = &response {
         crate::extension::require_minor(minor)?;
         response.validate()?;

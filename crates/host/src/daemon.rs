@@ -28,6 +28,7 @@ pub(crate) fn attach(
     let stdin = session.take_stdin();
     let output = OutputSession::open(Arc::clone(session), Arc::clone(&host.hub));
     let writer = WriterHandle::start(Arc::clone(session), stdin);
+    session.set_cursor_reply_writer(&writer);
     if let Some(admission) = admission {
         host.authority.register(admission, session, &writer);
     }
@@ -545,7 +546,8 @@ pub(super) async fn extended(
                 | fl_host_proto::RENDERED_CURSOR_STYLE_FEATURE
                 | fl_host_proto::HOST_STATUS_FEATURE
                 | fl_host_proto::SESSION_OWNER_FEATURE
-                | fl_host_proto::PTY_RETENTION_FEATURE,
+                | fl_host_proto::PTY_RETENTION_FEATURE
+                | fl_host_proto::HOSTED_EXIT_EVIDENCE_FEATURE,
             #[cfg(not(unix))]
             features: fl_host_proto::RELIABLE_FEATURE
                 | fl_host_proto::HOST_STATUS_FEATURE
@@ -562,6 +564,14 @@ pub(super) async fn extended(
         XReq::PtyRetentionStatus => Ok(XResp::PtyRetentionStatus {
             status: host.pty_retention_status(),
         }),
+        XReq::HostedExitEvidence { stream, hosted_id } => {
+            if !cfg!(unix) {
+                return Err(Refusal::Unsupported);
+            }
+            Ok(XResp::HostedExitEvidence {
+                status: host.hosted_exit_evidence(&stream, &hosted_id),
+            })
+        }
         XReq::CheckSessionOwner { stream, hosted_id } => {
             let sessions = host.sessions.lock().unwrap_or_else(|e| e.into_inner());
             let matches = stream.host == *host.authority.instance()
@@ -1202,7 +1212,10 @@ where
 {
     let blocking = matches!(
         request,
-        XReq::HostStatus | XReq::ListSessions | XReq::PtyRetentionStatus
+        XReq::HostStatus
+            | XReq::ListSessions
+            | XReq::PtyRetentionStatus
+            | XReq::HostedExitEvidence { .. }
     );
     let operation = budgeted_operation(operation(request), &host.reliable_budget)?;
     if blocking {
@@ -1309,7 +1322,9 @@ fn admit_extension(
                     .sum::<usize>()
                 + 64
         }
-        XReq::CheckSessionOwner { hosted_id, .. } => hosted_id.capacity() + 64,
+        XReq::CheckSessionOwner { hosted_id, .. } | XReq::HostedExitEvidence { hosted_id, .. } => {
+            hosted_id.capacity() + 64
+        }
         XReq::SendLine { line, .. } => line.capacity() + 64,
         XReq::Write { bytes, .. } => bytes.as_slice().len() + 64,
         _ => 64,
@@ -1318,6 +1333,14 @@ fn admit_extension(
         // Two bounded strings plus JSON (including worst-case escaping and Vec
         // growth) and the wire buffer. The permit lives through the socket write.
         XReq::HostStatus => 8192 + 2 * fl_host_proto::MAX_BUILD_FIELD_BYTES,
+        XReq::HostedExitEvidence { .. } => {
+            2 * fl_host_proto::HOSTED_EXIT_EVIDENCE_FRAME_BYTES
+                + fl_host_proto::MAX_HOSTED_EXIT_TAIL_BYTES
+                + 64
+                + 5
+                + std::mem::size_of::<fl_host_proto::Frame>()
+                + std::mem::size_of::<Vec<u8>>()
+        }
         // Bounded identity vector + names, JSON growth and simultaneous wire copy.
         XReq::PtyRetentionStatus => {
             8192 + fl_host_proto::MAX_RECENT_PTY_EVICTIONS

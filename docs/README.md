@@ -66,6 +66,35 @@ In addition to the guides above, `fl --help` documents the full command surface:
 * `fl agent` — agent identity registry, coverage areas, heartbeat liveness, `REGISTRY.md` rendering, and hosted session lifecycle (`spin-up`, two-phase `decommission`, and `remodel`: a move to another vendor that keeps the persona, project, role and worktree, restores the old vendor when the new one fails, and records a `remodel-<persona>` workspace handoff). The hub serves the same lifecycle at `POST /api/v1/sessions/spin-up`, `POST /api/v1/sessions/:id/decommission`, `POST /api/v1/sessions/:id/remodel`, `GET /api/v1/hosted-sessions`, and `POST /api/v1/hosted-sessions/:id/restart`; hosted sessions persist as `hosted-session-*` workspace runtime entries.
 * `fl state` — scoped memory, handoffs, and runtime state with owner sensitivity redaction and `MEMORY.md` / `STATE.md` rendering.
 * `fl wire` — FerroWire agent-to-agent messaging, receipts, native vendor push dispatch, and WebSocket relay.
+  When an unresolved route delivery causes a retained fence, the daemon runs a read-only
+  readiness check after `FL_WIRE_FENCE_RECOVERY_DELAY_SECS` (default 300 seconds). It checks at
+  most once per delay period, with a budget of `FL_WIRE_FENCE_RECOVERY_MAX_ATTEMPTS` (default 3)
+  per fence. A read-only result that confirms the seat is in a turn does not use that budget.
+  Status shows the seat as waiting, then raises it to needs-attention after 12 consecutive busy
+  probes while continuing to check at the configured delay. The `fl wire status` text output
+  lists the start of each busy streak in the `fence_recovery_busy_since` field as
+  `recipient=timestamp` entries.
+  Set `FL_WIRE_FENCE_RECOVERY_MAX_ATTEMPTS=0` to disable timed recovery. The delay must be
+  positive. Invalid values use the defaults and log a warning.
+  After the daemon verifies readiness, it sends the first held message with a warning that an
+  earlier attempt may already have arrived. Once the submit is confirmed, normal dispatch
+  resumes in admission order. Previously attempted messages in that queue also carry the warning.
+  A dead, blocked, or unverified route stays fenced. `fl wire status` and the FerroDeck mail
+  view show the reason, including while recovery waits for the delay or a delivery worker.
+  Timed recovery supports hosted Claude, Codex, and Muse routes. Non-hosted, Antigravity, Grok,
+  and webhook routes stay fenced and report the reason. Fences caused by queue overflow,
+  receipt bookkeeping errors, or global capacity limits do not start timed recovery. If the replay
+  worker fails, receipt bookkeeping fails, or the store cannot confirm a successful submission,
+  timed replay stops. In `fl wire status --json`, the outcome is `replay_worker_failed` or
+  `receipt_bookkeeping_failed`. For the latter, a `first_reason` of `initial_receipt_read_ambiguous`
+  means that a message has multiple stored receipts for the same recipient name, ignoring case.
+  Timed replay stops even if one of them has resolved. Correct the source peer or import data to
+  keep one canonical receipt for the recipient before syncing again. Wire has no per-receipt
+  deletion command. To remove the local duplicate, use `fl store recovery restore` with a verified
+  backup that has the canonical receipt alone, then complete offline recovery reconciliation before
+  resuming dispatch.
+  Acknowledging mail or re-registering the same route leaves a stopped fence in place. Change
+  the route identity or restart the Wire daemon to clear it.
 * `fl github pr` — pull-request review and merge policy evaluation, structured review markers, and gated merges.
 * `fl flow` — DAG workflow validation, import, step execution, review loops, and human approval sign-off.
 * `fl arch` — `.fl/architecture.toml` validation, Cargo workspace dependency/source conformance checks, and LikeC4 export.

@@ -26,6 +26,28 @@ pub(crate) struct ProjectionSnapshot {
     pub(crate) _reservation: Reservation,
 }
 
+pub(crate) type CursorPosition = (u16, u16);
+pub(crate) const CURSOR_REPORT_LIMIT: usize = 32;
+
+#[derive(Default)]
+pub(crate) struct CursorReports {
+    positions: [CursorPosition; CURSOR_REPORT_LIMIT],
+    len: usize,
+}
+
+impl CursorReports {
+    fn push(&mut self, position: CursorPosition) {
+        if let Some(slot) = self.positions.get_mut(self.len) {
+            *slot = position;
+            self.len += 1;
+        }
+    }
+
+    pub(crate) fn positions(&self) -> &[CursorPosition] {
+        &self.positions[..self.len]
+    }
+}
+
 pub(crate) struct Projection {
     parser: vt100::Parser,
     filter: StringFilter,
@@ -86,14 +108,20 @@ impl Projection {
             output_bytes: 0,
         })
     }
-    pub(crate) fn process(&mut self, bytes: &[u8]) {
+    pub(crate) fn process(&mut self, bytes: &[u8]) -> CursorReports {
+        let mut reports = CursorReports::default();
         if bytes.is_empty() {
-            return;
+            return reports;
         }
-        self.filter
-            .process(bytes, |chunk| self.parser.process(chunk));
+        self.filter.process(bytes, |chunk, cursor_query| {
+            self.parser.process(chunk);
+            if cursor_query {
+                reports.push(visible_cursor(self.parser.screen()));
+            }
+        });
         self.generation = self.generation.saturating_add(1);
         self.output_bytes = self.output_bytes.saturating_add(bytes.len() as u64);
+        reports
     }
     pub(crate) fn set_output_seq(&mut self, seq: u64) {
         self.output_seq = self.output_seq.max(seq);
@@ -115,16 +143,16 @@ impl Projection {
         if contents.len() > MAX_RENDERED_TEXT || contents.capacity() > 2 * MAX_RENDERED_TEXT {
             return Err(ExtensionRefusal::ResourceLimit);
         }
-        let (cursor_row, cursor_col) = screen.cursor_position();
+        let (cursor_row, cursor_col) = visible_cursor(screen);
         let (rows, cols) = screen.size();
         let dim_suffix_line = if include_cursor_style {
-            dim_suffix_line(screen, cursor_row, cursor_col, cols.get())
+            // Use the raw parser cursor: pending autowrap (col == width) is
+            // not a proven cursor cell and must not authorize a dim suffix.
+            let (raw_row, raw_col) = screen.cursor_position();
+            dim_suffix_line(screen, raw_row, raw_col, cols.get())
         } else {
             None
         };
-        // vt100 represents pending autowrap with col == width. Expose the
-        // visible cursor cell while retaining that pending state in the parser.
-        let cursor_col = cursor_col.min(cols.get() - 1);
         Ok(ProjectionSnapshot {
             contents,
             cursor_row,
@@ -163,6 +191,12 @@ impl Projection {
         self.generation = self.generation.saturating_add(1);
         Ok(self.generation)
     }
+}
+
+fn visible_cursor(screen: &vt100::Screen) -> CursorPosition {
+    let (row, col) = screen.cursor_position();
+    // vt100 represents pending autowrap with col == width.
+    (row, col.min(screen.size().1.get() - 1))
 }
 
 /// Locate this exact unwrapped cursor row in vt100's plain-text projection.
@@ -223,7 +257,33 @@ struct StringFilter {
     utf8_left: u8,
     utf8_min: u8,
     utf8_max: u8,
+    cursor_query: CursorQuery,
 }
+
+/// Recognize the supported, non-private CSI request in the filtered stream.
+/// Controls inside discarded strings never reach this state machine.
+#[derive(Clone, Copy, Default)]
+enum CursorQuery {
+    #[default]
+    Idle,
+    Escape,
+    Csi,
+    Parameter,
+}
+
+impl CursorQuery {
+    fn advance(&mut self, byte: u8) -> bool {
+        let complete = matches!((*self, byte), (Self::Parameter, b'n'));
+        *self = match (*self, byte) {
+            (_, 0x1b) => Self::Escape,
+            (Self::Escape, b'[') => Self::Csi,
+            (Self::Csi, b'6') => Self::Parameter,
+            _ => Self::Idle,
+        };
+        complete
+    }
+}
+
 impl StringFilter {
     fn continuation(&mut self, byte: u8) -> bool {
         if self.utf8_left > 0 && (self.utf8_min..=self.utf8_max).contains(&byte) {
@@ -250,12 +310,13 @@ impl StringFilter {
         };
         false
     }
-    fn process(&mut self, bytes: &[u8], mut emit: impl FnMut(&[u8])) {
+    // A query ends a chunk so the consumer sees the cursor at that exact byte.
+    fn process(&mut self, bytes: &[u8], mut emit: impl FnMut(&[u8], bool)) {
         let mut output = [0u8; 4096];
         let mut len = 0;
         for &byte in bytes {
             if len == output.len() {
-                emit(&output[..len]);
+                emit(&output[..len], false);
                 len = 0;
             }
             let continuation = self.continuation(byte);
@@ -278,6 +339,7 @@ impl StringFilter {
                     self.string = Some(byte == b']');
                     self.string_escape = false;
                     // Cancel any partial CSI/ESC in the downstream parser.
+                    self.cursor_query = CursorQuery::Idle;
                     output[len] = 0x18;
                     len += 1;
                     continue;
@@ -291,6 +353,7 @@ impl StringFilter {
                 self.escape = false;
                 self.string = Some(byte == 0x9d);
                 self.string_escape = false;
+                self.cursor_query = CursorQuery::Idle;
                 output[len] = 0x18;
                 len += 1;
             } else {
@@ -299,9 +362,13 @@ impl StringFilter {
                 }
                 output[len] = byte;
                 len += 1;
+                if self.cursor_query.advance(byte) {
+                    emit(&output[..len], true);
+                    len = 0;
+                }
             }
         }
-        emit(&output[..len]);
+        emit(&output[..len], false);
     }
 }
 
@@ -364,6 +431,20 @@ mod tests {
         assert_eq!(p.snapshot(true).unwrap().dim_suffix_line, None);
         p.process(b"\x1b[1;1H");
         assert_eq!(p.snapshot(true).unwrap().dim_suffix_line, None);
+    }
+
+    #[test]
+    fn cursor_reports_follow_split_queries_and_ignore_control_strings() {
+        let mut p = projection();
+        p.resize(4, 8, || Ok(())).unwrap();
+
+        assert!(p.process(b"\x1b[4;4H!\x1b[").positions().is_empty());
+        assert!(p.process(b"6").positions().is_empty());
+        let reports = p.process(
+            b"n\x1b[2;3H\x1b[6n\x1b[1;1H\x1b[?6n\x1b[6 n\x1b]X\x1b[6n\x07\x1bPX\x1b[6n\x1b\\",
+        );
+        assert_eq!(reports.positions(), &[(3, 3), (1, 2)]);
+        assert_eq!(p.parser.screen().cursor_position(), (0, 0));
     }
 
     #[test]
@@ -431,8 +512,12 @@ mod tests {
                 for split in 0..=input.len() {
                     let mut filter = StringFilter::default();
                     let mut sanitized = Vec::new();
-                    filter.process(&input[..split], |chunk| sanitized.extend_from_slice(chunk));
-                    filter.process(&input[split..], |chunk| sanitized.extend_from_slice(chunk));
+                    filter.process(&input[..split], |chunk, _| {
+                        sanitized.extend_from_slice(chunk)
+                    });
+                    filter.process(&input[split..], |chunk, _| {
+                        sanitized.extend_from_slice(chunk)
+                    });
                     assert!(
                         !sanitized.contains(&introducer),
                         "string introducer reached parser: {input:?}, split {split}: {sanitized:?}"
@@ -459,19 +544,19 @@ mod tests {
             // Inspect the actual parser input, not SliceBudget counters: an
             // admitted OSC payload would allocate in vte outside that budget.
             for byte in prefix {
-                filter.process(std::slice::from_ref(byte), |chunk| {
+                filter.process(std::slice::from_ref(byte), |chunk, _| {
                     assert!(!chunk.contains(&b']'), "OSC admitted for {prefix:?}");
                     p.parser.process(chunk);
                 });
             }
             let payload = [b'x'; 4096];
             for _ in 0..2300 {
-                filter.process(&payload, |chunk| {
+                filter.process(&payload, |chunk, _| {
                     assert!(chunk.is_empty(), "OSC payload reached parser");
                     p.parser.process(chunk);
                 });
             }
-            filter.process(b"\x07 visible", |chunk| p.parser.process(chunk));
+            filter.process(b"\x07 visible", |chunk, _| p.parser.process(chunk));
             assert_eq!(p.snapshot(false).unwrap().contents, expected);
         }
     }
@@ -490,7 +575,7 @@ mod tests {
             let mut filter = StringFilter::default();
             let mut sanitized = Vec::new();
             for byte in input {
-                filter.process(std::slice::from_ref(byte), |chunk| {
+                filter.process(std::slice::from_ref(byte), |chunk, _| {
                     sanitized.extend_from_slice(chunk)
                 });
             }

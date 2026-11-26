@@ -284,6 +284,93 @@ describe("WireMailPane", () => {
     );
   });
 
+  it("shows a retained fence that needs attention across recipient selection", () => {
+    const wireStatus: WireStatusResponse = {
+      daemon: "active",
+      dispatch_diagnostics: {
+        schema_version: 1,
+        instance_nonce: null,
+        instance_started_at: "2026-11-26T00:00:00.000Z",
+        scope: "daemon_lifetime",
+        records: [],
+        global_capacity_exhausted: false,
+        diagnostics_partial: false,
+        omitted_evidence_total: 0,
+        omitted_evidence_total_saturated: false,
+        fence_recovery_attention: [
+          {
+            recipient: "kayla",
+            outcome: "vendor_sign_in",
+            reason_label: "vendor sign-in screen",
+            exhausted: true,
+          },
+          {
+            recipient: "feira",
+            outcome: "hosted_binding_unavailable",
+            reason_label: "no hosted stream binding",
+            exhausted: false,
+          },
+          {
+            recipient: "jarvis",
+            outcome: "hosted_capture_unavailable",
+            reason_label: "hosted screen capture unavailable",
+            exhausted: false,
+          },
+          {
+            recipient: "ada",
+            outcome: "waiting_for_worker",
+            reason_label: "waiting for a delivery worker slot",
+            exhausted: false,
+          },
+          {
+            recipient: "ari",
+            outcome: "seat_busy",
+            reason_label: "seat is in a turn",
+            exhausted: true,
+            busy_since: "2026-11-26T01:00:00.000Z",
+          },
+          {
+            recipient: "bea",
+            outcome: "seat_busy_prolonged",
+            reason_label: "seat has been in a turn for 5m 41s",
+            exhausted: false,
+            busy_since: "2026-11-26T02:00:00.000Z",
+          },
+        ],
+      },
+      pending_recipients: [],
+    };
+
+    render(
+      <WireMailPane
+        messages={SAMPLE_MESSAGES}
+        selectedAgentName="ferris"
+        agents={DEFAULT_WORKSPACE_AGENTS}
+        wireStatus={wireStatus}
+      />,
+    );
+
+    expect(screen.getByTestId("wire-fence-recovery-attention-kayla")).toHaveTextContent(
+      "kayla: Wire recovery needs attention (vendor sign-in screen, attempt limit reached)",
+    );
+    expect(screen.getByTestId("wire-fence-recovery-attention-feira")).toHaveTextContent(
+      "feira: Wire recovery needs attention (no hosted stream binding)",
+    );
+    expect(screen.getByTestId("wire-fence-recovery-attention-jarvis")).toHaveTextContent(
+      "jarvis: Wire recovery needs attention (hosted screen capture unavailable)",
+    );
+    expect(screen.getByTestId("wire-fence-recovery-attention-ada")).toHaveTextContent(
+      "ada: Wire recovery pending (waiting for a delivery worker slot)",
+    );
+    expect(screen.getByTestId("wire-fence-recovery-attention-ari")).toHaveTextContent(
+      "ari: Wire recovery pending (seat is in a turn since 2026-11-26T01:00:00.000Z, attempt limit reached)",
+    );
+    expect(screen.getByTestId("wire-fence-recovery-attention-bea")).toHaveTextContent(
+      "bea: Wire recovery needs attention (seat has been in a turn for 5m 41s since 2026-11-26T02:00:00.000Z)",
+    );
+    expect(screen.queryByTestId("wire-diagnostics-available")).toBeNull();
+  });
+
   it("renders held recipient FenceDiagnostic row with registration_generation=unknown, decisive reason, stages, and zero recovery controls", () => {
     const wireStatus: WireStatusResponse = {
       daemon: "active",
@@ -369,7 +456,7 @@ describe("WireMailPane", () => {
     expect(holdRow).not.toHaveTextContent("registration_generation=0");
 
     expect(strip).toHaveTextContent(
-      "Daemon-lifetime hold suppresses automatic pushes; ACK and route registration do not clear it.",
+      "Later automatic pushes wait until the fence clears.",
     );
 
     const pendingKayla = screen.getByTestId("wire-pending-recipient-kayla");

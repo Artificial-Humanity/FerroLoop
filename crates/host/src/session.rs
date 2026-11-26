@@ -3,18 +3,28 @@
 use std::fs::File;
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, Weak};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use fl_host_proto::{
-    ChildExit, ChildRecord, ChildState, HostError, InputState, MAX_STDOUT_BACKLOG,
-    STDERR_TAIL_BYTES, SessionEpoch, SessionId, SpawnKind,
+    ChildExit, ChildRecord, ChildState, HostError, HostedExitEvidence, HostedExitEvidenceStatus,
+    InputState, MAX_STDOUT_BACKLOG, STDERR_TAIL_BYTES, SessionEpoch, SessionId, SpawnKind,
 };
 
 use crate::child::{CleanupReport, DescendantExit};
+use crate::exit_evidence::TerminalTail;
+use crate::input::WriterHandle;
+use crate::projection::CursorReports;
 
 // A total completion order, independent of map iteration and session names.
 static COMPLETION_ORDER: AtomicU64 = AtomicU64::new(1);
+
+fn unix_time_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as u64)
+        .unwrap_or(0)
+}
 
 pub struct Session {
     pub session: SessionId,
@@ -51,6 +61,7 @@ pub struct Session {
     sink: Mutex<Option<Weak<dyn StdoutSink>>>,
     reliable: Option<Arc<crate::reliable::ReliableJournal>>,
     projection: Mutex<Option<crate::projection::Projection>>,
+    cursor_reply_writer: OnceLock<Weak<WriterHandle>>,
     #[cfg(unix)]
     resize_master: Option<File>,
     #[cfg(unix)]
@@ -64,6 +75,9 @@ pub struct Session {
 struct OutBuf {
     bytes: Vec<u8>,
     eof: bool,
+    terminal_eof: bool,
+    terminal_tail: Option<Box<TerminalTail>>,
+    evidence_capture_ms: Option<u64>,
 }
 
 pub(crate) struct SessionParts {
@@ -92,13 +106,22 @@ impl Session {
         if let Some(owner) = owner.filter(|s| !s.is_empty() && s.len() <= self.hosted_owner.len()) {
             self.hosted_owner[..owner.len()].copy_from_slice(owner.as_bytes());
             self.hosted_owner_len = owner.len();
+            if self.mode() == fl_host_proto::SessionMode::Pty {
+                self.stdout
+                    .get_mut()
+                    .unwrap_or_else(|err| err.into_inner())
+                    .terminal_tail = Some(Box::new(TerminalTail::new()));
+            }
         }
         self
     }
 
     pub(crate) fn owned_by(&self, hosted_id: &str) -> bool {
-        self.hosted_owner_len != 0
-            && self.hosted_owner[..self.hosted_owner_len] == *hosted_id.as_bytes()
+        self.hosted_owner_len != 0 && self.hosted_owner() == hosted_id.as_bytes()
+    }
+
+    pub(crate) fn hosted_owner(&self) -> &[u8] {
+        &self.hosted_owner[..self.hosted_owner_len]
     }
 
     pub(crate) fn has_hosted_owner(&self) -> bool {
@@ -198,6 +221,22 @@ impl Session {
         }
     }
 
+    pub(crate) fn set_cursor_reply_writer(&self, writer: &Arc<WriterHandle>) {
+        if self.mode() == fl_host_proto::SessionMode::Pty {
+            self.cursor_reply_writer
+                .get_or_init(|| Arc::downgrade(writer));
+        }
+    }
+
+    fn enqueue_cursor_reports(&self, reports: Option<CursorReports>) {
+        let Some(reports) = reports.filter(|reports| !reports.positions().is_empty()) else {
+            return;
+        };
+        if let Some(writer) = self.cursor_reply_writer.get().and_then(Weak::upgrade) {
+            writer.enqueue_cursor_reports(reports.positions());
+        }
+    }
+
     // The projection lock covers every byte's parser update, raw tail, journal
     // admission/drop and watermark. Reads, polls and waits occur outside it.
     fn accept_output(
@@ -206,26 +245,26 @@ impl Session {
         bytes: crate::reliable::ChargedBytes,
     ) -> Result<(), fl_host_proto::ExtensionRefusal> {
         let mut projection = self.projection.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(projection) = projection.as_mut() {
-            projection.process(bytes.as_slice());
-        }
+        let reports = projection.as_mut().map(|p| p.process(bytes.as_slice()));
         self.push_stdout_tail(bytes.as_slice(), 64 * 1024);
         let result = journal.accept_read(bytes);
         if let Some(projection) = projection.as_mut() {
             projection.set_output_seq(journal.position().1);
         }
+        drop(projection);
+        self.enqueue_cursor_reports(reports);
         result
     }
     fn drop_pty_output(&self, journal: &crate::reliable::ReliableJournal, bytes: &[u8]) {
         let mut projection = self.projection.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(projection) = projection.as_mut() {
-            projection.process(bytes);
-        }
+        let reports = projection.as_mut().map(|p| p.process(bytes));
         self.push_stdout_tail(bytes, 64 * 1024);
         journal.drop_pty_unadmitted();
         if let Some(projection) = projection.as_mut() {
             projection.set_output_seq(journal.position().1);
         }
+        drop(projection);
+        self.enqueue_cursor_reports(reports);
     }
 
     pub fn new(parts: SessionParts) -> Self {
@@ -260,10 +299,6 @@ impl Session {
             control,
             stdin,
         } = parts;
-        let started_at_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
         Self {
             session,
             epoch,
@@ -273,7 +308,7 @@ impl Session {
             supervisor_start,
             pgid,
             control_inode,
-            started_at_ms,
+            started_at_ms: unix_time_ms(),
             hosted_owner: [0; fl_host_proto::MAX_HOSTED_OWNER_BYTES],
             hosted_owner_len: 0,
             control: Mutex::new(control),
@@ -287,6 +322,9 @@ impl Session {
             stdout: Mutex::new(OutBuf {
                 bytes: Vec::new(),
                 eof: false,
+                terminal_eof: false,
+                terminal_tail: None,
+                evidence_capture_ms: None,
             }),
             stdout_cv: Condvar::new(),
             stderr: Mutex::new(Vec::new()),
@@ -301,6 +339,7 @@ impl Session {
             sink: Mutex::new(None),
             reliable,
             projection: Mutex::new(None),
+            cursor_reply_writer: OnceLock::new(),
             #[cfg(unix)]
             resize_master: None,
             #[cfg(unix)]
@@ -498,18 +537,61 @@ impl Session {
 
     pub fn push_stdout_tail(&self, chunk: &[u8], max_cap: usize) {
         let mut buf = self.stdout.lock().unwrap_or_else(|err| err.into_inner());
+        if let Some(tail) = &mut buf.terminal_tail {
+            tail.push(chunk);
+        }
+        let bytes = &mut buf.bytes;
         if chunk.len() >= max_cap {
-            buf.bytes.clear();
-            buf.bytes.extend_from_slice(&chunk[chunk.len() - max_cap..]);
+            let drop_n = chunk.len() - max_cap;
+            bytes.clear();
+            bytes.extend_from_slice(&chunk[drop_n..]);
         } else {
-            let total = buf.bytes.len().saturating_add(chunk.len());
-            if total > max_cap {
-                let drop_n = total - max_cap;
-                buf.bytes.drain(..drop_n);
+            let drop_n = bytes
+                .len()
+                .saturating_add(chunk.len())
+                .saturating_sub(max_cap);
+            if drop_n > 0 {
+                bytes.drain(..drop_n);
             }
-            buf.bytes.extend_from_slice(chunk);
+            bytes.extend_from_slice(chunk);
         }
         self.stdout_cv.notify_all();
+    }
+
+    pub(crate) fn capture_hosted_exit(&self) -> HostedExitEvidenceStatus {
+        use HostedExitEvidenceStatus::{Exited, Pending, Unavailable};
+
+        let Some(journal) = self.reliable().filter(|_| self.has_hosted_owner()) else {
+            return Unavailable;
+        };
+        let exit = self.leader_exit();
+        let mut out = self.stdout.lock().unwrap_or_else(|err| err.into_inner());
+        if !out.eof {
+            return Pending;
+        }
+        if !out.terminal_eof {
+            return Unavailable;
+        }
+        let Some(exit) = exit else {
+            return Pending;
+        };
+        if exit.code.is_some() == exit.signal.is_some() {
+            return Unavailable;
+        }
+        let captured_at_ms = *out
+            .evidence_capture_ms
+            .get_or_insert_with(|| unix_time_ms().max(self.started_at_ms));
+        Exited(HostedExitEvidence {
+            stream: journal.stream().clone(),
+            exit,
+            started_at_ms: self.started_at_ms,
+            captured_at_ms,
+            terminal_tail: out
+                .terminal_tail
+                .as_deref()
+                .map(TerminalTail::snapshot)
+                .unwrap_or_default(),
+        })
     }
 
     pub fn stdout_tail(&self, max_bytes: usize) -> String {
@@ -528,10 +610,13 @@ impl Session {
     }
 
     pub fn stdout_eof(&self) {
-        self.stdout
-            .lock()
-            .unwrap_or_else(|err| err.into_inner())
-            .eof = true;
+        self.finish_stdout(false);
+    }
+
+    fn finish_stdout(&self, terminal_eof: bool) {
+        let mut out = self.stdout.lock().unwrap_or_else(|err| err.into_inner());
+        out.eof = true;
+        out.terminal_eof = terminal_eof;
         self.stdout_cv.notify_all();
     }
 
@@ -830,16 +915,17 @@ pub(crate) fn pump_reliable_stdout_with(
     journal: &crate::reliable::ReliableJournal,
     mut read: impl FnMut(&mut [u8]) -> std::io::Result<usize>,
 ) {
-    loop {
+    let drained = loop {
         if session.io_stop.load(Ordering::SeqCst) || sink.stopped() {
-            break;
+            break false;
         }
         let mut buffer = match journal.prepare_read() {
             Ok(buffer) => buffer,
             Err(_) if journal.pty_mode() => {
                 let mut scratch = [0u8; 4096];
                 match read(&mut scratch) {
-                    Ok(0) | Err(_) => break,
+                    Ok(0) => break true,
+                    Err(_) => break false,
                     Ok(len) => {
                         session.drop_pty_output(journal, &scratch[..len]);
                         continue;
@@ -854,17 +940,18 @@ pub(crate) fn pump_reliable_stdout_with(
         };
         session.set_stalled(false);
         match read(buffer.as_mut_slice()) {
-            Ok(0) | Err(_) => break,
+            Ok(0) => break true,
+            Err(_) => break false,
             Ok(len) => {
                 buffer.truncate(len);
                 if session.accept_output(journal, buffer).is_err() {
-                    break;
+                    break false;
                 }
             }
         }
-    }
+    };
     sink.eof();
-    session.stdout_eof();
+    session.finish_stdout(drained && !session.io_stop.load(Ordering::SeqCst));
 }
 
 pub fn pump_stderr(mut file: File, session: std::sync::Arc<Session>) {
@@ -909,6 +996,15 @@ fn pump_read(file: &mut File, buf: &mut [u8], session: &Session) -> std::io::Res
                 return Err(err);
             }
             match file.read(buf) {
+                // A drained PTY master on Linux reports EIO when the final
+                // slave closes. Other read errors do not establish EOF.
+                #[cfg(any(target_os = "linux", target_os = "android"))]
+                Err(err)
+                    if session.mode() == fl_host_proto::SessionMode::Pty
+                        && err.raw_os_error() == Some(libc::EIO) =>
+                {
+                    return Ok(0);
+                }
                 Err(err)
                     if matches!(
                         err.kind(),
@@ -1261,7 +1357,9 @@ mod tests {
         );
     }
     #[cfg(unix)]
-    fn pty_fixture() -> (
+    fn pty_fixture(
+        owner: Option<&str>,
+    ) -> (
         Arc<Session>,
         Arc<crate::reliable::ReliableJournal>,
         Arc<dyn StdoutSink>,
@@ -1282,12 +1380,10 @@ mod tests {
             fl_host_proto::PtyOptions::default(),
         )
         .unwrap();
-        let session = Arc::new(Session::with_projection(
-            parts,
-            Arc::clone(&journal),
-            projection,
-            None,
-        ));
+        let session = Arc::new(
+            Session::with_projection(parts, Arc::clone(&journal), projection, None)
+                .with_hosted_owner(owner),
+        );
         let sink: Arc<dyn StdoutSink> = crate::output::OutputSession::open(
             Arc::clone(&session),
             Arc::new(crate::output::Hub::new()),
@@ -1298,7 +1394,7 @@ mod tests {
     #[test]
     fn successful_pty_cleanup_releases_projection_without_ack_and_drain_keeps_raw_tail() {
         use crate::slice_budget::ChargeKind;
-        let (session, journal, sink) = pty_fixture();
+        let (session, journal, sink) = pty_fixture(None);
         assert!(journal.budget().used(ChargeKind::Projection) > 0);
         session.note_cleanup(CleanupReport { complete: true });
         assert_eq!(journal.budget().used(ChargeKind::Projection), 0);
@@ -1335,7 +1431,7 @@ mod tests {
     #[test]
     fn incomplete_pty_cleanup_preserves_projection_and_charge() {
         use crate::slice_budget::ChargeKind;
-        let (session, journal, _sink) = pty_fixture();
+        let (session, journal, _sink) = pty_fixture(None);
         let charged = journal.budget().used(ChargeKind::Projection);
         session.note_cleanup(CleanupReport { complete: false });
         session.drop_pty_output(&journal, b"still-visible");
@@ -1351,7 +1447,7 @@ mod tests {
     #[test]
     fn pty_projection_precedes_forced_unadmitted_drop_and_retains_raw_bytes() {
         use crate::slice_budget::{ChargeKind, EPOCH_DATA, reserve};
-        let (session, journal, sink) = pty_fixture();
+        let (session, journal, sink) = pty_fixture(None);
         let held = reserve(journal.budget(), ChargeKind::ReliableData, EPOCH_DATA).unwrap();
         assert!(journal.prepare_read().is_err());
         let raw = b"visible\x1b]secret\x07";
@@ -1377,8 +1473,60 @@ mod tests {
     }
     #[cfg(unix)]
     #[test]
+    fn hosted_exit_tail_captures_admitted_evicted_and_dropped_pty_bytes_once() {
+        use crate::slice_budget::{ChargeKind, EPOCH_DATA, reserve};
+        let (session, journal, sink) = pty_fixture(Some("agent"));
+        let accepted = b"accepted\x1b[6n\n";
+        let dropped = b"dropped\x1b[6n\n";
+        let last = b"last\n";
+        let mut first = journal.prepare_read().unwrap();
+        first.as_mut_slice()[..accepted.len()].copy_from_slice(accepted);
+        first.truncate(accepted.len());
+        session.accept_output(&journal, first).unwrap();
+        let (_, replay) = crate::reliable::begin_replay(&journal, 0).unwrap();
+        assert!(replay.gap().is_none());
+
+        // The next read evicts the first record and still cannot reserve a full
+        // read buffer. Release the pressure once its unadmitted bytes are read.
+        let available = EPOCH_DATA - journal.budget().used(ChargeKind::ReliableData);
+        let mut held =
+            Some(reserve(journal.budget(), ChargeKind::ReliableData, available).unwrap());
+        let mut chunks = [dropped.as_slice(), last.as_slice()].into_iter();
+        pump_reliable_stdout_with(&session, sink.as_ref(), &journal, |buf| {
+            let Some(chunk) = chunks.next() else {
+                return Ok(0);
+            };
+            if let Some(held) = held.take() {
+                assert_eq!(replay.gap().unwrap().next_seq, 2);
+                drop(held);
+            }
+            buf[..chunk.len()].copy_from_slice(chunk);
+            Ok(chunk.len())
+        });
+
+        let gap = replay.gap().unwrap();
+        assert_eq!((gap.from_seq, gap.next_seq), (1, 3));
+        let raw = [accepted.as_slice(), dropped, last].concat();
+        assert_eq!(session.stdout_tail(raw.len() * 2).as_bytes(), raw);
+        let screen = session.capture_screen(false).unwrap();
+        assert_eq!(
+            (screen.output_seq, screen.output_bytes),
+            (3, raw.len() as u64)
+        );
+        session.note_leader(ChildExit {
+            code: Some(1),
+            signal: None,
+        });
+        let HostedExitEvidenceStatus::Exited(evidence) = session.capture_hosted_exit() else {
+            panic!("expected hosted exit evidence");
+        };
+        assert_eq!(evidence.terminal_tail, "accepted\ndropped\nlast\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn pty_admitted_chunks_have_coherent_screen_and_watermark() {
-        let (session, journal, sink) = pty_fixture();
+        let (session, journal, sink) = pty_fixture(None);
         let chunks = [b"old\r\x1b[2".as_slice(), b"Knew\n"];
         let mut next = 0;
         pump_reliable_stdout_with(&session, sink.as_ref(), &journal, |buf| {
@@ -1407,7 +1555,7 @@ mod tests {
             Session::new(parts()).capture_screen(false),
             Err(fl_host_proto::ExtensionRefusal::WrongMode)
         ));
-        let (_, journal, _) = pty_fixture();
+        let (_, journal, _) = pty_fixture(None);
         let projection = crate::projection::Projection::new(
             Arc::clone(journal.budget()),
             fl_host_proto::PtyOptions::default(),
@@ -1429,7 +1577,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn concurrent_snapshots_never_mix_projection_and_byte_counters() {
-        let (session, journal, _sink) = pty_fixture();
+        let (session, journal, _sink) = pty_fixture(None);
         std::thread::scope(|scope| {
             let session = &session;
             let journal = &journal;

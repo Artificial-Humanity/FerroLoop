@@ -16,9 +16,12 @@ use fl_core::ferrowire::{DeliveryReceipt, DeliveryStatus, WireMessage};
 use fl_core::store::MessageStore;
 use fl_core::telemetry::AdapterKind;
 
-use crate::dispatch_diagnostics::{DispatchCallOutcome, DispatchReport, FailureStage};
+use crate::dispatch_diagnostics::{
+    DispatchCallOutcome, DispatchReport, FailureStage, FenceRecoveryOutcome,
+};
 use crate::identity::{
-    RouteTable, VendorRoute, normalize_persona, resolve_agy_exe, resolve_claude_key_path,
+    RouteEntry, RouteTable, VendorRoute, normalize_persona, resolve_agy_exe,
+    resolve_claude_key_path,
 };
 
 /// `clear` sends the vendor reset command only. `reforge` sends that command
@@ -2606,14 +2609,14 @@ pub fn tmux_exact_target(target: &str) -> String {
     }
 }
 
-/// `true` when `fl-wire` should query `fl-host`. In unit tests (`cfg(test)`), `fl-host` is
-/// consulted only when `FL_HOST_SOCK` is explicitly set so hermetic tests never reach a live
-/// host daemon on the machine.
+/// `true` when `fl-wire` should query `fl-host`. Unit tests require an explicitly
+/// configured or pinned endpoint.
 pub(crate) fn host_discovery_allowed() -> bool {
     std::env::var_os("FL_WIRE_TMUX_BIN").is_none() && {
         #[cfg(test)]
         {
-            std::env::var_os("FL_HOST_SOCK").is_some()
+            crate::runtime_context::pinned_endpoint().is_some()
+                || std::env::var_os("FL_HOST_SOCK").is_some()
         }
         #[cfg(not(test))]
         {
@@ -2716,6 +2719,7 @@ fn deliver_resolved_claude_host(
         text,
         opts,
         Some((host.client, host.stream, host.is_pty)),
+        None,
         None,
     )
 }
@@ -2897,11 +2901,16 @@ fn composer_unlocated_error() -> String {
     )
 }
 
+const COMPOSER_SESSION_BUSY: &str =
+    " session_busy: Claude session is not idle; holding delivery without sending keys";
+
 /// Claude session record is not in a deliverable status (#545-3).
 fn composer_session_busy_error() -> String {
-    format!(
-        "{COMPOSER_OCCUPIED_BY_NON_WIRE_INPUT_PREFIX} session_busy: Claude session is not idle; holding delivery without sending keys"
-    )
+    format!("{COMPOSER_OCCUPIED_BY_NON_WIRE_INPUT_PREFIX}{COMPOSER_SESSION_BUSY}")
+}
+
+pub(crate) fn is_composer_session_busy_error(err: &str) -> bool {
+    err.strip_prefix(COMPOSER_OCCUPIED_BY_NON_WIRE_INPUT_PREFIX) == Some(COMPOSER_SESSION_BUSY)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4152,7 +4161,7 @@ fn deliver_via_tmux_paste_with_opts(
     text: &str,
     opts: TmuxPasteOptions<'_>,
 ) -> Result<(), String> {
-    deliver_via_tmux_paste_with_resolved_host(target, text, opts, None, None)
+    deliver_via_tmux_paste_with_resolved_host(target, text, opts, None, None, None)
 }
 
 #[cfg(test)]
@@ -4397,10 +4406,16 @@ fn deliver_via_tmux_paste_with_resolved_host(
         bool,
     )>,
     bound_validate: Option<&dyn Fn() -> Result<(), String>>,
+    recovery: Option<&RecoveryPasteGuard<'_>>,
 ) -> Result<(), String> {
     let trimmed = text.trim();
     let raw_target = target;
-    let strict_claude = opts.is_claude_route && resolved.is_some();
+    if let Some(recovery) = recovery
+        && !resolved.as_ref().is_some_and(|(_, _, is_pty)| *is_pty)
+    {
+        return recovery.refuse(FenceRecoveryOutcome::HostedBindingUnavailable);
+    }
+    let strict_claude = opts.is_claude_route && resolved.is_some() && recovery.is_none();
     let capture_claude = if strict_claude && bound_validate.is_some() {
         capture_bound_claude_composer
     } else {
@@ -4430,7 +4445,14 @@ fn deliver_via_tmux_paste_with_resolved_host(
         let grant = client_cell
             .borrow_mut()
             .claim_controller(stream.clone())
-            .map_err(|e| format!("failed to claim fl-host controller for {target}: {e}"))?;
+            .map_err(|e| {
+                if let Some(recovery) = recovery {
+                    recovery
+                        .permission
+                        .set(Err(FenceRecoveryOutcome::HostedBindingUnavailable));
+                }
+                format!("failed to claim fl-host controller for {target}: {e}")
+            })?;
         let mut route_keys = vec![format!("host:{}", stream.session.as_str())];
         let target_key = format!("target:{raw_target}");
         if !route_keys.contains(&target_key) {
@@ -4449,7 +4471,7 @@ fn deliver_via_tmux_paste_with_resolved_host(
             verify_submission: opts.verify_submission,
             raw_text: None,
         };
-        return execute_verified_paste_delivery(
+        let delivery = execute_verified_paste_delivery(
             &spec,
             trimmed,
             std::thread::sleep,
@@ -4458,7 +4480,9 @@ fn deliver_via_tmux_paste_with_resolved_host(
                     return None;
                 }
                 let mut client = client_cell.borrow_mut();
-                let screen = if strict_claude {
+                let screen = if let Some(recovery) = recovery {
+                    recovery.observe(capture_bound_host_screen(&mut client, &stream))
+                } else if strict_claude {
                     capture_claude(&mut client, &stream)
                 } else {
                     capture_host_rendered_screen(&mut client, &stream)
@@ -4478,6 +4502,10 @@ fn deliver_via_tmux_paste_with_resolved_host(
                         return None;
                     }
                     screen.map(ScreenCapture::from_rendered_screen)
+                } else if let Some(recovery) = recovery {
+                    recovery
+                        .observe(capture_bound_host_screen(&mut client, &stream))
+                        .map(ScreenCapture::from_rendered_screen)
                 } else {
                     capture_host_rendered_screen(&mut client, &stream)
                         .map(ScreenCapture::from_rendered_screen)
@@ -4522,6 +4550,11 @@ fn deliver_via_tmux_paste_with_resolved_host(
                     trimmed.as_bytes().to_vec()
                 };
                 if opts.bracketed || !trimmed.is_empty() {
+                    if let Some(recovery) = recovery {
+                        let screen =
+                            capture_bound_host_screen(&mut client_cell.borrow_mut(), &stream);
+                        recovery.authorize_write(screen.as_ref(), None)?;
+                    }
                     let outcome = client_cell
                         .borrow_mut()
                         .write_raw(stream.clone(), grant.lease, payload)
@@ -4558,6 +4591,13 @@ fn deliver_via_tmux_paste_with_resolved_host(
                         .map_err(|err| format!("prompt submission unconfirmed: {err}"))?;
                     validate()?;
                 }
+                if let Some(recovery) = recovery {
+                    if !payload_written.get() {
+                        return recovery.refuse(FenceRecoveryOutcome::Inconclusive);
+                    }
+                    let screen = capture_bound_host_screen(&mut client_cell.borrow_mut(), &stream);
+                    recovery.authorize_write(screen.as_ref(), Some(trimmed))?;
+                }
                 let outcome = client_cell
                     .borrow_mut()
                     .write_raw(stream.clone(), grant.lease, b"\r".to_vec())
@@ -4571,6 +4611,14 @@ fn deliver_via_tmux_paste_with_resolved_host(
             || {},
             |_| {},
         );
+        if recovery.is_some_and(|guard| guard.permission.get() == Ok(false))
+            && let Some(wire_id) = extract_wire_message_id(trimmed)
+        {
+            // A concurrent ACK authorizes no retry of a payload left in the
+            // composer. Do not let a later normal push flush this draft.
+            remove_unconfirmed_wire_delivery(&spec.route_keys, wire_id);
+        }
+        return delivery;
     }
 
     let tmux = tmux_bin();
@@ -5588,6 +5636,20 @@ fn screen_has_dialog_or_menu_markers_with_context(
     route_keys: &[String],
 ) -> bool {
     let cleaned = normalize_terminal_screen(screen);
+    normalized_screen_has_dialog_or_menu_markers(
+        &cleaned,
+        post_paste_trimmed,
+        post_paste_raw,
+        route_keys,
+    )
+}
+
+fn normalized_screen_has_dialog_or_menu_markers(
+    cleaned: &str,
+    post_paste_trimmed: Option<&str>,
+    post_paste_raw: Option<&str>,
+    route_keys: &[String],
+) -> bool {
     let lines: Vec<&str> = cleaned.lines().collect();
     if lines.is_empty() {
         return false;
@@ -6046,38 +6108,43 @@ fn is_codex_footer_line(line: &str) -> bool {
 fn codex_composer_state(screen: &str) -> CodexComposerState {
     let cleaned = normalize_terminal_screen(screen);
     let lines: Vec<&str> = cleaned.lines().collect();
-    let Some(prompt_idx) = lines
+    let Some(composer) = codex_composer_lines(&lines) else {
+        return CodexComposerState::Unlocatable;
+    };
+    let first = strip_composer_prompt_prefix(composer[0]).trim();
+    if (first.is_empty() || first == CODEX_GHOST_PLACEHOLDER)
+        && composer[1..].iter().all(|line| line.trim().is_empty())
+    {
+        CodexComposerState::Empty
+    } else {
+        CodexComposerState::Occupied
+    }
+}
+
+fn codex_composer_lines<'a>(lines: &'a [&'a str]) -> Option<&'a [&'a str]> {
+    Some(&lines[codex_composer_range(lines)?])
+}
+
+fn codex_composer_range(lines: &[&str]) -> Option<std::ops::Range<usize>> {
+    let prompt = lines
         .iter()
-        .rposition(|l| l.trim_start().starts_with("› ") || l.trim_start() == "›")
-    else {
-        return CodexComposerState::Unlocatable;
-    };
-    let Some(last) = lines.iter().rposition(|l| !l.trim().is_empty()) else {
-        return CodexComposerState::Unlocatable;
-    };
-    if last <= prompt_idx {
-        return CodexComposerState::Unlocatable;
+        .rposition(|line| line.trim_start().starts_with("› ") || line.trim_start() == "›")?;
+    let last = lines.iter().rposition(|line| !line.trim().is_empty())?;
+    if last <= prompt {
+        return None;
     }
     let mut footer_start = last;
     while footer_start > 0 && !lines[footer_start - 1].trim().is_empty() {
         footer_start -= 1;
     }
-    if footer_start <= prompt_idx || !(footer_start..=last).all(|i| is_codex_footer_line(lines[i]))
+    if footer_start <= prompt
+        || !lines[footer_start..=last]
+            .iter()
+            .all(|line| is_codex_footer_line(line))
     {
-        return CodexComposerState::Unlocatable;
+        return None;
     }
-    if lines[prompt_idx + 1..footer_start]
-        .iter()
-        .any(|l| !l.trim().is_empty())
-    {
-        return CodexComposerState::Occupied;
-    }
-    let first = strip_composer_prompt_prefix(lines[prompt_idx]).trim();
-    if first.is_empty() || first == CODEX_GHOST_PLACEHOLDER {
-        CodexComposerState::Empty
-    } else {
-        CodexComposerState::Occupied
-    }
+    Some(prompt..footer_start)
 }
 
 fn composer_located_for_style(screen: &str, style: ComposerStyle) -> bool {
@@ -7142,6 +7209,546 @@ pub fn claude_route_live_pane(route: &VendorRoute) -> Option<String> {
     })
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RecoveryReadiness {
+    Ready(RecoveryTarget),
+    Hold(FenceRecoveryOutcome),
+}
+
+#[derive(Debug)]
+enum RecoveryPasteError {
+    Refused(FenceRecoveryOutcome),
+    AlreadyResolved,
+    Uncertain(PushError),
+}
+
+/// Carry typed refusal and mutation evidence through the shared paste executor.
+struct RecoveryPasteGuard<'a> {
+    route: &'a VendorRoute,
+    still_current: &'a dyn Fn() -> Result<bool, FenceRecoveryOutcome>,
+    permission: std::cell::Cell<Result<bool, FenceRecoveryOutcome>>,
+    write_attempted: std::cell::Cell<bool>,
+}
+
+impl<'a> RecoveryPasteGuard<'a> {
+    fn new(
+        route: &'a VendorRoute,
+        still_current: &'a dyn Fn() -> Result<bool, FenceRecoveryOutcome>,
+    ) -> Self {
+        Self {
+            route,
+            still_current,
+            permission: std::cell::Cell::new(Ok(true)),
+            write_attempted: std::cell::Cell::default(),
+        }
+    }
+
+    fn observe(&self, screen: Option<RenderedCursorScreen>) -> Option<RenderedCursorScreen> {
+        if self.permission.get() == Ok(true) {
+            match screen.as_ref() {
+                None => self
+                    .permission
+                    .set(Err(FenceRecoveryOutcome::HostedCaptureUnavailable)),
+                Some(screen)
+                    if !self.write_attempted.get()
+                        && retained_fence_screen_gate(self.route, &screen.contents)
+                            == Err(FenceRecoveryOutcome::VendorSignIn) =>
+                {
+                    self.permission.set(Err(FenceRecoveryOutcome::VendorSignIn));
+                }
+                _ => {}
+            }
+        }
+        screen
+    }
+
+    fn refuse(&self, reason: FenceRecoveryOutcome) -> Result<(), String> {
+        self.permission.set(Err(reason));
+        Err("retained fence recovery could not confirm hosted input".into())
+    }
+
+    fn authorize_write(
+        &self,
+        screen: Option<&RenderedCursorScreen>,
+        payload: Option<&str>,
+    ) -> Result<(), String> {
+        let checked = (|| {
+            if !self.permission.get()? {
+                return Ok(false);
+            }
+            let screen = screen.ok_or(FenceRecoveryOutcome::HostedCaptureUnavailable)?;
+            match payload {
+                Some(payload) => retained_fence_submit_proven(self.route, screen, payload)?,
+                None => {
+                    retained_fence_screen_readiness(
+                        self.route,
+                        &screen.contents,
+                        screen.cursor_state(),
+                    )?;
+                }
+            }
+            (self.still_current)()
+        })();
+        self.permission.set(checked);
+        if checked != Ok(true) {
+            return Err("retained fence recovery could not authorize hosted input".into());
+        }
+        // Record before issuing the RPC. A connection error cannot prove that
+        // the server did not consume the request.
+        self.write_attempted.set(true);
+        Ok(())
+    }
+
+    fn finish(&self, delivery: Result<(), String>) -> Result<(), RecoveryPasteError> {
+        delivery.map_err(|err| match self.permission.get() {
+            Ok(false) => RecoveryPasteError::AlreadyResolved,
+            _ if self.write_attempted.get() => {
+                RecoveryPasteError::Uncertain(PushError::Failed(err))
+            }
+            permission => RecoveryPasteError::Refused(
+                permission
+                    .err()
+                    .unwrap_or(FenceRecoveryOutcome::Inconclusive),
+            ),
+        })
+    }
+}
+
+/// A successful recovery probe retains the exact fl-host stream. The replay
+/// path must not discover a substitute route or fall back to another transport.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RecoveryTarget {
+    Hosted {
+        stream: fl_host_proto::StreamId,
+        hosted_id: String,
+    },
+    #[cfg(test)]
+    FixtureWebhook,
+}
+
+impl RecoveryTarget {
+    fn dispatch(
+        self,
+        entry: &RouteEntry,
+        message: &WireMessage,
+        still_current: &dyn Fn() -> Result<bool, FenceRecoveryOutcome>,
+    ) -> Result<DeliveryStatus, RecoveryPasteError> {
+        use FenceRecoveryOutcome::{HostedBindingUnavailable, HostedCaptureUnavailable};
+        use RecoveryPasteError::Refused;
+
+        if !still_current().map_err(Refused)? {
+            return Err(RecoveryPasteError::AlreadyResolved);
+        }
+        let (stream, hosted_id) = match self {
+            Self::Hosted { stream, hosted_id } => (stream, hosted_id),
+            #[cfg(test)]
+            Self::FixtureWebhook => {
+                return push_to_route(&entry.route, message)
+                    .map(|()| DeliveryStatus::Acked)
+                    .map_err(RecoveryPasteError::Uncertain);
+            }
+        };
+        if entry.hosted_id.as_deref() != Some(hosted_id.as_str()) {
+            return Err(Refused(HostedBindingUnavailable));
+        }
+        let mut client = connect_recovery_host().ok_or(Refused(HostedBindingUnavailable))?;
+        if !client
+            .check_session_owner(stream.clone(), &hosted_id)
+            .unwrap_or(false)
+        {
+            return Err(Refused(HostedBindingUnavailable));
+        }
+        let route = &entry.route;
+        let screen = capture_bound_host_screen(&mut client, &stream)
+            .ok_or(Refused(HostedCaptureUnavailable))?;
+        retained_fence_screen_readiness(route, &screen.contents, screen.cursor_state())
+            .map_err(Refused)?;
+        let target = stream.session.clone();
+        let vendor = route.canonical_vendor();
+        let guard = RecoveryPasteGuard::new(route, still_current);
+        let delivery = deliver_via_tmux_paste_with_resolved_host(
+            target.as_str(),
+            &sanitize_for_paste(&format_push_message(message)),
+            TmuxPasteOptions {
+                bracketed: !matches!(vendor, "muse" | "grok"),
+                verify_submission: true,
+                session_id: route.session_identity().map(|(_, id)| id),
+                is_muse_route: vendor == "muse",
+                is_claude_route: vendor == "claude",
+                composer_style: ComposerStyle::for_route(route),
+            },
+            Some((client, stream, true)),
+            None,
+            Some(&guard),
+        );
+        guard.finish(delivery)?;
+        Ok(if vendor == "codex" {
+            DeliveryStatus::Delivered
+        } else {
+            DeliveryStatus::Acked
+        })
+    }
+}
+
+/// Examine a route using read-only dispatch liveness and a rendered capture
+/// from the exact host session named by the trusted runtime record.
+pub(crate) fn probe_retained_fence_readiness(
+    entry: &RouteEntry,
+    recipient: &str,
+    host_session_id: Option<&str>,
+    home_override: Option<&Path>,
+    runtime_leader_pid: Option<u32>,
+) -> RecoveryReadiness {
+    use FenceRecoveryOutcome::{
+        DeadRoute, HostProbesDisabled, HostedBindingUnavailable, HostedCaptureUnavailable,
+        HostedLeaderPidUnavailable, UnsupportedRoute,
+    };
+    use RecoveryReadiness::Hold;
+
+    if crate::identity::explicit_route_entry_is_dead(entry, Some(recipient), false) {
+        return Hold(DeadRoute);
+    }
+    if !matches!(
+        entry.route.canonical_vendor(),
+        "claude" | "codex" | "muse" | "grok"
+    ) {
+        return Hold(UnsupportedRoute);
+    }
+    if !crate::identity::host_probes_allowed(home_override) {
+        return Hold(HostProbesDisabled);
+    }
+    let (Some(session_id), Some(hosted_id)) = (host_session_id, entry.hosted_id.as_deref()) else {
+        return Hold(HostedBindingUnavailable);
+    };
+    use crate::identity::parse_hosted_identity;
+    let expected = (
+        entry.route.canonical_vendor().to_owned(),
+        recipient.to_owned(),
+    );
+    if parse_hosted_identity(session_id).as_ref() != Ok(&expected)
+        || parse_hosted_identity(hosted_id).as_ref() != Ok(&expected)
+    {
+        return Hold(HostedBindingUnavailable);
+    }
+    let Some(runtime_leader_pid) = runtime_leader_pid.filter(|pid| *pid != 0) else {
+        return Hold(HostedLeaderPidUnavailable);
+    };
+    let Some(mut client) = connect_recovery_host() else {
+        return Hold(HostedBindingUnavailable);
+    };
+    let Ok(sessions) = client.list_sessions() else {
+        return Hold(HostedBindingUnavailable);
+    };
+    let stream = match retained_fence_host_stream(&sessions, session_id, runtime_leader_pid) {
+        Ok(stream) => stream,
+        Err(status) => return Hold(status),
+    };
+    if !client
+        .check_session_owner(stream.clone(), hosted_id)
+        .unwrap_or(false)
+    {
+        return Hold(HostedBindingUnavailable);
+    }
+    let Some(screen) = capture_bound_host_screen(&mut client, stream) else {
+        return Hold(HostedCaptureUnavailable);
+    };
+    match retained_fence_screen_readiness(&entry.route, &screen.contents, screen.cursor_state()) {
+        Ok(()) => RecoveryReadiness::Ready(RecoveryTarget::Hosted {
+            stream: stream.clone(),
+            hosted_id: hosted_id.to_string(),
+        }),
+        Err(status) => Hold(status),
+    }
+}
+
+fn connect_recovery_host() -> Option<fl_host_proto::BlockingHostClient> {
+    let endpoint = crate::runtime_context::host_endpoint().ok()?;
+    fl_host_proto::BlockingHostClient::connect(&endpoint).ok()
+}
+
+fn retained_fence_host_stream<'a>(
+    sessions: &'a [fl_host_proto::SessionSummary],
+    target: &str,
+    runtime_leader_pid: u32,
+) -> Result<&'a fl_host_proto::StreamId, FenceRecoveryOutcome> {
+    use FenceRecoveryOutcome::{DeadRoute, HostedBindingUnavailable, Inconclusive};
+    use fl_host_proto::{ChildState, InputState, SessionMode};
+
+    let mut matches = sessions
+        .iter()
+        .filter(|s| s.stream.session.as_str() == target);
+    let session = matches.next().ok_or(DeadRoute)?;
+    if matches.next().is_some() {
+        return Err(HostedBindingUnavailable);
+    }
+    let ChildState::Running(child) = &session.state else {
+        return Err(DeadRoute);
+    };
+    if child.pid != runtime_leader_pid {
+        return Err(HostedBindingUnavailable);
+    }
+    if session.mode != SessionMode::Pty
+        || session.input != InputState::Writable
+        || child.input != InputState::Writable
+        || child.session != session.stream.session
+        || child.session_epoch != session.stream.epoch
+    {
+        return Err(Inconclusive);
+    }
+    Ok(&session.stream)
+}
+
+fn retained_fence_screen_readiness(
+    route: &VendorRoute,
+    contents: &str,
+    cursor: Option<CursorState>,
+) -> Result<(), FenceRecoveryOutcome> {
+    retained_fence_screen_gate(route, contents)?;
+    let vendor = route.canonical_vendor();
+    let ready = if vendor == "grok" && !composer_region_located(contents) {
+        // Grok also uses an unframed > prompt. Its cursor must be at an
+        // empty trailing prompt. Blank captures alone never prove readiness.
+        let cleaned = normalize_terminal_screen(contents);
+        cleaned
+            .lines()
+            .enumerate()
+            .filter(|(_, line)| !line.trim().is_empty())
+            .last()
+            .is_some_and(|(row, line)| {
+                let prompt_col = line.chars().take_while(|c| c.is_whitespace()).count() + 1;
+                line.trim() == ">"
+                    && cursor.is_some_and(|cursor| {
+                        usize::from(cursor.row) == row
+                            && (prompt_col..=prompt_col + 1).contains(&usize::from(cursor.col))
+                    })
+            })
+    } else {
+        let style = if vendor == "grok" {
+            ComposerStyle::Ruled
+        } else {
+            ComposerStyle::for_route(route)
+        };
+        match probe_composer_ready_from_screen(contents, cursor, &[], style, vendor == "muse") {
+            Some(true) => true,
+            Some(false) => return Err(FenceRecoveryOutcome::ComposerDraft),
+            None => false,
+        }
+    };
+    if ready {
+        Ok(())
+    } else {
+        Err(FenceRecoveryOutcome::Inconclusive)
+    }
+}
+
+/// A blocker recognized on a hosted vendor's active terminal screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostedScreenBlocker {
+    VendorSignIn,
+    BlockingDialog,
+}
+
+/// Classifies a rendered screen for a canonical vendor name without sending any input.
+/// A missing result means no blocker was recognized, including for unsupported vendors.
+pub fn classify_hosted_screen_blocker(vendor: &str, contents: &str) -> Option<HostedScreenBlocker> {
+    if !supports_hosted_screen_blockers(vendor) {
+        return None;
+    }
+    classify_normalized_screen_blocker(vendor, &normalize_terminal_screen(contents), false)
+}
+
+fn supports_hosted_screen_blockers(vendor: &str) -> bool {
+    matches!(vendor, "codex" | "claude" | "muse" | "grok")
+}
+
+fn classify_normalized_screen_blocker(
+    vendor: &str,
+    cleaned: &str,
+    include_ambiguous_markers: bool,
+) -> Option<HostedScreenBlocker> {
+    // Wire must withhold input on ambiguity. A hosted status needs corroborating UI rows.
+    if (vendor == "codex" && codex_screen_is_onboarding(cleaned))
+        || (include_ambiguous_markers
+            && cleaned
+                .lines()
+                .any(|line| line.trim().eq_ignore_ascii_case("Sign in to continue")))
+    {
+        return Some(HostedScreenBlocker::VendorSignIn);
+    }
+    if ((include_ambiguous_markers
+        || (vendor == "claude" && claude_screen_is_workspace_trust_dialog(cleaned)))
+        && normalized_screen_has_dialog_or_menu_markers(cleaned, None, None, &[]))
+        || (vendor == "muse" && muse_screen_is_hook_trust_dialog(cleaned))
+    {
+        return Some(HostedScreenBlocker::BlockingDialog);
+    }
+    None
+}
+
+fn retained_fence_screen_gate(
+    route: &VendorRoute,
+    contents: &str,
+) -> Result<(), FenceRecoveryOutcome> {
+    use FenceRecoveryOutcome::{
+        BlankScreen, DialogWaiting, SeatBusy, UnsupportedRoute, VendorSignIn,
+    };
+
+    let vendor = route.canonical_vendor();
+    if !supports_hosted_screen_blockers(vendor) {
+        return Err(UnsupportedRoute);
+    }
+    let cleaned = normalize_terminal_screen(contents);
+    if cleaned.trim().is_empty() {
+        return Err(BlankScreen);
+    }
+    match classify_normalized_screen_blocker(vendor, &cleaned, true) {
+        Some(HostedScreenBlocker::VendorSignIn) => return Err(VendorSignIn),
+        Some(HostedScreenBlocker::BlockingDialog) => return Err(DialogWaiting),
+        None => {}
+    }
+    let busy = match vendor {
+        "claude" => claude_screen_is_busy_main(contents),
+        "codex" => return retained_fence_codex_gate(&cleaned),
+        "grok" => cleaned
+            .lines()
+            .any(|line| matches!(line.trim(), "Thinking..." | "Thinking…")),
+        _ => false,
+    };
+    if busy {
+        return Err(SeatBusy);
+    }
+    Ok(())
+}
+
+fn retained_fence_codex_gate(cleaned: &str) -> Result<(), FenceRecoveryOutcome> {
+    use FenceRecoveryOutcome::{Inconclusive, SeatBusy};
+
+    let lines: Vec<_> = cleaned.lines().collect();
+    let composer = codex_composer_range(&lines);
+    // Scan the whole screen when the composer cannot be located. A located
+    // composer bounds the scan so text in an owner's draft is excluded.
+    let status_rows = &lines[..composer.as_ref().map_or(lines.len(), |range| range.start)];
+    if status_rows.iter().any(|row| {
+        let status = row.trim();
+        status.starts_with("• Working (")
+            || status.starts_with("• Working...")
+            || status.starts_with("• Working…")
+            || (row.starts_with("• ") && row.trim_end().ends_with("esc to interrupt)"))
+    }) {
+        return Err(SeatBusy);
+    }
+    composer.map(|_| ()).ok_or(Inconclusive)
+}
+
+fn codex_screen_is_onboarding(cleaned: &str) -> bool {
+    let lines: Vec<_> = cleaned.lines().collect();
+    // Onboarding replaces the composer. Match the heading and choice as
+    // standalone UI rows, so references in an ordinary reply are not a login screen.
+    codex_composer_range(&lines).is_none()
+        && lines
+            .iter()
+            .rposition(|line| {
+                matches!(
+                    line.trim(),
+                    "Welcome to Codex" | "Welcome to Codex, OpenAI's command-line coding agent"
+                )
+            })
+            .is_some_and(|heading| {
+                lines[heading + 1..].iter().take(12).any(|line| {
+                    line.trim_start().trim_start_matches(['>', '›']).trim()
+                        == "1. Sign in with ChatGPT"
+                })
+            })
+}
+
+fn claude_screen_is_workspace_trust_dialog(cleaned: &str) -> bool {
+    let mut lines = cleaned
+        .lines()
+        .rev()
+        .map(|line| {
+            strip_dialog_box_prefix(line)
+                .trim_end()
+                .trim_end_matches(['│', '┃'])
+                .trim_end()
+        })
+        .filter(|line| !line.is_empty())
+        .take(12);
+    lines.next() == Some("Enter to confirm · Esc to cancel")
+        && lines
+            .by_ref()
+            .take(2)
+            .map(|line| line.trim_start_matches('❯').trim_start())
+            .eq(["Yes, I trust this folder", "No, exit"])
+        && lines.any(|line| line.starts_with("Quick safety check:"))
+}
+
+fn muse_screen_is_hook_trust_dialog(cleaned: &str) -> bool {
+    // Muse places its hook-trust choices at the bottom, separated from the title by blank rows.
+    let mut lines = cleaned
+        .lines()
+        .rev()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .take(12);
+    lines.next() == Some("Up/Down to choose, Enter to confirm. Esc continues without trusting.")
+        && lines
+            .by_ref()
+            .take(3)
+            .map(|line| line.strip_prefix("⟩ ").unwrap_or(line))
+            .eq([
+                "3. Continue without trusting",
+                "2. Trust all and continue",
+                "1. Review hooks",
+            ])
+        && lines.any(|line| line == "Review plugin hooks")
+}
+
+fn retained_fence_submit_proven(
+    route: &VendorRoute,
+    screen: &RenderedCursorScreen,
+    payload: &str,
+) -> Result<(), FenceRecoveryOutcome> {
+    let contents = &screen.contents;
+    let cleaned = normalize_terminal_screen(contents);
+    let mut lines: Vec<&str> = cleaned.lines().collect();
+    let vendor = route.canonical_vendor();
+    let ruled_range = || {
+        let (composer, top) = composer_region_lines(&lines)?;
+        Some(top + 1..top + 1 + composer.len())
+    };
+    let composer = match vendor {
+        "codex" => codex_composer_range(&lines),
+        "grok" => ruled_range().or_else(|| {
+            // A wrapped Wire header can extend beyond the generic ruleless tail.
+            lines
+                .iter()
+                .rposition(|line| line.trim_start().starts_with("> "))
+                .map(|prompt| prompt..lines.len())
+        }),
+        _ => ruled_range(),
+    };
+    let delivery = UnconfirmedWireDelivery::from_payload(payload);
+    if let Some(composer) = composer
+        && let Some((compact, _)) =
+            build_compact_from_composer_slice(&lines[composer.clone()], false)
+        && match_delivery_prefix(&compact, &delivery, false)
+            .iter()
+            .any(|prefix| prefix.rest.is_empty())
+    {
+        // The visible composer exactly matches this Wire paste. Inspect the
+        // surrounding UI with an empty prompt so mail text cannot mimic it.
+        let empty_composer: &[&str] = match vendor {
+            "codex" => &["› ", ""], // Keep the blank separator above the footer.
+            "grok" => &["> "],
+            _ => &["❯ "],
+        };
+        lines.splice(composer, empty_composer.iter().copied());
+        return retained_fence_screen_gate(route, &lines.join("\n"));
+    }
+    retained_fence_screen_readiness(route, contents, screen.cursor_state())?;
+    Err(FenceRecoveryOutcome::Inconclusive)
+}
+
 /// Passively inspect `route`'s terminal composer without sending any keys.
 ///
 /// Returns `Some(true)` when a rendered capture shows no dialog/menu markers and either an empty
@@ -7489,6 +8096,7 @@ pub fn dispatch_bound_claude_operator_prompt(
         opts,
         Some((host.client, host.stream, host.is_pty)),
         Some(&validate),
+        None,
     )
     .map_err(ClaudeBoundError::Delivery)
 }
@@ -7706,6 +8314,7 @@ pub fn dispatch_message_for_store<S: MessageStore>(
         now,
         None,
         &mut DispatchReport::default(),
+        None,
         dispatch_to_route_for_recipient_with_push_error,
     )
     .0
@@ -7750,8 +8359,45 @@ pub(crate) fn dispatch_message_for_recipient_with_report<S: MessageStore>(
         now,
         Some(recipient),
         report,
+        None,
         dispatch_to_route_for_recipient_with_push_error,
     )
+}
+
+/// Keep the receipt policy of normal dispatch while confining a timed replay
+/// to the exact target positively identified by the recovery probe.
+/// The callback returns false if a concurrent receipt transition already resolved delivery.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn dispatch_message_for_recipient_on_recovery_target<S: MessageStore>(
+    store: &S,
+    msg: &WireMessage,
+    now: At,
+    recipient: &str,
+    report: &mut DispatchReport,
+    entry: &RouteEntry,
+    target: RecoveryTarget,
+    still_current: impl Fn() -> Result<bool, FenceRecoveryOutcome>,
+) -> Result<(Vec<DeliveryReceipt>, Option<bool>), FenceRecoveryOutcome> {
+    let mut refusal = None;
+    let dispatched = dispatch_message_selected_with_status(
+        store,
+        &mut RouteTable::default(),
+        None,
+        msg,
+        now,
+        Some(recipient),
+        report,
+        Some(FixedRecoveryDispatch {
+            entry,
+            deliver: &mut |message| target.clone().dispatch(entry, message, &still_current),
+            refusal: &mut refusal,
+        }),
+        dispatch_to_route_for_recipient_with_push_error,
+    );
+    match refusal {
+        Some(reason) => Err(reason),
+        None => Ok(dispatched),
+    }
 }
 
 /// Unit fault tests observe the same selected pass without vendor I/O. This
@@ -7800,12 +8446,19 @@ fn dispatch_message_selected<S: MessageStore>(
         now,
         recipient,
         report,
+        None,
         |route, _recipient, msg| {
             dispatch(route, msg)
                 .map(|()| DeliveryStatus::Acked)
                 .map_err(PushError::Failed)
         },
     )
+}
+
+struct FixedRecoveryDispatch<'a> {
+    entry: &'a RouteEntry,
+    deliver: &'a mut dyn FnMut(&WireMessage) -> Result<DeliveryStatus, RecoveryPasteError>,
+    refusal: &'a mut Option<FenceRecoveryOutcome>,
 }
 
 // The private callback keeps fault tests on this same pass without invoking vendor I/O.
@@ -7819,6 +8472,7 @@ fn dispatch_message_selected_with_status<S: MessageStore>(
     now: At,
     recipient: Option<&str>,
     report: &mut DispatchReport,
+    mut recovery: Option<FixedRecoveryDispatch<'_>>,
     mut dispatch: impl FnMut(
         &VendorRoute,
         Option<&str>,
@@ -7831,6 +8485,16 @@ fn dispatch_message_selected_with_status<S: MessageStore>(
     };
     if let Some(recipient) = recipient {
         receipts.retain(|receipt| receipt.recipient_name.eq_ignore_ascii_case(recipient));
+    }
+    if recovery.is_some() && receipts.len() != 1 {
+        // Imports key receipts by recipient ID. Different IDs can share the
+        // selected name, but recovery must make at most one delivery call.
+        report.record_failure(if receipts.is_empty() {
+            FailureStage::InitialReceiptReadMissing
+        } else {
+            FailureStage::InitialReceiptReadAmbiguous
+        });
+        return (Vec::new(), None);
     }
     let deliverable = |rcpt: &DeliveryReceipt| {
         !matches!(
@@ -7851,7 +8515,7 @@ fn dispatch_message_selected_with_status<S: MessageStore>(
         .any(|rcpt| routable(rcpt) && routes.get(&rcpt.recipient_name).is_none());
     let stale_table =
         || routes.discovery_due(ROUTE_REDISCOVERY_INTERVAL) && receipts.iter().any(routable);
-    if home_override.is_some() || missing_route || stale_table() {
+    if recovery.is_none() && (home_override.is_some() || missing_route || stale_table()) {
         routes.discover_routes(home_override, now.clone());
     }
     let allow_probes = crate::identity::host_probes_allowed(home_override);
@@ -7861,17 +8525,41 @@ fn dispatch_message_selected_with_status<S: MessageStore>(
         if !deliverable(&rcpt) {
             continue;
         }
-        let Some(entry) = routes.get(&rcpt.recipient_name).cloned() else {
+        let entry = if let Some(recovery) = &recovery {
+            Some(recovery.entry)
+        } else {
+            routes.get(&rcpt.recipient_name)
+        };
+        let Some(entry) = entry.cloned() else {
             continue;
         };
-        attempted = true;
         // Keys may have been sent by either dispatch call; a later zero-key hold must not
         // erase that (duplicate-delivery risk), so track it across the re-route retry.
         let mut may_have_sent_keys = false;
         let slot = report.record_call_started(&entry);
-        let mut pushed = dispatch(&entry.route, Some(rcpt.recipient_name.as_str()), msg);
+        let mut pushed = if let Some(recovery) = &mut recovery {
+            match (recovery.deliver)(msg) {
+                Ok(status) => Ok(status),
+                Err(RecoveryPasteError::Uncertain(err)) => {
+                    may_have_sent_keys = true;
+                    Err(err)
+                }
+                Err(RecoveryPasteError::AlreadyResolved) => {
+                    report.record_call_finished(slot, DispatchCallOutcome::ReturnedOk);
+                    continue;
+                }
+                Err(RecoveryPasteError::Refused(reason)) => {
+                    report.record_call_finished(slot, DispatchCallOutcome::ReturnedError);
+                    *recovery.refusal = Some(reason);
+                    break;
+                }
+            }
+        } else {
+            dispatch(&entry.route, Some(rcpt.recipient_name.as_str()), msg)
+        };
+        attempted = true;
         if let Err(ref e) = pushed {
-            may_have_sent_keys = matches!(e, PushError::Failed(_))
+            may_have_sent_keys |= matches!(e, PushError::Failed(_))
                 && !is_composer_occupied_zero_keys_error(e.as_str());
         }
         report.record_call_finished(
@@ -7900,7 +8588,8 @@ fn dispatch_message_selected_with_status<S: MessageStore>(
                 });
                 // The session may have restarted since this route was learned (a new pid, socket or
                 // pane). Rescan for this persona, and push once more only when its route changed.
-                if routes.refresh_persona(&rcpt.recipient_name, home_override, now.clone())
+                if recovery.is_none()
+                    && routes.refresh_persona(&rcpt.recipient_name, home_override, now.clone())
                     && let Some(fresh) = routes.get(&rcpt.recipient_name).cloned()
                 {
                     let slot = report.record_call_started(&fresh);
@@ -20845,6 +21534,843 @@ exit 1"#,
         )
         .expect_err("dialog screen must fail closed on ruled vendor");
         assert!(is_composer_occupied_zero_keys_error(&err), "got: {err}");
+    }
+
+    // Final rows of two busy Codex 0.172.0 captures from fl host capture --rendered.
+    // Transcript and private footer details omitted. Blank-row padding normalized.
+    const CODEX_BUSY_CAPTURE: &str =
+        include_str!("../tests/fixtures/codex-0.172.0-busy-standard.txt");
+    const CODEX_BUSY_WARNING_CAPTURE: &str =
+        include_str!("../tests/fixtures/codex-0.172.0-busy-warning.txt");
+
+    // The same standard capture with all 40 terminal rows, including the transcript
+    // layout with its content and identifiers replaced.
+    const CODEX_BUSY_FULL_CAPTURE: &str =
+        include_str!("../tests/fixtures/codex-0.172.0-busy-full.txt");
+
+    #[test]
+    fn retained_fence_recovery_requires_a_located_ready_composer() {
+        let codex = VendorRoute::Codex {
+            thread_id: "thread".into(),
+            cwd: None,
+        };
+        let footer = "  GPT-6.1-Sol medium · ~/project\n  ← for agents · ? for shortcuts";
+        let idle = format!("› Ask Codex to do anything\n\n{footer}");
+        let draft = format!("› owner draft\n\n{footer}");
+        let busy = format!("• Working (4s · esc to interrupt)\n\n{idle}");
+        let busy_with_details = format!(
+            "• Working (4s · esc to interrupt)\n └ Reading source\n   and its tests\n\n{idle}"
+        );
+        let busy_with_tip = format!(
+            "• Working (4s · esc to interrupt)\n  └ Tip: Try /help.\n                                          Copying 5 chars…\n\n{idle}"
+        );
+        let busy_with_toast = format!(
+            "• Working (4s · esc to interrupt)\n                                          Copying 5 chars…\n\n{idle}"
+        );
+        let busy_with_different_header =
+            format!("• Compacting context (4s · esc to interrupt)\n\n{idle}");
+        let queued = "• Queued follow-up inputs\n  ↳ later\n    a wrapped input\n    shift+← edit last queued message";
+        let busy_with_approval_and_queue = format!(
+            "• Working (4s · esc to interrupt)\n └ Checking policy\n  └ Tip text\n\n  ! Approval needed in Robie [explorer]\n    /subagents to review requests\n\n{queued}\n\n{idle}"
+        );
+        let old_busy = format!("• Working…\nPrevious turn completed.\n\n{idle}");
+        let old_busy_with_indented_output =
+            format!("• Working…\n    Previous turn completed.\n\n{idle}");
+        let busy_with_separated_branches =
+            format!("• Working…\n\n └ Checking policy\n  └ Tip text\n\n{idle}");
+        let old_queue = format!("• Working…\n\n{queued}\nPrevious turn completed.\n\n{idle}");
+        let busy_with_blank_rows = format!("• Working...\n\n\n{idle}");
+        let busy_draft = format!("› owner draft\n  • Working...\n\n{footer}");
+        let unlocated_busy = format!("• Working...\n\n{footer}");
+        let sign_in =
+            "\x1b[1mWelcome to Codex\x1b[0m\n\n  › 1. Sign in with ChatGPT\n    2. Use an API key";
+        assert_eq!(CODEX_BUSY_FULL_CAPTURE.lines().count(), 40);
+        for (screen, expected) in [
+            (idle.as_str(), Ok(())),
+            (draft.as_str(), Err(FenceRecoveryOutcome::ComposerDraft)),
+            (busy.as_str(), Err(FenceRecoveryOutcome::SeatBusy)),
+            (
+                busy_with_details.as_str(),
+                Err(FenceRecoveryOutcome::SeatBusy),
+            ),
+            (busy_with_tip.as_str(), Err(FenceRecoveryOutcome::SeatBusy)),
+            (
+                busy_with_toast.as_str(),
+                Err(FenceRecoveryOutcome::SeatBusy),
+            ),
+            (
+                busy_with_different_header.as_str(),
+                Err(FenceRecoveryOutcome::SeatBusy),
+            ),
+            (
+                busy_with_approval_and_queue.as_str(),
+                Err(FenceRecoveryOutcome::SeatBusy),
+            ),
+            (old_busy.as_str(), Err(FenceRecoveryOutcome::SeatBusy)),
+            (
+                old_busy_with_indented_output.as_str(),
+                Err(FenceRecoveryOutcome::SeatBusy),
+            ),
+            (
+                busy_with_separated_branches.as_str(),
+                Err(FenceRecoveryOutcome::SeatBusy),
+            ),
+            (old_queue.as_str(), Err(FenceRecoveryOutcome::SeatBusy)),
+            (
+                busy_with_blank_rows.as_str(),
+                Err(FenceRecoveryOutcome::SeatBusy),
+            ),
+            (CODEX_BUSY_CAPTURE, Err(FenceRecoveryOutcome::SeatBusy)),
+            (CODEX_BUSY_FULL_CAPTURE, Err(FenceRecoveryOutcome::SeatBusy)),
+            (
+                CODEX_BUSY_WARNING_CAPTURE,
+                Err(FenceRecoveryOutcome::SeatBusy),
+            ),
+            (
+                busy_draft.as_str(),
+                Err(FenceRecoveryOutcome::ComposerDraft),
+            ),
+            (unlocated_busy.as_str(), Err(FenceRecoveryOutcome::SeatBusy)),
+            (footer, Err(FenceRecoveryOutcome::Inconclusive)),
+            ("", Err(FenceRecoveryOutcome::BlankScreen)),
+            (sign_in, Err(FenceRecoveryOutcome::VendorSignIn)),
+        ] {
+            assert_eq!(
+                retained_fence_screen_readiness(&codex, screen, None),
+                expected,
+                "{screen:?}"
+            );
+        }
+
+        let claude = VendorRoute::Claude {
+            pid: 0,
+            session_id: "session".into(),
+            socket_path: PathBuf::new(),
+            key_path: None,
+        };
+        assert_eq!(
+            retained_fence_screen_readiness(&claude, "", None),
+            Err(FenceRecoveryOutcome::BlankScreen)
+        );
+        let composer = "────────────────────\n❯ \n────────────────────";
+        assert_eq!(
+            retained_fence_screen_readiness(&claude, composer, None),
+            Ok(())
+        );
+        let busy = format!("{composer}\n  esc to interrupt");
+        assert_eq!(
+            retained_fence_screen_readiness(&claude, &busy, None),
+            Err(FenceRecoveryOutcome::SeatBusy)
+        );
+    }
+
+    #[test]
+    fn retained_fence_recovery_binds_ruleless_grok_prompt_to_cursor() {
+        let route = VendorRoute::Grok {
+            session_id: "session".into(),
+            cwd: None,
+            tmux_target: None,
+            tmux_pane: None,
+        };
+        let idle = "Grok 4\n> ";
+        assert_eq!(
+            retained_fence_screen_readiness(&route, idle, Some(CursorState::new(1, 2))),
+            Ok(())
+        );
+        use FenceRecoveryOutcome::{BlankScreen, DialogWaiting, Inconclusive, SeatBusy};
+        for (screen, cursor, reason) in [
+            ("", Some(CursorState::new(0, 0)), BlankScreen),
+            (idle, None, Inconclusive),
+            (idle, Some(CursorState::new(0, 0)), Inconclusive),
+            (
+                "Grok 4\n> draft",
+                Some(CursorState::new(1, 7)),
+                Inconclusive,
+            ),
+            (
+                "Grok 4\n> \nThinking...",
+                Some(CursorState::new(1, 2)),
+                SeatBusy,
+            ),
+            (
+                "Grok 4\nThinking...\n> ",
+                Some(CursorState::new(2, 2)),
+                SeatBusy,
+            ),
+            (
+                "Grok 4\n> 1. Allow once\n  2. Deny",
+                Some(CursorState::new(1, 2)),
+                DialogWaiting,
+            ),
+        ] {
+            assert_eq!(
+                retained_fence_screen_readiness(&route, screen, cursor),
+                Err(reason),
+                "{screen:?}"
+            );
+        }
+        assert_eq!(
+            retained_fence_screen_readiness(
+                &route,
+                "Grok 4\nSign in to continue\n> ",
+                Some(CursorState::new(2, 2)),
+            ),
+            Err(FenceRecoveryOutcome::VendorSignIn),
+        );
+    }
+
+    #[test]
+    fn retained_fence_recovery_classifies_captured_sign_in_and_quoted_text() {
+        let codex = VendorRoute::Codex {
+            thread_id: "thread".into(),
+            cwd: None,
+        };
+        // Rendered Codex 0.172.0 onboarding rows from the 2026-11-25 incident.
+        let onboarding = "  Welcome to Codex, OpenAI's command-line coding agent\n\
+                          \x20 Choose how you want to use Codex.\n\
+                          > 1. Sign in with ChatGPT\n\
+                          \x20 2. Sign in with Device Code\n\
+                          \x20 3. Sign in another way\n\
+                          \x20 Press enter to continue";
+        assert_eq!(
+            retained_fence_screen_readiness(&codex, onboarding, None),
+            Err(FenceRecoveryOutcome::VendorSignIn)
+        );
+        assert_eq!(
+            classify_hosted_screen_blocker("codex", onboarding),
+            Some(HostedScreenBlocker::VendorSignIn)
+        );
+        let quoted = "• The dialog said Welcome to Codex and Sign in with ChatGPT.\n\n\
+                      › Ask Codex to do anything\n\n\
+                      \x20 GPT-6.1-Sol medium · ~/project\n\
+                      \x20 ← for agents · ? for shortcuts";
+        assert_eq!(
+            retained_fence_screen_readiness(&codex, quoted, None),
+            Ok(())
+        );
+        assert_eq!(classify_hosted_screen_blocker("codex", quoted), None);
+    }
+
+    #[test]
+    fn hosted_screen_blockers_recognize_real_terminal_captures() {
+        let codex = include_str!("../tests/fixtures/hosted-screen/codex-0.172.0-signin.txt");
+        assert_eq!(
+            classify_hosted_screen_blocker("codex", codex),
+            Some(HostedScreenBlocker::VendorSignIn),
+        );
+
+        let onboarding_rows = codex
+            .lines()
+            .skip_while(|line| !line.trim_start().starts_with("Welcome to Codex"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            classify_hosted_screen_blocker("codex", &onboarding_rows),
+            Some(HostedScreenBlocker::VendorSignIn),
+        );
+        let with_composer = format!(
+            "{onboarding_rows}\n\n› Ask Codex to do anything\n\n  GPT-6.1-Sol medium · ~/project\n"
+        );
+        assert_eq!(
+            classify_hosted_screen_blocker("codex", &with_composer),
+            None
+        );
+
+        let mut terminal = vt100::Parser::new(
+            std::num::NonZeroU16::new(24).unwrap(),
+            std::num::NonZeroU16::new(100).unwrap(),
+            0,
+        );
+        terminal.process(include_bytes!(
+            "../tests/fixtures/hosted-screen/muse-1.4.25-hook-trust.raw"
+        ));
+        assert_eq!(
+            classify_hosted_screen_blocker("muse", &terminal.screen().contents()),
+            Some(HostedScreenBlocker::BlockingDialog),
+        );
+    }
+
+    #[test]
+    fn hosted_screen_blocker_does_not_treat_reply_prose_as_a_prompt() {
+        let codex = VendorRoute::Codex {
+            thread_id: "thread".into(),
+            cwd: None,
+        };
+        for (prose, wire_outcome) in [
+            (
+                "• The page reads:\nSign in to continue",
+                FenceRecoveryOutcome::VendorSignIn,
+            ),
+            (
+                "• The menu says Esc to cancel.",
+                FenceRecoveryOutcome::DialogWaiting,
+            ),
+        ] {
+            let screen = format!(
+                "{prose}\n\n› Ask Codex to do anything\n\n  GPT-6.1-Sol medium · ~/project"
+            );
+            assert_eq!(
+                retained_fence_screen_gate(&codex, &screen),
+                Err(wire_outcome)
+            );
+            assert_eq!(classify_hosted_screen_blocker("codex", &screen), None);
+        }
+    }
+
+    #[test]
+    fn hosted_screen_blocker_ignores_blank_unsupported_and_busy_screens() {
+        let busy = "• Working (4s · esc to interrupt)\n› Ask Codex to do anything\n  GPT-6.1-Sol medium · ~/project";
+
+        assert_eq!(classify_hosted_screen_blocker("codex", busy), None);
+        assert_eq!(classify_hosted_screen_blocker("codex", " \n "), None);
+        assert_eq!(
+            classify_hosted_screen_blocker("unknown", "Sign in to continue"),
+            None
+        );
+    }
+
+    #[test]
+    fn retained_fence_recovery_classifies_captured_trust_dialogs() {
+        let claude = VendorRoute::Claude {
+            pid: 0,
+            session_id: "session".into(),
+            socket_path: PathBuf::new(),
+            key_path: None,
+        };
+        // Claude workspace-trust incident excerpt, 2026-11-10. Path redacted.
+        let claude_trust = "Accessing workspace: /project\n\
+                            Quick safety check: Is this a project you created or one you trust?\n\
+                            ❯ No, exit\n\
+                            \x20 Yes, I trust this folder\n\
+                            Enter to confirm · Esc to cancel";
+        assert_eq!(
+            retained_fence_screen_readiness(&claude, claude_trust, None),
+            Err(FenceRecoveryOutcome::DialogWaiting)
+        );
+
+        assert_eq!(
+            classify_hosted_screen_blocker("claude", claude_trust),
+            Some(HostedScreenBlocker::BlockingDialog)
+        );
+
+        let claude_idle = format!("{claude_trust}\n❯ \n  ? for shortcuts");
+        assert_eq!(classify_hosted_screen_blocker("claude", &claude_idle), None);
+
+        let muse = VendorRoute::Muse {
+            session_id: "session".into(),
+            cwd: None,
+            tmux_target: None,
+            tmux_pane: None,
+        };
+        // Muse 1.4.25 hook-trust capture, with explanatory prose omitted from rows 3 and 4.
+        let mut muse_rows = [""; 19];
+        muse_rows[0] = "Review plugin hooks";
+        muse_rows[1] = "4 new or changed hooks need your trust.";
+        muse_rows[15..].copy_from_slice(&[
+            "⟩ 1. Review hooks",
+            "  2. Trust all and continue",
+            "  3. Continue without trusting",
+            "Up/Down to choose, Enter to confirm. Esc continues without trusting.",
+        ]);
+        let muse_trust = muse_rows.join("\n");
+        assert_eq!(
+            retained_fence_screen_readiness(&muse, &muse_trust, None),
+            Err(FenceRecoveryOutcome::DialogWaiting)
+        );
+
+        assert_eq!(
+            classify_hosted_screen_blocker("muse", &muse_trust),
+            Some(HostedScreenBlocker::BlockingDialog)
+        );
+
+        let rule = "────────────────────────────────────────";
+        let muse_idle = format!("{muse_trust}\n{rule}\n❯ \n{rule}\n  muse-wonder-full-1.0 · idle");
+        assert_eq!(
+            retained_fence_screen_readiness(&muse, &muse_idle, Some(CursorState::new(20, 2))),
+            Ok(())
+        );
+        assert_eq!(classify_hosted_screen_blocker("muse", &muse_idle), None);
+    }
+
+    #[test]
+    fn retained_fence_recovery_explains_disabled_host_probes() {
+        let mut routes = RouteTable::default();
+        routes.upsert_explicit(
+            "test",
+            VendorRoute::Codex {
+                thread_id: "thread".into(),
+                cwd: None,
+            },
+            At::from_unix_millis(1),
+        );
+        assert_eq!(
+            probe_retained_fence_readiness(
+                routes.get("test").unwrap(),
+                "test",
+                Some("test.codex"),
+                Some(Path::new("/unused/home")),
+                Some(42),
+            ),
+            RecoveryReadiness::Hold(FenceRecoveryOutcome::HostProbesDisabled)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retained_fence_recovery_requires_recorded_leader_pid_before_host_lookup() {
+        let _tmux_lock = TMUX_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _no_tmux = EnvGuard::remove("FL_WIRE_TMUX_BIN");
+        let _no_disable = EnvGuard::remove("FL_WIRE_DISABLE_HOST_DISCOVERY");
+        let temp = tempfile::tempdir().unwrap();
+        let _runtime = crate::runtime_context::pin(
+            fl_host_proto::HostEndpoint::unix(temp.path().join("host.sock")).unwrap(),
+            None,
+        );
+        let mut routes = RouteTable::default();
+        routes.upsert_explicit_with_meta(
+            "test",
+            VendorRoute::Codex {
+                thread_id: "thread".into(),
+                cwd: None,
+            },
+            At::from_unix_millis(1),
+            Some("codex:test".into()),
+            None,
+            false,
+        );
+        let route = routes.get("test").unwrap();
+        for pid in [None, Some(0)] {
+            assert_eq!(
+                probe_retained_fence_readiness(route, "test", Some("test.codex"), None, pid),
+                RecoveryReadiness::Hold(FenceRecoveryOutcome::HostedLeaderPidUnavailable)
+            );
+        }
+    }
+
+    #[test]
+    fn retained_fence_recovery_only_submits_the_visible_wire_paste() {
+        let codex = VendorRoute::Codex {
+            thread_id: "thread".into(),
+            cwd: None,
+        };
+        let footer = "  GPT-6.1-Sol medium · ~/project\n  ← for agents · ? for shortcuts";
+        let screen = |contents: String| RenderedCursorScreen {
+            contents,
+            cursor: None,
+            dims: None,
+            ghost_styled: false,
+        };
+        let payload = "one line of payload\nsecond line of payload";
+        assert_eq!(
+            retained_fence_submit_proven(
+                &codex,
+                &screen(format!(
+                    "› one line of payload\n  second line of payload\n\n{footer}"
+                )),
+                payload,
+            ),
+            Ok(())
+        );
+        for contents in [
+            format!("› one line of payload\n  second line with an edit\n\n{footer}"),
+            format!("› [Pasted Content]\n\n{footer}"),
+            format!("› Ask Codex to do anything\n\n{footer}"),
+            "Welcome to Codex\n  › 1. Sign in with ChatGPT\n    2. Use an API key".into(),
+        ] {
+            assert!(retained_fence_submit_proven(&codex, &screen(contents), payload).is_err());
+        }
+        let grok = VendorRoute::Grok {
+            session_id: "session".into(),
+            cwd: None,
+            tmux_target: None,
+            tmux_pane: None,
+        };
+        let payload = "Observed on Grok:\nThinking...";
+        assert_eq!(
+            retained_fence_submit_proven(&grok, &screen(format!("Grok 4\n> {payload}")), payload,),
+            Ok(())
+        );
+        assert_eq!(
+            retained_fence_submit_proven(
+                &grok,
+                &screen(format!("Grok 4\nThinking...\n> {payload}")),
+                payload,
+            ),
+            Err(FenceRecoveryOutcome::SeatBusy)
+        );
+    }
+
+    #[test]
+    fn retained_fence_replay_revalidates_after_each_fresh_host_capture() {
+        use fl_host_proto::{
+            BlockingHostClient, ControllerLease, ExtensionLimits, ExtensionRequest,
+            ExtensionResponse, HostConfig, HostEndpoint, HostInstance, HostListener, HostRequest,
+            HostResponse, RENDERED_PTY_FEATURE, RenderedScreen, SendOutcome, SessionEpoch,
+            SessionId, StreamId,
+        };
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::Arc;
+
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        enum Scenario {
+            SignIn,
+            LostCapture,
+            ReplacedBeforePayload,
+            ReplacedBeforeEnter,
+            BusyBeforePaste,
+            HookAndTipBeforePaste,
+            CapturedBusyBeforePaste,
+            RejectedSteerBeforePaste,
+            BusyBeforeEnter,
+            CapturedBusyBeforeEnter,
+            RejectedSteerBeforeEnter,
+            AckedBeforeEnter,
+            WriteError,
+            CodexIncidentMail,
+            GrokIncidentMail,
+        }
+        use Scenario::*;
+
+        impl Scenario {
+            fn payload(self) -> &'static str {
+                if self == GrokIncidentMail {
+                    "Observed on Grok:\nSign in to continue"
+                } else {
+                    "[fl-wire mail/normal] from test (id: urn:uuid:recovery-fixture)\n\
+                     Observed on Codex:\nWelcome to Codex\nSign in with ChatGPT"
+                }
+            }
+        }
+
+        let temp = TempDir::new().unwrap();
+        fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let endpoint = HostEndpoint::unix(temp.path().join("fl-host.sock")).unwrap();
+        let stream = StreamId {
+            host: HostInstance::new([5; 16]),
+            session: SessionId::new("retained-fence-test.codex").unwrap(),
+            epoch: SessionEpoch(4),
+        };
+        let server_endpoint = endpoint.clone();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let counts = Arc::new(Mutex::new((0, Vec::<Vec<u8>>::new())));
+        let server_counts = Arc::clone(&counts);
+        let footer = "  GPT-6.1-Sol medium · ~/project\n  ← for agents · ? for shortcuts";
+        let busy_preview = "• Working (4s · esc to interrupt)\n\n  Queued follow-up inputs\n  ↳ later\n    shift+← edit last queued message";
+        // Codex 0.172.0 indents rejected-steer preview continuations by four spaces.
+        let rejected_steer_preview = "• Working (4s · esc to interrupt)\n\n\
+            • Messages to be submitted at end of turn\n  ↳ first\n    • Working...\n    more";
+        let idle_capture =
+            &CODEX_BUSY_WARNING_CAPTURE[CODEX_BUSY_WARNING_CAPTURE.find("› ").unwrap()..];
+        let scenarios = [
+            SignIn,
+            LostCapture,
+            ReplacedBeforePayload,
+            ReplacedBeforeEnter,
+            BusyBeforePaste,
+            HookAndTipBeforePaste,
+            CapturedBusyBeforePaste,
+            RejectedSteerBeforePaste,
+            BusyBeforeEnter,
+            CapturedBusyBeforeEnter,
+            RejectedSteerBeforeEnter,
+            AckedBeforeEnter,
+            WriteError,
+            CodexIncidentMail,
+            GrokIncidentMail,
+        ];
+
+        let server = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async move {
+                let mut config = HostConfig::new(server_endpoint);
+                config.minor = 1;
+                let mut listener = HostListener::bind(config).await.unwrap();
+                let _fixture =
+                    crate::test_isolation::register_unix_socket(listener.endpoint().socket_path())
+                        .unwrap();
+                ready_tx.send(()).unwrap();
+                for scenario in scenarios {
+                    let mut conn = listener.accept().await.unwrap();
+                    while let Ok(HostRequest::Extended { id, request }) = conn.recv().await {
+                        let response = match request {
+                            ExtensionRequest::Capabilities => ExtensionResponse::Capabilities {
+                                host: HostInstance::new([5; 16]),
+                                features: RENDERED_PTY_FEATURE,
+                                limits: ExtensionLimits::default(),
+                            },
+                            ExtensionRequest::ClaimController { .. } => {
+                                ExtensionResponse::Controller {
+                                    lease: ControllerLease(1),
+                                    acked: 0,
+                                    latest: 0,
+                                }
+                            }
+                            ExtensionRequest::CaptureRendered { mut stream } => {
+                                let mut observed = server_counts.lock().unwrap();
+                                observed.0 += 1;
+                                let contents = match (scenario, observed.0, observed.1.len()) {
+                                    (GrokIncidentMail, _, 1) => {
+                                        format!("Grok 4\n> {}", scenario.payload())
+                                    }
+                                    (GrokIncidentMail, _, _) => "Grok 4\n> ".to_string(),
+                                    (SignIn, 2, _) => {
+                                        "Welcome to Codex\n  › 1. Sign in with ChatGPT".into()
+                                    }
+                                    (BusyBeforePaste, 2, _) => {
+                                        format!("{busy_preview}\n\n› Ask Codex to do anything\n\n{footer}")
+                                    }
+                                    (HookAndTipBeforePaste, 2, _) => {
+                                        format!(
+                                            "• Working (35s · esc to interrupt)\n └ Checking policy\n   and its hooks\n  └ Tip text\n\n› Ask Codex to do anything\n\n{footer}"
+                                        )
+                                    }
+                                    (CapturedBusyBeforePaste, 2, _) => CODEX_BUSY_CAPTURE.into(),
+                                    (RejectedSteerBeforePaste, 2, _) => {
+                                        format!("{rejected_steer_preview}\n\n{idle_capture}")
+                                    }
+                                    (_, _, 1) => {
+                                        let composer = scenario.payload().replace('\n', "\n  ");
+                                        match scenario {
+                                            BusyBeforeEnter => {
+                                                format!("{busy_preview}\n\n› {composer}\n\n{footer}")
+                                            }
+                                            CapturedBusyBeforeEnter => CODEX_BUSY_WARNING_CAPTURE
+                                                .replacen(CODEX_GHOST_PLACEHOLDER, &composer, 1),
+                                            RejectedSteerBeforeEnter => {
+                                                let pasted = idle_capture.replacen(
+                                                    CODEX_GHOST_PLACEHOLDER,
+                                                    &composer,
+                                                    1,
+                                                );
+                                                format!("{rejected_steer_preview}\n\n{pasted}")
+                                            }
+                                            CodexIncidentMail => idle_capture
+                                                .replacen(CODEX_GHOST_PLACEHOLDER, &composer, 1),
+                                            _ => format!("› {composer}\n\n{footer}"),
+                                        }
+                                    }
+                                    (
+                                        CapturedBusyBeforeEnter
+                                        | RejectedSteerBeforeEnter
+                                        | CodexIncidentMail,
+                                        _,
+                                        _,
+                                    ) => idle_capture.into(),
+                                    _ => format!("› Ask Codex to do anything\n\n{footer}"),
+                                };
+                                if scenario == LostCapture && observed.0 == 2 {
+                                    stream.epoch = SessionEpoch(999);
+                                }
+                                ExtensionResponse::RenderedCapture {
+                                    screen: RenderedScreen {
+                                        schema: 1,
+                                        stream,
+                                        contents,
+                                        cursor_row: if scenario == GrokIncidentMail {
+                                            1
+                                        } else {
+                                            0
+                                        },
+                                        cursor_col: 2,
+                                        rows: 24,
+                                        cols: 80,
+                                        generation: 1,
+                                        output_seq: 0,
+                                        output_bytes: 0,
+                                    },
+                                }
+                            }
+                            ExtensionRequest::Write { bytes, .. } => {
+                                server_counts.lock().unwrap().1.push(bytes.into_vec());
+                                if scenario == WriteError {
+                                    break;
+                                }
+                                ExtensionResponse::Input {
+                                    outcome: SendOutcome::Written,
+                                }
+                            }
+                            unexpected => panic!("unexpected fake host request: {unexpected:?}"),
+                        };
+                        conn.respond(&HostResponse::Extended { id, response })
+                            .await
+                            .unwrap();
+                    }
+                }
+            });
+        });
+        ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+
+        let route = VendorRoute::Codex {
+            thread_id: "thread".into(),
+            cwd: None,
+        };
+        let grok_route = VendorRoute::Grok {
+            session_id: "session".into(),
+            cwd: None,
+            tmux_target: None,
+            tmux_pane: None,
+        };
+        for scenario in scenarios {
+            *counts.lock().unwrap() = (0, Vec::new());
+            let route = if scenario == GrokIncidentMail {
+                &grok_route
+            } else {
+                &route
+            };
+            let payload = scenario.payload();
+            let bracketed = scenario != GrokIncidentMail;
+            let validate = || {
+                // A replacement/ACK occurs during the preceding rendered capture,
+                // after any earlier validation could have authorized the old route.
+                match (scenario, counts.lock().unwrap().0) {
+                    (ReplacedBeforePayload, 2) | (ReplacedBeforeEnter, 3) => {
+                        Err(FenceRecoveryOutcome::RouteChanged)
+                    }
+                    (AckedBeforeEnter, 3) => Ok(false),
+                    _ => Ok(true),
+                }
+            };
+            let guard = RecoveryPasteGuard::new(route, &validate);
+            let client = BlockingHostClient::connect(&endpoint).unwrap();
+            let delivery = deliver_via_tmux_paste_with_resolved_host(
+                stream.session.as_str(),
+                payload,
+                TmuxPasteOptions {
+                    bracketed,
+                    verify_submission: true,
+                    session_id: None,
+                    is_muse_route: false,
+                    is_claude_route: false,
+                    composer_style: ComposerStyle::for_route(route),
+                },
+                Some((client, stream.clone(), true)),
+                None,
+                Some(&guard),
+            );
+            let outcome = guard.finish(delivery);
+            let observed = counts.lock().unwrap();
+            let (reason, expected_writes) = match scenario {
+                SignIn => (Some(FenceRecoveryOutcome::VendorSignIn), 0),
+                LostCapture => (Some(FenceRecoveryOutcome::HostedCaptureUnavailable), 0),
+                BusyBeforePaste
+                | HookAndTipBeforePaste
+                | CapturedBusyBeforePaste
+                | RejectedSteerBeforePaste => (Some(FenceRecoveryOutcome::SeatBusy), 0),
+                ReplacedBeforePayload => (Some(FenceRecoveryOutcome::RouteChanged), 0),
+                ReplacedBeforeEnter
+                | BusyBeforeEnter
+                | CapturedBusyBeforeEnter
+                | RejectedSteerBeforeEnter
+                | AckedBeforeEnter
+                | WriteError => (None, 1),
+                CodexIncidentMail | GrokIncidentMail => (None, 2),
+            };
+            match (scenario, outcome) {
+                (_, Err(RecoveryPasteError::Refused(actual))) => assert_eq!(Some(actual), reason),
+                (AckedBeforeEnter, Err(RecoveryPasteError::AlreadyResolved)) => {
+                    assert!(!route_has_unconfirmed_wire_deliveries(&[format!(
+                        "host:{}",
+                        stream.session.as_str(),
+                    )]));
+                }
+                (
+                    BusyBeforeEnter | CapturedBusyBeforeEnter | RejectedSteerBeforeEnter,
+                    Err(RecoveryPasteError::Uncertain(_)),
+                ) => {
+                    assert_eq!(guard.permission.get(), Err(FenceRecoveryOutcome::SeatBusy));
+                }
+                (ReplacedBeforeEnter | WriteError, Err(RecoveryPasteError::Uncertain(_)))
+                | (CodexIncidentMail | GrokIncidentMail, Ok(())) => {}
+                (_, unexpected) => panic!("{scenario:?}: unexpected result {unexpected:?}"),
+            }
+            assert_eq!(observed.1.len(), expected_writes, "{scenario:?}");
+            if expected_writes > 0 {
+                let expected_payload = if bracketed {
+                    format!("\x1b[200~{payload}\x1b[201~").into_bytes()
+                } else {
+                    payload.as_bytes().to_vec()
+                };
+                assert_eq!(observed.1[0], expected_payload);
+            }
+            if expected_writes == 2 {
+                assert_eq!(observed.1[1].as_slice(), b"\r");
+            }
+        }
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn retained_fence_recovery_requires_exact_unique_writable_pty() {
+        use fl_host_proto::{
+            ChildRecord, ChildState, HostInstance, InputState, SessionEpoch, SessionId,
+            SessionMode, SessionSummary, SpawnKind, StreamId,
+        };
+
+        let summary = |name: &str| {
+            let session = SessionId::new(name).unwrap();
+            let epoch = SessionEpoch(4);
+            SessionSummary {
+                stream: StreamId {
+                    host: HostInstance::new([5; 16]),
+                    session: session.clone(),
+                    epoch,
+                },
+                mode: SessionMode::Pty,
+                input: InputState::Writable,
+                state: ChildState::Running(ChildRecord {
+                    session,
+                    session_epoch: epoch,
+                    kind: SpawnKind::Pty,
+                    pid: 42,
+                    input: InputState::Writable,
+                    started_at_ms: 0,
+                    exit: None,
+                    consumer_stalled: false,
+                }),
+                acked: 0,
+                latest: 0,
+            }
+        };
+        let target = "Feira.codex";
+        let other_vendor = summary("Feira.claude");
+        let other_case = summary("feira.codex");
+        let winner = summary(target);
+        let sessions = [other_case, other_vendor, winner.clone()];
+        assert_eq!(
+            retained_fence_host_stream(&sessions, target, 42),
+            Ok(&winner.stream)
+        );
+        assert_eq!(
+            retained_fence_host_stream(&sessions, target, 7),
+            Err(FenceRecoveryOutcome::HostedBindingUnavailable)
+        );
+        assert_eq!(
+            retained_fence_host_stream(&sessions[..2], target, 42),
+            Err(FenceRecoveryOutcome::DeadRoute)
+        );
+        assert_eq!(
+            retained_fence_host_stream(&[winner.clone(), winner.clone()], target, 42),
+            Err(FenceRecoveryOutcome::HostedBindingUnavailable)
+        );
+
+        let mut fenced = winner.clone();
+        fenced.input = InputState::Fenced;
+        assert_eq!(
+            retained_fence_host_stream(&[fenced], target, 42),
+            Err(FenceRecoveryOutcome::Inconclusive)
+        );
+        let mut exited = winner;
+        let ChildState::Running(child) = exited.state else {
+            unreachable!()
+        };
+        exited.state = ChildState::LeaderExited(child);
+        assert_eq!(
+            retained_fence_host_stream(&[exited], target, 42),
+            Err(FenceRecoveryOutcome::DeadRoute)
+        );
     }
 
     // Fixtures below are trimmed from real captures (2026-11-13): idle from

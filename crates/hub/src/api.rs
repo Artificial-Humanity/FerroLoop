@@ -65,6 +65,7 @@ use fl_wire::dispatcher::{
     preflight_session_reset, push_operator_prompt_to_route, push_operator_prompt_with_intent,
     push_to_route_for_recipient,
 };
+use fl_wire::hosted_recovery_notice::NOTICE_STATE_SLUG_PREFIX;
 use fl_wire::identity::{RouteTable, normalize_persona};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -535,7 +536,7 @@ fn route_http_request(state: &HubState, req: &HttpRequest) -> HttpResponse {
             handle_post_session_bulk_action(state, &authority, req)
         }
         ("GET", "/api/v1/commands") => handle_get_commands(state),
-        ("GET", "/api/v1/hosted-sessions") => handle_get_hosted_sessions(state),
+        ("GET", "/api/v1/hosted-sessions") => handle_get_hosted_sessions(state, &authority),
         ("POST", "/api/v1/state/checkpoint") => {
             handle_post_state_checkpoint(state, &authority, req)
         }
@@ -1993,6 +1994,32 @@ pub struct HubDispatchDiagnostics {
     pub diagnostics_partial: bool,
     pub omitted_evidence_total: u64,
     pub omitted_evidence_total_saturated: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fence_recovery_attempts: Vec<HubFenceRecoveryAttempt>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fence_recovery_attention: Vec<HubFenceRecoveryAttention>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HubFenceRecoveryAttempt {
+    pub recipient: String,
+    pub attempt: u32,
+    pub limit: u32,
+    pub at: fl_core::at::At,
+    pub outcome: fl_wire::dispatch_diagnostics::FenceRecoveryOutcome,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub busy_probe_count: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HubFenceRecoveryAttention {
+    pub recipient: String,
+    pub outcome: fl_wire::dispatch_diagnostics::FenceRecoveryOutcome,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub reason_label: String,
+    pub exhausted: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub busy_since: Option<fl_core::at::At>,
 }
 
 /// Allowlist projection of [`fl_wire::dispatch_diagnostics::FenceDiagnostic`].
@@ -2173,6 +2200,8 @@ impl HubDispatchDiagnostics {
             diagnostics_partial,
             omitted_evidence_total,
             omitted_evidence_total_saturated,
+            fence_recovery_attempts,
+            fence_recovery_attention,
         } = diag;
         Self {
             schema_version,
@@ -2187,6 +2216,31 @@ impl HubDispatchDiagnostics {
             diagnostics_partial,
             omitted_evidence_total,
             omitted_evidence_total_saturated,
+            fence_recovery_attempts: fence_recovery_attempts
+                .into_iter()
+                .filter_map(|row| {
+                    Some(HubFenceRecoveryAttempt {
+                        recipient: normalize_persona(&row.recipient)?,
+                        attempt: row.attempt,
+                        limit: row.limit,
+                        at: row.at,
+                        outcome: row.outcome,
+                        busy_probe_count: row.busy_probe_count,
+                    })
+                })
+                .collect(),
+            fence_recovery_attention: fence_recovery_attention
+                .into_iter()
+                .filter_map(|row| {
+                    Some(HubFenceRecoveryAttention {
+                        recipient: normalize_persona(&row.recipient)?,
+                        outcome: row.outcome,
+                        reason_label: row.reason_label().into_owned(),
+                        exhausted: row.exhausted,
+                        busy_since: row.busy_since,
+                    })
+                })
+                .collect(),
         }
     }
 }
@@ -2763,6 +2817,8 @@ fn is_reserved_hub_slug(slug: &str) -> bool {
     slug.starts_with("hub-pairing-")
         || slug.starts_with("hub-session-")
         || slug.starts_with("hub-node-")
+        || slug.starts_with(crate::lifecycle::HOSTED_RESPAWN_STATE_SLUG_PREFIX)
+        || slug.starts_with(NOTICE_STATE_SLUG_PREFIX)
 }
 
 fn is_internal_hub_entry(entry: &StateEntry) -> bool {
@@ -3044,10 +3100,7 @@ fn handle_post_state(
 
     let normalized_slug = slug.trim().to_ascii_lowercase();
     if is_reserved_hub_slug(&normalized_slug) {
-        return HttpResponse::json(
-            403,
-            json!({ "error": "reserved internal hub authentication slug prefix" }),
-        );
+        return HttpResponse::json(403, json!({ "error": "reserved internal hub slug prefix" }));
     }
 
     let sensitive_flag = obj.get("sensitive").and_then(Value::as_bool);
@@ -3220,7 +3273,7 @@ fn handle_post_state_checkpoint(
         if is_reserved_hub_slug(&normalized) {
             return HttpResponse::json(
                 403,
-                json!({ "error": "reserved internal hub authentication slug prefix" }),
+                json!({ "error": "reserved internal hub slug prefix" }),
             );
         }
     }
@@ -5643,15 +5696,18 @@ fn handle_dynamic_api_routes(
         }
     }
 
-    // /api/v1/hosted-sessions/:id/restart
-    if segments.len() == 5
-        && segments[0] == "api"
-        && segments[1] == "v1"
-        && segments[2] == "hosted-sessions"
-        && segments[4] == "restart"
-        && method == "POST"
-    {
-        return handle_post_hosted_session_restart(state, authority, &percent_decode(segments[3]));
+    // /api/v1/hosted-sessions/:id/{restart,recovery-evidence}
+    if let ["api", "v1", "hosted-sessions", id, action] = segments.as_slice() {
+        match (method, *action) {
+            ("POST", "restart") => {
+                return handle_post_hosted_session_restart(state, authority, &percent_decode(id));
+            }
+            ("GET", "recovery-evidence") => {
+                return handle_get_hosted_recovery_evidence(state, authority, &percent_decode(id))
+                    .with_header("Cache-Control", "no-store");
+            }
+            _ => {}
+        }
     }
 
     // /api/v1/sessions/:id/queue/:prompt_id or /api/v1/sessions/:id/queue/:prompt_id/send-now
@@ -8527,6 +8583,7 @@ fn lifecycle_error_response(err: &LifecycleError) -> HttpResponse {
 pub(crate) fn lifecycle_env(state: &HubState) -> LifecycleEnv<'_> {
     let mut env = LifecycleEnv::new(state.config.home_override.as_deref());
     env.workspace_root = state.config.repo_root.parent();
+    env.blocker_evidence = Some(&state.hosted_blocker_evidence);
     env
 }
 
@@ -8844,6 +8901,16 @@ fn handle_post_session_remodel(
     session_id: &str,
     req: &HttpRequest,
 ) -> HttpResponse {
+    handle_post_session_remodel_with_env(state, authority, session_id, req, &lifecycle_env(state))
+}
+
+pub(crate) fn handle_post_session_remodel_with_env(
+    state: &HubState,
+    authority: &HubAuthority,
+    session_id: &str,
+    req: &HttpRequest,
+    env: &LifecycleEnv<'_>,
+) -> HttpResponse {
     if !authority.is_owner() {
         return HttpResponse::json(
             403,
@@ -8860,8 +8927,7 @@ fn handle_post_session_remodel(
     };
     let by = authority.actor_name();
     let persona = target.persona.clone();
-    let env = lifecycle_env(state);
-    match lifecycle::with_lifecycle_fence(&env, &persona, "remodel", |env| {
+    match lifecycle::with_lifecycle_fence(env, &persona, "remodel", |env| {
         #[cfg(test)]
         BEFORE_REMODEL_STORE_READ.with_borrow_mut(|hook| {
             if let Some(f) = hook.take() {
@@ -8869,6 +8935,18 @@ fn handle_post_session_remodel(
             }
         });
         let (store, target) = owned_lifecycle_target(state, session_id, &persona)?;
+        let caller = caller_of(authority);
+        let mut observations = lifecycle::LaunchAuthObservations::new();
+        let (store, target) = if let Some(auth_target) =
+            lifecycle::remodel_auth_target(&*store, env, &target, &payload, caller)?
+        {
+            drop(store);
+            let issue = auth_target.probe(env);
+            observations.insert(auth_target, issue);
+            owned_lifecycle_target(state, session_id, &persona)?
+        } else {
+            (store, target)
+        };
         Ok(
             match run_remodel(
                 state,
@@ -8877,7 +8955,8 @@ fn handle_post_session_remodel(
                 &target,
                 &payload,
                 by,
-                caller_of(authority),
+                caller,
+                &observations,
             ) {
                 RemodelRun::Done { data, .. } => HttpResponse::json(200, data),
                 RemodelRun::Failed { data, .. } => HttpResponse::json(502, data),
@@ -8914,6 +8993,7 @@ pub(crate) enum RemodelRun {
 /// handshake queueing for `prepare`, and the `session.remodeled` / `session.remodel_failed`
 /// broadcast. The caller acquires the persona fence before reopening `store` and passes
 /// its borrowed proof in `env`; both remain held until this returns.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn run_remodel(
     state: &HubState,
     store: &AnyStore,
@@ -8922,20 +9002,30 @@ pub(crate) fn run_remodel(
     payload: &RemodelRequest,
     by: &str,
     caller: lifecycle::Caller,
+    observations: &lifecycle::LaunchAuthObservations,
 ) -> RemodelRun {
     // The overrides the teardown clears, as they were, so a restore can put them back.
     let mut cleared_overrides: Vec<(String, ModelOverride)> = Vec::new();
-    let result = lifecycle::remodel_session(store, env, target, payload, by, caller, |key| {
-        for k in [key.to_string(), key.to_ascii_lowercase()] {
-            if let Some(o) = state.session_model_override(&k)
-                && !cleared_overrides.iter().any(|(seen, _)| *seen == k)
-            {
-                cleared_overrides.push((k, o));
+    let result = lifecycle::remodel_session_with_auth(
+        store,
+        env,
+        target,
+        payload,
+        by,
+        caller,
+        observations,
+        |key| {
+            for k in [key.to_string(), key.to_ascii_lowercase()] {
+                if let Some(o) = state.session_model_override(&k)
+                    && !cleared_overrides.iter().any(|(seen, _)| *seen == k)
+                {
+                    cleared_overrides.push((k, o));
+                }
             }
-        }
-        state.clear_session_prompt_queue(key);
-        state.clear_session_model_override(key);
-    });
+            state.clear_session_prompt_queue(key);
+            state.clear_session_model_override(key);
+        },
+    );
     // Teardown and spin-up dropped the route scan; the store snapshot is dropped for every
     // write request. Drop the scan here too, so a failed remodel's restore shows at once.
     crate::discovery::invalidate_route_discovery_cache();
@@ -9018,14 +9108,75 @@ pub(crate) fn run_remodel(
     }
 }
 
-fn handle_get_hosted_sessions(state: &HubState) -> HttpResponse {
+fn handle_get_hosted_sessions(state: &HubState, authority: &HubAuthority) -> HttpResponse {
+    #[derive(Serialize)]
+    struct HostedSessionView {
+        #[serde(flatten)]
+        record: lifecycle::HostedSessionRecord,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        recovery_attention: Option<lifecycle::HostedRecoveryAttention>,
+    }
+
     let Ok(store) = open_store_response(state) else {
         return store_open_failure();
     };
-    match lifecycle::list_hosted_sessions(&*store) {
-        Ok(sessions) => HttpResponse::json(200, json!({ "sessions": sessions })),
-        Err(e) => lifecycle_error_response(&e),
+    let sessions = match lifecycle::list_hosted_sessions(&*store) {
+        Ok(sessions) => sessions,
+        Err(e) => return lifecycle_error_response(&e),
+    };
+    let owner = authority.is_owner();
+    let sessions: Vec<_> = sessions
+        .into_iter()
+        .map(|record| {
+            let recovery_attention = if owner
+                && record.hosted
+                && !matches!(
+                    record.status.as_str(),
+                    lifecycle::STATUS_DECOMMISSIONING | lifecycle::STATUS_DECOMMISSIONED
+                ) {
+                lifecycle::load_hosted_respawn_state(&*store, &record.session_id)
+                    .ok()
+                    .and_then(|state| state.recovery_attention)
+            } else {
+                None
+            };
+            HostedSessionView {
+                record,
+                recovery_attention,
+            }
+        })
+        .collect();
+    HttpResponse::json(200, json!({ "sessions": sessions }))
+}
+
+fn handle_get_hosted_recovery_evidence(
+    state: &HubState,
+    authority: &HubAuthority,
+    id: &str,
+) -> HttpResponse {
+    if !authority.is_owner() {
+        return HttpResponse::json(
+            403,
+            json!({ "error": "only Owner authority may read hosted recovery evidence" }),
+        );
     }
+    let Ok(store) = open_store_response(state) else {
+        return store_open_failure();
+    };
+    let evidence = match lifecycle::hosted_recovery_evidence(&*store, id) {
+        Ok(evidence) => evidence,
+        Err(err) => return lifecycle_error_response(&err),
+    };
+    let evidence = evidence.map(|exit| {
+        json!({
+            "exit_code": exit.exit.code,
+            "signal": exit.exit.signal,
+            "started_at_ms": exit.started_at_ms,
+            "captured_at_ms": exit.captured_at_ms,
+            "terminal_tail": exit.terminal_tail,
+        })
+    });
+    HttpResponse::json(200, json!({ "session_id": id, "evidence": evidence }))
 }
 
 fn handle_post_hosted_session_restart(
@@ -11128,6 +11279,56 @@ mod tests {
         assert!(owner.iter().all(|h| h.entry.slug != "hub-session-abc123"));
     }
 
+    #[test]
+    fn private_hosted_exit_evidence_is_excluded_even_from_owner_state_views() {
+        let (_dir, store) = test_store(fl_store::BackendKind::Redb);
+        let slugs = [
+            lifecycle::hosted_respawn_state_slug("claude:fixture"),
+            "hosted-recovery-notice-018fcf7c-a219-7777-8888-000000006872".into(),
+        ];
+        for slug in &slugs {
+            store
+                .upsert_state(UpsertStateArgs {
+                    scope: StateScope::Workspace,
+                    slug: slug.clone(),
+                    sensitivity: SensitivityPatch::SetSensitive,
+                    payload: StatePayload::Runtime(RuntimeEntry {
+                        value: json!({"terminal_tail": "privatecapturedoutput"}),
+                        merge_mode: MergeMode::LastWriter,
+                    }),
+                    at: stamp::now(),
+                    by: "fixture".into(),
+                })
+                .unwrap();
+        }
+        let owner = HubAuthority::Owner {
+            login: "owner".into(),
+        };
+        let state = handle_get_state(&store, &owner, &HttpRequest::new("GET", "/api/v1/state"));
+        assert_eq!(state.status, 200);
+        assert_eq!(state.json_value().unwrap()["entries"], json!([]));
+        let entries = store.list_state(None, None).unwrap();
+        let (hits, total) = search_state_for_hub(
+            &store,
+            &entries,
+            "privatecapturedoutput",
+            None,
+            None,
+            10,
+            true,
+        );
+        assert!(hits.is_empty());
+        assert_eq!(total, 0);
+        for slug in slugs {
+            let write = HttpRequest::new("POST", "/api/v1/state").with_json_body(&json!({
+                "slug": slug,
+                "concern": "runtime",
+                "value": "overwrite attempt",
+            }));
+            assert_eq!(handle_post_state(&store, &owner, &write).status, 403);
+        }
+    }
+
     fn sensitive_handoff_entry(n: u64) -> StateEntry {
         StateEntry {
             id: StateId(seq_iri(n)),
@@ -11674,9 +11875,10 @@ mod tests {
             let store = state.open_store().unwrap();
             lifecycle::persist_hosted_session(&*store, &record, "test").unwrap();
         }
-        let response = handle_get_hosted_sessions(&state);
-        assert_eq!(response.status, 200);
-        let json = response.json_value().unwrap();
+        let target = "/api/v1/hosted-sessions";
+        let (status, json) = roles_call(&state, "GET", target, "owner-test-tok", None);
+        assert_eq!(status, 200);
+        assert!(json["sessions"][0].get("recovery_attention").is_none());
         assert_eq!(
             json["sessions"][0]["stop_reason"],
             "prerequisite_unavailable"
@@ -11685,6 +11887,164 @@ mod tests {
             json["sessions"][0]["launch_prerequisite_detail"],
             "/private/control.sock: NotFound"
         );
+    }
+
+    #[test]
+    fn hosted_sessions_http_recovery_attention_is_owner_only() {
+        let (_tmp, state) = roles_test_state();
+        let record: lifecycle::HostedSessionRecord = serde_json::from_value(json!({
+            "session_id":"codex:ada", "persona":"ada", "project":"ferroloop", "role":"assistant",
+            "vendor":"codex", "model":null, "node_id":"ai-lab-0", "hosted":true, "status":"stopped",
+            "stop_reason":"crash_loop", "restart_policy":"on-failure", "restart_count":0,
+            "tmux_target":null, "cwd":null, "hydration_dispatched":false, "created_at_ms":1,
+            "updated_at_ms":1, "decommission_prepared_at_ms":null
+        }))
+        .unwrap();
+        {
+            let store = state.open_store().unwrap();
+            lifecycle::persist_hosted_session(&*store, &record, "test").unwrap();
+            store
+                .upsert_state(UpsertStateArgs {
+                    scope: StateScope::Workspace,
+                    slug: lifecycle::hosted_respawn_state_slug(&record.session_id),
+                    sensitivity: SensitivityPatch::SetSensitive,
+                    payload: StatePayload::Runtime(RuntimeEntry {
+                        value: json!({"recovery_attention": "exhausted", "recovery_attempts": 6}),
+                        merge_mode: MergeMode::LastWriter,
+                    }),
+                    at: stamp::now(),
+                    by: "test".into(),
+                })
+                .unwrap();
+        }
+
+        let target = "/api/v1/hosted-sessions";
+        let (status, peer) = roles_call(&state, "GET", target, "peer-test-tok", None);
+        assert_eq!(status, 200);
+        assert_eq!(peer["sessions"], json!([record]));
+        let (status, mut owner) = roles_call(&state, "GET", target, "owner-test-tok", None);
+        assert_eq!(status, 200);
+        let session = owner["sessions"][0].as_object_mut().unwrap();
+        assert_eq!(
+            session.remove("recovery_attention"),
+            Some(json!("exhausted"))
+        );
+        assert_eq!(owner, peer);
+    }
+
+    #[test]
+    fn hosted_recovery_evidence_http_requires_owner_and_active_exact_incident() {
+        let (_tmp, state) = roles_test_state();
+        let mut record: lifecycle::HostedSessionRecord = serde_json::from_value(json!({
+            "session_id":"codex:ada", "persona":"ada", "project":"ferroloop", "role":"assistant",
+            "vendor":"codex", "model":null, "node_id":"ai-lab-0", "hosted":true, "status":"stopped",
+            "stop_reason":"crash_loop", "restart_policy":"on-failure", "restart_count":0,
+            "tmux_target":null, "cwd":null, "hydration_dispatched":false, "created_at_ms":1,
+            "updated_at_ms":1
+        }))
+        .unwrap();
+        let slug = lifecycle::hosted_respawn_state_slug(&record.session_id);
+        let seed = |value| {
+            state
+                .open_store()
+                .unwrap()
+                .upsert_state(UpsertStateArgs {
+                    scope: StateScope::Workspace,
+                    slug: slug.clone(),
+                    sensitivity: SensitivityPatch::SetSensitive,
+                    payload: StatePayload::Runtime(RuntimeEntry {
+                        value,
+                        merge_mode: MergeMode::LastWriter,
+                    }),
+                    at: stamp::now(),
+                    by: "test".into(),
+                })
+                .unwrap();
+        };
+        lifecycle::persist_hosted_session(&*state.open_store().unwrap(), &record, "test").unwrap();
+        let stream = json!({ "host": "00000000000000000000000000000000", "session": "Ada.codex", "epoch": 5 });
+        let tail = "private vendor diagnostic\nsecond line";
+        let mut respawn = json!({
+            "recovery_attention": "exhausted",
+            "exit_evidence": { "exits": [{
+                "stream": stream,
+                "attempt": "Baseline",
+                "observed_at_ms": 20,
+                "evidence": {
+                    "stream": stream,
+                    "exit": { "code": 1, "signal": null },
+                    "started_at_ms": 10,
+                    "captured_at_ms": 20,
+                    "terminal_tail": tail,
+                },
+            }] },
+        });
+        seed(respawn.clone());
+
+        let target = "/api/v1/hosted-sessions/codex%3Aada/recovery-evidence";
+        let request = HttpRequest::new("GET", target);
+        assert_eq!(handle_http_request(&state, &request).status, 401);
+        let peer = handle_http_request(
+            &state,
+            &request
+                .clone()
+                .with_header("authorization", "Bearer peer-test-tok")
+                .with_header("x-fl-agent", "owner"),
+        );
+        assert_eq!(peer.status, 403);
+        assert!(!String::from_utf8_lossy(&peer.body).contains("private vendor diagnostic"));
+
+        let owner = request.with_header("authorization", "Bearer owner-test-tok");
+        let response = handle_http_request(&state, &owner);
+        assert_eq!(response.status, 200);
+        assert!(
+            response
+                .headers
+                .contains(&("Cache-Control".into(), "no-store".into()))
+        );
+        assert_eq!(
+            response.json_value().unwrap(),
+            json!({
+                "session_id": "codex:ada",
+                "evidence": {
+                    "started_at_ms": 10, "captured_at_ms": 20, "exit_code": 1,
+                    "signal": null, "terminal_tail": tail,
+                },
+            })
+        );
+        let (status, list) = roles_call(
+            &state,
+            "GET",
+            "/api/v1/hosted-sessions",
+            "owner-test-tok",
+            None,
+        );
+        assert_eq!(status, 200);
+        assert_eq!(list["sessions"][0]["recovery_attention"], "exhausted");
+        assert!(!list.to_string().contains("private vendor diagnostic"));
+        for alias in ["ada", "Codex%3Aada", "%20codex%3Aada"] {
+            let (status, _) = roles_call(
+                &state,
+                "GET",
+                &format!("/api/v1/hosted-sessions/{alias}/recovery-evidence"),
+                "owner-test-tok",
+                None,
+            );
+            assert_eq!(status, 404, "alias {alias} resolved to a private incident");
+        }
+
+        respawn["exit_evidence"]["exits"][0]["evidence"]["terminal_tail"] =
+            json!("x".repeat(fl_host_proto::MAX_HOSTED_EXIT_TAIL_BYTES + 1));
+        seed(respawn);
+        assert_eq!(handle_http_request(&state, &owner).status, 500);
+
+        seed(json!({ "recovery_attention": "exhausted" }));
+        let response = handle_http_request(&state, &owner);
+        assert_eq!(response.status, 200);
+        assert_eq!(response.json_value().unwrap()["evidence"], Value::Null);
+        record.status = lifecycle::STATUS_DECOMMISSIONED.into();
+        lifecycle::persist_hosted_session(&*state.open_store().unwrap(), &record, "test").unwrap();
+        assert_eq!(handle_http_request(&state, &owner).status, 404);
     }
 }
 
@@ -13259,6 +13619,8 @@ mod council_guidance_tests {
                     diagnostics_partial: false,
                     omitted_evidence_total: 0,
                     omitted_evidence_total_saturated: false,
+                    fence_recovery_attempts: Vec::new(),
+                    fence_recovery_attention: Vec::new(),
                 }),
                 registration_diagnostics: vec![],
                 pending_recipients: vec![],
@@ -13335,7 +13697,8 @@ mod council_guidance_tests {
         use fl_wire::daemon::{DaemonStatus, LocalResponse, RecipientPendingSummary};
         use fl_wire::dispatch_diagnostics::{
             DiagnosticsScope, DispatchCallOutcome, DispatchDiagnostics, FailureStage,
-            FenceDiagnostic, FenceReason, RouteAdapter, RouteDispatchObservation, SuppressionPhase,
+            FenceDiagnostic, FenceReason, FenceRecoveryAttempt, FenceRecoveryAttention,
+            FenceRecoveryOutcome, RouteAdapter, RouteDispatchObservation, SuppressionPhase,
         };
         use fl_wire::identity::{RouteEntry, VendorRoute};
         use std::io::{BufRead, BufReader, Write};
@@ -13447,6 +13810,55 @@ mod council_guidance_tests {
                     diagnostics_partial: false,
                     omitted_evidence_total: 0,
                     omitted_evidence_total_saturated: false,
+                    fence_recovery_attempts: vec![
+                        FenceRecoveryAttempt {
+                            recipient: "felix".into(),
+                            attempt: 3,
+                            limit: 3,
+                            at: ts_for_status.clone(),
+                            outcome: FenceRecoveryOutcome::VendorSignIn,
+                            busy_probe_count: None,
+                        },
+                        FenceRecoveryAttempt {
+                            recipient: "ada".into(),
+                            attempt: 1,
+                            limit: 3,
+                            at: ts_for_status.clone(),
+                            outcome: FenceRecoveryOutcome::SeatBusy,
+                            busy_probe_count: Some(300),
+                        },
+                        FenceRecoveryAttempt {
+                            recipient: "/secret/recovery-diagnostic".into(),
+                            attempt: 1,
+                            limit: 3,
+                            at: ts_for_status.clone(),
+                            outcome: FenceRecoveryOutcome::Inconclusive,
+                            busy_probe_count: None,
+                        },
+                    ],
+                    fence_recovery_attention: vec![
+                        FenceRecoveryAttention {
+                            recipient: "felix".into(),
+                            outcome: FenceRecoveryOutcome::VendorSignIn,
+                            exhausted: true,
+                            busy_since: None,
+                            busy_elapsed_ms: None,
+                        },
+                        FenceRecoveryAttention {
+                            recipient: "ada".into(),
+                            outcome: FenceRecoveryOutcome::SeatBusyProlonged,
+                            exhausted: false,
+                            busy_since: Some(ts_for_status.clone()),
+                            busy_elapsed_ms: Some(341_000),
+                        },
+                        FenceRecoveryAttention {
+                            recipient: "/secret/recovery-diagnostic".into(),
+                            outcome: FenceRecoveryOutcome::Inconclusive,
+                            exhausted: false,
+                            busy_since: None,
+                            busy_elapsed_ms: None,
+                        },
+                    ],
                 }),
                 registration_diagnostics: vec![
                     fl_wire::dispatch_diagnostics::RouteRegistrationDiagnostic {
@@ -13532,6 +13944,7 @@ mod council_guidance_tests {
             "active-secret-routes.sock",
             "/secret/key_path",
             "/secret/claude.sock",
+            "/secret/recovery-diagnostic",
         ] {
             assert!(
                 !raw_json.contains(forbidden),
@@ -13546,6 +13959,49 @@ mod council_guidance_tests {
         assert_eq!(rec["phase"], "retained_fence");
         assert_eq!(rec["decisive_reason"], "receipt_write_error");
         assert_eq!(rec["route_dispatch_calls"], 2);
+        let attempts = body["dispatch_diagnostics"]["fence_recovery_attempts"]
+            .as_array()
+            .unwrap();
+        assert_eq!(attempts.len(), 2);
+        assert_eq!(
+            attempts[0],
+            json!({
+                "recipient": "felix",
+                "attempt": 3,
+                "limit": 3,
+                "at": ts,
+                "outcome": "vendor_sign_in",
+            })
+        );
+        assert_eq!(
+            attempts[1],
+            json!({
+                "recipient": "ada",
+                "attempt": 1,
+                "limit": 3,
+                "at": ts,
+                "outcome": "seat_busy",
+                "busy_probe_count": 300,
+            })
+        );
+        assert_eq!(
+            body["dispatch_diagnostics"]["fence_recovery_attention"],
+            json!([
+                {
+                    "recipient": "felix",
+                    "outcome": "vendor_sign_in",
+                    "reason_label": "vendor sign-in screen",
+                    "exhausted": true,
+                },
+                {
+                    "recipient": "ada",
+                    "outcome": "seat_busy_prolonged",
+                    "reason_label": "seat has been in a turn for 5m 41s",
+                    "exhausted": false,
+                    "busy_since": ts,
+                },
+            ])
+        );
         let obs = rec["route_observations"].as_array().unwrap();
         assert_eq!(obs.len(), 2);
         assert_eq!(obs[0]["adapter"], "agy");
