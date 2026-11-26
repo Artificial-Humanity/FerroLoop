@@ -7,8 +7,8 @@ export interface ParkedPromptDraft {
   text: string;
   queuedText: string;
   files: Pick<SavedPromptAttachment, "name" | "media_type" | "url">[];
-  recovery?: "hub_restarted" | "session_replaced" | "refused" | "submission_refused";
-  /** A refused POST may have no Hub file references to recover. */
+  recovery?: "hub_restarted" | "session_replaced" | "refused" | "submission_refused" | "submission_unconfirmed";
+  /** A POST without a queue receipt has no Hub file references to recover. */
   attachmentCount?: number;
   attachments?: PromptAttachment[];
 }
@@ -19,7 +19,7 @@ export function parkedPromptDraftScope(hub: string, owner: string, seat: string)
 
 const memory = new Map<string, ParkedPromptDraft>();
 // Retain at most one maximum-size request's worth of encoded, unsaved uploads.
-const MAX_REFUSED_ATTACHMENT_CHARS = 24 * 1024 * 1024;
+const MAX_UNSAVED_ATTACHMENT_CHARS = 24 * 1024 * 1024;
 
 function attachmentChars(attachments: PromptAttachment[] = []): number {
   return attachments.reduce((count, file) => count + file.data_base64.length, 0);
@@ -61,7 +61,7 @@ export function writeParkedPromptDraft(scope: string, draft: ParkedPromptDraft, 
     if (attachments?.length) {
       let chars = attachmentChars(attachments);
       for (const other of memory.values()) chars += attachmentChars(other.attachments);
-      keepAttachments = chars <= MAX_REFUSED_ATTACHMENT_CHARS;
+      keepAttachments = chars <= MAX_UNSAVED_ATTACHMENT_CHARS;
     }
     memory.set(key, keepAttachments ? draft : saved);
   }

@@ -174,6 +174,33 @@ describe("held operator prompts (#496 defect 1)", () => {
     expect(composer).toHaveValue("Keep this draft");
   });
 
+  it.each(["", "New draft"])("keeps an unconfirmed Claude POST out of the composer when it contains '%s'", async (newDraft) => {
+    const target = `claude-619-lost-post-${newDraft.length}`;
+    const client = new HubApiClient({ fetchImpl: async () => new Response("{}") });
+    vi.spyOn(client, "getSessionTranscript").mockResolvedValue({ session_id: target, turns: [] });
+    let loseReply!: (error: TypeError) => void;
+    const send = vi.spyOn(client, "sendSessionPrompt").mockReturnValue(
+      new Promise((_, reject) => { loseReply = reject; }),
+    );
+    render(<ChatPane sessionId={target} adapter="claude" apiClient={client} authority={{ tier: "owner", login: "owner" }} />);
+    const composer = screen.getByLabelText("Message");
+    fireEvent.change(composer, { target: { value: "Original submission" } });
+    fireEvent.click(screen.getByRole("button", { name: "Send Message" }));
+    if (newDraft) fireEvent.change(composer, { target: { value: newDraft } });
+    await act(async () => loseReply(new TypeError("Lost HTTP reply")));
+
+    expect(await screen.findByText(/Check the session and queue before resending/)).toBeVisible();
+    expect(composer).toHaveValue(newDraft);
+    const restore = screen.getByRole("button", { name: "Restore draft" });
+    if (newDraft) {
+      expect(restore).toBeDisabled();
+      fireEvent.change(composer, { target: { value: "" } });
+    }
+    fireEvent.click(restore);
+    await waitFor(() => expect(composer).toHaveValue("Original submission"));
+    expect(send).toHaveBeenCalledTimes(1);
+  });
+
   it("keeps a refused submission and its file when another draft is already open", async () => {
     const target = "claude-619-delayed-refusal";
     const client = new HubApiClient({ fetchImpl: async () => new Response("{}") });

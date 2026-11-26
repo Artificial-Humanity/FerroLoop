@@ -1118,7 +1118,7 @@ function selectSessionDraft(target: string, restoredKey: string | null): { key: 
   return { key: target, draft: loadSessionDraft(target) };
 }
 
-let refusedDraftSequence = 0;
+let submissionDraftSequence = 0;
 
 type TranscriptRefreshState = "loading" | "ready" | "stale" | "unavailable" | "denied";
 interface TranscriptSnapshot {
@@ -2607,7 +2607,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
     if (!apiClient || !recoveryScope || !restoredDraftKey || recovering || !accepts()) return;
     const composerAvailable = () => !draftRef.current.promptText && !draftRef.current.attachments.length &&
       !pendingPrompts.has(targetSessionOrAgent) && !pendingAttachmentReads.has(draftKey);
-    if (restore && ((!sessionId && draft.recovery !== "submission_refused") || !composerAvailable())) return;
+    if (restore && ((!sessionId && draft.epoch !== "local") || !composerAvailable())) return;
     setRecovering(true);
     try {
       let files = draft.attachments ?? [];
@@ -2840,6 +2840,14 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
       owner.authEpoch === ownerRef.current.authEpoch && submittedToken === apiClient?.getToken();
     const submittedDraft = { promptText, attachments: [...attachments] };
     const content = trimmedPrompt || "Attached file(s).";
+    const backUpSubmission = (scope: string, recovery: "submission_refused" | "submission_unconfirmed") => {
+      writeParkedPromptDraft(scope, {
+        id: globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${++submissionDraftSequence}`,
+        sessionId: submittedTarget, epoch: "local", text: submittedDraft.promptText, queuedText: content,
+        files: [], recovery, attachmentCount: submittedDraft.attachments.length,
+        attachments: submittedDraft.attachments,
+      });
+    };
     const matchingBefore = effectiveTurns.filter((turn) =>
       turn.role.toLowerCase() === "user" &&
       extractTurnAttachments(turn.content || "", { stripAgyWrapper: true })
@@ -2926,6 +2934,11 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
       }
     } catch (err) {
       if (recoveryScope && !sameSubmissionAuth()) return;
+      if (recoveryScope && adapter === "claude" && !payload.send_now && attempted &&
+        !res && !isKnownPromptRefusal(err)) {
+        backUpSubmission(recoveryScope, "submission_unconfirmed");
+        return;
+      }
       if (codexSendNow && attempted && !isPromptDeliveryFailure(res) && !isKnownPromptRefusal(err)) {
         recordUnconfirmedDelivery(submittedTarget);
         return;
@@ -2945,12 +2958,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
       } else if (recoveryScope && (adapter === "claude" || submittedDraftKey === restoredDraftKey) &&
         (isKnownPromptRefusal(err) || res?.delivery_stage === "refused" ||
           res?.delivery_stage === "not_connected" || res?.delivery_stage === "held")) {
-        writeParkedPromptDraft(recoveryScope, {
-          id: globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${++refusedDraftSequence}`,
-          sessionId: submittedTarget, epoch: "local", text: submittedDraft.promptText, queuedText: content,
-          files: [], recovery: "submission_refused", attachmentCount: submittedDraft.attachments.length,
-          attachments: submittedDraft.attachments,
-        });
+        backUpSubmission(recoveryScope, "submission_refused");
       }
       notifyDraft(submittedDraftKey, restored, message);
 
@@ -4212,9 +4220,11 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
                 ? "The original conversation changed. Its queued prompt is available as a draft."
                 : draft.recovery === "submission_refused"
                   ? "The submitted prompt was refused. Its draft is available to restore."
-                  : "The original session refused this queued prompt. Its draft is available to restore."}</div>
+                  : draft.recovery === "submission_unconfirmed"
+                    ? "Delivery unconfirmed. Check the session and queue before resending."
+                    : "The original session refused this queued prompt. Its draft is available to restore."}</div>
             <div style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={draft.text}>{draft.text || "Attached files"}</div>
-            <button type="button" className="fd-btn" disabled={(!sessionId && draft.recovery !== "submission_refused") || recovering || Boolean(promptText || attachments.length) || submitting}
+            <button type="button" className="fd-btn" disabled={(!sessionId && draft.epoch !== "local") || recovering || Boolean(promptText || attachments.length) || submitting}
               onClick={() => void handleRecoverParkedPrompt(draft, true)}>
               Restore draft
             </button>{" "}
