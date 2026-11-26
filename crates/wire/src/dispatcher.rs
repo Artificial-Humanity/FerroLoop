@@ -7480,24 +7480,23 @@ fn retained_fence_codex_gate(cleaned: &str) -> Result<(), FenceRecoveryOutcome> 
 
 fn retained_fence_codex_working(rows: &[&str]) -> bool {
     let mut rows = rows.iter().rev().copied();
-    let Some(row) = rows.next() else {
-        return false;
-    };
-    let is_working = |line: &str| {
-        let line = line.trim();
-        line.starts_with("• Working (") || matches!(line, "• Working..." | "• Working…")
-    };
-    if is_working(row) {
-        return true;
+    while let Some(row) = rows.next() {
+        let trimmed = row.trim();
+        if trimmed.starts_with("• Working (") || matches!(trimmed, "• Working..." | "• Working…")
+        {
+            return true;
+        }
+
+        // The status detail and working tip can each start a branch. Only
+        // walk contiguous branches and their deeper-indented continuations.
+        let branch = std::iter::once(row)
+            .chain(rows.by_ref())
+            .find(|line| !line.starts_with("   ") || line.trim().is_empty());
+        if !branch.is_some_and(|line| line.starts_with(" └ ") || line.starts_with("  └ ")) {
+            break;
+        }
     }
-    // A status detail or working tip has a branch marker. Its continuation
-    // and adjacent right-aligned feedback use deeper indentation.
-    let detail_start = std::iter::once(row)
-        .chain(rows.by_ref())
-        .take(3)
-        .find(|line| !line.starts_with("   "));
-    detail_start.is_some_and(|line| line.starts_with(" └ ") || line.starts_with("  └ "))
-        && rows.next().is_some_and(is_working)
+    false
 }
 
 fn retained_fence_codex_onboarding(cleaned: &str) -> bool {
@@ -21346,11 +21345,13 @@ exit 1"#,
         );
         let queued = "• Queued follow-up inputs\n  ↳ later\n    shift+← edit last queued message";
         let busy_with_approval_and_queue = format!(
-            "• Working (4s · esc to interrupt)\n\n  ! Approval needed in Robie [explorer]\n    /subagents to review requests\n\n{queued}\n\n{idle}"
+            "• Working (4s · esc to interrupt)\n └ Checking policy\n  └ Tip text\n\n  ! Approval needed in Robie [explorer]\n    /subagents to review requests\n\n{queued}\n\n{idle}"
         );
         let queue_without_status = format!("{queued}\n\n{idle}");
         let clipped_queue = format!("  ↳ later\n\n{idle}");
         let old_busy = format!("• Working…\nPrevious turn completed.\n\n{idle}");
+        let old_busy_with_branches =
+            format!("• Working…\n\n └ Previous detail\n  └ Previous tip\n\n{idle}");
         let old_queue = format!("• Working…\n\n{queued}\nPrevious turn completed.\n\n{idle}");
         let distant_busy = format!("• Working...\n\n\n{idle}");
         let busy_draft = format!("› owner draft\n  • Working...\n\n{footer}");
@@ -21379,6 +21380,7 @@ exit 1"#,
                 Err(FenceRecoveryOutcome::Inconclusive),
             ),
             (old_busy.as_str(), Ok(())),
+            (old_busy_with_branches.as_str(), Ok(())),
             (old_queue.as_str(), Ok(())),
             (distant_busy.as_str(), Ok(())),
             (
@@ -21678,6 +21680,7 @@ exit 1"#,
             ReplacedBeforePayload,
             ReplacedBeforeEnter,
             BusyBeforePaste,
+            HookAndTipBeforePaste,
             BusyBeforeEnter,
             AckedBeforeEnter,
             WriteError,
@@ -21717,6 +21720,7 @@ exit 1"#,
             ReplacedBeforePayload,
             ReplacedBeforeEnter,
             BusyBeforePaste,
+            HookAndTipBeforePaste,
             BusyBeforeEnter,
             AckedBeforeEnter,
             WriteError,
@@ -21766,6 +21770,11 @@ exit 1"#,
                                     }
                                     (BusyBeforePaste, 2, _) => {
                                         format!("{busy_preview}\n\n› Ask Codex to do anything\n\n{footer}")
+                                    }
+                                    (HookAndTipBeforePaste, 2, _) => {
+                                        format!(
+                                            "• Working (35s · esc to interrupt)\n └ Checking policy\n   and its hooks\n  └ Tip text\n\n› Ask Codex to do anything\n\n{footer}"
+                                        )
                                     }
                                     (_, _, 1) => {
                                         let composer = scenario.payload().replace('\n', "\n  ");
@@ -21871,7 +21880,9 @@ exit 1"#,
             let (reason, expected_writes) = match scenario {
                 SignIn => (Some(FenceRecoveryOutcome::VendorSignIn), 0),
                 LostCapture => (Some(FenceRecoveryOutcome::HostedCaptureUnavailable), 0),
-                BusyBeforePaste => (Some(FenceRecoveryOutcome::SeatBusy), 0),
+                BusyBeforePaste | HookAndTipBeforePaste => {
+                    (Some(FenceRecoveryOutcome::SeatBusy), 0)
+                }
                 ReplacedBeforePayload => (Some(FenceRecoveryOutcome::RouteChanged), 0),
                 ReplacedBeforeEnter | BusyBeforeEnter | AckedBeforeEnter | WriteError => (None, 1),
                 CodexIncidentMail | GrokIncidentMail => (None, 2),
