@@ -1111,6 +1111,7 @@ thread_local! {
     static TEST_RECOVERY_ATTACHMENT_FAILURE: std::cell::Cell<Option<&'static str>> = const { std::cell::Cell::new(None) };
     static TEST_RESPAWN_SAVE_FAILURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static TEST_RUNNING_RECORD_SAVE_FAILURE: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+    static TEST_CLEAN_EXIT_RECORD_SAVE_FAILURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static TEST_CODEX_HOME: std::cell::RefCell<Option<Option<std::ffi::OsString>>> = const { std::cell::RefCell::new(None) };
 }
 
@@ -3782,6 +3783,52 @@ fn prerequisite_retry_allowed(by: &str, prior_reason: Option<&str>) -> bool {
         )
 }
 
+/// Apply exact exit evidence and save the automatic recovery decision before any effects.
+fn classify_automatic_recovery<S: StateStore>(
+    store: &S,
+    runtime: &dyn SessionRuntime,
+    record: &mut HostedSessionRecord,
+    state: &mut HostedRespawnState,
+    now: u64,
+) -> Result<Option<recovery::Decision>, LifecycleError> {
+    let loaded_state = state.clone();
+    let exit_evidence::RecoveryExitEvidence::Ready {
+        clean_exit,
+        resolution,
+    } = state
+        .exit_evidence
+        .refresh_for_recovery(runtime, record, now)
+    else {
+        return Ok(None);
+    };
+    let reason = record.stop_reason.as_deref().unwrap_or("");
+    let decision = (!clean_exit).then(|| match &resolution {
+        Some(exit) => recovery::classify_at_exit(state, reason, now, exit.observed_at_ms),
+        None => recovery::classify(state, reason, now),
+    });
+
+    let state_saved = if *state != loaded_state {
+        save_hosted_respawn_state(store, &record.session_id, state, AUTO_RESPAWN_ACTOR)
+    } else {
+        Ok(())
+    };
+    if state_saved.is_ok()
+        && let Some(exit) = resolution
+    {
+        exit.log(&record.session_id);
+    }
+    // Persist the clean stop even if saving its evidence failed. If the record write
+    // fails instead, the saved exact exit still prevents recovery on the next pass.
+    if clean_exit {
+        record.stop_reason = Some(STOP_REASON_CLEAN_EXIT.into());
+        record.launch_prerequisite_detail = None;
+        record.updated_at_ms = now;
+        persist_hosted_session(store, record, AUTO_RESPAWN_ACTOR)?;
+    }
+    state_saved?;
+    Ok(decision)
+}
+
 /// Reserve exactly one automatic attempt in the current phase before launch effects.
 fn reserve_automatic_respawn(
     state: &mut HostedRespawnState,
@@ -4312,6 +4359,14 @@ pub fn persist_hosted_session<S: StateStore>(
     {
         return Err(LifecycleError::Store(
             "injected running-record save failure".into(),
+        ));
+    }
+    #[cfg(test)]
+    if record.stop_reason.as_deref() == Some(STOP_REASON_CLEAN_EXIT)
+        && TEST_CLEAN_EXIT_RECORD_SAVE_FAILURE.with(|fail| fail.get())
+    {
+        return Err(LifecycleError::Store(
+            "injected clean-exit record save failure".into(),
         ));
     }
     let mut normalized = record.clone();
@@ -8048,7 +8103,7 @@ fn reconcile_dead_hosted_session_fenced<S: StateStore>(
                 let expected_pid = record.runtime_leader_pid.or(record.pid);
                 let clean_exit = match &evidence {
                     fl_host_proto::HostedExitEvidenceStatus::Exited(evidence) => {
-                        evidence.exit.code == Some(0) && evidence.exit.signal.is_none()
+                        exit_evidence::is_clean_exit(evidence)
                     }
                     _ => {
                         let code = match respawn_state.exit_evidence.bound_stream(&record) {
@@ -8702,28 +8757,11 @@ where
                 "automatic restart requires runtime spawning".into(),
             ));
         }
-        let loaded_state = respawn_state.clone();
-        if respawn_state
-            .exit_evidence
-            .refresh_pending(env.runtime, &record.session_id, now)
-        {
-            return Err(LifecycleError::Conflict(
-                "automatic restart is waiting for hosted exit evidence".into(),
-            ));
-        }
-        let decision = recovery::classify(
-            &mut respawn_state,
-            record.stop_reason.as_deref().unwrap_or(""),
-            now,
-        );
-        // Persist classification before even a prerequisite probe. Reloading under this lock
-        // prevents a stale reconcile candidate from spending or resetting another operation's state.
-        if respawn_state != loaded_state {
-            save_hosted_respawn_state(store, &record.session_id, &respawn_state, by)?;
-        }
+        let decision =
+            classify_automatic_recovery(store, env.runtime, &mut record, &mut respawn_state, now)?;
         if !matches!(
             decision,
-            recovery::Decision::FastLaunch | recovery::Decision::SlowLaunch
+            Some(recovery::Decision::FastLaunch | recovery::Decision::SlowLaunch)
         ) {
             return Err(LifecycleError::Conflict(
                 "automatic restart is not due or recovery is exhausted".into(),
@@ -9706,36 +9744,29 @@ where
                 }
             };
             let _ = promote_confirmed_hydration(&*guard, &mut fresh);
-            let loaded_state = rstate.clone();
-            if rstate
-                .exit_evidence
-                .refresh_pending(env.runtime, &fresh.session_id, now)
-            {
-                return Ok(());
-            }
             let was_incident = rstate.recovery_started_at_ms.is_some();
-            let decision =
-                recovery::classify(&mut rstate, fresh.stop_reason.as_deref().unwrap_or(""), now);
-            let exhaustion_transition = decision == recovery::Decision::Exhausted
-                && (loaded_state.next_allowed_at_ms.is_some()
-                    || fresh.stop_reason.as_deref() != Some(STOP_REASON_CRASH_LOOP));
-            // State first: a failed write cannot probe, launch or advance recovery.
-            if rstate != loaded_state
-                && let Err(err) = save_hosted_respawn_state(
-                    &*guard,
-                    &fresh.session_id,
-                    &rstate,
-                    AUTO_RESPAWN_ACTOR,
-                )
-            {
-                if should_log_auto_respawn_warning(&fresh.session_id, now) {
-                    eprintln!(
-                        "hub: warning ({}): failed to save recovery policy: {err}",
-                        fresh.session_id
-                    );
+            let had_deadline = rstate.next_allowed_at_ms.is_some();
+            let decision = match classify_automatic_recovery(
+                &*guard,
+                env.runtime,
+                &mut fresh,
+                &mut rstate,
+                now,
+            ) {
+                Ok(Some(decision)) => decision,
+                Ok(None) => return Ok(()),
+                Err(err) => {
+                    if should_log_auto_respawn_warning(&fresh.session_id, now) {
+                        eprintln!(
+                            "hub: warning ({}): failed to persist automatic recovery decision: {err}",
+                            fresh.session_id
+                        );
+                    }
+                    return Ok(());
                 }
-                return Ok(());
-            }
+            };
+            let exhaustion_transition = decision == recovery::Decision::Exhausted
+                && (had_deadline || fresh.stop_reason.as_deref() != Some(STOP_REASON_CRASH_LOOP));
             if rstate.recovery_started_at_ms.is_some() {
                 if (decision == recovery::Decision::Exhausted
                     || fresh.stop_reason.as_deref() != Some(STOP_REASON_PREREQUISITE_UNAVAILABLE))
@@ -22425,6 +22456,7 @@ mod tests {
             TEST_RECOVERY_ATTACHMENT_FAILURE.with(|fail| fail.set(None));
             TEST_RESPAWN_SAVE_FAILURE.with(|fail| fail.set(false));
             TEST_RUNNING_RECORD_SAVE_FAILURE.with(|fail| fail.set(None));
+            TEST_CLEAN_EXIT_RECORD_SAVE_FAILURE.with(|fail| fail.set(false));
             TEST_LAUNCH_PREREQUISITE.with(|slot| *slot.borrow_mut() = None);
             TEST_LAUNCH_PREREQUISITE_SEQUENCE.with(|slot| slot.borrow_mut().clear());
             TEST_LAUNCH_PREREQUISITE_CALLS.with(|calls| calls.set(0));
@@ -22435,6 +22467,12 @@ mod tests {
 
     #[test]
     fn hosted_exit_evidence_follows_counted_launches_without_a_surviving_pid() {
+        for resolve_directly in [false, true] {
+            assert_counted_hosted_exits(resolve_directly);
+        }
+    }
+
+    fn assert_counted_hosted_exits(resolve_directly: bool) {
         use fl_host_proto::{
             ChildExit, HostInstance, HostedExitEvidence, SessionEpoch, SessionId, StreamId,
         };
@@ -22501,11 +22539,16 @@ mod tests {
                     due
                 }
             };
-            assert_eq!(sweep(now + 1), 0);
-            assert_eq!(
-                sweep(now + DEAD_STREAK_MIN_SPACING_MS + 1),
-                usize::from(launch == 1)
-            );
+            let observed_at = if launch == 4 {
+                let first_fast = load_hosted_respawn_state(&*store, id)
+                    .unwrap()
+                    .respawn_timestamps_ms[0];
+                first_fast + AUTO_RESPAWN_WINDOW_MS - 1
+            } else {
+                now + DEAD_STREAK_MIN_SPACING_MS + 1
+            };
+            assert_eq!(sweep(observed_at - DEAD_STREAK_MIN_SPACING_MS), 0);
+            assert_eq!(sweep(observed_at), usize::from(launch == 1));
             if launch == 4 {
                 let state = load_hosted_respawn_state(&*store, id).unwrap();
                 assert_eq!(state.recovery_started_at_ms, None);
@@ -22516,19 +22559,27 @@ mod tests {
                         .is_empty()
                 );
                 fake.hosted_exit_pending_epoch.set(None);
+                let resolved_at =
+                    observed_at + crate::boot_reconcile::RETRY_INTERVAL.as_millis() as u64;
+                let direct_restart = || {
+                    TEST_RESPAWN_NOW_MS.with(|clock| clock.set(Some(resolved_at)));
+                    assert!(matches!(
+                        restart_hosted_session(&*store, &env, id, AUTO_RESPAWN_ACTOR),
+                        Err(LifecycleError::Conflict(_))
+                    ));
+                };
+                if resolve_directly {
+                    direct_restart();
+                }
+                assert_eq!(sweep(resolved_at), 0);
+                if !resolve_directly {
+                    direct_restart();
+                }
+                let state = load_hosted_respawn_state(&*store, id).unwrap();
+                assert_eq!(state.recovery_started_at_ms, Some(observed_at));
                 assert_eq!(
-                    sweep(
-                        now + DEAD_STREAK_MIN_SPACING_MS
-                            + 1
-                            + crate::boot_reconcile::RETRY_INTERVAL.as_millis() as u64
-                    ),
-                    0
-                );
-                assert!(
-                    load_hosted_respawn_state(&*store, id)
-                        .unwrap()
-                        .recovery_started_at_ms
-                        .is_some()
+                    state.next_allowed_at_ms,
+                    Some(observed_at + recovery::RECOVERY_INTERVAL_MS)
                 );
             }
             let state = load_hosted_respawn_state(&*store, id).unwrap();
@@ -22612,6 +22663,103 @@ mod tests {
             let body = item["message"]["body"].as_str().unwrap();
             assert!(body.contains("exit code 1"));
             assert!(!body.contains("private fixed terminal"));
+        }
+    }
+
+    #[test]
+    fn hosted_exit_evidence_pending_clean_exit_stops_automatic_recovery() {
+        use fl_host_proto::{
+            ChildExit, HostInstance, HostedExitEvidence, SessionEpoch, SessionId, StreamId,
+        };
+        let _reset = RecoveryFixtureReset;
+        for (direct, fail_evidence_write) in
+            [(false, false), (false, true), (true, false), (true, true)]
+        {
+            let home = TempDir::new().unwrap();
+            let _trusted = trusted_codex_home(home.path(), home.path());
+            let store = MemStore::default();
+            register(&store, "recovery-lead", "ferroloop", AgentRole::Lead);
+            let fake = FakeRuntime::default();
+            fake.vanish_windows.borrow_mut().push("codex".into());
+            *fake.hosted_exit_fixture.borrow_mut() = Some(HostedExitEvidence {
+                stream: StreamId {
+                    host: HostInstance::new([1; 16]),
+                    session: SessionId::new("Clean.codex").unwrap(),
+                    epoch: SessionEpoch(0),
+                },
+                exit: ChildExit {
+                    code: Some(0),
+                    signal: None,
+                },
+                started_at_ms: 10,
+                captured_at_ms: 20,
+                terminal_tail: "terminal output".into(),
+            });
+            let env = fake.env(home.path());
+            let mut request = req("clean", "assistant", "codex");
+            request.cwd = Some(home.path().display().to_string());
+            TEST_RESPAWN_NOW_MS.with(|clock| clock.set(Some(1_000)));
+            let out = spin_up(&store, &env, &request, "owner", Caller::Owner).unwrap();
+            let id = out.session_id.as_str();
+            fake.presence_of
+                .borrow_mut()
+                .insert("Clean:codex".into(), RuntimePresence::Gone);
+            fake.hosted_exit_pending_epoch.set(Some(SessionEpoch(1)));
+            let reconcile = |ms| {
+                TEST_RESPAWN_NOW_MS.with(|clock| clock.set(Some(ms)));
+                reconcile_and_respawn_hosted_sessions(&store, &env).unwrap()
+            };
+            assert!(reconcile(1_001).is_empty());
+            assert!(reconcile(1_001 + DEAD_STREAK_MIN_SPACING_MS).is_empty());
+            assert_eq!(
+                get_hosted_session_by_id(&store, id)
+                    .unwrap()
+                    .unwrap()
+                    .stop_reason
+                    .as_deref(),
+                Some(STOP_REASON_RUNTIME_GONE)
+            );
+            assert_eq!(fake.launches.borrow().len(), 1);
+
+            // The exact lookup resolves after the initial fallback inventory returned no code.
+            fake.hosted_exit_pending_epoch.set(None);
+            let resolved_at = 20_000;
+            TEST_RESPAWN_NOW_MS.with(|clock| clock.set(Some(resolved_at)));
+            TEST_RESPAWN_SAVE_FAILURE.with(|fail| fail.set(fail_evidence_write));
+            TEST_CLEAN_EXIT_RECORD_SAVE_FAILURE.with(|fail| fail.set(!fail_evidence_write));
+            let failure = if fail_evidence_write {
+                "injected respawn-state save failure"
+            } else {
+                "injected clean-exit record save failure"
+            };
+            assert!(matches!(
+                restart_hosted_session(&store, &env, id, AUTO_RESPAWN_ACTOR),
+                Err(LifecycleError::Store(detail)) if detail.contains(failure)
+            ));
+            assert_eq!(fake.launches.borrow().len(), 1);
+            // The Host may drop the evidence before the next automatic pass.
+            *fake.hosted_exit_fixture.borrow_mut() = None;
+            TEST_RESPAWN_SAVE_FAILURE.with(|fail| fail.set(false));
+            TEST_CLEAN_EXIT_RECORD_SAVE_FAILURE.with(|fail| fail.set(false));
+            TEST_RESPAWN_NOW_MS.with(|clock| clock.set(Some(resolved_at + 1)));
+            if direct {
+                assert!(matches!(
+                    restart_hosted_session(&store, &env, id, AUTO_RESPAWN_ACTOR),
+                    Err(LifecycleError::Conflict(_))
+                ));
+            } else {
+                assert!(reconcile(resolved_at + 1).is_empty());
+            }
+            let stopped = get_hosted_session_by_id(&store, id).unwrap().unwrap();
+            assert_eq!(stopped.status, STATUS_STOPPED);
+            assert_eq!(stopped.stop_reason.as_deref(), Some(STOP_REASON_CLEAN_EXIT));
+            assert_eq!(fake.launches.borrow().len(), 1);
+            assert!(
+                store
+                    .list_wire_inbox(&Default::default())
+                    .unwrap()
+                    .is_empty()
+            );
         }
     }
 

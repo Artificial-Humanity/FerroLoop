@@ -14,20 +14,38 @@ pub(super) enum Decision {
 
 /// Classify a stopped record. Mutation must be saved before any probe or launch.
 pub(super) fn classify(state: &mut HostedRespawnState, reason: &str, now: u64) -> Decision {
+    classify_at_exit(state, reason, now, now)
+}
+
+/// A delayed exit can exhaust the fast budget as of its observation. Any existing
+/// deadline or launch reservation still uses the current wall clock.
+pub(super) fn classify_at_exit(
+    state: &mut HostedRespawnState,
+    reason: &str,
+    now: u64,
+    observed_at_ms: u64,
+) -> Decision {
     state.recovery_healthy_since_ms = None;
     if state.recovery_started_at_ms.is_none() {
+        let budget_at_ms = observed_at_ms.min(now);
+        let guard_tripped = reason == STOP_REASON_CRASH_LOOP
+            || state
+                .respawn_timestamps_ms
+                .iter()
+                .filter(|&&ts| budget_at_ms.saturating_sub(ts) < AUTO_RESPAWN_WINDOW_MS)
+                .count()
+                >= AUTO_RESPAWN_MAX_IN_WINDOW;
+        let prune_at_ms = if guard_tripped { budget_at_ms } else { now };
         state
             .respawn_timestamps_ms
-            .retain(|ts| now.saturating_sub(*ts) < AUTO_RESPAWN_WINDOW_MS);
+            .retain(|ts| prune_at_ms.saturating_sub(*ts) < AUTO_RESPAWN_WINDOW_MS);
         state
             .exit_evidence
-            .prune_fast_exits(&state.respawn_timestamps_ms, now);
-        if reason == STOP_REASON_CRASH_LOOP
-            || state.respawn_timestamps_ms.len() >= AUTO_RESPAWN_MAX_IN_WINDOW
-        {
-            state.recovery_started_at_ms = Some(now);
+            .prune_fast_exits(&state.respawn_timestamps_ms, prune_at_ms);
+        if guard_tripped {
+            state.recovery_started_at_ms = Some(observed_at_ms);
             state.recovery_attempts = 0;
-            state.next_allowed_at_ms = Some(now.saturating_add(RECOVERY_INTERVAL_MS));
+            state.next_allowed_at_ms = Some(observed_at_ms.saturating_add(RECOVERY_INTERVAL_MS));
             return Decision::Wait;
         }
     }

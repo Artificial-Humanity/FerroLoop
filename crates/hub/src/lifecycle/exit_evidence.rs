@@ -39,6 +39,29 @@ pub struct HostedExitIncident {
     exits: Vec<CountedExit>,
 }
 
+pub(super) enum RecoveryExitEvidence {
+    Pending,
+    Ready {
+        clean_exit: bool,
+        resolution: Option<ResolvedPendingExit>,
+    },
+}
+
+pub(super) struct ResolvedPendingExit {
+    pub(super) observed_at_ms: u64,
+    epoch: u64,
+    detail: String,
+}
+
+impl ResolvedPendingExit {
+    pub(super) fn log(&self, hosted_id: &str) {
+        eprintln!(
+            "hub: warning ({hosted_id}): resolved hosted child exit at epoch {}. {}",
+            self.epoch, self.detail,
+        );
+    }
+}
+
 impl HostedExitIncident {
     pub(super) fn is_empty(&self) -> bool {
         self.launch.is_none() && self.exits.is_empty()
@@ -129,29 +152,53 @@ impl HostedExitIncident {
         capture_exact(runtime, stream, &record.session_id)
     }
 
-    /// Return true while the latest counted exit is still waiting for terminal evidence.
-    pub(super) fn refresh_pending(
+    /// Resolve Pending for the current launch, retaining its original observation time.
+    pub(super) fn refresh_for_recovery(
         &mut self,
         runtime: &dyn SessionRuntime,
-        hosted_id: &str,
+        record: &HostedSessionRecord,
         now: u64,
-    ) -> bool {
-        let Some(exit) = self.exits.last_mut().filter(|exit| exit.pending) else {
-            return false;
+    ) -> RecoveryExitEvidence {
+        use RecoveryExitEvidence::{Pending, Ready};
+
+        let no_evidence = Ready {
+            clean_exit: false,
+            resolution: None,
         };
-        let elapsed = now.checked_sub(exit.observed_at_ms);
-        if elapsed == Some(0) {
-            return true;
+        let Some(stream) = self.bound_stream(record).cloned() else {
+            return no_evidence;
+        };
+        let Some(exit) = self.exits.last_mut().filter(|exit| exit.stream == stream) else {
+            return no_evidence;
+        };
+        let mut resolution = None;
+        if exit.pending {
+            let elapsed = now.checked_sub(exit.observed_at_ms);
+            if elapsed == Some(0) {
+                return Pending;
+            }
+            if let HostedExitEvidenceStatus::Exited(evidence) =
+                capture_exact(runtime, &exit.stream, &record.session_id)
+            {
+                exit.evidence = Some(evidence);
+            } else if elapsed.is_some_and(|ms| ms < PENDING_EXIT_EVIDENCE_MS) {
+                return Pending;
+            }
+            exit.pending = false;
+            resolution = Some(ResolvedPendingExit {
+                observed_at_ms: exit.observed_at_ms,
+                epoch: exit.stream.epoch.0,
+                detail: exit
+                    .evidence
+                    .as_ref()
+                    .map_or_else(|| "evidence: unavailable".into(), exit_status),
+            });
         }
-        if let HostedExitEvidenceStatus::Exited(evidence) =
-            capture_exact(runtime, &exit.stream, hosted_id)
-        {
-            exit.evidence = Some(evidence);
-        } else if elapsed.is_some_and(|ms| ms < PENDING_EXIT_EVIDENCE_MS) {
-            return true;
+        // A resolved clean exit still applies if a prior stopped-record write failed.
+        Ready {
+            clean_exit: exit.evidence.as_ref().is_some_and(is_clean_exit),
+            resolution,
         }
-        exit.pending = false;
-        false
     }
 
     pub(super) fn count_exit(
@@ -293,6 +340,10 @@ fn remember_spawn<S: StateStore>(
         return Err(err);
     }
     Ok(())
+}
+
+pub(super) fn is_clean_exit(evidence: &HostedExitEvidence) -> bool {
+    evidence.exit.code == Some(0) && evidence.exit.signal.is_none()
 }
 
 fn complete_failure(evidence: &HostedExitEvidence) -> bool {
