@@ -185,6 +185,65 @@ describe("held operator prompts (#496 defect 1)", () => {
     expect(send).not.toHaveBeenCalled();
   });
 
+  it.each(["the composer changes", "the DELETE reply is lost"] as const)(
+    "keeps a fresh-device refused draft when %s during restore", async (interruption) => {
+      const replyLost = interruption === "the DELETE reply is lost";
+      const target = replyLost ? "claude-619-lost-restore-reply" : "claude-619-restore-with-edit";
+      const file = { name: "saved.txt", media_type: "text/plain",
+        url: "/api/v1/attachments/saved.txt", path: "/data/attachments/saved.txt" };
+      const item = heldItem({ id: "retained-prompt", session_id: "old-native", prompt: "Keep this draft",
+        hold_reason: null, delivery_state: "refused", refusal_reason: "session_replaced",
+        retained_as_draft: true, claude_terminal: true, attachments: [file] });
+      const client = new HubApiClient({ fetchImpl: async () => new Response("{}") });
+      const readFile = vi.spyOn(client, "getQueuedPromptAttachment").mockResolvedValue(new Blob(["saved"]));
+      const send = vi.spyOn(client, "sendSessionPrompt");
+      type CancelResponse = Awaited<ReturnType<HubApiClient["cancelQueuedPrompt"]>>;
+      let removeArchive!: (result: CancelResponse) => void;
+      let loseReply!: (error: Error) => void;
+      const cancel = vi.spyOn(client, "cancelQueuedPrompt")
+        .mockReturnValueOnce(new Promise((resolve, reject) => {
+          removeArchive = resolve;
+          loseReply = reject;
+        }))
+        .mockRejectedValueOnce(new HubApiError(404, "Draft already removed"));
+      const props = { agentName: target, adapter: "claude", sessionId: target, apiClient: client,
+        authority: { tier: "owner", login: "owner" } as const, queueEpoch: "hub-1", turns: [] };
+      const { rerender } = render(<ChatPane {...props} queue={[item]} />);
+      const composer = screen.getByLabelText("Message");
+      const scope = parkedPromptDraftScope(client.getBaseUrl(), "owner", target);
+
+      expect(readParkedPromptDrafts(scope)).toHaveLength(0);
+      fireEvent.click(screen.getByRole("button", { name: "Restore draft" }));
+      await waitFor(() => expect(cancel).toHaveBeenCalledWith(target, item.id));
+      expect(readParkedPromptDrafts(scope)).toMatchObject([{
+        text: item.prompt, recovery: "session_replaced", attachments: [{ name: file.name }],
+        files: [{ name: file.name, media_type: file.media_type, url: file.url }],
+      }]);
+      expect(screen.getAllByRole("button", { name: "Restore draft" })).toHaveLength(1);
+
+      const newDraft = replyLost ? "" : "Independent new draft";
+      if (replyLost) {
+        await act(async () => loseReply(new TypeError("Lost DELETE reply")));
+      } else {
+        fireEvent.change(composer, { target: { value: newDraft } });
+        rerender(<ChatPane {...props} queue={[]} />);
+        await act(async () => removeArchive({ session_id: target, prompt_id: item.id, status: "cancelled", queue: [] }));
+      }
+      expect(composer).toHaveValue(newDraft);
+      const recovery = await screen.findByRole("button", { name: "Restore draft" });
+      if (newDraft) {
+        expect(recovery).toBeDisabled();
+        fireEvent.change(composer, { target: { value: "" } });
+      }
+      fireEvent.click(recovery);
+      await waitFor(() => expect(composer).toHaveValue(item.prompt));
+      expect(screen.getByTestId("attachment-chip-list")).toHaveTextContent(file.name);
+      expect(readFile).toHaveBeenCalledExactlyOnceWith(file.url);
+      expect(send).not.toHaveBeenCalled();
+      expect(readParkedPromptDrafts(scope)).toHaveLength(0);
+    },
+  );
+
   it("bounds recovery records across seats and clears only parked drafts on sign-out", () => {
     clearParkedPromptDrafts();
     const scope = parkedPromptDraftScope("", "owner", "seat-one");

@@ -1536,7 +1536,8 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
     .filter((item) => item.retained_as_draft && item.delivery_state === "refused")
     .map((item) => ({
       id: item.id, sessionId: item.session_id, epoch: queueEpochEvidence,
-      text: item.prompt, queuedText: item.prompt, files: item.attachments ?? [],
+      text: item.prompt, queuedText: item.prompt,
+      files: (item.attachments ?? []).map(({ name, media_type, url }) => ({ name, media_type, url })),
       recovery: item.refusal_reason === "session_replaced" ? "session_replaced" : "refused",
       retainedByHub: true, refusalDetail: item.delivery_error,
     }));
@@ -2630,8 +2631,13 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
     if (restore && ((!sessionId && draft.epoch !== "local") || !composerAvailable())) return;
     setRecovering(true);
     try {
-      let files = draft.attachments ?? [];
-      if (restore && !draft.attachments) {
+      const stagedAttachments = restore && draft.retainedByHub
+        ? readParkedPromptDrafts(recoveryScope)
+          .find((item) => item.id === draft.id && item.epoch === draft.epoch)?.attachments
+        : undefined;
+      const savedAttachments = draft.attachments ?? stagedAttachments;
+      let files = savedAttachments ?? [];
+      if (restore && !savedAttachments) {
         const restored = await Promise.allSettled(draft.files.map(async (file) => {
           const blob = await apiClient.getQueuedPromptAttachment(file.url);
           return fileToPromptAttachment(new File([blob], file.name, { type: file.media_type }));
@@ -2639,6 +2645,11 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
         files = restored.flatMap((result) => result.status === "fulfilled" ? [result.value] : []);
       }
       if (!accepts() || (restore && !composerAvailable())) return;
+      if (restore && draft.retainedByHub) {
+        // A DELETE can succeed even if its reply is lost or the composer changes while waiting.
+        writeParkedPromptDraft(recoveryScope, { ...draft, attachments: files, retainedByHub: undefined });
+        refreshPendingPrompts();
+      }
       if (draft.recovery === "session_replaced" || draft.recovery === "refused") {
         try {
           if (draft.retainedByHub && onCancelQueued) {
