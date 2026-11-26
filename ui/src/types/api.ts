@@ -755,6 +755,16 @@ export function normalizeHydrationWarnings(raw: unknown): string[] {
   return raw.filter((item): item is string => typeof item === "string");
 }
 
+export type HostedBlockReason =
+  | "vendor_sign_in"
+  | "blocking_dialog"
+  | "hydration_overdue";
+
+export interface HostedBlock {
+  reason: HostedBlockReason;
+  observed_at_ms: number;
+}
+
 export type HostedRecoveryAttention = "recovery" | "exhausted";
 
 export interface HostedRecoveryAttentionTarget {
@@ -787,6 +797,7 @@ export interface HostedSessionSummary {
   node_id: string;
   status: string;
   stop_reason?: string | null;
+  block?: HostedBlock | null;
   launch_prerequisite_detail?: string | null;
   restart_count?: number;
   updated_at_ms?: number;
@@ -1330,6 +1341,7 @@ export interface WireDispatchDiagnostics {
     limit: number;
     at: string;
     outcome: string;
+    busy_probe_count?: number;
   }[];
   fence_recovery_attention?: {
     recipient: string;
@@ -2004,6 +2016,7 @@ export type WatchSeverity = "info" | "warning" | "critical";
 export type WatchAlertRule =
   | "spend"
   | "quota"
+  | "hosted_block"
   | "heartbeat_stale"
   | "heartbeat_dead"
   | "crash_loop"
@@ -2092,6 +2105,7 @@ export interface WatchHostedSession {
   node_id: string;
   status: string;
   stop_reason?: string | null;
+  block?: HostedBlock | null;
   launch_prerequisite_detail?: string | null;
   restart_count: number;
   updated_at_ms: number;

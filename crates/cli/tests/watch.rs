@@ -260,6 +260,93 @@ fn liveness_human_and_json() {
 }
 
 #[test]
+fn agent_liveness_exposes_running_and_stopped_hosted_blockers() {
+    let env = Env::new();
+    {
+        let store = env.open();
+        for (id, persona, vendor, status, stop_reason, block) in [
+            (
+                "codex:ada",
+                "ada",
+                "codex",
+                "running",
+                None,
+                json!({"reason": "vendor_sign_in", "observed_at_ms": 123}),
+            ),
+            (
+                "muse:bo",
+                "bo",
+                "muse",
+                "stopped",
+                Some("startup_blocked"),
+                json!({"reason": "blocking_dialog", "observed_at_ms": 124}),
+            ),
+            (
+                "claude:legacy",
+                "legacy",
+                "claude",
+                "stopped",
+                Some("startup_blocked"),
+                Value::Null,
+            ),
+            (
+                "codex:crashed",
+                "crashed",
+                "codex",
+                "stopped",
+                Some("runtime_gone"),
+                json!({"reason": "vendor_sign_in", "observed_at_ms": 125}),
+            ),
+        ] {
+            put_runtime(
+                &store,
+                &format!("hosted-session-{vendor}-{persona}"),
+                json!({
+                    "session_id": id, "persona": persona, "vendor": vendor,
+                    "status": status, "stop_reason": stop_reason, "block": block,
+                }),
+            );
+        }
+    }
+    let fl = || {
+        let mut command = env.fl();
+        command
+            .env("FL_WIRE_DISABLE_HOST_DISCOVERY", "1")
+            .env_remove("FL_WIRE_ROUTES")
+            .env_remove("FL_HOST_SOCK");
+        command
+    };
+
+    let all = fl().args(["agent", "liveness", "--json"]).output().unwrap();
+    assert!(all.status.success(), "{all:?}");
+    let rows = json_of(&all.stdout);
+    assert_eq!(rows.as_array().unwrap().len(), 3);
+    assert_eq!(rows[0]["target"], "claude:legacy");
+    assert_eq!(rows[0]["stop_reason"], "startup_blocked");
+    assert!(rows[0].get("block").is_none());
+    assert_eq!(rows[1]["target"], "codex:ada");
+    assert_eq!(rows[1]["block"]["reason"], "vendor_sign_in");
+    assert!(rows[1].get("stop_reason").is_none());
+    assert_eq!(rows[2]["target"], "muse:bo");
+    assert_eq!(rows[2]["block"]["reason"], "blocking_dialog");
+    assert_eq!(rows[2]["stop_reason"], "startup_blocked");
+
+    let running = fl().args(["agent", "liveness", "ada"]).output().unwrap();
+    assert!(running.status.success(), "{running:?}");
+    assert!(String::from_utf8_lossy(&running.stdout).contains("\tblock=vendor_sign_in"));
+
+    let stopped = fl()
+        .args(["agent", "liveness", "muse:bo"])
+        .output()
+        .unwrap();
+    assert!(stopped.status.success(), "{stopped:?}");
+    assert!(
+        String::from_utf8_lossy(&stopped.stdout)
+            .contains("\tblock=blocking_dialog\tstop_reason=startup_blocked")
+    );
+}
+
+#[test]
 fn alerts_fail_on_critical_exit_status_and_overrides() {
     let env = Env::new();
     seed(&env);

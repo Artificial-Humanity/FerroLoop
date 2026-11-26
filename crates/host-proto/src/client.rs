@@ -89,6 +89,7 @@ pub struct AsyncHostClient {
     io: ClientIo,
     major: u16,
     minor: u16,
+    extension_features: Option<u64>,
     correlator: ClientCorrelator,
     frame_timeout: Duration,
     write_timeout: Duration,
@@ -399,16 +400,8 @@ impl AsyncHostClient {
         {
             return Ok(false);
         }
-        match self
-            .extension_request(crate::ExtensionRequest::Capabilities)
-            .await?
-        {
-            crate::ExtensionResponse::Capabilities { features, .. } => {
-                if features & crate::SESSION_OWNER_FEATURE == 0 {
-                    return Ok(false);
-                }
-            }
-            _ => return Err(HostError::Protocol("capabilities response required".into())),
+        if self.extension_features().await? & crate::SESSION_OWNER_FEATURE == 0 {
+            return Ok(false);
         }
         match self
             .extension_request(crate::ExtensionRequest::CheckSessionOwner {
@@ -681,25 +674,30 @@ impl AsyncHostClient {
         }
     }
 
-    async fn require_rendered_pty(&mut self) -> Result<(), HostError> {
+    async fn extension_features(&mut self) -> Result<u64, HostError> {
         if self.minor < 1 {
-            return Err(HostError::Unsupported {
-                subject: "rendered PTY",
-            });
+            return Ok(0);
         }
-        match self
-            .diagnosed_extension_request(crate::ExtensionRequest::Capabilities)
+        if let Some(features) = self.extension_features {
+            return Ok(features);
+        }
+        let crate::ExtensionResponse::Capabilities { features, .. } = self
+            .extension_request(crate::ExtensionRequest::Capabilities)
             .await?
-        {
-            crate::ExtensionResponse::Capabilities { features, .. }
-                if features & crate::RENDERED_PTY_FEATURE != 0 =>
-            {
-                Ok(())
-            }
-            crate::ExtensionResponse::Capabilities { .. } => Err(HostError::Unsupported {
+        else {
+            return Err(HostError::Protocol("capabilities response required".into()));
+        };
+        self.extension_features = Some(features);
+        Ok(features)
+    }
+
+    async fn require_rendered_pty(&mut self) -> Result<(), HostError> {
+        if self.extension_features().await? & crate::RENDERED_PTY_FEATURE != 0 {
+            Ok(())
+        } else {
+            Err(HostError::Unsupported {
                 subject: "rendered PTY",
-            }),
-            _ => Err(HostError::Protocol("capabilities response required".into())),
+            })
         }
     }
 
@@ -824,6 +822,7 @@ impl AsyncHostClient {
             io: ClientIo::Pipe(pipe),
             major,
             minor,
+            extension_features: None,
             correlator: ClientCorrelator::new(),
             frame_timeout: FRAME_READ_TIMEOUT,
             write_timeout: WRITE_TIMEOUT,
@@ -1140,6 +1139,7 @@ async fn drive_unix(
         io: ClientIo::Unix(stream),
         major,
         minor,
+        extension_features: None,
         correlator: ClientCorrelator::new(),
         frame_timeout: FRAME_READ_TIMEOUT,
         write_timeout: WRITE_TIMEOUT,
@@ -1222,6 +1222,7 @@ mod tests {
                 io: ClientIo::Mem(client),
                 major: 1,
                 minor: 0,
+                extension_features: None,
                 correlator: ClientCorrelator::new(),
                 frame_timeout: Duration::from_secs(2),
                 write_timeout: Duration::from_secs(2),
@@ -1381,14 +1382,14 @@ mod tests {
                 ));
                 // A following legacy request is a deterministic sentinel. Unknown
                 // requests cannot be silently left unread in the mock socket.
-                let id = if minor == 0 { 1 } else { 3 };
+                let id = if minor == 0 { 1 } else { 2 };
                 assert!(matches!(
                     client.request(list(id)).await.unwrap(),
                     HostResponse::Listed { .. }
                 ));
             };
             let daemon = async {
-                for index in 0..if minor == 0 { 1 } else { 3 } {
+                for index in 0..if minor == 0 { 1 } else { 2 } {
                     let frame = auth::read_frame_async(
                         &mut server,
                         Instant::now() + Duration::from_secs(2),
@@ -1397,7 +1398,7 @@ mod tests {
                     .await
                     .unwrap();
                     let request = crate::decode_request_for_minor(minor, &frame).unwrap();
-                    let response = if minor == 1 && index < 2 {
+                    let response = if minor == 1 && index == 0 {
                         let HostRequest::Extended {
                             id,
                             request: crate::ExtensionRequest::Capabilities,
@@ -1807,6 +1808,7 @@ mod extension_client_tests {
             io: ClientIo::Mem(left),
             major: 1,
             minor: 0,
+            extension_features: None,
             correlator: ClientCorrelator::new(),
             frame_timeout: Duration::from_secs(1),
             write_timeout: Duration::from_secs(1),
@@ -1848,6 +1850,7 @@ mod extension_client_tests {
                 io: ClientIo::Mem(left),
                 major: 1,
                 minor: 1,
+                extension_features: None,
                 correlator: ClientCorrelator::new(),
                 frame_timeout: Duration::from_secs(1),
                 write_timeout: Duration::from_secs(1),

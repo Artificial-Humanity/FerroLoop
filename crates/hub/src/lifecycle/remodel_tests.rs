@@ -16,6 +16,7 @@ fn env(home: &TempDir) -> LifecycleEnv<'_> {
         workspace_root: None,
         log_hydration_warnings: true,
         lifecycle_fence: None,
+        blocker_evidence: None,
     }
 }
 
@@ -1059,9 +1060,24 @@ fn blocked_codex_sign_in_refuses_before_remodel_teardown_unless_overridden() {
 #[test]
 fn inconclusive_codex_sign_in_allows_remodel_with_one_warning() {
     let home = TempDir::new().unwrap();
-    let _trusted = trusted_codex_home(home.path(), home.path());
+    let workspace = home.path().join("workspace");
+    let project = workspace.join("FerroLoop");
+    std::fs::create_dir_all(workspace.join(".agents/roles")).unwrap();
+    std::fs::create_dir(workspace.join(".agents/memory")).unwrap();
+    std::fs::create_dir(&project).unwrap();
+    std::fs::write(workspace.join(".agents/AGENTS.md"), "workspace guidance").unwrap();
+    std::fs::write(
+        workspace.join(".agents/roles/assistant.md"),
+        "role guidance",
+    )
+    .unwrap();
+    for file in ["AGENTS.md", "WORKFLOW.md", "PERSONA.md"] {
+        std::fs::write(project.join(file), "project guidance").unwrap();
+    }
+    let _trusted = trusted_codex_home(home.path(), &project);
     let fake = FakeRuntime::default();
-    let env = fake.env(home.path());
+    let mut env = fake.env(home.path());
+    env.workspace_root = Some(&workspace);
     let store = MemStore::default();
     spin_with(
         &store,
@@ -1070,7 +1086,7 @@ fn inconclusive_codex_sign_in_allows_remodel_with_one_warning() {
         "assistant",
         "claude",
         None,
-        Some(home.path()),
+        Some(&project),
     );
     TEST_LAUNCH_AUTH.with(|slot| {
         *slot.borrow_mut() = Some(Box::new(|_| Some(LaunchSignInIssue::Inconclusive)));
@@ -1956,6 +1972,7 @@ fn a_failed_remodel_refreshes_tombstones_when_it_undoes_the_new_record() {
         node_id: DEFAULT_NODE_ID.into(),
         hosted: true,
         status: STATUS_DECOMMISSIONED.into(),
+        block: None,
         stop_reason: None,
         launch_prerequisite_detail: None,
         restart_policy: "never".into(),
