@@ -326,13 +326,13 @@ describe("WireMailPane", () => {
             recipient: "ari",
             outcome: "seat_busy",
             reason_label: "seat is in a turn",
-            exhausted: false,
+            exhausted: true,
             busy_since: "2026-11-26T01:00:00.000Z",
           },
           {
             recipient: "bea",
             outcome: "seat_busy_prolonged",
-            reason_label: "seat is still in a turn after 12 consecutive probes",
+            reason_label: "seat has been in a turn for 5m 41s",
             exhausted: false,
             busy_since: "2026-11-26T02:00:00.000Z",
           },
@@ -363,10 +363,10 @@ describe("WireMailPane", () => {
       "ada: Wire recovery pending (waiting for a delivery worker slot)",
     );
     expect(screen.getByTestId("wire-fence-recovery-attention-ari")).toHaveTextContent(
-      "ari: Wire recovery pending (seat is in a turn since 2026-11-26T01:00:00.000Z)",
+      "ari: Wire recovery pending (seat is in a turn since 2026-11-26T01:00:00.000Z, attempt limit reached)",
     );
     expect(screen.getByTestId("wire-fence-recovery-attention-bea")).toHaveTextContent(
-      "bea: Wire recovery needs attention (seat is still in a turn after 12 consecutive probes since 2026-11-26T02:00:00.000Z)",
+      "bea: Wire recovery needs attention (seat has been in a turn for 5m 41s since 2026-11-26T02:00:00.000Z)",
     );
     expect(screen.queryByTestId("wire-diagnostics-available")).toBeNull();
   });
