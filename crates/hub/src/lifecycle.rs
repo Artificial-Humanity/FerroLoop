@@ -27,6 +27,7 @@ use fl_wire::dispatcher::{
     OperatorPromptError, OperatorPromptIntent, OperatorPromptOutcome, PushError,
     push_operator_prompt_with_intent,
 };
+use fl_wire::hosted_recovery_notice;
 use fl_wire::identity::{
     RouteTable, VendorRoute, is_native_session_id, legacy_routes_path, resolve_routes_path,
 };
@@ -3674,6 +3675,14 @@ pub fn hosted_respawn_state_slug(session_id: &str) -> String {
     )
 }
 
+/// Recovery phase that needs the owner's attention when no eligible recipient exists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HostedRecoveryAttention {
+    Recovery,
+    Exhausted,
+}
+
 /// Disjoint runtime state for automatic respawn backoff and crash-loop protection.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostedRespawnState {
@@ -3692,6 +3701,8 @@ pub struct HostedRespawnState {
     /// Successful deliveries keyed as `recovery:<recipient>` or `exhausted:<recipient>`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub crash_loop_notified_recipients: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_attention: Option<HostedRecoveryAttention>,
     #[serde(default, skip_serializing_if = "HostedExitIncident::is_empty")]
     pub exit_evidence: HostedExitIncident,
 }
@@ -3709,6 +3720,7 @@ impl HostedRespawnState {
             && self.recovery_attempts == 0
             && self.recovery_healthy_since_ms.is_none()
             && self.crash_loop_notified_recipients.is_empty()
+            && self.recovery_attention.is_none()
             && self.exit_evidence.is_empty()
     }
 
@@ -9374,7 +9386,7 @@ fn resolve_project_lead<S: AgentRegistry>(
     Ok(active_leads.into_iter().next())
 }
 
-fn notify_crash_loop_recipients<S: AgentRegistry + MessageStore>(
+fn notify_crash_loop_recipients<S: AgentRegistry + MessageStore + StateStore>(
     store: &S,
     fresh: &HostedSessionRecord,
     state: &mut HostedRespawnState,
@@ -9435,15 +9447,22 @@ fn notify_crash_loop_recipients<S: AgentRegistry + MessageStore>(
         &fresh.persona,
         fresh.role.eq_ignore_ascii_case("lead"),
     );
-    if recipients.is_empty()
-        && should_log_auto_respawn_warning(&fresh.session_id, current_respawn_clock_ms())
-    {
-        eprintln!(
-            "hub: warning ({}): nobody could be notified of recovery status; no eligible Lead or Lab Manager",
-            fresh.session_id
-        );
-    }
     let exhausted = state.recovery_attempts >= recovery::RECOVERY_MAX_ATTEMPTS;
+    if recipients.is_empty() {
+        state.recovery_attention = Some(if exhausted {
+            HostedRecoveryAttention::Exhausted
+        } else {
+            HostedRecoveryAttention::Recovery
+        });
+        state.crash_loop_notified = false;
+        if should_log_auto_respawn_warning(&fresh.session_id, current_respawn_clock_ms()) {
+            eprintln!(
+                "hub: warning ({}): nobody could be notified of recovery status; no eligible Lead or Lab Manager",
+                fresh.session_id
+            );
+        }
+        return;
+    }
     let subject = if exhausted {
         format!("Recovery exhausted: {} left stopped", fresh.session_id)
     } else {
@@ -9470,12 +9489,38 @@ fn notify_crash_loop_recipients<S: AgentRegistry + MessageStore>(
         "Hosted session `{}` (persona `{}`, vendor `{}`) hit the fast crash-loop guard. {schedule} Inspect the failure; after resolving it, run `fl agent restart {}` to restart from saved settings. A prerequisite refusal before any process spawns spends no recovery launch; a real spawn stays charged. FerroLoop does not start the vendor daemon. {evidence}.",
         fresh.session_id, fresh.persona, fresh.vendor, fresh.session_id
     );
+    let tail = state
+        .exit_evidence
+        .latest_evidence()
+        .map(|evidence| evidence.terminal_tail.as_str())
+        .filter(|tail| !tail.trim().is_empty())
+        .map(str::to_owned);
     recovery::deliver_pending(state, &recipients, |recipient| {
         let Some(agent) = agents.iter().find(|agent| agent.name_key == recipient) else {
             return false;
         };
+        let at = stamp::now();
+        let id = tail.as_deref().and_then(|tail| {
+            // Store the private excerpt first. The mail remains useful if the write fails.
+            hosted_recovery_notice::prepare(
+                store,
+                &agent.id,
+                &fresh.project,
+                tail,
+                at.clone(),
+                AUTO_RESPAWN_ACTOR,
+            )
+            .ok()
+        });
+        let body = if id.is_some() {
+            format!(
+                "{body} To read the sanitized terminal excerpt on the originating node, run `fl wire read --for {recipient} --all`."
+            )
+        } else {
+            body.clone()
+        };
         match store.send_wire(SendWireArgs {
-            id: None,
+            id: id.clone(),
             sender_id: None,
             sender_name: "system".into(),
             sender_host: None,
@@ -9484,14 +9529,17 @@ fn notify_crash_loop_recipients<S: AgentRegistry + MessageStore>(
             urgency: MessageUrgency::Normal,
             durable: true,
             subject: subject.clone(),
-            body: body.clone(),
+            body,
             reply_to: None,
             thread_id: None,
             deadline_at: None,
-            at: stamp::now(),
+            at,
         }) {
             Ok(_) => true,
             Err(err) => {
+                if let Some(id) = id.as_ref() {
+                    hosted_recovery_notice::discard_unsent(store, id);
+                }
                 if should_log_auto_respawn_warning(&fresh.session_id, current_respawn_clock_ms()) {
                     eprintln!(
                         "hub: warning ({}): failed recovery notice to `{recipient}`: {err}",
@@ -9502,6 +9550,12 @@ fn notify_crash_loop_recipients<S: AgentRegistry + MessageStore>(
             }
         }
     });
+    if recipients
+        .iter()
+        .any(|name| recovery::notice_delivered(state, name))
+    {
+        state.recovery_attention = None;
+    }
 }
 
 /// Reconcile dead hosted sessions and automatically respawn eligible `on-failure` sessions that
@@ -9666,7 +9720,7 @@ where
                 {
                     if should_log_auto_respawn_warning(&fresh.session_id, now) {
                         eprintln!(
-                            "hub: warning ({}): failed to save recovery notice deliveries: {err}",
+                            "hub: warning ({}): failed to save recovery notice state: {err}",
                             fresh.session_id
                         );
                     }
@@ -14852,7 +14906,7 @@ mod tests {
         );
     }
 
-    fn register(store: &MemStore, persona: &str, project: &str, role: AgentRole) {
+    fn register(store: &impl AgentRegistry, persona: &str, project: &str, role: AgentRole) {
         store
             .register_agent(RegisterAgentArgs {
                 display_name: capitalize(persona),
@@ -22289,8 +22343,15 @@ mod tests {
         let _reset = RecoveryFixtureReset;
         let home = TempDir::new().unwrap();
         let _trusted = trusted_codex_home(home.path(), home.path());
-        let store = MemStore::default();
-        register(&store, "recovery-lead", "ferroloop", AgentRole::Lead);
+        let hub = crate::HubState::new(crate::HubServerConfig {
+            store_path: home.path().join("recovery.redb"),
+            repo_root: home.path().into(),
+            home_override: Some(home.path().into()),
+            owner_token: Some("test-owner".into()),
+            ..crate::HubServerConfig::default()
+        });
+        let store = hub.open_store().unwrap();
+        register(&*store, "recovery-lead", "ferroloop", AgentRole::Lead);
         let fake = FakeRuntime::default();
         fake.vanish_windows.borrow_mut().push("codex".into());
         *fake.hosted_exit_fixture.borrow_mut() = Some(HostedExitEvidence {
@@ -22311,17 +22372,17 @@ mod tests {
         let mut request = req("early", "assistant", "codex");
         request.cwd = Some(home.path().display().to_string());
         TEST_RESPAWN_NOW_MS.with(|clock| clock.set(Some(1_000)));
-        let out = spin_up(&store, &env, &request, "owner", Caller::Owner).unwrap();
+        let out = spin_up(&*store, &env, &request, "owner", Caller::Owner).unwrap();
         let id = out.session_id.as_str();
         assert!(!out.runtime_spawned);
         assert_eq!(
-            get_hosted_session_by_id(&store, id).unwrap().unwrap().pid,
+            get_hosted_session_by_id(&*store, id).unwrap().unwrap().pid,
             None
         );
 
         let sweep = |ms| {
             TEST_RESPAWN_NOW_MS.with(|clock| clock.set(Some(ms)));
-            reconcile_and_respawn_hosted_sessions(&store, &env)
+            reconcile_and_respawn_hosted_sessions(&*store, &env)
                 .unwrap()
                 .len()
         };
@@ -22329,7 +22390,7 @@ mod tests {
             .borrow_mut()
             .insert("Early:codex".into(), RuntimePresence::Gone);
         for launch in 1..=10 {
-            let due = load_hosted_respawn_state(&store, id)
+            let due = load_hosted_respawn_state(&*store, id)
                 .unwrap()
                 .next_allowed_at_ms;
             let now = match launch {
@@ -22346,7 +22407,7 @@ mod tests {
                 sweep(now + DEAD_STREAK_MIN_SPACING_MS + 1),
                 usize::from(launch == 1)
             );
-            let state = load_hosted_respawn_state(&store, id).unwrap();
+            let state = load_hosted_respawn_state(&*store, id).unwrap();
             let evidence = state.exit_evidence.latest_evidence().unwrap();
             assert_eq!(evidence.stream.epoch, SessionEpoch(launch));
             assert_eq!(evidence.terminal_tail, "private fixed terminal failure");
@@ -22373,18 +22434,63 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(stored.sensitive);
-        let notices = store
-            .list_wire_inbox(&fl_core::ferrowire::WireFilter {
-                recipient: Some("recovery-lead".into()),
-                ..Default::default()
-            })
-            .unwrap();
+        let filter = fl_core::ferrowire::WireFilter {
+            recipient: Some("recovery-lead".into()),
+            ..Default::default()
+        };
+        let mut notices = store.list_wire_inbox(&filter).unwrap();
         assert_eq!(notices.len(), 2);
+        fl_wire::hosted_recovery_notice::attach_to_local_inbox(&*store, &filter, &mut notices);
         for notice in notices {
-            assert!(matches!(notice.message.to, WireAddress::AgentId(_)));
-            assert!(notice.message.body.contains("deterministic launch failure"));
-            assert!(notice.message.body.contains("exit code 1"));
-            assert!(!notice.message.body.contains("private fixed terminal"));
+            assert!(
+                notice
+                    .message
+                    .body
+                    .contains("private fixed terminal failure")
+            );
+            let stored = store.get_wire_message(&notice.message.id).unwrap().unwrap();
+            assert!(matches!(stored.to, WireAddress::AgentId(_)));
+            assert!(stored.body.contains("deterministic launch failure"));
+            assert!(stored.body.contains("exit code 1"));
+            assert!(!stored.body.contains("private fixed terminal"));
+        }
+        // Reject the mail after attachment preparation, then exercise the next retry.
+        let mut invalid_mail_record = get_hosted_session_by_id(&*store, id).unwrap().unwrap();
+        invalid_mail_record.session_id = "x".repeat(fl_core::ferrowire::MAX_SUBJECT_BYTES + 1);
+        let mut pending = load_hosted_respawn_state(&*store, id).unwrap();
+        pending.crash_loop_notified_recipients.clear();
+        pending.recovery_attention = Some(HostedRecoveryAttention::Exhausted);
+        let runtime_entries = || {
+            store
+                .list_state(Some(&StateScope::Workspace), Some(StateConcern::Runtime))
+                .unwrap()
+                .len()
+        };
+        let entries_before_retry = runtime_entries();
+        for _ in 0..2 {
+            notify_crash_loop_recipients(&*store, &invalid_mail_record, &mut pending);
+            assert_eq!(runtime_entries(), entries_before_retry);
+            assert!(pending.crash_loop_notified_recipients.is_empty());
+            assert_eq!(
+                pending.recovery_attention,
+                Some(HostedRecoveryAttention::Exhausted)
+            );
+        }
+
+        drop(store);
+        let response = crate::api::handle_http_request(
+            &hub,
+            &crate::api::HttpRequest::new("GET", "/api/v1/wire/messages?to=recovery-lead")
+                .with_header("authorization", "Bearer test-owner"),
+        );
+        assert_eq!(response.status, 200);
+        let messages = response.json_value().unwrap();
+        let messages = messages["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 2);
+        for item in messages {
+            let body = item["message"]["body"].as_str().unwrap();
+            assert!(body.contains("exit code 1"));
+            assert!(!body.contains("private fixed terminal"));
         }
     }
 
@@ -22739,6 +22845,7 @@ mod tests {
         let incident = HostedRespawnState {
             recovery_started_at_ms: Some(1),
             recovery_attempts: 2,
+            recovery_attention: Some(HostedRecoveryAttention::Recovery),
             next_allowed_at_ms: Some(601_000),
             ..Default::default()
         };
@@ -23608,6 +23715,13 @@ mod tests {
                 .unwrap();
                 assert_eq!(events, vec!["session.recovery_exhausted"]);
             }
+            reconcile_and_respawn_hosted_sessions(&store, &env).unwrap();
+            let expected = if exhausted { "exhausted" } else { "recovery" };
+            let saved_state = load_hosted_respawn_state(&store, &record.session_id).unwrap();
+            assert_eq!(
+                serde_json::to_value(saved_state).unwrap()["recovery_attention"],
+                expected,
+            );
             let revisions = store.state_revisions_after(0).unwrap().len();
             let saved = get_hosted_session_by_id(&store, &record.session_id)
                 .unwrap()
@@ -23631,6 +23745,30 @@ mod tests {
             }
         }
         assert_eq!(events, vec!["session.recovery_exhausted"]);
+
+        register(&store, "new-lead", "ferroloop", AgentRole::Lead);
+        for _ in 0..2 {
+            assert!(
+                reconcile_and_respawn_hosted_sessions(&store, &env)
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+        let notices = store
+            .list_wire_inbox(&fl_core::ferrowire::WireFilter {
+                recipient: Some("new-lead".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(notices.len(), 1);
+        assert!(notices[0].message.subject.contains("Recovery exhausted"));
+        let saved_state = load_hosted_respawn_state(&store, &record.session_id).unwrap();
+        assert!(
+            serde_json::to_value(saved_state)
+                .unwrap()
+                .get("recovery_attention")
+                .is_none()
+        );
     }
 
     #[test]

@@ -11,7 +11,7 @@ use fl_core::state::{
     MergeMode, RuntimeEntry, SensitivityPatch, StateConcern, StatePayload, StateScope,
     UpsertStateArgs, validate_slug,
 };
-use fl_core::store::{AgentRegistry, StateStore, StoreError};
+use fl_core::store::{AgentRegistry, MessageStore, StateStore, StoreError};
 use fl_host_proto::{MAX_HOSTED_EXIT_TAIL_BYTES, MAX_HOSTED_EXIT_TAIL_LINES};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -65,7 +65,7 @@ pub fn prepare(
 
     store.upsert_state(UpsertStateArgs {
         scope: StateScope::Workspace,
-        slug: format!("{NOTICE_STATE_SLUG_PREFIX}{uuid}"),
+        slug: attachment_slug(uuid),
         sensitivity: SensitivityPatch::SetSensitive,
         payload: StatePayload::Runtime(RuntimeEntry {
             value: serde_json::json!(Attachment {
@@ -79,6 +79,33 @@ pub fn prepare(
         by: by.into(),
     })?;
     Ok(id)
+}
+
+/// Drop the live attachment after a send failure only when the mail is absent.
+pub fn discard_unsent(store: &(impl StateStore + MessageStore), id: &MessageId) {
+    if let Some(uuid) = notice_uuid(id)
+        && matches!(store.get_wire_message(id), Ok(None))
+    {
+        let _ = store.delete_state_by_key(
+            &StateScope::Workspace,
+            StateConcern::Runtime,
+            &attachment_slug(uuid),
+        );
+    }
+}
+
+fn attachment_slug(uuid: Uuid) -> String {
+    format!("{NOTICE_STATE_SLUG_PREFIX}{uuid}")
+}
+
+fn notice_uuid(id: &MessageId) -> Option<Uuid> {
+    let id = id.as_str().strip_prefix("urn:uuid:")?;
+    let uuid = Uuid::parse_str(id).ok()?;
+    (id.len() == 36
+        && uuid.get_version_num() == 7
+        && uuid.get_variant() == uuid::Variant::RFC4122
+        && uuid.as_bytes().ends_with(NOTICE_UUID_MARKER))
+    .then_some(uuid)
 }
 
 /// Append private excerpts only to a local inbox read scoped to one recipient.
@@ -121,20 +148,12 @@ fn load_tail(store: &(impl StateStore + AgentRegistry), item: &WireInboxItem) ->
     {
         return None;
     }
-    let id = message.id.as_str().strip_prefix("urn:uuid:")?;
-    let uuid = Uuid::parse_str(id).ok()?;
-    if id.len() != 36
-        || uuid.get_version_num() != 7
-        || uuid.get_variant() != uuid::Variant::RFC4122
-        || !uuid.as_bytes().ends_with(NOTICE_UUID_MARKER)
-    {
-        return None;
-    }
+    let uuid = notice_uuid(&message.id)?;
     let entry = store
         .get_state_by_key(
             &StateScope::Workspace,
             StateConcern::Runtime,
-            &format!("{NOTICE_STATE_SLUG_PREFIX}{uuid}"),
+            &attachment_slug(uuid),
         )
         .ok()??;
     if !entry.sensitive {

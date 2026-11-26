@@ -65,6 +65,7 @@ use fl_wire::dispatcher::{
     preflight_session_reset, push_operator_prompt_to_route, push_operator_prompt_with_intent,
     push_to_route_for_recipient,
 };
+use fl_wire::hosted_recovery_notice::NOTICE_STATE_SLUG_PREFIX;
 use fl_wire::identity::{RouteTable, normalize_persona};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -535,7 +536,7 @@ fn route_http_request(state: &HubState, req: &HttpRequest) -> HttpResponse {
             handle_post_session_bulk_action(state, &authority, req)
         }
         ("GET", "/api/v1/commands") => handle_get_commands(state),
-        ("GET", "/api/v1/hosted-sessions") => handle_get_hosted_sessions(state),
+        ("GET", "/api/v1/hosted-sessions") => handle_get_hosted_sessions(state, &authority),
         ("POST", "/api/v1/state/checkpoint") => {
             handle_post_state_checkpoint(state, &authority, req)
         }
@@ -2764,6 +2765,7 @@ fn is_reserved_hub_slug(slug: &str) -> bool {
         || slug.starts_with("hub-session-")
         || slug.starts_with("hub-node-")
         || slug.starts_with(crate::lifecycle::HOSTED_RESPAWN_STATE_SLUG_PREFIX)
+        || slug.starts_with(NOTICE_STATE_SLUG_PREFIX)
 }
 
 fn is_internal_hub_entry(entry: &StateEntry) -> bool {
@@ -9016,14 +9018,40 @@ pub(crate) fn run_remodel(
     }
 }
 
-fn handle_get_hosted_sessions(state: &HubState) -> HttpResponse {
+fn handle_get_hosted_sessions(state: &HubState, authority: &HubAuthority) -> HttpResponse {
+    #[derive(Serialize)]
+    struct HostedSessionView {
+        #[serde(flatten)]
+        record: lifecycle::HostedSessionRecord,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        recovery_attention: Option<lifecycle::HostedRecoveryAttention>,
+    }
+
     let Ok(store) = open_store_response(state) else {
         return store_open_failure();
     };
-    match lifecycle::list_hosted_sessions(&*store) {
-        Ok(sessions) => HttpResponse::json(200, json!({ "sessions": sessions })),
-        Err(e) => lifecycle_error_response(&e),
-    }
+    let sessions = match lifecycle::list_hosted_sessions(&*store) {
+        Ok(sessions) => sessions,
+        Err(e) => return lifecycle_error_response(&e),
+    };
+    let owner = authority.is_owner();
+    let sessions: Vec<_> = sessions
+        .into_iter()
+        .map(|record| {
+            let recovery_attention = if owner {
+                lifecycle::load_hosted_respawn_state(&*store, &record.session_id)
+                    .ok()
+                    .and_then(|state| state.recovery_attention)
+            } else {
+                None
+            };
+            HostedSessionView {
+                record,
+                recovery_attention,
+            }
+        })
+        .collect();
+    HttpResponse::json(200, json!({ "sessions": sessions }))
 }
 
 fn handle_post_hosted_session_restart(
@@ -11129,20 +11157,25 @@ mod tests {
     #[test]
     fn private_hosted_exit_evidence_is_excluded_even_from_owner_state_views() {
         let (_dir, store) = test_store(fl_store::BackendKind::Redb);
-        let slug = crate::lifecycle::hosted_respawn_state_slug("claude:fixture");
-        store
-            .upsert_state(UpsertStateArgs {
-                scope: StateScope::Workspace,
-                slug: slug.clone(),
-                sensitivity: SensitivityPatch::SetSensitive,
-                payload: StatePayload::Runtime(RuntimeEntry {
-                    value: json!({"terminal_tail": "privatecapturedoutput"}),
-                    merge_mode: MergeMode::LastWriter,
-                }),
-                at: stamp::now(),
-                by: "fixture".into(),
-            })
-            .unwrap();
+        let slugs = [
+            lifecycle::hosted_respawn_state_slug("claude:fixture"),
+            "hosted-recovery-notice-018fcf7c-a219-7777-8888-000000006872".into(),
+        ];
+        for slug in &slugs {
+            store
+                .upsert_state(UpsertStateArgs {
+                    scope: StateScope::Workspace,
+                    slug: slug.clone(),
+                    sensitivity: SensitivityPatch::SetSensitive,
+                    payload: StatePayload::Runtime(RuntimeEntry {
+                        value: json!({"terminal_tail": "privatecapturedoutput"}),
+                        merge_mode: MergeMode::LastWriter,
+                    }),
+                    at: stamp::now(),
+                    by: "fixture".into(),
+                })
+                .unwrap();
+        }
         let owner = HubAuthority::Owner {
             login: "owner".into(),
         };
@@ -11161,12 +11194,14 @@ mod tests {
         );
         assert!(hits.is_empty());
         assert_eq!(total, 0);
-        let write = HttpRequest::new("POST", "/api/v1/state").with_json_body(&json!({
-            "slug": slug,
-            "concern": "runtime",
-            "value": "overwrite attempt",
-        }));
-        assert_eq!(handle_post_state(&store, &owner, &write).status, 403);
+        for slug in slugs {
+            let write = HttpRequest::new("POST", "/api/v1/state").with_json_body(&json!({
+                "slug": slug,
+                "concern": "runtime",
+                "value": "overwrite attempt",
+            }));
+            assert_eq!(handle_post_state(&store, &owner, &write).status, 403);
+        }
     }
 
     fn sensitive_handoff_entry(n: u64) -> StateEntry {
@@ -11715,9 +11750,10 @@ mod tests {
             let store = state.open_store().unwrap();
             lifecycle::persist_hosted_session(&*store, &record, "test").unwrap();
         }
-        let response = handle_get_hosted_sessions(&state);
-        assert_eq!(response.status, 200);
-        let json = response.json_value().unwrap();
+        let target = "/api/v1/hosted-sessions";
+        let (status, json) = roles_call(&state, "GET", target, "owner-test-tok", None);
+        assert_eq!(status, 200);
+        assert!(json["sessions"][0].get("recovery_attention").is_none());
         assert_eq!(
             json["sessions"][0]["stop_reason"],
             "prerequisite_unavailable"
@@ -11726,6 +11762,49 @@ mod tests {
             json["sessions"][0]["launch_prerequisite_detail"],
             "/private/control.sock: NotFound"
         );
+    }
+
+    #[test]
+    fn hosted_sessions_http_recovery_attention_is_owner_only() {
+        let (_tmp, state) = roles_test_state();
+        let record: lifecycle::HostedSessionRecord = serde_json::from_value(json!({
+            "session_id":"codex:ada", "persona":"ada", "project":"ferroloop", "role":"assistant",
+            "vendor":"codex", "model":null, "node_id":"ai-lab-0", "hosted":true, "status":"stopped",
+            "stop_reason":"crash_loop", "restart_policy":"on-failure", "restart_count":0,
+            "tmux_target":null, "cwd":null, "hydration_dispatched":false, "created_at_ms":1,
+            "updated_at_ms":1, "decommission_prepared_at_ms":null
+        }))
+        .unwrap();
+        {
+            let store = state.open_store().unwrap();
+            lifecycle::persist_hosted_session(&*store, &record, "test").unwrap();
+            store
+                .upsert_state(UpsertStateArgs {
+                    scope: StateScope::Workspace,
+                    slug: lifecycle::hosted_respawn_state_slug(&record.session_id),
+                    sensitivity: SensitivityPatch::SetSensitive,
+                    payload: StatePayload::Runtime(RuntimeEntry {
+                        value: json!({"recovery_attention": "exhausted", "recovery_attempts": 6}),
+                        merge_mode: MergeMode::LastWriter,
+                    }),
+                    at: stamp::now(),
+                    by: "test".into(),
+                })
+                .unwrap();
+        }
+
+        let target = "/api/v1/hosted-sessions";
+        let (status, peer) = roles_call(&state, "GET", target, "peer-test-tok", None);
+        assert_eq!(status, 200);
+        assert_eq!(peer["sessions"], json!([record]));
+        let (status, mut owner) = roles_call(&state, "GET", target, "owner-test-tok", None);
+        assert_eq!(status, 200);
+        let session = owner["sessions"][0].as_object_mut().unwrap();
+        assert_eq!(
+            session.remove("recovery_attention"),
+            Some(json!("exhausted"))
+        );
+        assert_eq!(owner, peer);
     }
 }
 
