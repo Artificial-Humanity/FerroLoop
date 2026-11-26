@@ -29,6 +29,9 @@ struct CountedExit {
     evidence: Option<HostedExitEvidence>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pending: bool,
+    // A withheld Pending exit still needs its first budget decision at the original time.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    classify_at_observation: bool,
 }
 
 impl CountedExit {
@@ -44,6 +47,7 @@ impl CountedExit {
             observed_at_ms,
             evidence,
             pending,
+            classify_at_observation: false,
         }
     }
 }
@@ -213,7 +217,7 @@ impl HostedExitIncident {
         })
     }
 
-    /// Resolve Pending for the current launch, retaining its original observation time.
+    /// Resolve delayed evidence for the current launch, retaining its observation time.
     pub(super) fn refresh_for_recovery(
         &mut self,
         runtime: &dyn SessionRuntime,
@@ -232,8 +236,7 @@ impl HostedExitIncident {
         let Some(exit) = self.exits.last_mut().filter(|exit| exit.stream == stream) else {
             return no_evidence;
         };
-        let mut resolution = None;
-        if exit.pending {
+        let resolved = if exit.pending {
             let elapsed = now.checked_sub(exit.observed_at_ms);
             if elapsed == Some(0) {
                 return Pending;
@@ -246,15 +249,18 @@ impl HostedExitIncident {
                 return Pending;
             }
             exit.pending = false;
-            resolution = Some(ResolvedPendingExit {
-                observed_at_ms: exit.observed_at_ms,
-                epoch: exit.stream.epoch.0,
-                detail: exit
-                    .evidence
-                    .as_ref()
-                    .map_or_else(|| "evidence: unavailable".into(), exit_status),
-            });
-        }
+            true
+        } else {
+            std::mem::take(&mut exit.classify_at_observation)
+        };
+        let resolution = resolved.then(|| ResolvedPendingExit {
+            observed_at_ms: exit.observed_at_ms,
+            epoch: exit.stream.epoch.0,
+            detail: exit
+                .evidence
+                .as_ref()
+                .map_or_else(|| "evidence: unavailable".into(), exit_status),
+        });
         // A resolved clean exit still applies if a prior stopped-record write failed.
         Ready {
             clean_exit: exit.evidence.as_ref().is_some_and(is_clean_exit),
@@ -283,6 +289,7 @@ impl HostedExitIncident {
                 .find(|entry| entry.stream == exit.stream && entry.pending)
         {
             previous.pending = false;
+            previous.classify_at_observation = true;
             return true;
         }
         self.push_counted_exit(exit)
@@ -525,6 +532,7 @@ mod tests {
                 observed_at_ms: now,
                 evidence: Some(failure),
                 pending: false,
+                classify_at_observation: false,
             });
         }
 
@@ -579,6 +587,7 @@ mod tests {
                         observed_at_ms: 2,
                         evidence: Some(baseline),
                         pending: false,
+                        classify_at_observation: false,
                     },
                     CountedExit {
                         stream: fast.stream.clone(),
@@ -586,6 +595,7 @@ mod tests {
                         observed_at_ms: 3,
                         evidence: Some(fast),
                         pending: false,
+                        classify_at_observation: false,
                     },
                 ],
             },

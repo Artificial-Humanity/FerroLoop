@@ -21538,9 +21538,11 @@ mod tests {
             SessionEpoch, SessionId, SessionMode, SessionSummary, SpawnKind, StreamId,
         };
 
+        let first_fast_ms = 1_000;
+        let last_in_window_ms = first_fast_ms + AUTO_RESPAWN_WINDOW_MS - 1;
         for (exit_code, stop_reason, pending_at_ms) in [
             (1, STOP_REASON_RUNTIME_GONE, None),
-            (1, STOP_REASON_RUNTIME_GONE, Some(1_001)),
+            (1, STOP_REASON_RUNTIME_GONE, Some(last_in_window_ms)),
             (0, STOP_REASON_CLEAN_EXIT, None),
         ] {
             let _reset = RecoveryFixtureReset;
@@ -21580,8 +21582,22 @@ mod tests {
                 captured_at_ms: 20,
                 terminal_tail: "private sign-in prompt content".into(),
             });
-            TEST_RESPAWN_NOW_MS.with(|clock| clock.set(Some(1_000)));
             let mut respawn = HostedRespawnState::default();
+            let launcher = if pending_at_ms.is_some() {
+                for _ in 0..AUTO_RESPAWN_MAX_IN_WINDOW {
+                    let now = respawn.next_allowed_at_ms.unwrap_or(first_fast_ms);
+                    recovery::reserve_attempt(&mut respawn, now);
+                }
+                AUTO_RESPAWN_ACTOR
+            } else {
+                "owner"
+            };
+            let launched_at_ms = respawn
+                .respawn_timestamps_ms
+                .last()
+                .copied()
+                .unwrap_or(first_fast_ms);
+            TEST_RESPAWN_NOW_MS.with(|clock| clock.set(Some(launched_at_ms)));
             assert!(
                 exit_evidence::spawn_and_remember(
                     &store,
@@ -21589,7 +21605,7 @@ mod tests {
                     &mut respawn,
                     &record,
                     None,
-                    "owner"
+                    launcher
                 )
                 .unwrap()
             );
@@ -21608,7 +21624,7 @@ mod tests {
                 let incident = serde_json::to_value(&respawn.exit_evidence).unwrap();
                 let mut entry = incident["exits"][0].as_object().unwrap().clone();
                 assert_eq!(entry.remove("pending"), Some(serde_json::Value::Bool(true)));
-                serde_json::Value::Object(entry)
+                (observed_at_ms, serde_json::Value::Object(entry))
             });
 
             fake.clear();
@@ -21635,7 +21651,11 @@ mod tests {
                 input: InputState::Fenced,
             });
 
-            for now in [1_001, 1_001 + DEAD_STREAK_MIN_SPACING_MS] {
+            let first_dead_poll_ms = pending_at_ms.unwrap_or(launched_at_ms) + 1;
+            for now in [
+                first_dead_poll_ms,
+                first_dead_poll_ms + DEAD_STREAK_MIN_SPACING_MS,
+            ] {
                 TEST_RESPAWN_NOW_MS.with(|clock| clock.set(Some(now)));
                 reconcile_dead_hosted_sessions(&store, &env, "test").unwrap();
             }
@@ -21647,6 +21667,20 @@ mod tests {
             assert!(fake.hosted_exit_lookups.borrow().is_empty());
 
             let counted = load_hosted_respawn_state(&store, &record.session_id).unwrap();
+            if prior_exit.is_some() {
+                // Both the recovery classification and its original time basis must survive retries.
+                TEST_RESPAWN_SAVE_FAILURE.with(|fail| fail.set(true));
+                assert!(
+                    reconcile_and_respawn_hosted_sessions(&store, &env)
+                        .unwrap()
+                        .is_empty()
+                );
+                TEST_RESPAWN_SAVE_FAILURE.with(|fail| fail.set(false));
+                assert_eq!(
+                    load_hosted_respawn_state(&store, &record.session_id).unwrap(),
+                    counted
+                );
+            }
             let recovered = reconcile_and_respawn_hosted_sessions(&store, &env).unwrap();
             if exit_code == 0 {
                 assert_eq!(counted, respawn);
@@ -21659,12 +21693,26 @@ mod tests {
                 assert_eq!(exits[0]["stream"], serde_json::to_value(stream).unwrap());
                 assert_eq!(exits[0].get("evidence"), Some(&serde_json::Value::Null));
                 assert!(exits[0].get("pending").is_none());
-                if let Some(prior_exit) = prior_exit {
-                    assert_eq!(exits[0], prior_exit);
+                if let Some((observed_at_ms, prior_exit)) = prior_exit {
+                    assert!(
+                        recovered.is_empty(),
+                        "the expired reservation still counted at exit"
+                    );
+                    assert!(fake.launches.borrow().is_empty());
+                    let state = load_hosted_respawn_state(&store, &record.session_id).unwrap();
+                    assert_eq!(state.recovery_started_at_ms, Some(observed_at_ms));
+                    assert_eq!(
+                        state.next_allowed_at_ms,
+                        Some(observed_at_ms + recovery::RECOVERY_INTERVAL_MS)
+                    );
+                    assert_eq!(state.respawn_timestamps_ms, respawn.respawn_timestamps_ms);
+                    let incident = serde_json::to_value(&state.exit_evidence).unwrap();
+                    assert_eq!(incident["exits"], serde_json::json!([prior_exit]));
+                } else {
+                    assert_eq!(recovered.len(), 1);
+                    assert_eq!(recovered[0].record.status, STATUS_RUNNING);
+                    assert_eq!(fake.launches.borrow().len(), 1);
                 }
-                assert_eq!(recovered.len(), 1);
-                assert_eq!(recovered[0].record.status, STATUS_RUNNING);
-                assert_eq!(fake.launches.borrow().len(), 1);
             }
             assert!(fake.hosted_exit_lookups.borrow().is_empty());
         }
