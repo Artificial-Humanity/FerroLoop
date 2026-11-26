@@ -21,7 +21,9 @@ use fl_core::state::{
     StateScope, UpsertStateArgs, validate_slug,
 };
 use fl_core::store::{AgentRegistry, Catalog, MessageStore, StateStore, StoreError};
-use fl_core::{VendorDescriptor, VendorRegistry, VendorTransport, lookup_vendor};
+use fl_core::{
+    LaunchSignInIssue, VendorDescriptor, VendorRegistry, VendorTransport, lookup_vendor,
+};
 use fl_exec::stamp;
 use fl_wire::dispatcher::{
     OperatorPromptError, OperatorPromptIntent, OperatorPromptOutcome, PushError,
@@ -35,6 +37,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::api::{reforge_role_label, route_matches_session_id, synthesize_decommission_prompt};
 
+pub(crate) mod blockers;
 mod exit_evidence;
 pub use exit_evidence::HostedExitIncident;
 #[cfg(test)]
@@ -108,6 +111,7 @@ pub const STATUS_STOPPED: &str = "stopped";
 
 pub const STOP_REASON_RUNTIME_GONE: &str = "runtime_gone";
 pub const STOP_REASON_CLEAN_EXIT: &str = "clean_exit";
+pub const STOP_REASON_STARTUP_BLOCKED: &str = "startup_blocked";
 pub const STOP_REASON_CRASH_LOOP: &str = "crash_loop";
 pub const STOP_REASON_PREREQUISITE_UNAVAILABLE: &str = "prerequisite_unavailable";
 pub const LAUNCH_PREREQUISITE_RETRY_MS: u64 = 60_000;
@@ -204,6 +208,7 @@ pub struct LifecycleEnv<'a> {
     pub log_hydration_warnings: bool,
     /// Borrowed proof for nested helpers; never a bypass for a different persona.
     pub(crate) lifecycle_fence: Option<&'a lock::LifecycleFence>,
+    pub(crate) blocker_evidence: Option<&'a blockers::PromptExitEvidence>,
 }
 
 /// Process-wide [`fl_core::VendorHostAdapterRegistry`] slot injected at startup by `fl-cli`.
@@ -236,6 +241,7 @@ impl<'a> LifecycleEnv<'a> {
             workspace_root: None,
             log_hydration_warnings: true,
             lifecycle_fence: None,
+            blocker_evidence: None,
         }
     }
 
@@ -981,9 +987,9 @@ pub(crate) use fl_wire::vendor_adapter::{
     resolve_vendor_bin, split_window_tag, with_local_bin,
 };
 
-/// Read-only launch checks run independently of adapter selection. Return the checked
-/// configuration directory so a daemon child cannot inherit a different CODEX_HOME.
-fn preflight_vendor_launch(
+/// Validate Codex project trust and pin the same configuration home and working directory
+/// for the sign-in observation and the child.
+fn prepare_vendor_launch(
     env: &LifecycleEnv<'_>,
     vendor: &str,
     hosted: bool,
@@ -1020,13 +1026,71 @@ fn preflight_vendor_launch(
             .ok_or_else(|| invalid_field("cwd", "must be valid UTF-8"))?
             .to_string(),
     );
-    if env
-        .vendor_launch_options_for_vendor(vendor, fl_core::permissions::Posture::Auto)
-        .remote_control
-    {
-        check_vendor_launch_prerequisite(env, vendor, Some(&config_home))?;
-    }
     Ok(Some(config_home))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct LaunchAuthTarget {
+    config_home: PathBuf,
+    pub(crate) cwd: PathBuf,
+}
+
+impl LaunchAuthTarget {
+    pub(crate) fn probe(&self, env: &LifecycleEnv<'_>) -> Option<LaunchSignInIssue> {
+        #[cfg(test)]
+        if let Some(issue) = TEST_LAUNCH_AUTH.with_borrow(|probe| probe.as_ref().map(|f| f(self))) {
+            return issue;
+        }
+        env.host_vendor_adapter("codex")
+            .and_then(|adapter| adapter.probe_launch_auth(&self.config_home, &self.cwd))
+    }
+}
+
+fn uses_codex_daemon(env: &LifecycleEnv<'_>, vendor: &str) -> bool {
+    vendor == "codex"
+        && env
+            .vendor_launch_options_for_vendor(vendor, fl_core::permissions::Posture::Auto)
+            .remote_control
+}
+
+fn launch_auth_target(
+    env: &LifecycleEnv<'_>,
+    vendor: &str,
+    config_home: Option<&Path>,
+    cwd: Option<&str>,
+) -> Option<LaunchAuthTarget> {
+    if !uses_codex_daemon(env, vendor) {
+        return None;
+    }
+    Some(LaunchAuthTarget {
+        config_home: config_home?.to_path_buf(),
+        cwd: PathBuf::from(cwd?),
+    })
+}
+
+enum LaunchAuth<'a> {
+    Skip,
+    Observe,
+    Observed(&'a LaunchAuthTarget, Option<LaunchSignInIssue>),
+}
+
+impl LaunchAuth<'_> {
+    fn warning(&self, target: Option<&LaunchAuthTarget>) -> Result<Option<String>, LifecycleError> {
+        match self {
+            Self::Observed(checked, issue) if target == Some(*checked) => {
+                Ok(issue.map(|issue| issue.message().into()))
+            }
+            Self::Observed(..) => Err(launch_auth_target_changed()),
+            Self::Skip | Self::Observe => Ok(None),
+        }
+    }
+}
+
+fn launch_auth_target_changed() -> LifecycleError {
+    LifecycleError::Conflict(
+        "the managed Codex launch target changed during sign-in verification; retry the operation"
+            .into(),
+    )
 }
 
 fn check_vendor_launch_prerequisite(
@@ -1037,16 +1101,10 @@ fn check_vendor_launch_prerequisite(
     #[cfg(test)]
     TEST_LAUNCH_PREREQUISITE_CALLS.with(|calls| calls.set(calls.get() + 1));
     #[cfg(test)]
-    if let Some(result) =
-        TEST_LAUNCH_PREREQUISITE_SEQUENCE.with(|slot| slot.borrow_mut().pop_front())
+    if let Some(result) = TEST_LAUNCH_PREREQUISITE_SEQUENCE
+        .with(|slot| slot.borrow_mut().pop_front())
+        .or_else(|| TEST_LAUNCH_PREREQUISITE.with(|slot| slot.borrow().clone()))
     {
-        return result.map_err(|r| LifecycleError::PrerequisiteUnavailable {
-            code: r.code,
-            detail: r.detail,
-        });
-    }
-    #[cfg(test)]
-    if let Some(result) = TEST_LAUNCH_PREREQUISITE.with(|slot| slot.borrow().clone()) {
         return result.map_err(|r| LifecycleError::PrerequisiteUnavailable {
             code: r.code,
             detail: r.detail,
@@ -1101,10 +1159,17 @@ fn codex_config_home(
 }
 
 #[cfg(test)]
+type LaunchPrerequisiteCheck = Result<(), fl_core::LaunchPrerequisiteRefusal>;
+
+#[cfg(test)]
+type LaunchAuthTestProbe = Box<dyn Fn(&LaunchAuthTarget) -> Option<LaunchSignInIssue>>;
+
+#[cfg(test)]
 thread_local! {
+    pub(crate) static TEST_LAUNCH_AUTH: std::cell::RefCell<Option<LaunchAuthTestProbe>> = const { std::cell::RefCell::new(None) };
     // Scoped ambient input replacement, not a trust bypass or process environment edit.
-    static TEST_LAUNCH_PREREQUISITE: std::cell::RefCell<Option<Result<(), fl_core::LaunchPrerequisiteRefusal>>> = const { std::cell::RefCell::new(None) };
-    static TEST_LAUNCH_PREREQUISITE_SEQUENCE: std::cell::RefCell<std::collections::VecDeque<Result<(), fl_core::LaunchPrerequisiteRefusal>>> = const { std::cell::RefCell::new(std::collections::VecDeque::new()) };
+    static TEST_LAUNCH_PREREQUISITE: std::cell::RefCell<Option<LaunchPrerequisiteCheck>> = const { std::cell::RefCell::new(None) };
+    static TEST_LAUNCH_PREREQUISITE_SEQUENCE: std::cell::RefCell<std::collections::VecDeque<LaunchPrerequisiteCheck>> = const { std::cell::RefCell::new(std::collections::VecDeque::new()) };
     static TEST_LAUNCH_PREREQUISITE_CALLS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
     static TEST_RESPAWN_LOAD_FAILURE_SESSION: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
     static TEST_RESPAWN_SAVE_FAILURE_SESSION: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
@@ -1118,7 +1183,8 @@ thread_local! {
 #[cfg(test)]
 pub(crate) struct IsolatedCodexHome(
     Option<Option<std::ffi::OsString>>,
-    Option<Result<(), fl_core::LaunchPrerequisiteRefusal>>,
+    Option<LaunchPrerequisiteCheck>,
+    Option<LaunchAuthTestProbe>,
 );
 #[cfg(test)]
 impl IsolatedCodexHome {
@@ -1126,6 +1192,7 @@ impl IsolatedCodexHome {
         Self(
             TEST_CODEX_HOME.with(|slot| slot.replace(Some(None))),
             TEST_LAUNCH_PREREQUISITE.with(|slot| slot.replace(Some(Ok(())))),
+            TEST_LAUNCH_AUTH.with(|slot| slot.replace(Some(Box::new(|_| None)))),
         )
     }
 }
@@ -1134,6 +1201,7 @@ impl Drop for IsolatedCodexHome {
     fn drop(&mut self) {
         TEST_CODEX_HOME.with(|slot| *slot.borrow_mut() = self.0.take());
         TEST_LAUNCH_PREREQUISITE.with(|slot| *slot.borrow_mut() = self.1.take());
+        TEST_LAUNCH_AUTH.with(|slot| *slot.borrow_mut() = self.2.take());
     }
 }
 
@@ -2630,6 +2698,7 @@ pub(crate) struct FakeRuntime {
     /// Scripted [`SessionRuntime::recorded_exit_code`] answers.
     pub(crate) exit_codes: std::cell::RefCell<BTreeMap<String, i32>>,
     hosted_exit_fixture: std::cell::RefCell<Option<fl_host_proto::HostedExitEvidence>>,
+    hosted_exit_inventory: std::cell::RefCell<Option<fl_host_proto::SessionSummary>>,
     hosted_exit_lookups: std::cell::RefCell<Vec<(fl_host_proto::StreamId, String)>>,
     hosted_exit_pending_epoch: std::cell::Cell<Option<fl_host_proto::SessionEpoch>>,
     /// The [`HOSTED_MARK`] of each window of the shared session that has one, by `muse:<window>`.
@@ -2691,6 +2760,7 @@ impl FakeRuntime {
             workspace_root: None,
             log_hydration_warnings: true,
             lifecycle_fence: None,
+            blocker_evidence: None,
         }
     }
 
@@ -3067,6 +3137,18 @@ impl SessionRuntime for FakeRuntime {
             return None;
         }
         self.exit_codes.borrow().get(unit).copied()
+    }
+
+    fn recorded_host_exit_code(
+        &self,
+        stream: &fl_host_proto::StreamId,
+        expected_pid: Option<u32>,
+    ) -> Option<i32> {
+        select_host_stream_exit_code(
+            self.hosted_exit_inventory.borrow().as_slice(),
+            stream,
+            expected_pid,
+        )
     }
 }
 
@@ -3526,6 +3608,9 @@ pub struct HostedSessionRecord {
     /// `running`, `decommissioning`, `decommissioned`, or `stopped`.
     /// `stopped` means the tmux window was confirmed gone; the agent stays.
     pub status: String,
+    /// A live seat awaiting operator action or overdue startup hydration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub block: Option<fl_watch::HostedBlock>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stop_reason: Option<String>,
     /// Bounded socket path and probe result for an unavailable launch prerequisite.
@@ -3580,6 +3665,20 @@ pub struct HostedSessionRecord {
     pub created_at_ms: u64,
     pub updated_at_ms: u64,
     pub decommission_prepared_at_ms: Option<u64>,
+}
+
+impl HostedSessionRecord {
+    fn stopped_while_blocked(&self) -> bool {
+        self.status.eq_ignore_ascii_case(STATUS_STOPPED)
+            && self.stop_reason.as_deref() == Some(STOP_REASON_STARTUP_BLOCKED)
+    }
+
+    fn active_block(&self) -> Option<fl_watch::HostedBlock> {
+        self.block.filter(|block| {
+            block.reason != fl_watch::HostedBlockReason::HydrationOverdue
+                || self.hydration_status == HydrationStatus::Unconfirmed
+        })
+    }
 }
 
 /// Compute the `fl-host` session identifier for an optional `tmux_target` (`<Persona>.<vendor>`,
@@ -4073,11 +4172,28 @@ fn receipt_matches_record(receipt: &HydrationReceipt, record: &HostedSessionReco
             || receipt.session_id.eq_ignore_ascii_case(&record.session_id))
 }
 
+fn apply_hydration_receipt(receipt: &HydrationReceipt, record: &mut HostedSessionRecord) {
+    if !receipt_matches_record(receipt, record) {
+        return;
+    }
+    if record.hydration_status == HydrationStatus::Unconfirmed {
+        record.hydration_status = HydrationStatus::Confirmed;
+    }
+    if !record.stopped_while_blocked()
+        && record.block.is_some_and(|block| {
+            block.reason == fl_watch::HostedBlockReason::HydrationOverdue
+                || (!receipt.session_id.is_empty() && receipt.accepted_at_ms > block.observed_at_ms)
+        })
+    {
+        record.block = None;
+    }
+}
+
 fn promote_confirmed_hydration<S: StateStore>(
     store: &S,
     record: &mut HostedSessionRecord,
 ) -> Result<(), LifecycleError> {
-    if record.hydration_status == HydrationStatus::Unconfirmed
+    if (record.hydration_status == HydrationStatus::Unconfirmed || record.block.is_some())
         && let Some(generation) = record.hydration_generation.as_deref()
         && is_valid_hydration_generation(generation)
         && let Some(entry) = store.get_state_by_key(
@@ -4087,9 +4203,8 @@ fn promote_confirmed_hydration<S: StateStore>(
         )?
         && let StatePayload::Runtime(rt) = entry.payload
         && let Ok(receipt) = serde_json::from_value::<HydrationReceipt>(rt.value)
-        && receipt_matches_record(&receipt, record)
     {
-        record.hydration_status = HydrationStatus::Confirmed;
+        apply_hydration_receipt(&receipt, record);
     }
     Ok(())
 }
@@ -4403,6 +4518,12 @@ pub fn persist_hosted_session<S: StateStore>(
             record.session_id
         );
     }
+    if !normalized.stopped_while_blocked()
+        && (!normalized.status.eq_ignore_ascii_case(STATUS_RUNNING)
+            || normalized.active_block().is_none())
+    {
+        normalized.block = None;
+    }
     let value =
         serde_json::to_value(&normalized).map_err(|e| LifecycleError::Store(e.to_string()))?;
     // Never replace another session's record (see `check_slug_free`).
@@ -4453,12 +4574,10 @@ pub fn list_hosted_sessions<S: StateStore>(
         }
     }
     for rec in &mut records {
-        if rec.hydration_status == HydrationStatus::Unconfirmed
-            && let Some(generation) = rec.hydration_generation.as_deref()
+        if let Some(generation) = rec.hydration_generation.as_deref()
             && let Some(receipt) = receipts.get(generation)
-            && receipt_matches_record(receipt, rec)
         {
-            rec.hydration_status = HydrationStatus::Confirmed;
+            apply_hydration_receipt(receipt, rec);
         }
     }
     records.sort_by(|a, b| a.session_id.cmp(&b.session_id));
@@ -6342,8 +6461,8 @@ pub fn spin_up<S: AgentRegistry + StateStore + Catalog + MessageStore>(
     spin_up_with_store(store, || Ok(store), env, req, by, caller)
 }
 
-/// Like [`spin_up`], but releases `store_guard` across [`resume_launch_survived`] and re-opens it
-/// via `reopen_store` afterward so hub-wide store locks are never held during the survival watch.
+/// Like [`spin_up`], but releases `store_guard` for the daemon sign-in check and
+/// [`resume_launch_survived`], reopening it through `reopen_store` afterward.
 pub fn spin_up_with_store<S, G, F>(
     store_guard: G,
     mut reopen_store: F,
@@ -6359,12 +6478,28 @@ where
 {
     let persona = req.validate()?.persona;
     if env.lifecycle_fence.is_some_and(|f| f.covers(&persona)) {
-        return spin_up_fenced(store_guard, &mut reopen_store, env, req, by, caller);
+        return spin_up_fenced(
+            store_guard,
+            &mut reopen_store,
+            env,
+            req,
+            by,
+            caller,
+            LaunchAuth::Observe,
+        );
     }
     drop(store_guard);
     with_lifecycle_fence(env, &persona, "spin-up", |env| {
         let store_guard = reopen_store()?;
-        spin_up_fenced(store_guard, &mut reopen_store, env, req, by, caller)
+        spin_up_fenced(
+            store_guard,
+            &mut reopen_store,
+            env,
+            req,
+            by,
+            caller,
+            LaunchAuth::Observe,
+        )
     })
 }
 
@@ -6375,6 +6510,7 @@ fn spin_up_fenced<S, G, F>(
     req: &SpinUpRequest,
     by: &str,
     caller: Caller,
+    launch_auth: LaunchAuth<'_>,
 ) -> Result<SpinUpResponse, LifecycleError>
 where
     S: AgentRegistry + StateStore + Catalog + MessageStore,
@@ -6447,7 +6583,29 @@ where
     if let Some(record) = &previous {
         respawn_state = load_hosted_respawn_state_policy(store, &record.session_id, true)?;
     }
-    let config_home = preflight_vendor_launch(env, &v.vendor, v.hosted, &mut v.cwd)?;
+    let config_home = prepare_vendor_launch(env, &v.vendor, v.hosted, &mut v.cwd)?;
+    let auth_target = launch_auth_target(env, &v.vendor, config_home.as_deref(), v.cwd.as_deref());
+    if let (LaunchAuth::Observe, Some(target)) = (&launch_auth, auth_target.as_ref()) {
+        check_registration(store, &v, OwnAgent::AsIs)?;
+        drop(store_guard);
+        let issue = target.probe(env);
+        return spin_up_fenced(
+            reopen_store()?,
+            reopen_store,
+            env,
+            req,
+            by,
+            caller,
+            LaunchAuth::Observed(target, issue),
+        );
+    }
+    let mut warnings: Vec<_> = launch_auth
+        .warning(auth_target.as_ref())?
+        .into_iter()
+        .collect();
+    if auth_target.is_some() {
+        check_vendor_launch_prerequisite(env, &v.vendor, config_home.as_deref())?;
+    }
     let tmux_target = has_runtime.then(|| hosted_tmux_target(&v.vendor, &v.persona));
     let host_session_id = host_session_id_for_target(tmux_target.as_deref());
     let unit = tmux_target
@@ -6522,7 +6680,7 @@ where
     if env.log_hydration_warnings {
         crate::hydration::log_warnings(&v.persona, &session_id, &guidance.warnings);
     }
-    let mut warnings = guidance.warnings;
+    warnings.extend(guidance.warnings);
     let mut prompt = guidance.text;
 
     let mut is_claude_resume = false;
@@ -6605,6 +6763,13 @@ where
         node_id: v.node_id.clone(),
         hosted: v.hosted,
         status: STATUS_RUNNING.to_string(),
+        block: previous
+            .as_ref()
+            .filter(|r| {
+                v.hosted && !will_spawn && is_live_hosted(r) && r.tmux_target == tmux_target
+            })
+            .and_then(|r| r.block)
+            .filter(|block| block.reason != fl_watch::HostedBlockReason::HydrationOverdue),
         stop_reason: None,
         launch_prerequisite_detail: None,
         restart_policy: "on-failure".to_string(),
@@ -7180,6 +7345,7 @@ fn record_for_target<S: AgentRegistry>(
         node_id: DEFAULT_NODE_ID.to_string(),
         hosted: false,
         status: STATUS_RUNNING.to_string(),
+        block: None,
         stop_reason: None,
         launch_prerequisite_detail: None,
         // A session this lifecycle never started is not restarted by it.
@@ -8029,7 +8195,11 @@ fn reconcile_dead_hosted_session_fenced<S: StateStore>(
         return Ok(());
     }
     let mut respawn_state = load_hosted_respawn_state(store, &record.session_id)?;
+    let previous_block = record.block;
     let _ = promote_confirmed_hydration(store, &mut record);
+    if record.block != previous_block {
+        persist_hosted_session(store, &record, by)?;
+    }
     if record.vendor == "claude" {
         let mut rstate = load_claude_resume_state(store, &record.session_id);
         if claude_survival_window_active(env, &rstate, current_respawn_clock_ms()) {
@@ -8146,46 +8316,49 @@ fn reconcile_dead_hosted_session_fenced<S: StateStore>(
                         let _ = sync_claude_vendor_session_id_from_route(store, env, &mut record);
                     }
                 }
-                let observed_at_ms = current_respawn_clock_ms();
-                let evidence = respawn_state.exit_evidence.capture(env.runtime, &record);
                 let expected_pid = record.runtime_leader_pid.or(record.pid);
-                let clean_exit = match &evidence {
-                    fl_host_proto::HostedExitEvidenceStatus::Exited(evidence) => {
-                        exit_evidence::is_clean_exit(evidence)
-                    }
-                    _ => {
-                        let code = match respawn_state.exit_evidence.bound_stream(&record) {
-                            Some(stream) => {
-                                env.runtime.recorded_host_exit_code(stream, expected_pid)
-                            }
-                            None => env.runtime.recorded_exit_code(&target, expected_pid),
-                        };
-                        code == Some(0)
-                    }
-                };
-                if !clean_exit
-                    && record.hosted
-                    && record.restart_policy.eq_ignore_ascii_case("on-failure")
+                let recorded_exit_code = || match respawn_state.exit_evidence.bound_stream(&record)
                 {
-                    exit_evidence::save_counted_exit(
-                        store,
-                        &record,
-                        &mut respawn_state,
-                        evidence,
-                        observed_at_ms,
-                        by,
-                    )?;
-                }
-                record.status = STATUS_STOPPED.to_string();
-                record.launch_prerequisite_detail = None;
-                record.stop_reason = Some(
+                    Some(stream) => env.runtime.recorded_host_exit_code(stream, expected_pid),
+                    None => env.runtime.recorded_exit_code(&target, expected_pid),
+                };
+                let stop_reason = if blockers::blocked_at_exit(&record, env.blocker_evidence) {
+                    // A verified startup block needs only the exit code. Its terminal may contain
+                    // sign-in material that must stay out of the recovery incident.
+                    if recorded_exit_code() == Some(0) {
+                        STOP_REASON_CLEAN_EXIT
+                    } else {
+                        STOP_REASON_STARTUP_BLOCKED
+                    }
+                } else {
+                    let observed_at_ms = current_respawn_clock_ms();
+                    let evidence = respawn_state.exit_evidence.capture(env.runtime, &record);
+                    let clean_exit = match &evidence {
+                        fl_host_proto::HostedExitEvidenceStatus::Exited(evidence) => {
+                            exit_evidence::is_clean_exit(evidence)
+                        }
+                        _ => recorded_exit_code() == Some(0),
+                    };
                     if clean_exit {
                         STOP_REASON_CLEAN_EXIT
                     } else {
+                        if record.hosted && record.restart_policy.eq_ignore_ascii_case("on-failure")
+                        {
+                            exit_evidence::save_counted_exit(
+                                store,
+                                &record,
+                                &mut respawn_state,
+                                evidence,
+                                observed_at_ms,
+                                by,
+                            )?;
+                        }
                         STOP_REASON_RUNTIME_GONE
                     }
-                    .to_string(),
-                );
+                };
+                record.status = STATUS_STOPPED.to_string();
+                record.launch_prerequisite_detail = None;
+                record.stop_reason = Some(stop_reason.into());
                 record.updated_at_ms = now_ms();
                 if let Err(err) = persist_hosted_session(store, &record, by) {
                     eprintln!(
@@ -8698,9 +8871,8 @@ pub fn restart_hosted_session<S: StateStore + AgentRegistry + Catalog + MessageS
     restart_hosted_session_with_store(store, || Ok(store), env, id, by)
 }
 
-/// Like [`restart_hosted_session`], but releases `store_guard` across [`resume_launch_survived`]
-/// and re-opens it via `reopen_store` afterward so hub-wide store locks are never held during the
-/// survival watch.
+/// Like [`restart_hosted_session`], but releases `store_guard` for explicit daemon sign-in
+/// checks and [`resume_launch_survived`], reopening it through `reopen_store` afterward.
 pub fn restart_hosted_session_with_store<S, G, F>(
     store_guard: G,
     reopen_store: F,
@@ -8744,6 +8916,11 @@ where
             &initial_record.session_id,
             by,
             strict_target,
+            if by == AUTO_RESPAWN_ACTOR {
+                LaunchAuth::Skip
+            } else {
+                LaunchAuth::Observe
+            },
         );
     }
     drop(store_guard);
@@ -8756,6 +8933,11 @@ where
             &initial_record.session_id,
             by,
             strict_target,
+            if by == AUTO_RESPAWN_ACTOR {
+                LaunchAuth::Skip
+            } else {
+                LaunchAuth::Observe
+            },
         )
     })
 }
@@ -8767,6 +8949,7 @@ fn restart_hosted_session_fenced<S, G, F>(
     id: &str,
     by: &str,
     strict_target: Option<&str>,
+    launch_auth: LaunchAuth<'_>,
 ) -> Result<RestartResponse, LifecycleError>
 where
     S: StateStore + AgentRegistry + Catalog + MessageStore,
@@ -8866,11 +9049,11 @@ where
     }
     let prior_stop_reason = record.stop_reason.clone();
     let retry_prerequisite = prerequisite_retry_allowed(by, prior_stop_reason.as_deref());
-    let mut recast_staged = false;
-    // Classify every preparation error under the same lock as its attempt reservation.
-    let preparation = (|| {
+    // Derive the same config home and working directory used by the hosted child. On an
+    // explicit restart, reopen the store and resolve the settings again after probing.
+    let launch = (|| -> Result<_, LifecycleError> {
         let recast_assignment = current_recast_assignment(store, &record.persona)?;
-        recast_staged = recast_assignment.is_some();
+        let recast_staged = recast_assignment.is_some();
         if let Some(agent) = recast_assignment {
             record.project = agent.project;
             record.role = role_label_of(&agent.role);
@@ -8884,7 +9067,37 @@ where
             )?;
         }
         let config_home =
-            preflight_vendor_launch(env, &record.vendor, record.hosted, &mut record.cwd)?;
+            prepare_vendor_launch(env, &record.vendor, record.hosted, &mut record.cwd)?;
+        Ok((config_home, recast_staged))
+    })();
+    let auth_target = launch.as_ref().ok().and_then(|(home, _)| {
+        launch_auth_target(env, &record.vendor, home.as_deref(), record.cwd.as_deref())
+    });
+    if let (LaunchAuth::Observe, Some(target)) = (&launch_auth, auth_target.as_ref()) {
+        drop(store_guard);
+        let issue = target.probe(env);
+        return restart_hosted_session_fenced(
+            reopen_store()?,
+            reopen_store,
+            env,
+            id,
+            by,
+            strict_target,
+            LaunchAuth::Observed(target, issue),
+        );
+    }
+    let mut warnings: Vec<_> = launch_auth
+        .warning(auth_target.as_ref())?
+        .into_iter()
+        .collect();
+    let mut recast_staged = false;
+    // Classify every preparation error under the same lock as its attempt reservation.
+    let preparation = (|| {
+        let (config_home, staged) = launch?;
+        recast_staged = staged;
+        if auth_target.is_some() {
+            check_vendor_launch_prerequisite(env, &record.vendor, config_home.as_deref())?;
+        }
         if record.hosted && vendor_has_runtime(&record.vendor) && env.spawn_runtime {
             env.runtime.preflight_spawn(&record.session_id)?;
         }
@@ -9034,7 +9247,7 @@ where
     if env.log_hydration_warnings {
         crate::hydration::log_warnings(&record.persona, &record.session_id, &guidance.warnings);
     }
-    let mut warnings = guidance.warnings;
+    warnings.extend(guidance.warnings);
     let mut prompt = guidance.text;
 
     let mut is_claude_resume = false;
@@ -9119,6 +9332,7 @@ where
             &hydration_ack_slug(&hydration_generation),
         );
     }
+    let was_stopped_while_blocked = record.stopped_while_blocked();
     record.status = STATUS_RUNNING.to_string();
     record.stop_reason = None;
     record.launch_prerequisite_detail = None;
@@ -9130,6 +9344,14 @@ where
     };
     if is_claude_resume {
         record.hydration_dispatched = true;
+    }
+    if will_spawn
+        || was_stopped_while_blocked
+        || record
+            .block
+            .is_some_and(|block| block.reason == fl_watch::HostedBlockReason::HydrationOverdue)
+    {
+        record.block = None;
     }
     if will_spawn {
         if respawn_state.exit_evidence.clear_launch() {
@@ -10178,6 +10400,9 @@ pub struct RemodelRequest {
     /// `prepare` or `execute` (the default).
     #[serde(default)]
     pub mode: Option<String>,
+    /// Allow prepare or execute even when the destination daemon rejects sign-in or has none.
+    #[serde(default)]
+    pub allow_blocked_sign_in: bool,
     #[serde(default)]
     pub cwd: Option<String>,
     #[serde(default)]
@@ -10251,12 +10476,14 @@ pub fn remodel_handoff_slug(persona: &str) -> String {
 /// A remodel that passed every check that can run before the old session is touched.
 struct RemodelPlan {
     mode: RemodelMode,
+    allow_blocked_sign_in: bool,
     persona: String,
     from_session_id: String,
     from_vendor: String,
     from_model: Option<String>,
     /// The new session, validated.
     to: ValidSpinUp,
+    auth_target: Option<LaunchAuthTarget>,
     /// The spin-up that puts the old session back, when its vendor is one spin-up can start.
     restore: Option<SpinUpRequest>,
 }
@@ -10371,26 +10598,74 @@ fn check_old_runtime_stoppable<S: StateStore>(
     Ok(())
 }
 
-/// Whether [`remodel_session`] would refuse this remodel before its first side effect, with
-/// nothing done: the same checks, error texts and statuses (see `plan_remodel`, whose result this
-/// drops, so the two cannot drift). It only reads: the store, the runtime directory, the key
-/// probe and, when runtime calls are on, whether a tmux session of the persona's name runs.
+/// Managed daemon sign-in observations scoped to one launch operation or balance batch.
+pub(crate) type LaunchAuthObservations = BTreeMap<LaunchAuthTarget, Option<LaunchSignInIssue>>;
+
+/// Resolve the exact destination before releasing the store for the daemon request.
+pub(crate) fn remodel_auth_target<S: AgentRegistry + StateStore + Catalog>(
+    store: &S,
+    env: &LifecycleEnv<'_>,
+    target: &SessionTarget,
+    req: &RemodelRequest,
+    caller: Caller,
+) -> Result<Option<LaunchAuthTarget>, LifecycleError> {
+    if !uses_codex_daemon(env, &req.vendor.trim().to_ascii_lowercase()) || !env.spawn_runtime {
+        return Ok(None);
+    }
+    let target = reload_lifecycle_target(store, target)?;
+    Ok(plan_remodel(store, env, &target, req, caller)?.auth_target)
+}
+
+pub(crate) fn observed_launch_auth(
+    observations: &LaunchAuthObservations,
+    target: &LaunchAuthTarget,
+) -> Result<Option<LaunchSignInIssue>, LifecycleError> {
+    observations
+        .get(target)
+        .copied()
+        .ok_or_else(launch_auth_target_changed)
+}
+
+/// Apply the remodel's refusals using a sign-in observation from outside the store guard.
 pub(crate) fn remodel_precheck<S: AgentRegistry + StateStore + Catalog>(
     store: &S,
     env: &LifecycleEnv<'_>,
     target: &SessionTarget,
     req: &RemodelRequest,
     caller: Caller,
+    observe: impl FnOnce(&LaunchAuthTarget) -> Result<Option<LaunchSignInIssue>, LifecycleError>,
 ) -> Result<(), LifecycleError> {
-    plan_remodel(store, env, target, req, caller).map(drop)
+    let plan = plan_remodel(store, env, target, req, caller)?;
+    check_remodel_launch(env, &plan, observe).map(drop)
 }
 
-/// Every check a remodel can make before its first side effect, in the order the siblings make
+fn check_remodel_launch(
+    env: &LifecycleEnv<'_>,
+    plan: &RemodelPlan,
+    observe: impl FnOnce(&LaunchAuthTarget) -> Result<Option<LaunchSignInIssue>, LifecycleError>,
+) -> Result<Vec<String>, LifecycleError> {
+    let Some(target) = &plan.auth_target else {
+        return Ok(Vec::new());
+    };
+    check_vendor_launch_prerequisite(env, &plan.to.vendor, Some(&target.config_home))?;
+    let Some(issue) = observe(target)? else {
+        return Ok(Vec::new());
+    };
+    if issue.blocks_remodel() && !plan.allow_blocked_sign_in {
+        return Err(LifecycleError::Conflict(format!(
+            "{} To proceed anyway, use --allow-blocked-sign-in (API: allow_blocked_sign_in).",
+            issue.message()
+        )));
+    }
+    Ok(vec![issue.message().into()])
+}
+
+/// Store-dependent checks before a remodel's first side effect, in the order the siblings make
 /// them: the teardown gate (403), a decommissioned record (409), no record at all (404), the
 /// request fields as spin-up validates them (400), the runtime directory (400), the registry
 /// checks spin-up makes with the persona's own agent counted as retired (409), a non-Owner
 /// remodel that could not be restored (409), and an old runtime the teardown cannot stop (409).
-/// It has no side effect: [`remodel_precheck`] is this, with the plan dropped.
+/// This has no side effect. [`remodel_precheck`] also validates the destination daemon.
 fn plan_remodel<S: AgentRegistry + StateStore + Catalog>(
     store: &S,
     env: &LifecycleEnv<'_>,
@@ -10532,14 +10807,18 @@ fn plan_remodel<S: AgentRegistry + StateStore + Catalog>(
         preflight_teardown_runtime(store, env, target, caller)?;
         check_old_runtime_stoppable(store, env, target, &to)?;
     }
-    preflight_vendor_launch(env, &to.vendor, to.hosted, &mut to.cwd)?;
+    let config_home = prepare_vendor_launch(env, &to.vendor, to.hosted, &mut to.cwd)?;
+    let auth_target =
+        launch_auth_target(env, &to.vendor, config_home.as_deref(), to.cwd.as_deref());
     Ok(RemodelPlan {
         mode,
+        allow_blocked_sign_in: req.allow_blocked_sign_in,
         persona: target.persona.clone(),
         from_session_id: target.session_id.clone(),
         from_vendor,
         from_model,
         to,
+        auth_target,
         restore,
     })
 }
@@ -10593,6 +10872,7 @@ fn record_remodel_handoff<S: StateStore>(
     let notes = serde_json::json!({
         "kind": "remodel",
         "outcome": outcome.as_str(),
+        "allow_blocked_sign_in": plan.allow_blocked_sign_in,
         "persona": plan.persona,
         "from_session_id": plan.from_session_id,
         "to_session_id": report.to_session_id,
@@ -10684,6 +10964,7 @@ type SpinUpFn<'f, S> = dyn FnMut(
         &SpinUpRequest,
         &str,
         Caller,
+        LaunchAuth<'_>,
     ) -> Result<SpinUpResponse, LifecycleError>
     + 'f;
 
@@ -10702,7 +10983,7 @@ type SpinUpFn<'f, S> = dyn FnMut(
 ///
 /// A same-vendor remodel ends with the same session id, `running`, on the new model and `cwd`.
 ///
-/// The shared persona fence covers prepare, teardown, both vendor identities and rollback.
+/// The shared persona fence covers preflight, prepare, teardown, both vendor identities and rollback.
 /// Hub callers release their initial store guard before acquiring it and reopen afterward.
 pub fn remodel_session<S: AgentRegistry + StateStore + Catalog + MessageStore>(
     store: &S,
@@ -10713,37 +10994,46 @@ pub fn remodel_session<S: AgentRegistry + StateStore + Catalog + MessageStore>(
     caller: Caller,
     clear_queue: impl FnMut(&str),
 ) -> Result<RemodelResponse, LifecycleError> {
-    remodel_session_with_queue_cleanup(
-        store,
-        env,
-        target,
-        req,
-        by,
-        caller,
-        clear_queue_keys(clear_queue),
-    )
+    with_lifecycle_fence(env, &target.persona, "remodel", |env| {
+        let mut observations = LaunchAuthObservations::new();
+        if let Some(target) = remodel_auth_target(store, env, target, req, caller)? {
+            let issue = target.probe(env);
+            observations.insert(target, issue);
+        }
+        remodel_session_with_auth(
+            store,
+            env,
+            target,
+            req,
+            by,
+            caller,
+            &observations,
+            clear_queue_keys(clear_queue),
+        )
+    })
 }
 
-pub(crate) fn remodel_session_with_queue_cleanup<
-    S: AgentRegistry + StateStore + Catalog + MessageStore,
->(
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn remodel_session_with_auth<S: AgentRegistry + StateStore + Catalog + MessageStore>(
     store: &S,
     env: &LifecycleEnv<'_>,
     target: &SessionTarget,
     req: &RemodelRequest,
     by: &str,
     caller: Caller,
+    observations: &LaunchAuthObservations,
     cleanup_queue: impl FnMut(TeardownQueueCleanup<'_>),
 ) -> Result<RemodelResponse, LifecycleError> {
-    remodel_with(
+    remodel_with_auth(
         store,
         env,
         target,
         req,
         by,
         caller,
+        observations,
         cleanup_queue,
-        &mut |store, env, req, by, caller| {
+        &mut |store, env, req, by, caller, launch_auth| {
             #[cfg(test)]
             if FAIL_SPIN_UP_VENDORS.with_borrow(|v| v.contains(&req.vendor)) {
                 return Err(LifecycleError::Store(format!(
@@ -10751,7 +11041,9 @@ pub(crate) fn remodel_session_with_queue_cleanup<
                     req.vendor
                 )));
             }
-            spin_up(store, env, req, by, caller)
+            // The remodel already holds the persona fence. Activation uses the verified
+            // destination key and both launch paths still check socket availability.
+            spin_up_fenced(store, || Ok(store), env, req, by, caller, launch_auth)
         },
     )
 }
@@ -10764,6 +11056,7 @@ thread_local! {
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn remodel_with<S: AgentRegistry + StateStore + Catalog + MessageStore>(
     store: &S,
@@ -10775,9 +11068,49 @@ fn remodel_with<S: AgentRegistry + StateStore + Catalog + MessageStore>(
     cleanup_queue: impl FnMut(TeardownQueueCleanup<'_>),
     spin: &mut SpinUpFn<'_, S>,
 ) -> Result<RemodelResponse, LifecycleError> {
+    let mut observations = LaunchAuthObservations::new();
+    if let Some(target) = remodel_auth_target(store, env, target, req, caller)? {
+        let issue = target.probe(env);
+        observations.insert(target, issue);
+    }
+    remodel_with_auth(
+        store,
+        env,
+        target,
+        req,
+        by,
+        caller,
+        &observations,
+        cleanup_queue,
+        spin,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn remodel_with_auth<S: AgentRegistry + StateStore + Catalog + MessageStore>(
+    store: &S,
+    env: &LifecycleEnv<'_>,
+    target: &SessionTarget,
+    req: &RemodelRequest,
+    by: &str,
+    caller: Caller,
+    observations: &LaunchAuthObservations,
+    cleanup_queue: impl FnMut(TeardownQueueCleanup<'_>),
+    spin: &mut SpinUpFn<'_, S>,
+) -> Result<RemodelResponse, LifecycleError> {
     with_lifecycle_fence(env, &target.persona, "remodel", |env| {
         let target = reload_lifecycle_target(store, target)?;
-        remodel_fenced(store, env, &target, req, by, caller, cleanup_queue, spin)
+        remodel_fenced(
+            store,
+            env,
+            &target,
+            req,
+            by,
+            caller,
+            observations,
+            cleanup_queue,
+            spin,
+        )
     })
 }
 
@@ -10789,10 +11122,14 @@ fn remodel_fenced<S: AgentRegistry + StateStore + Catalog + MessageStore>(
     req: &RemodelRequest,
     by: &str,
     caller: Caller,
+    observations: &LaunchAuthObservations,
     cleanup_queue: impl FnMut(TeardownQueueCleanup<'_>),
     spin: &mut SpinUpFn<'_, S>,
 ) -> Result<RemodelResponse, LifecycleError> {
     let plan = plan_remodel(store, env, target, req, caller)?;
+    let mut warnings = check_remodel_launch(env, &plan, |target| {
+        observed_launch_auth(observations, target)
+    })?;
     let to = &plan.to;
     if plan.mode == RemodelMode::Prepare {
         let out = prepare_decommission(store, env, target, by, caller)?;
@@ -10825,7 +11162,7 @@ fn remodel_fenced<S: AgentRegistry + StateStore + Catalog + MessageStore>(
             host_session_id,
             prompt: out.prompt,
             handoff: None,
-            warnings: Vec::new(),
+            warnings,
             posture: to.posture,
             permission_receipts: to.permission_receipts.clone(),
         });
@@ -10846,10 +11183,17 @@ fn remodel_fenced<S: AgentRegistry + StateStore + Catalog + MessageStore>(
     // The last step that can fail with nothing changed: if it does, the session still runs.
     let handoff = record_remodel_handoff(store, &plan, RemodelOutcome::InProgress, &report, by)?;
 
+    let launch_auth = plan
+        .auth_target
+        .as_ref()
+        .map_or(LaunchAuth::Skip, |target| {
+            // The warning was added to the remodel response during the precheck.
+            LaunchAuth::Observed(target, None)
+        });
     let spun = teardown_session_with_queue_cleanup(store, env, target, by, caller, cleanup_queue)
         .map_err(|e| format!("teardown of `{}` failed: {e}", plan.from_session_id))
         .and_then(|torn| {
-            spin(store, env, &plan.spin_up_request(), by, caller)
+            spin(store, env, &plan.spin_up_request(), by, caller, launch_auth)
                 .and_then(|out| require_runtime(env, out))
                 .map(|out| (torn, out))
                 .map_err(|e| format!("spin-up on {} failed: {e}", to.vendor))
@@ -10859,7 +11203,6 @@ fn remodel_fenced<S: AgentRegistry + StateStore + Catalog + MessageStore>(
 
     let error = match spun {
         Ok((torn, out)) => {
-            let mut warnings = Vec::new();
             if plan.restore.is_none() {
                 warnings.push(format!(
                     "no restore was possible: spin-up cannot start vendor `{}`, so a failure \
@@ -10906,7 +11249,13 @@ fn remodel_fenced<S: AgentRegistry + StateStore + Catalog + MessageStore>(
                 permission_receipts: out.permission_receipts,
             });
         }
-        Err(error) => error,
+        Err(error) => {
+            if warnings.is_empty() {
+                error
+            } else {
+                format!("{error}\n{}", warnings.join("\n"))
+            }
+        }
     };
 
     // A spin-up that failed after its first persist left the new session's record `running`
@@ -10931,10 +11280,17 @@ fn remodel_fenced<S: AgentRegistry + StateStore + Catalog + MessageStore>(
         ..*env
     };
     let restored = match &plan.restore {
-        Some(restore) => spin(store, &restore_env, restore, by, Caller::Owner)
-            .and_then(|out| require_runtime(env, out))
-            .map(|out| out.session_id)
-            .map_err(|e| e.to_string()),
+        Some(restore) => spin(
+            store,
+            &restore_env,
+            restore,
+            by,
+            Caller::Owner,
+            LaunchAuth::Skip,
+        )
+        .and_then(|out| require_runtime(env, out))
+        .map(|out| out.session_id)
+        .map_err(|e| e.to_string()),
         None => Err(format!(
             "vendor `{}` is not one spin-up can start",
             plan.from_vendor
@@ -11554,6 +11910,7 @@ mod tests {
             workspace_root: None,
             log_hydration_warnings: true,
             lifecycle_fence: None,
+            blocker_evidence: None,
         }
     }
 
@@ -16096,6 +16453,7 @@ mod tests {
             node_id: DEFAULT_NODE_ID.into(),
             hosted: true,
             status: status.into(),
+            block: None,
             stop_reason: None,
             launch_prerequisite_detail: None,
             restart_policy: "on-failure".into(),
@@ -18582,6 +18940,30 @@ mod tests {
             i3_restarted.record.hydration_status,
             HydrationStatus::Unconfirmed,
             "I3: prior receipt for reused generation must be cleared before redelivery"
+        );
+        let mut awaiting = i3_restarted.record;
+        awaiting.block = Some(fl_watch::HostedBlock {
+            reason: fl_watch::HostedBlockReason::HydrationOverdue,
+            observed_at_ms: awaiting.updated_at_ms,
+        });
+        persist_hosted_session(&i3_store, &awaiting, "test").unwrap();
+        let redelivered =
+            restart_hosted_session(&i3_store, &i3_env, "claude:ada", "owner").unwrap();
+        assert_eq!(
+            redelivered.record.hydration_generation,
+            awaiting.hydration_generation
+        );
+        assert_eq!(
+            redelivered.record.hydration_status,
+            HydrationStatus::Unconfirmed
+        );
+        assert_eq!(redelivered.record.block, None);
+        assert_eq!(
+            get_hosted_session_record(&i3_store, "claude:ada")
+                .unwrap()
+                .unwrap()
+                .block,
+            None,
         );
         fence_hydration_register(&i3_store, "ada", Some(&g_orig)).unwrap();
         assert!(
@@ -21240,6 +21622,327 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(after_decomm.status, STATUS_DECOMMISSIONED);
+    }
+
+    #[test]
+    fn newer_exact_hydration_receipt_clears_startup_block_before_dead_reconcile() {
+        let home = TempDir::new().unwrap();
+        let cwd = TempDir::new().unwrap();
+        let _trusted_codex = trusted_codex_home(home.path(), cwd.path());
+        let store = MemStore::default();
+        let fake = FakeRuntime::default();
+        let evidence = blockers::PromptExitEvidence::default();
+        let mut env = fake.env(home.path());
+        env.blocker_evidence = Some(&evidence);
+        let mut record = hosted_record("codex", "recovered", STATUS_RUNNING, true);
+        record.hydration_generation = Some("00000000-03e8-7000-8000-000000000001".into());
+        record.hydration_status = HydrationStatus::Unconfirmed;
+        record.cwd = Some(cwd.path().to_str().unwrap().into());
+        record.runtime_leader_pid = Some(9876);
+        let block = fl_watch::HostedBlock {
+            reason: fl_watch::HostedBlockReason::BlockingDialog,
+            observed_at_ms: 2_000,
+        };
+        record.block = Some(block);
+        persist_hosted_session(&store, &record, "test").unwrap();
+        blockers::remember_test_block(&evidence, &record);
+
+        let generation = record.hydration_generation.as_deref().unwrap();
+        let mut receipt = HydrationReceipt {
+            session_id: record.session_id.clone(),
+            persona: record.persona.clone(),
+            generation: generation.into(),
+            accepted_at_ms: block.observed_at_ms,
+        };
+        let save_receipt = |receipt: &HydrationReceipt| {
+            store
+                .upsert_state(UpsertStateArgs {
+                    scope: StateScope::Workspace,
+                    slug: hydration_ack_slug(generation),
+                    sensitivity: SensitivityPatch::Inherit,
+                    payload: StatePayload::Runtime(RuntimeEntry {
+                        value: serde_json::to_value(receipt).unwrap(),
+                        merge_mode: MergeMode::LastWriter,
+                    }),
+                    at: stamp::now(),
+                    by: "test".into(),
+                })
+                .unwrap();
+        };
+        let listed = || list_hosted_sessions(&store).unwrap().remove(0);
+        let keyed = || {
+            get_hosted_session_by_id(&store, &record.session_id)
+                .unwrap()
+                .unwrap()
+        };
+        save_receipt(&receipt);
+        assert_eq!(listed().block, Some(block));
+        assert_eq!(keyed().hydration_status, HydrationStatus::Confirmed);
+
+        receipt.accepted_at_ms += 1;
+        receipt.session_id = "muse:recovered".into();
+        save_receipt(&receipt);
+        assert_eq!(keyed().block, Some(block));
+        assert!(blockers::blocked_at_exit(&keyed(), Some(&evidence)));
+
+        receipt.session_id = record.session_id.clone();
+        save_receipt(&receipt);
+        assert_eq!(listed().block, None);
+        assert_eq!(keyed().block, None);
+
+        let unit = record.tmux_target.as_ref().unwrap().clone();
+        fake.presence_of
+            .borrow_mut()
+            .insert(unit.clone(), RuntimePresence::Gone);
+        fake.exit_codes.borrow_mut().insert(unit, 1);
+        reconcile_dead_hosted_sessions(&store, &env, "test").unwrap();
+        let running = get_hosted_session_record(&store, &record.session_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(running.status, STATUS_RUNNING);
+        assert_eq!(running.block, None);
+        reconcile_dead_hosted_sessions(&store, &env, "test").unwrap();
+        let stopped = get_hosted_session_record(&store, &record.session_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stopped.status, STATUS_STOPPED);
+        assert_eq!(
+            stopped.stop_reason.as_deref(),
+            Some(STOP_REASON_RUNTIME_GONE)
+        );
+        assert_eq!(stopped.block, None);
+
+        let respawned = reconcile_and_respawn_hosted_sessions(&store, &env).unwrap();
+        assert_eq!(respawned.len(), 1);
+        assert_eq!(respawned[0].record.status, STATUS_RUNNING);
+        assert_eq!(respawned[0].record.block, None);
+        assert_eq!(
+            load_hosted_respawn_state(&store, &record.session_id)
+                .unwrap()
+                .respawn_timestamps_ms
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn blocked_hosted_exit_stops_without_crash_attempt_or_respawn() {
+        assert_blocked_hosted_exit(1, STOP_REASON_STARTUP_BLOCKED);
+    }
+
+    #[test]
+    fn blocked_hosted_exit_code_zero_stops_cleanly_without_exit_evidence() {
+        assert_blocked_hosted_exit(0, STOP_REASON_CLEAN_EXIT);
+    }
+
+    fn assert_blocked_hosted_exit(exit_code: i32, stop_reason: &str) {
+        use fl_host_proto::{
+            ChildExit, ChildRecord, ChildState, HostInstance, HostedExitEvidence, InputState,
+            SessionEpoch, SessionId, SessionMode, SessionSummary, SpawnKind, StreamId,
+        };
+
+        let home = TempDir::new().unwrap();
+        let store = MemStore::default();
+        register(&store, "recovery-lead", "ferroloop", AgentRole::Lead);
+        let fake = FakeRuntime::default();
+        let evidence = blockers::PromptExitEvidence::default();
+        let mut env = fake.env(home.path());
+        env.blocker_evidence = Some(&evidence);
+        let mut record = hosted_record("muse", "waiting", STATUS_RUNNING, true);
+        record.tmux_target = Some(hosted_tmux_target(&record.vendor, &record.persona));
+        record.host_session_id = host_session_id_for_target(record.tmux_target.as_deref());
+        record.hydration_generation = Some(next_hydration_generation());
+        record.runtime_leader_pid = Some(9876);
+        record.block = Some(fl_watch::HostedBlock {
+            reason: fl_watch::HostedBlockReason::BlockingDialog,
+            observed_at_ms: 1,
+        });
+        persist_hosted_session(&store, &record, "test").unwrap();
+
+        let unit = record.tmux_target.as_deref().unwrap();
+        let stream = StreamId {
+            host: HostInstance::new([1; 16]),
+            session: SessionId::new(record.host_session_id.as_deref().unwrap()).unwrap(),
+            epoch: SessionEpoch(1),
+        };
+        let exit = ChildExit {
+            code: Some(exit_code),
+            signal: None,
+        };
+        *fake.hosted_exit_fixture.borrow_mut() = Some(HostedExitEvidence {
+            stream: StreamId {
+                epoch: SessionEpoch(0),
+                ..stream.clone()
+            },
+            exit: exit.clone(),
+            started_at_ms: 10,
+            captured_at_ms: 20,
+            terminal_tail: "private prompt content".into(),
+        });
+        let mut respawn = HostedRespawnState::default();
+        assert!(
+            exit_evidence::spawn_and_remember(&store, &env, &mut respawn, &record, None, "owner")
+                .unwrap()
+        );
+        assert_eq!(respawn.exit_evidence.bound_stream(&record), Some(&stream));
+        let respawn_entry = || {
+            store
+                .get_state_by_key(
+                    &StateScope::Workspace,
+                    StateConcern::Runtime,
+                    &hosted_respawn_state_slug(&record.session_id),
+                )
+                .unwrap()
+                .unwrap()
+        };
+        let before = respawn_entry();
+
+        blockers::remember_test_block(
+            &evidence,
+            &get_hosted_session_record(&store, &record.session_id)
+                .unwrap()
+                .unwrap(),
+        );
+        fake.clear();
+        fake.launches.borrow_mut().clear();
+        fake.presence_of
+            .borrow_mut()
+            .insert(unit.into(), RuntimePresence::Gone);
+        // The unit name can have a replacement. Only the launch's exact stream is authoritative.
+        fake.exit_codes
+            .borrow_mut()
+            .insert(unit.into(), i32::from(exit_code == 0));
+        *fake.hosted_exit_inventory.borrow_mut() = Some(SessionSummary {
+            state: ChildState::CleanupComplete(ChildRecord {
+                pid: record.runtime_leader_pid.unwrap(),
+                session: stream.session.clone(),
+                session_epoch: stream.epoch,
+                kind: SpawnKind::Pty,
+                input: InputState::Fenced,
+                started_at_ms: 10,
+                exit: Some(exit),
+                consumer_stalled: false,
+            }),
+            stream,
+            mode: SessionMode::Pty,
+            acked: 0,
+            latest: 0,
+            input: InputState::Fenced,
+        });
+
+        for _ in 0..3 {
+            assert!(
+                reconcile_and_respawn_hosted_sessions(&store, &env)
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+        let stopped = get_hosted_session_by_id(&store, &record.session_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stopped.status, STATUS_STOPPED);
+        assert_eq!(stopped.stop_reason.as_deref(), Some(stop_reason));
+        assert_eq!(stopped.block, record.block.filter(|_| exit_code != 0));
+        assert_eq!(stopped.restart_count, 0);
+        assert!(fake.launches.borrow().is_empty());
+        assert!(fake.hosted_exit_lookups.borrow().is_empty());
+        assert_eq!(
+            load_hosted_respawn_state(&store, &record.session_id).unwrap(),
+            respawn
+        );
+        assert_eq!(respawn_entry(), before, "the recovery state was rewritten");
+        assert!(
+            store
+                .list_wire_inbox(&Default::default())
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn manual_restart_clears_a_saved_startup_block() {
+        let home = TempDir::new().unwrap();
+        let store = MemStore::default();
+        let fake = FakeRuntime::default();
+        let env = fake.env(home.path());
+        let mut record = hosted_record("muse", "waiting", STATUS_STOPPED, true);
+        record.tmux_target = Some(hosted_tmux_target(&record.vendor, &record.persona));
+        record.cwd = Some(home.path().display().to_string());
+        record.stop_reason = Some(STOP_REASON_STARTUP_BLOCKED.into());
+        record.block = Some(fl_watch::HostedBlock {
+            reason: fl_watch::HostedBlockReason::BlockingDialog,
+            observed_at_ms: 1,
+        });
+        register(&store, &record.persona, "ferroloop", AgentRole::Assistant);
+        persist_hosted_session(&store, &record, "test").unwrap();
+        let load = || {
+            get_hosted_session_record(&store, &record.session_id)
+                .unwrap()
+                .unwrap()
+        };
+        assert_eq!(load().block, record.block);
+
+        let result =
+            restart_agent_session(&store, &env, &record.session_id, "owner", Caller::Owner)
+                .unwrap();
+
+        assert_eq!(result.record.session_id, record.session_id);
+        let restarted = load();
+        assert_eq!(restarted.status, STATUS_RUNNING);
+        assert_eq!(restarted.stop_reason, None);
+        assert_eq!(restarted.block, None);
+        assert_eq!(restarted.restart_count, 1);
+        assert!(restarted.runtime_spawned);
+        assert_eq!(fake.launches.borrow().len(), 1);
+    }
+
+    #[test]
+    fn overdue_hydration_without_prompt_evidence_allows_crash_recovery() {
+        let home = TempDir::new().unwrap();
+        let cwd = TempDir::new().unwrap();
+        let _trusted_codex = trusted_codex_home(home.path(), cwd.path());
+        let store = MemStore::default();
+        let fake = FakeRuntime::default();
+        let env = fake.env(home.path());
+        let mut record = hosted_record("codex", "overdue", STATUS_RUNNING, true);
+        record.cwd = Some(cwd.path().to_str().unwrap().into());
+        record.hydration_dispatched = true;
+        record.hydration_generation = Some("00000000-03e8-7000-8000-000000000001".into());
+        record.block = Some(fl_watch::HostedBlock {
+            reason: fl_watch::HostedBlockReason::HydrationOverdue,
+            observed_at_ms: 181_000,
+        });
+        let unit = record.tmux_target.as_ref().unwrap().clone();
+        fake.presence_of
+            .borrow_mut()
+            .insert(unit.clone(), RuntimePresence::Gone);
+        fake.exit_codes.borrow_mut().insert(unit, 1);
+        persist_hosted_session(&store, &record, "test").unwrap();
+
+        for _ in 0..2 {
+            reconcile_dead_hosted_sessions(&store, &env, "test").unwrap();
+        }
+        let stopped = get_hosted_session_by_id(&store, &record.session_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stopped.status, STATUS_STOPPED);
+        assert_eq!(
+            stopped.stop_reason.as_deref(),
+            Some(STOP_REASON_RUNTIME_GONE)
+        );
+
+        let respawned = reconcile_and_respawn_hosted_sessions(&store, &env).unwrap();
+        assert_eq!(respawned.len(), 1);
+        assert_eq!(respawned[0].record.status, STATUS_RUNNING);
+        assert_eq!(respawned[0].record.block, None);
+        assert_eq!(fake.launches.borrow().len(), 1);
+        assert_eq!(
+            load_hosted_respawn_state(&store, &record.session_id)
+                .unwrap()
+                .respawn_timestamps_ms
+                .len(),
+            1
+        );
     }
 
     #[test]
@@ -24088,6 +24791,127 @@ mod tests {
         assert!(fake.calls.borrow().is_empty());
     }
 
+    #[test]
+    fn explicit_codex_auth_checks_release_the_store_and_report_inconclusive() {
+        use std::rc::Rc;
+        use std::sync::Mutex;
+
+        let home = TempDir::new().unwrap();
+        let _trusted = trusted_codex_home(home.path(), home.path());
+        let fake = FakeRuntime::default();
+        let env = fake.env(home.path());
+        let store = Rc::new(Mutex::new(MemStore::default()));
+        let check_store = store.clone();
+        let probes = Rc::new(std::cell::Cell::new(0));
+        let observed = probes.clone();
+        let expected = home.path().canonicalize().unwrap();
+        TEST_LAUNCH_AUTH.with(|probe| {
+            *probe.borrow_mut() = Some(Box::new(move |target| {
+                assert_eq!(target.cwd, expected);
+                assert!(
+                    check_store.try_lock().is_ok(),
+                    "auth probe held the store mutex"
+                );
+                observed.set(observed.get() + 1);
+                Some(LaunchSignInIssue::Inconclusive)
+            }))
+        });
+
+        let req = SpinUpRequest {
+            persona: "uncertain".into(),
+            vendor: "codex".into(),
+            project: "ferroloop".into(),
+            role: "assistant".into(),
+            cwd: Some(home.path().display().to_string()),
+            ..SpinUpRequest::default()
+        };
+        let spun = spin_up_with_store(
+            store.lock().unwrap(),
+            || Ok(store.lock().unwrap()),
+            &env,
+            &req,
+            "owner",
+            Caller::Owner,
+        )
+        .unwrap();
+        let warning = LaunchSignInIssue::Inconclusive.message();
+        assert!(spun.warnings.iter().any(|line| line == warning));
+        assert!(spun.runtime_spawned);
+        assert_eq!(probes.get(), 1);
+
+        let out = restart_hosted_session_with_store(
+            store.lock().unwrap(),
+            || Ok(store.lock().unwrap()),
+            &env,
+            &spun.session_id,
+            "owner",
+        )
+        .unwrap();
+        assert!(out.warnings.iter().any(|line| line == warning));
+        assert_eq!(probes.get(), 2);
+    }
+
+    #[test]
+    fn codex_auth_warning_allows_spin_up_and_manual_restart() {
+        let home = TempDir::new().unwrap();
+        let _trusted = trusted_codex_home(home.path(), home.path());
+        let fake = FakeRuntime::default();
+        let env = fake.env(home.path());
+        let store = MemStore::default();
+        TEST_LAUNCH_AUTH.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(|_| Some(LaunchSignInIssue::Rejected)));
+        });
+        let req = SpinUpRequest {
+            persona: "warned".into(),
+            vendor: "codex".into(),
+            project: "ferroloop".into(),
+            role: "assistant".into(),
+            cwd: Some(home.path().display().to_string()),
+            ..SpinUpRequest::default()
+        };
+        let spun = spin_up(&store, &env, &req, "owner", Caller::Owner).unwrap();
+        assert!(spun.runtime_spawned);
+        assert!(
+            spun.warnings
+                .iter()
+                .any(|warning| warning == LaunchSignInIssue::Rejected.message())
+        );
+
+        let mut stopped = get_hosted_session_by_id(&store, &spun.session_id)
+            .unwrap()
+            .unwrap();
+        fake.clear();
+        stopped.status = STATUS_STOPPED.into();
+        stopped.stop_reason = Some(STOP_REASON_CRASH_LOOP.into());
+        persist_hosted_session(&store, &stopped, "owner").unwrap();
+        save_hosted_respawn_state(
+            &store,
+            &spun.session_id,
+            &HostedRespawnState {
+                respawn_timestamps_ms: vec![900],
+                recovery_attempts: 2,
+                ..Default::default()
+            },
+            "owner",
+        )
+        .unwrap();
+
+        let restarted = restart_hosted_session(&store, &env, &spun.session_id, "owner").unwrap();
+        assert!(restarted.runtime_live);
+        assert_eq!(restarted.record.status, STATUS_RUNNING);
+        assert_eq!(restarted.record.launch_prerequisite_detail, None);
+        assert!(
+            restarted
+                .warnings
+                .iter()
+                .any(|warning| warning == LaunchSignInIssue::Rejected.message())
+        );
+        assert_eq!(
+            load_hosted_respawn_state(&store, &spun.session_id).unwrap(),
+            HostedRespawnState::default()
+        );
+    }
+
     // CI only: a lost trust entry must spend the ordinary bounded automatic budget.
     #[test]
     fn automatic_invalid_preflight_charges_budget_and_reaches_crash_loop() {
@@ -24132,6 +24956,35 @@ mod tests {
         TEST_RESPAWN_NOW_MS.with(|clock| clock.set(None));
     }
 
+    #[test]
+    fn fenced_automatic_codex_recovery_checks_socket_without_probing_sign_in() {
+        let _reset = RecoveryFixtureReset;
+        let home = TempDir::new().unwrap();
+        let _trusted = trusted_codex_home(home.path(), home.path());
+        let store = MemStore::default();
+        let fake = FakeRuntime::default();
+        let env = fake.env(home.path());
+        let mut record = hosted_record("codex", "worker", STATUS_STOPPED, false);
+        record.cwd = Some(home.path().display().to_string());
+        record.stop_reason = Some(STOP_REASON_RUNTIME_GONE.into());
+        persist_hosted_session(&store, &record, "owner").unwrap();
+        TEST_RESPAWN_NOW_MS.with(|clock| clock.set(Some(1_000)));
+        TEST_LAUNCH_PREREQUISITE_CALLS.with(|calls| calls.set(0));
+        TEST_LAUNCH_AUTH.with(|probe| {
+            *probe.borrow_mut() = Some(Box::new(|_| {
+                panic!("automatic recovery must not ask the daemon for sign-in")
+            }));
+        });
+
+        // The production sweep holds the persona fence before calling restart.
+        let restarted = reconcile_and_respawn_hosted_sessions(&store, &env).unwrap();
+        assert_eq!(restarted.len(), 1);
+        assert!(restarted[0].runtime_live);
+        assert_eq!(restarted[0].record.session_id, record.session_id);
+        assert_eq!(restarted[0].record.status, STATUS_RUNNING);
+        assert!(TEST_LAUNCH_PREREQUISITE_CALLS.with(|calls| calls.get()) > 0);
+    }
+
     // CI only: the second probe distinguishes a vanished daemon from a broken launch.
     #[test]
     fn failed_codex_startup_charges_real_spawns_even_when_prerequisite_vanishes() {
@@ -24148,6 +25001,11 @@ mod tests {
         {
             let home = TempDir::new().unwrap();
             let _trusted = trusted_codex_home(home.path(), home.path());
+            TEST_LAUNCH_AUTH.with(|probe| {
+                *probe.borrow_mut() = Some(Box::new(|_| {
+                    panic!("automatic recovery must not ask the daemon for sign-in")
+                }))
+            });
             let store = MemStore::default();
             let fake = FakeRuntime::default();
             if spawn_fails {

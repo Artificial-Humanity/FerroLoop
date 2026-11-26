@@ -31,6 +31,7 @@ use std::collections::BTreeMap;
 use crate::WatchError;
 use crate::liveness::{WatchHealthReport, WatchLiveness};
 use crate::rollups::WatchTelemetryReport;
+use crate::runtime::WatchHostedSession;
 
 /// How urgent an alert is. Orders `Info < Warning < Critical`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -59,6 +60,8 @@ pub enum WatchAlertRule {
     Spend,
     /// A vendor quota window at or above a percentage threshold.
     Quota,
+    /// A vendor has running hosted sessions that need operator attention.
+    HostedBlock,
     /// An active agent whose heartbeat is stale (or whose host is unreachable).
     HeartbeatStale,
     /// An active agent whose heartbeat says live but whose process is gone.
@@ -75,6 +78,7 @@ impl WatchAlertRule {
         match self {
             WatchAlertRule::Spend => "spend",
             WatchAlertRule::Quota => "quota",
+            WatchAlertRule::HostedBlock => "hosted_block",
             WatchAlertRule::HeartbeatStale => "heartbeat_stale",
             WatchAlertRule::HeartbeatDead => "heartbeat_dead",
             WatchAlertRule::CrashLoop => "crash_loop",
@@ -317,6 +321,17 @@ pub fn evaluate_watch_alerts(
     thresholds: &WatchThresholds,
     now_ms: u64,
 ) -> Vec<WatchAlert> {
+    evaluate_watch_alerts_with_hosted_sessions(telemetry, health, quotas, &[], thresholds, now_ms)
+}
+
+pub(crate) fn evaluate_watch_alerts_with_hosted_sessions(
+    telemetry: &WatchTelemetryReport,
+    health: &WatchHealthReport,
+    quotas: &[WatchQuotaWindow],
+    hosted_sessions: &[WatchHostedSession],
+    thresholds: &WatchThresholds,
+    now_ms: u64,
+) -> Vec<WatchAlert> {
     let mut out = Vec::new();
     let mut push = |rule: WatchAlertRule,
                     severity: Severity,
@@ -511,6 +526,65 @@ pub fn evaluate_watch_alerts(
                 "remodel sessions on {vendor} onto an available vendor, or hold new work until \
                  the window resets"
             ),
+        );
+    }
+
+    let mut blocked_counts = BTreeMap::<String, (u64, u64)>::new();
+    for seat in hosted_sessions {
+        let vendor = seat.vendor.trim();
+        if vendor.is_empty() {
+            continue;
+        }
+        let running = seat.is_running() && seat.block.is_some();
+        let stopped = seat.is_stopped_while_blocked();
+        if running || stopped {
+            let counts = blocked_counts
+                .entry(vendor.to_ascii_lowercase())
+                .or_default();
+            counts.0 += u64::from(running);
+            counts.1 += u64::from(stopped);
+        }
+    }
+    for (vendor, (running, stopped)) in blocked_counts {
+        let seat_word = |count| if count == 1 { "seat" } else { "seats" };
+        let (message, hint) = match (running, stopped) {
+            (0, _) => (
+                format!(
+                    "{vendor} has {stopped} hosted {} stopped while blocked",
+                    seat_word(stopped)
+                ),
+                "Restart the stopped seats after the block is cleared, or remove them with `fl agent decommission`.",
+            ),
+            (_, 0) => (
+                format!(
+                    "{vendor} has {running} blocked hosted {}",
+                    seat_word(running)
+                ),
+                "Inspect the affected hosted sessions for sign-in, a prompt that needs a decision, or overdue hydration.",
+            ),
+            (_, _) => (
+                format!(
+                    "{vendor} has {running} blocked hosted {} and {stopped} hosted {} stopped while blocked",
+                    seat_word(running),
+                    seat_word(stopped),
+                ),
+                "Inspect the affected hosted sessions. Restart the stopped seats after the block is cleared, or remove them with `fl agent decommission`.",
+            ),
+        };
+        push(
+            WatchAlertRule::HostedBlock,
+            Severity::Warning,
+            WatchEntity {
+                kind: WatchEntityKind::Vendor,
+                id: vendor.clone(),
+                label: None,
+            },
+            format!("vendor:{vendor}"),
+            message,
+            (running + stopped) as f64,
+            1.0,
+            None,
+            hint.into(),
         );
     }
 

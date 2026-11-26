@@ -2862,26 +2862,43 @@ fn dispatch_diagnostics_summary(
     };
     let mut waiting = Vec::new();
     let mut needs_attention = Vec::new();
+    let mut busy_since = Vec::new();
     for row in &diagnostics.fence_recovery_attention {
         let Some(recipient) = fl_wire::identity::normalize_persona(&row.recipient) else {
             continue;
         };
-        let reason = row.outcome.label();
-        let since = row
-            .busy_since
-            .as_ref()
-            .map_or_else(String::new, |at| format!(" since {at}"));
+        let reason = row.reason_label();
+        if let Some(at) = row.busy_since.as_ref() {
+            busy_since.push(format!("{recipient}={at}"));
+        }
         let exhausted = if row.exhausted { ":exhausted" } else { "" };
         let group = match row.outcome {
-            WaitingForDelay | WaitingForWorker => &mut waiting,
-            SeatBusy if !row.exhausted => &mut waiting,
+            WaitingForDelay | WaitingForWorker | SeatBusy => &mut waiting,
             _ => &mut needs_attention,
         };
-        group.push(format!("{recipient}:{reason}{since}{exhausted}"));
+        group.push(format!("{recipient}:{reason}{exhausted}"));
     }
+    // Ring insertion order defines the latest observed streak for each recipient.
+    let mut last_busy_probe_counts = std::collections::BTreeMap::new();
+    for row in &diagnostics.fence_recovery_attempts {
+        if row.outcome == SeatBusy
+            && let Some(recipient) = fl_wire::identity::normalize_persona(&row.recipient)
+        {
+            last_busy_probe_counts.insert(recipient, row.busy_probe_count);
+        }
+    }
+    let last_busy_probe_counts = last_busy_probe_counts
+        .into_iter()
+        .filter_map(|(recipient, count)| count.map(|count| format!("{recipient}:{count}")))
+        .collect();
     let recovery_status = [
         ("fence_recovery_needs_attention", needs_attention),
         ("fence_recovery_waiting", waiting),
+        ("fence_recovery_busy_since", busy_since),
+        (
+            "fence_recovery_last_busy_probe_counts",
+            last_busy_probe_counts,
+        ),
     ]
     .into_iter()
     .filter(|(_, rows)| !rows.is_empty())
@@ -3048,6 +3065,16 @@ pub(crate) mod tests {
             "diagnostics_partial": false,
             "omitted_evidence_total": 0,
             "omitted_evidence_total_saturated": false,
+            "fence_recovery_attempts": [
+                {"recipient": "Den", "attempt": 1, "limit": 3, "at": "2026-11-26T00:13:00.000Z", "outcome": "seat_busy", "busy_probe_count": 8},
+                {"recipient": "den", "attempt": 1, "limit": 3, "at": "2026-11-26T00:13:00.000Z", "outcome": "released"},
+                {"recipient": "den", "attempt": 1, "limit": 3, "at": "2026-11-26T00:12:34.567Z", "outcome": "seat_busy", "busy_probe_count": 2},
+                {"recipient": "sera", "attempt": 1, "limit": 3, "at": "2026-11-26T01:00:00.000Z", "outcome": "seat_busy", "busy_probe_count": 5},
+                {"recipient": "sera", "attempt": 1, "limit": 3, "at": "2026-11-26T01:00:00.000Z", "outcome": "released"},
+                {"recipient": "eve", "attempt": 1, "limit": 3, "at": "2026-11-26T01:05:41.000Z", "outcome": "seat_busy", "busy_probe_count": 12},
+                {"recipient": "max", "attempt": 1, "limit": 3, "at": "2026-11-26T01:05:41.000Z", "outcome": "seat_busy"},
+                {"recipient": "/private/path", "attempt": 1, "limit": 3, "at": "2026-11-26T01:05:41.000Z", "outcome": "seat_busy", "busy_probe_count": 4},
+            ],
             "fence_recovery_attention": [
                 {"recipient": "feira", "outcome": "vendor_sign_in", "exhausted": true},
                 {"recipient": "ada", "outcome": "dead_route", "exhausted": false},
@@ -3056,8 +3083,9 @@ pub(crate) mod tests {
                 {"recipient": "ari", "outcome": "waiting_for_delay", "exhausted": false},
                 {"recipient": "bea", "outcome": "waiting_for_worker", "exhausted": false},
                 {"recipient": "cal", "outcome": "recovery_disabled", "exhausted": false},
-                {"recipient": "den", "outcome": "seat_busy", "exhausted": false, "busy_since": "2026-11-26T00:00:00.000Z"},
-                {"recipient": "eve", "outcome": "seat_busy_prolonged", "exhausted": false, "busy_since": "2026-11-26T01:00:00.000Z"},
+                {"recipient": "den", "outcome": "seat_busy", "exhausted": true, "busy_since": "2026-11-26T00:12:34.567Z"},
+                {"recipient": "eve", "outcome": "seat_busy_prolonged", "exhausted": false, "busy_since": "2026-11-26T01:00:00.000Z", "busy_elapsed_ms": 341_000},
+                {"recipient": "max", "outcome": "seat_busy_prolonged", "exhausted": false},
                 {"recipient": "eli", "outcome": "dialog_waiting", "exhausted": false},
                 {"recipient": "gia", "outcome": "composer_draft", "exhausted": false},
                 {"recipient": "hal", "outcome": "blank_screen", "exhausted": false},
@@ -3073,14 +3101,25 @@ pub(crate) mod tests {
         assert!(summary.contains(
             "\tfence_recovery_needs_attention=feira:vendor sign-in screen:exhausted,ada:dead route,ferris:no hosted stream binding,jarvis:hosted screen capture unavailable"
         ));
-        let (attention, waiting) = summary.split_once("\tfence_recovery_waiting=").unwrap();
+        let (attention, waiting_and_history) =
+            summary.split_once("\tfence_recovery_waiting=").unwrap();
+        let (waiting, busy_since_and_history) = waiting_and_history
+            .split_once("\tfence_recovery_busy_since=")
+            .unwrap();
+        let (busy_since, last_busy_probe_counts) = busy_since_and_history
+            .split_once("\tfence_recovery_last_busy_probe_counts=")
+            .unwrap();
         assert_eq!(
             waiting,
-            "ari:waiting for the recovery delay,bea:waiting for a delivery worker slot,den:seat is in a turn since 2026-11-26T00:00:00.000Z"
+            "ari:waiting for the recovery delay,bea:waiting for a delivery worker slot,den:seat is in a turn:exhausted"
         );
-        assert!(attention.contains(
-            "eve:seat is still in a turn after 12 consecutive probes since 2026-11-26T01:00:00.000Z"
-        ));
+        assert_eq!(
+            busy_since,
+            "den=2026-11-26T00:12:34.567Z,eve=2026-11-26T01:00:00.000Z"
+        );
+        assert_eq!(last_busy_probe_counts, "den:2,eve:12,sera:5");
+        assert!(attention.contains("eve:seat has been in a turn for 5m 41s"));
+        assert!(attention.contains("max:seat is still in a turn"));
         for entry in [
             "cal:timed recovery is disabled",
             "eli:a dialog waits for input",
@@ -3490,6 +3529,7 @@ pub(crate) mod tests {
             node_id: "local".into(),
             hosted: true,
             status: fl_hub::lifecycle::STATUS_RUNNING.into(),
+            block: None,
             stop_reason: None,
             launch_prerequisite_detail: None,
             restart_policy: "on-failure".into(),
@@ -4417,6 +4457,7 @@ pub(crate) mod tests {
                 node_id: "local".into(),
                 hosted: true,
                 status: fl_hub::lifecycle::STATUS_RUNNING.into(),
+                block: None,
                 stop_reason: None,
                 launch_prerequisite_detail: None,
                 restart_policy: "on-failure".into(),
@@ -4641,6 +4682,7 @@ pub(crate) mod tests {
                 node_id: "local".into(),
                 hosted: true,
                 status: fl_hub::lifecycle::STATUS_DECOMMISSIONED.into(),
+                block: None,
                 stop_reason: None,
                 launch_prerequisite_detail: None,
                 restart_policy: "on-failure".into(),
@@ -5067,6 +5109,7 @@ pub(crate) mod tests {
                 node_id: "local".into(),
                 hosted: true,
                 status: fl_hub::lifecycle::STATUS_RUNNING.into(),
+                block: None,
                 stop_reason: None,
                 launch_prerequisite_detail: None,
                 restart_policy: "on-failure".into(),
@@ -5490,6 +5533,7 @@ pub(crate) mod tests {
                 node_id: "local".into(),
                 hosted: true,
                 status: fl_hub::lifecycle::STATUS_RUNNING.into(),
+                block: None,
                 stop_reason: None,
                 launch_prerequisite_detail: None,
                 restart_policy: "on-failure".into(),
@@ -5592,6 +5636,7 @@ pub(crate) mod tests {
                 node_id: "local".into(),
                 hosted: true,
                 status: fl_hub::lifecycle::STATUS_RUNNING.into(),
+                block: None,
                 stop_reason: None,
                 launch_prerequisite_detail: None,
                 restart_policy: "on-failure".into(),
@@ -5930,6 +5975,7 @@ pub(crate) mod tests {
                 node_id: "local".into(),
                 hosted: true,
                 status: fl_hub::lifecycle::STATUS_RUNNING.into(),
+                block: None,
                 stop_reason: None,
                 launch_prerequisite_detail: None,
                 restart_policy: "on-failure".into(),
@@ -6270,6 +6316,7 @@ pub(crate) mod tests {
                 node_id: "local".into(),
                 hosted: true,
                 status: fl_hub::lifecycle::STATUS_RUNNING.into(),
+                block: None,
                 stop_reason: None,
                 launch_prerequisite_detail: None,
                 restart_policy: "on-failure".into(),
@@ -6404,6 +6451,7 @@ pub(crate) mod tests {
                 node_id: "local".into(),
                 hosted: true,
                 status: fl_hub::lifecycle::STATUS_RUNNING.into(),
+                block: None,
                 stop_reason: None,
                 launch_prerequisite_detail: None,
                 restart_policy: "on-failure".into(),
@@ -7117,6 +7165,7 @@ pub(crate) mod tests {
             node_id: "local".into(),
             hosted: true,
             status: fl_hub::lifecycle::STATUS_RUNNING.into(),
+            block: None,
             stop_reason: None,
             launch_prerequisite_detail: None,
             restart_policy: "on-failure".into(),

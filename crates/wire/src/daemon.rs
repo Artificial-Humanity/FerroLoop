@@ -1068,7 +1068,7 @@ const MAX_OVERFLOW_RECIPIENTS: usize = 128;
 const DEFAULT_FENCE_RECOVERY_DELAY_SECS: u64 = 300;
 const DEFAULT_FENCE_RECOVERY_MAX_ATTEMPTS: u32 = 3;
 const MAX_FENCE_PROBES_PER_POLL: usize = 4;
-const FENCE_BUSY_ATTENTION_PROBES: u8 = 12;
+const FENCE_BUSY_ATTENTION_PROBES: u32 = 12;
 
 #[derive(Clone, Copy)]
 struct FenceRecoveryPolicy {
@@ -1157,7 +1157,7 @@ struct RetainedFenceRecovery {
     last_attempt: Option<At>,
     attempts: u32,
     busy_since: Option<At>,
-    consecutive_busy_probes: u8,
+    consecutive_busy_probes: u32,
     phase: RetainedFencePhase,
     deferred_release: DeferredFenceRelease,
 }
@@ -1261,6 +1261,7 @@ fn failure_reason(stage: FailureStage) -> FenceReason {
         FailureStage::MessageLookupError => FenceReason::MessageLookupError,
         FailureStage::InitialReceiptReadError => FenceReason::InitialReceiptReadError,
         FailureStage::InitialReceiptReadMissing => FenceReason::InitialReceiptReadMissing,
+        FailureStage::InitialReceiptReadAmbiguous => FenceReason::InitialReceiptReadAmbiguous,
         FailureStage::TransportError => FenceReason::TransportError,
         FailureStage::DeadExplicitRoute => FenceReason::DeadExplicitRoute,
         FailureStage::ComposerOccupiedByNonWireInput => FenceReason::ComposerOccupiedByNonWireInput,
@@ -2508,6 +2509,7 @@ where
                                 &recipient,
                                 FenceRecoveryOutcome::SeatBusy,
                                 busy_since,
+                                &state.since,
                             );
                         } else {
                             diagnostics.set_fence_recovery_attention(
@@ -2674,6 +2676,7 @@ where
             state.consecutive_busy_probes = 0;
         }
         let mut diagnostics = lock(&self.dispatch_diagnostics);
+        let mut busy_probe_count = None;
         let outcome = match current {
             Some(state) if outcome == FenceRecoveryOutcome::SeatBusy => {
                 // A typed busy refusal proves zero writes. Keep the delay
@@ -2681,13 +2684,19 @@ where
                 state.attempts = state.attempts.saturating_sub(1);
                 state.phase = RetainedFencePhase::Waiting;
                 state.consecutive_busy_probes = state.consecutive_busy_probes.saturating_add(1);
+                busy_probe_count = Some(state.consecutive_busy_probes);
                 let busy_since = state.busy_since.get_or_insert_with(|| run.at.clone());
                 let status = if state.consecutive_busy_probes >= FENCE_BUSY_ATTENTION_PROBES {
                     FenceRecoveryOutcome::SeatBusyProlonged
                 } else {
                     FenceRecoveryOutcome::SeatBusy
                 };
-                diagnostics.set_busy_fence_recovery_status(recipient, status, busy_since.clone());
+                diagnostics.set_busy_fence_recovery_status(
+                    recipient,
+                    status,
+                    busy_since.clone(),
+                    &run.at,
+                );
                 outcome
             }
             Some(_) if outcome == FenceRecoveryOutcome::Released => {
@@ -2754,6 +2763,7 @@ where
             limit: self.fence_recovery_policy.max_attempts,
             at: run.at.clone(),
             outcome,
+            busy_probe_count,
         };
         diagnostics.record_fence_recovery(attempt);
     }
@@ -6071,6 +6081,65 @@ mod tests {
     }
 
     #[test]
+    fn timed_fence_recovery_stops_before_sending_case_colliding_receipts() {
+        let (_tmp, inner, listener, first, since) = timed_recovery_fixture();
+        let original = inner.store.list_wire_receipts(&first).unwrap().remove(0);
+        let alias = DeliveryReceipt {
+            recipient_id: fl_core::ids::seq_iri(42),
+            recipient_name: "HeLd".into(),
+            ..original.clone()
+        };
+        assert_ne!(alias.recipient_id, original.recipient_id);
+        let imported = inner.store.import_wire_batch(&[], &[alias]).unwrap();
+        assert_eq!(imported.imported_receipts, 1);
+        let before = inner.store.list_wire_receipts(&first).unwrap();
+        assert_eq!(before.len(), 2);
+        assert!(before.iter().all(|receipt| {
+            receipt.recipient_name.eq_ignore_ascii_case("held")
+                && receipt.status == DeliveryStatus::Pending
+                && receipt.attempts == 1
+        }));
+        *lock(&inner.fence_recovery_probe_hook) = Some(Box::new(|| {
+            RecoveryReadiness::Ready(RecoveryTarget::FixtureWebhook)
+        }));
+        let due = since.unix_millis() + 300_000;
+        inner.poll_retained_fences(At::from_unix_millis(due));
+        wait_on_recovery(|| !lock(&inner.dispatch_queues).contains_key("held"));
+
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        assert_eq!(inner.store.list_wire_receipts(&first).unwrap(), before);
+        assert!(inner.is_recipient_fenced("held"));
+        let status = inner.diagnostics_snapshot();
+        assert_eq!(status.records[0].route_dispatch_calls, 0);
+        assert_eq!(
+            status.records[0].first_reason,
+            FenceReason::InitialReceiptReadAmbiguous
+        );
+        assert_eq!(
+            status.fence_recovery_attempts[0].outcome,
+            FenceRecoveryOutcome::ReceiptBookkeepingFailed
+        );
+        assert_eq!(
+            status.fence_recovery_attention[0].outcome,
+            FenceRecoveryOutcome::ReceiptBookkeepingFailed
+        );
+
+        inner.poll_retained_fences(At::from_unix_millis(due + 300_001));
+        wait_on_recovery(|| !lock(&inner.dispatch_queues).contains_key("held"));
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        assert_eq!(
+            inner.diagnostics_snapshot().fence_recovery_attempts.len(),
+            1
+        );
+    }
+
+    #[test]
     fn timed_fence_recovery_stops_after_submit_without_receipt_confirmation() {
         for (fault, stage, outcome) in [
             (
@@ -6576,7 +6645,37 @@ mod tests {
         exercise_timed_recovery_hosted_busy_backlog(true);
     }
 
-    fn exercise_timed_recovery_hosted_busy_backlog(exhaust_busy_parks: bool) {
+    #[derive(Debug, Default)]
+    struct HostedRecoveryScreen {
+        writes: Vec<String>,
+        captures: usize,
+        busy: bool,
+        busy_captures: usize,
+        busy_on_capture: Option<usize>,
+        busy_after_paste: bool,
+    }
+
+    struct HostedRecoveryFixture {
+        endpoint: fl_host_proto::HostEndpoint,
+        screen: Arc<Mutex<HostedRecoveryScreen>>,
+        listener: crate::test_isolation::RegisteredUnixListener,
+        stop: tokio::sync::oneshot::Sender<()>,
+        server: std::thread::JoinHandle<()>,
+    }
+
+    impl HostedRecoveryFixture {
+        fn stop(self) {
+            self.stop.send(()).unwrap();
+            self.server.join().unwrap();
+        }
+    }
+
+    // Give each scenario a distinct host session so the in-process paste ledger stays isolated.
+    fn hosted_claude_recovery_fixture(
+        inner: &DaemonInner<FaultStore>,
+        tmp: &TempDir,
+        host_session: &str,
+    ) -> HostedRecoveryFixture {
         use fl_host_proto::{
             ChildRecord, ChildState, ControllerLease, ExtensionLimits, ExtensionRequest,
             ExtensionResponse, HostConfig, HostEndpoint, HostInstance, HostListener, HostRequest,
@@ -6585,19 +6684,9 @@ mod tests {
         };
         use std::os::unix::fs::PermissionsExt;
 
-        #[derive(Debug, Default)]
-        struct ScreenState {
-            writes: Vec<String>,
-            busy: bool,
-            busy_captures: usize,
-        }
-
-        let _env_lock = lock(&crate::dispatcher::TMUX_ENV_LOCK);
-        let (tmp, mut inner) = production_recovery_rig();
-        Arc::get_mut(&mut inner).unwrap().config.home_override = None;
         fs::set_permissions(tmp.path(), fs::Permissions::from_mode(0o700)).unwrap();
         let endpoint = HostEndpoint::unix(tmp.path().join("fl-host.sock")).unwrap();
-        let session_id = SessionId::new("Held.claude").unwrap();
+        let session_id = SessionId::new(host_session).unwrap();
         let stream = StreamId {
             host: HostInstance::new([6; 16]),
             session: session_id.clone(),
@@ -6620,7 +6709,7 @@ mod tests {
             acked: 0,
             latest: 0,
         };
-        let screen_state = Arc::new(Mutex::new(ScreenState::default()));
+        let screen_state = Arc::new(Mutex::new(HostedRecoveryScreen::default()));
         let observed = Arc::clone(&screen_state);
         let (ready_tx, ready_rx) = mpsc::channel();
         let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel::<()>();
@@ -6671,23 +6760,27 @@ mod tests {
                                 ExtensionRequest::CaptureRendered { stream } => {
                                     let mut state = lock(&observed);
                                     let rule = "────────────────────────────────────────";
-                                    let (composer, footer) = if state.busy {
-                                        state.busy_captures += 1;
-                                        (String::new(), "esc to interrupt")
-                                    } else if let Some(paste) =
-                                        state.writes.last().filter(|write| write.as_str() != "\r")
-                                    {
-                                        (
+                                    state.captures += 1;
+                                    let pasted =
+                                        state.writes.last().filter(|write| write.as_str() != "\r");
+                                    let busy = state.busy
+                                        || state.busy_on_capture == Some(state.captures)
+                                        || (state.busy_after_paste && pasted.is_some());
+                                    let composer = pasted
+                                        .map(|paste| {
                                             paste
                                                 .strip_prefix("\x1b[200~")
                                                 .unwrap()
                                                 .strip_suffix("\x1b[201~")
                                                 .unwrap()
-                                                .replace('\n', "\n  "),
-                                            "? for shortcuts",
-                                        )
+                                                .replace('\n', "\n  ")
+                                        })
+                                        .unwrap_or_default();
+                                    let footer = if busy {
+                                        state.busy_captures += 1;
+                                        "esc to interrupt"
                                     } else {
-                                        (String::new(), "? for shortcuts")
+                                        "? for shortcuts"
                                     };
                                     ExtensionResponse::RenderedCapture {
                                         screen: RenderedScreen {
@@ -6733,7 +6826,6 @@ mod tests {
                 });
         });
         ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-        let _scope = crate::runtime_context::pin(endpoint, None);
 
         // Ordinary dispatch goes through Claude's native message socket after
         // the test releases the active turn on the hosted stream.
@@ -6756,20 +6848,154 @@ mod tests {
             true,
         );
         put_recovery_runtime(
-            &inner,
+            inner,
             "claude",
             serde_json::json!({
                 "session_id": "claude:held",
                 "vendor": "claude",
                 "persona": "held",
                 "hosted": true,
-                "host_session_id": "Held.claude",
+                "host_session_id": host_session,
                 "status": "running",
                 "hydration_generation": "gen-1",
                 "hydration_status": "confirmed",
                 "runtime_leader_pid": 42,
             }),
         );
+        HostedRecoveryFixture {
+            endpoint,
+            screen: screen_state,
+            listener,
+            stop: stop_tx,
+            server,
+        }
+    }
+
+    #[test]
+    fn timed_fence_recovery_refunds_busy_at_target_dispatch() {
+        let _env_lock = lock(&crate::dispatcher::TMUX_ENV_LOCK);
+        let (tmp, mut inner) = production_recovery_rig();
+        let daemon = Arc::get_mut(&mut inner).unwrap();
+        daemon.config.home_override = None;
+        daemon.fence_recovery_policy.max_attempts = 1;
+        let host = hosted_claude_recovery_fixture(&inner, &tmp, "HELD.claude");
+        let _scope = crate::runtime_context::pin(host.endpoint.clone(), None);
+        // The scheduler and worker probes find a ready composer. Only the
+        // pinned RecoveryTarget's own capture observes the busy footer.
+        lock(&host.screen).busy_on_capture = Some(3);
+        let (message, since) = hold_recovery_mail(&inner);
+        let before = inner.store.list_wire_receipts(&message).unwrap();
+        let delay = inner.fence_recovery_policy.delay_ms;
+        let due = since.unix_millis() + delay;
+
+        inner.poll_retained_fences(At::from_unix_millis(due));
+        wait_on_recovery(|| {
+            !inner
+                .diagnostics_snapshot()
+                .fence_recovery_attempts
+                .is_empty()
+        });
+        let status = inner.diagnostics_snapshot();
+        let attempt = &status.fence_recovery_attempts[0];
+        assert_eq!(attempt.outcome, FenceRecoveryOutcome::SeatBusy);
+        assert_eq!(attempt.attempt, 1);
+        assert_eq!(attempt.busy_probe_count, Some(1));
+        assert!(!status.fence_recovery_attention[0].exhausted);
+        assert!(inner.is_recipient_fenced("held"));
+        assert_eq!(lock(&inner.fence_recoveries)["held"].attempts, 0);
+        assert_eq!(inner.store.list_wire_receipts(&message).unwrap(), before);
+        {
+            let screen = lock(&host.screen);
+            assert_eq!(screen.captures, 3);
+            assert_eq!(screen.busy_captures, 1);
+            assert!(screen.writes.is_empty());
+        }
+
+        inner.poll_retained_fences(At::from_unix_millis(due + delay));
+        wait_on_recovery(|| inner.diagnostics_snapshot().fence_recovery_attempts.len() == 2);
+        let status = inner.diagnostics_snapshot();
+        assert_eq!(
+            status.fence_recovery_attempts[1].outcome,
+            FenceRecoveryOutcome::Released
+        );
+        assert_eq!(status.fence_recovery_attempts[1].attempt, 1);
+        assert!(!inner.is_recipient_fenced("held"));
+        let receipt = &inner.store.list_wire_receipts(&message).unwrap()[0];
+        assert_eq!(receipt.status, DeliveryStatus::Acked);
+        assert_eq!(receipt.attempts, before[0].attempts + 1);
+        {
+            let screen = lock(&host.screen);
+            assert_eq!(screen.writes.len(), 2);
+            assert!(screen.writes[0].contains(message.as_str()));
+            assert_eq!(screen.writes[1], "\r");
+        }
+        host.stop();
+    }
+
+    #[test]
+    fn timed_fence_recovery_charges_busy_after_hosted_paste() {
+        let _env_lock = lock(&crate::dispatcher::TMUX_ENV_LOCK);
+        let (tmp, mut inner) = production_recovery_rig();
+        let daemon = Arc::get_mut(&mut inner).unwrap();
+        daemon.config.home_override = None;
+        daemon.fence_recovery_policy.max_attempts = 1;
+        let host = hosted_claude_recovery_fixture(&inner, &tmp, "held.claude");
+        let _scope = crate::runtime_context::pin(host.endpoint.clone(), None);
+        lock(&host.screen).busy_after_paste = true;
+        let (message, since) = hold_recovery_mail(&inner);
+        let before = inner.store.list_wire_receipts(&message).unwrap();
+        let delay = inner.fence_recovery_policy.delay_ms;
+        let due = since.unix_millis() + delay;
+
+        inner.poll_retained_fences(At::from_unix_millis(due));
+        wait_on_recovery(|| {
+            !inner
+                .diagnostics_snapshot()
+                .fence_recovery_attempts
+                .is_empty()
+        });
+        let status = inner.diagnostics_snapshot();
+        let attempt = &status.fence_recovery_attempts[0];
+        assert_eq!(attempt.outcome, FenceRecoveryOutcome::ReplayFailed);
+        assert_eq!(attempt.attempt, 1);
+        assert_eq!(attempt.busy_probe_count, None);
+        assert!(status.fence_recovery_attention[0].exhausted);
+        assert!(inner.is_recipient_fenced("held"));
+        assert_eq!(lock(&inner.fence_recoveries)["held"].attempts, 1);
+        let receipt = &inner.store.list_wire_receipts(&message).unwrap()[0];
+        assert_eq!(receipt.status, DeliveryStatus::Pending);
+        assert_eq!(receipt.attempts, before[0].attempts + 1);
+        let captures = {
+            let screen = lock(&host.screen);
+            assert!(screen.busy_captures > 0);
+            assert_eq!(screen.writes.len(), 1);
+            let paste = &screen.writes[0];
+            assert!(paste.starts_with("\x1b[200~"));
+            assert!(paste.contains(message.as_str()));
+            assert!(paste.ends_with("\x1b[201~"));
+            screen.captures
+        };
+        inner.poll_retained_fences(At::from_unix_millis(due + delay));
+        assert_eq!(
+            inner.diagnostics_snapshot().fence_recovery_attempts.len(),
+            1
+        );
+        {
+            let screen = lock(&host.screen);
+            assert_eq!(screen.captures, captures);
+            assert_eq!(screen.writes.len(), 1);
+        }
+        host.stop();
+    }
+
+    fn exercise_timed_recovery_hosted_busy_backlog(exhaust_busy_parks: bool) {
+        let _env_lock = lock(&crate::dispatcher::TMUX_ENV_LOCK);
+        let (tmp, mut inner) = production_recovery_rig();
+        Arc::get_mut(&mut inner).unwrap().config.home_override = None;
+        let host = hosted_claude_recovery_fixture(&inner, &tmp, "Held.claude");
+        let _scope = crate::runtime_context::pin(host.endpoint.clone(), None);
+        let screen_state = &host.screen;
+        let listener = &host.listener;
         let (first, since) = hold_recovery_mail(&inner);
         let admit_tail = |n| {
             let (response, _) = inner.handle_local_request(LocalRequest::Send {
@@ -6803,7 +7029,7 @@ mod tests {
             inner.diagnostics_snapshot().fence_recovery_attempts[0].outcome,
             FenceRecoveryOutcome::Released,
             "fixture capture state: {:?}",
-            lock(&screen_state)
+            lock(screen_state)
         );
         wait_on_recovery(|| {
             lock(&inner.dispatch_queues)
@@ -6819,7 +7045,7 @@ mod tests {
             io::ErrorKind::WouldBlock
         );
         {
-            let screen = lock(&screen_state);
+            let screen = lock(screen_state);
             assert_eq!(screen.writes.len(), 2);
             assert!(screen.writes[0].contains(first.as_str()));
             assert!(screen.writes[0].contains(TIMED_FENCE_REDELIVERY_NOTICE));
@@ -6827,7 +7053,7 @@ mod tests {
             assert!(screen.busy_captures > 0);
         }
 
-        const BUSY_POLLS: usize = 13;
+        const BUSY_POLLS: u32 = 13;
         if exhaust_busy_parks {
             let busy_since = lock(&inner.dispatch_queues)["held"]
                 .composer_busy_since
@@ -6863,19 +7089,24 @@ mod tests {
             let hold_at = status.records[0].hold_observed_at.unix_millis();
             let delay = inner.fence_recovery_policy.delay_ms;
             for probe in 1..=BUSY_POLLS {
-                let due = hold_at + probe as u64 * delay;
+                let due = hold_at + u64::from(probe) * delay;
                 inner.poll_retained_fences(At::from_unix_millis(due - 1));
                 assert_eq!(
-                    inner.diagnostics_snapshot().fence_recovery_attempts.len(),
-                    probe
+                    inner
+                        .diagnostics_snapshot()
+                        .fence_recovery_attempts
+                        .last()
+                        .unwrap()
+                        .busy_probe_count,
+                    (probe > 1).then_some(probe - 1)
                 );
                 inner.poll_retained_fences(At::from_unix_millis(due));
                 let status = inner.diagnostics_snapshot();
-                assert_eq!(status.fence_recovery_attempts.len(), probe + 1);
-                assert_eq!(
-                    status.fence_recovery_attempts[probe].outcome,
-                    FenceRecoveryOutcome::SeatBusy
-                );
+                assert_eq!(status.fence_recovery_attempts.len(), 2);
+                let probe_row = &status.fence_recovery_attempts[1];
+                assert_eq!(probe_row.outcome, FenceRecoveryOutcome::SeatBusy);
+                assert_eq!(probe_row.busy_probe_count, Some(probe));
+                assert_eq!(probe_row.at.unix_millis(), due);
                 assert_eq!(lock(&inner.fence_recoveries)["held"].attempts, 0);
                 let busy = &status.fence_recovery_attention[0];
                 assert_eq!(
@@ -6899,13 +7130,13 @@ mod tests {
                 1
             );
             {
-                let mut screen = lock(&screen_state);
+                let mut screen = lock(screen_state);
                 assert_eq!(screen.writes.len(), 2);
                 assert!(screen.busy_captures > COMPOSER_OCCUPIED_MAX_REPROBES as usize);
                 screen.busy = false;
             }
             inner.poll_retained_fences(At::from_unix_millis(
-                hold_at + (BUSY_POLLS as u64 + 1) * delay,
+                hold_at + (u64::from(BUSY_POLLS) + 1) * delay,
             ));
             wait_on_recovery(|| {
                 lock(&inner.dispatch_queues)
@@ -6913,19 +7144,19 @@ mod tests {
                     .is_some_and(|queue| queue.composer_retry_at.is_some())
             });
             let status = inner.diagnostics_snapshot();
-            assert_eq!(status.fence_recovery_attempts.len(), BUSY_POLLS + 2);
+            assert_eq!(status.fence_recovery_attempts.len(), 3);
             let replay = status.fence_recovery_attempts.last().unwrap();
             assert_eq!(replay.attempt, 1);
             assert_eq!(replay.outcome, FenceRecoveryOutcome::Released);
             assert!(!inner.is_recipient_fenced("held"));
-            let screen = lock(&screen_state);
+            let screen = lock(screen_state);
             assert_eq!(screen.writes.len(), 4);
             assert!(screen.writes[2].contains(second.as_str()));
             assert!(screen.writes[2].contains(TIMED_FENCE_REDELIVERY_NOTICE));
             assert_eq!(screen.writes[3], "\r");
         }
 
-        lock(&screen_state).busy = false;
+        lock(screen_state).busy = false;
         let retry_at = lock(&inner.dispatch_queues)["held"]
             .composer_retry_at
             .clone()
@@ -6933,9 +7164,9 @@ mod tests {
         inner.poll_retained_fences(retry_at);
         wait_on_recovery(|| !lock(&inner.dispatch_queues).contains_key("held"));
         if !exhaust_busy_parks {
-            assert_hosted_claude_peer_delivery(&listener, &second, true);
+            assert_hosted_claude_peer_delivery(listener, &second, true);
         }
-        assert_hosted_claude_peer_delivery(&listener, &third, false);
+        assert_hosted_claude_peer_delivery(listener, &third, false);
         for id in [&second, &third] {
             assert_eq!(
                 inner.store.list_wire_receipts(id).unwrap()[0].status,
@@ -6948,18 +7179,13 @@ mod tests {
         );
         assert_eq!(
             inner.diagnostics_snapshot().fence_recovery_attempts.len(),
-            if exhaust_busy_parks {
-                BUSY_POLLS + 2
-            } else {
-                1
-            }
+            if exhaust_busy_parks { 3 } else { 1 }
         );
         assert_eq!(
-            lock(&screen_state).writes.len(),
+            lock(screen_state).writes.len(),
             if exhaust_busy_parks { 4 } else { 2 }
         );
-        stop_tx.send(()).unwrap();
-        server.join().unwrap();
+        host.stop();
     }
 
     fn assert_hosted_claude_peer_delivery(
@@ -7083,8 +7309,20 @@ mod tests {
         // waited longer and must be probed before those busy seats retry.
         inner.poll_retained_fences(At::from_unix_millis(since + 3_000));
         let attempts = inner.diagnostics_snapshot().fence_recovery_attempts;
-        assert_eq!(attempts.len(), 2 * MAX_FENCE_PROBES_PER_POLL);
-        assert_eq!(attempts[MAX_FENCE_PROBES_PER_POLL].recipient, "agent-e");
+        assert_eq!(attempts.len(), recipients.len());
+        assert_eq!(
+            attempts
+                .iter()
+                .map(|row| (row.recipient.as_str(), row.busy_probe_count))
+                .collect::<Vec<_>>(),
+            [
+                ("agent-d", Some(1)),
+                ("agent-e", Some(1)),
+                ("agent-a", Some(2)),
+                ("agent-b", Some(2)),
+                ("agent-c", Some(2)),
+            ]
+        );
         assert!(
             attempts
                 .iter()
@@ -7103,7 +7341,11 @@ mod tests {
 
     #[test]
     fn timed_fence_recovery_refunds_worker_busy_and_resets_streak_on_other_outcomes() {
-        let (_tmp, inner, listener, first, since) = timed_recovery_fixture();
+        let (_tmp, mut inner, listener, first, since) = timed_recovery_fixture();
+        Arc::get_mut(&mut inner)
+            .unwrap()
+            .fence_recovery_policy
+            .delay_ms = 31_000;
         let mut call = 0;
         *lock(&inner.fence_recovery_probe_hook) = Some(Box::new(move || {
             call += 1;
@@ -7111,7 +7353,7 @@ mod tests {
                 // The twelfth timed poll sees readiness, but its worker's
                 // second read-only check sees busy before attempting delivery.
                 12 => RecoveryReadiness::Ready(RecoveryTarget::FixtureWebhook),
-                14 => RecoveryReadiness::Hold(FenceRecoveryOutcome::Inconclusive),
+                15 => RecoveryReadiness::Hold(FenceRecoveryOutcome::Inconclusive),
                 _ => RecoveryReadiness::Hold(FenceRecoveryOutcome::SeatBusy),
             }
         }));
@@ -7122,36 +7364,51 @@ mod tests {
         }
         wait_on_recovery(|| !lock(&inner.dispatch_queues).contains_key("held"));
         let diagnostics = inner.diagnostics_snapshot();
-        assert_eq!(diagnostics.fence_recovery_attempts.len(), 12);
-        assert!(
-            diagnostics
-                .fence_recovery_attempts
-                .iter()
-                .all(|row| { row.attempt == 1 && row.outcome == FenceRecoveryOutcome::SeatBusy })
-        );
+        assert_eq!(diagnostics.fence_recovery_attempts.len(), 1);
+        let probe_row = &diagnostics.fence_recovery_attempts[0];
+        assert_eq!(probe_row.attempt, 1);
+        assert_eq!(probe_row.outcome, FenceRecoveryOutcome::SeatBusy);
+        assert_eq!(probe_row.busy_probe_count, Some(12));
         let busy = &diagnostics.fence_recovery_attention[0];
         assert_eq!(busy.outcome, FenceRecoveryOutcome::SeatBusyProlonged);
         assert_eq!(busy.busy_since, Some(due(1)));
+        assert_eq!(busy.busy_elapsed_ms, Some(341_000));
+        assert_eq!(busy.reason_label(), "seat has been in a turn for 5m 41s");
         assert_eq!(lock(&inner.fence_recoveries)["held"].attempts, 0);
 
         inner.poll_retained_fences(due(13));
+        let diagnostics = inner.diagnostics_snapshot();
+        let busy = &diagnostics.fence_recovery_attention[0];
+        assert_eq!(busy.busy_since, Some(due(1)));
+        assert_eq!(busy.busy_elapsed_ms, Some(372_000));
+
+        inner.poll_retained_fences(due(14));
         let diagnostics = inner.diagnostics_snapshot();
         assert_eq!(
             diagnostics.fence_recovery_attention[0].outcome,
             FenceRecoveryOutcome::Inconclusive
         );
         assert_eq!(diagnostics.fence_recovery_attention[0].busy_since, None);
+        assert_eq!(
+            diagnostics.fence_recovery_attention[0].busy_elapsed_ms,
+            None
+        );
         assert_eq!(lock(&inner.fence_recoveries)["held"].attempts, 1);
 
-        inner.poll_retained_fences(due(14));
+        inner.poll_retained_fences(due(15));
         let diagnostics = inner.diagnostics_snapshot();
+        assert_eq!(diagnostics.fence_recovery_attempts.len(), 3);
+        assert_eq!(
+            diagnostics.fence_recovery_attempts[2].busy_probe_count,
+            Some(1)
+        );
         assert_eq!(
             diagnostics.fence_recovery_attention[0].outcome,
             FenceRecoveryOutcome::SeatBusy
         );
         assert_eq!(
             diagnostics.fence_recovery_attention[0].busy_since,
-            Some(due(14))
+            Some(due(15))
         );
         assert_eq!(lock(&inner.fence_recoveries)["held"].attempts, 1);
         assert_eq!(

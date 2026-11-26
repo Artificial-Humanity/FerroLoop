@@ -5558,6 +5558,20 @@ fn screen_has_dialog_or_menu_markers_with_context(
     route_keys: &[String],
 ) -> bool {
     let cleaned = normalize_terminal_screen(screen);
+    normalized_screen_has_dialog_or_menu_markers(
+        &cleaned,
+        post_paste_trimmed,
+        post_paste_raw,
+        route_keys,
+    )
+}
+
+fn normalized_screen_has_dialog_or_menu_markers(
+    cleaned: &str,
+    post_paste_trimmed: Option<&str>,
+    post_paste_raw: Option<&str>,
+    route_keys: &[String],
+) -> bool {
     let lines: Vec<&str> = cleaned.lines().collect();
     if lines.is_empty() {
         return false;
@@ -7449,6 +7463,50 @@ fn retained_fence_screen_readiness(
     }
 }
 
+/// A blocker recognized on a hosted vendor's active terminal screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostedScreenBlocker {
+    VendorSignIn,
+    BlockingDialog,
+}
+
+/// Classifies a rendered screen for a canonical vendor name without sending any input.
+/// A missing result means no blocker was recognized, including for unsupported vendors.
+pub fn classify_hosted_screen_blocker(vendor: &str, contents: &str) -> Option<HostedScreenBlocker> {
+    if !supports_hosted_screen_blockers(vendor) {
+        return None;
+    }
+    classify_normalized_screen_blocker(vendor, &normalize_terminal_screen(contents), false)
+}
+
+fn supports_hosted_screen_blockers(vendor: &str) -> bool {
+    matches!(vendor, "codex" | "claude" | "muse" | "grok")
+}
+
+fn classify_normalized_screen_blocker(
+    vendor: &str,
+    cleaned: &str,
+    include_ambiguous_markers: bool,
+) -> Option<HostedScreenBlocker> {
+    // Wire must withhold input on ambiguity. A hosted status needs corroborating UI rows.
+    if (vendor == "codex" && codex_screen_is_onboarding(cleaned))
+        || (include_ambiguous_markers
+            && cleaned
+                .lines()
+                .any(|line| line.trim().eq_ignore_ascii_case("Sign in to continue")))
+    {
+        return Some(HostedScreenBlocker::VendorSignIn);
+    }
+    if ((include_ambiguous_markers
+        || (vendor == "claude" && claude_screen_is_workspace_trust_dialog(cleaned)))
+        && normalized_screen_has_dialog_or_menu_markers(cleaned, None, None, &[]))
+        || (vendor == "muse" && muse_screen_is_hook_trust_dialog(cleaned))
+    {
+        return Some(HostedScreenBlocker::BlockingDialog);
+    }
+    None
+}
+
 fn retained_fence_screen_gate(
     route: &VendorRoute,
     contents: &str,
@@ -7457,31 +7515,22 @@ fn retained_fence_screen_gate(
         BlankScreen, DialogWaiting, SeatBusy, UnsupportedRoute, VendorSignIn,
     };
 
-    let cleaned = normalize_terminal_screen(contents);
     let vendor = route.canonical_vendor();
-    if !matches!(vendor, "codex" | "claude" | "muse" | "grok") {
+    if !supports_hosted_screen_blockers(vendor) {
         return Err(UnsupportedRoute);
     }
+    let cleaned = normalize_terminal_screen(contents);
     if cleaned.trim().is_empty() {
         return Err(BlankScreen);
     }
-    if (vendor == "codex" && retained_fence_codex_onboarding(&cleaned))
-        || cleaned
-            .lines()
-            .any(|line| line.trim().eq_ignore_ascii_case("Sign in to continue"))
-    {
-        return Err(VendorSignIn);
-    }
-    if screen_has_dialog_or_menu_markers_with_context(contents, None, None, &[])
-        || (vendor == "muse" && retained_fence_muse_trust_dialog(&cleaned))
-    {
-        return Err(DialogWaiting);
+    match classify_normalized_screen_blocker(vendor, &cleaned, true) {
+        Some(HostedScreenBlocker::VendorSignIn) => return Err(VendorSignIn),
+        Some(HostedScreenBlocker::BlockingDialog) => return Err(DialogWaiting),
+        None => {}
     }
     let busy = match vendor {
         "claude" => claude_screen_is_busy_main(contents),
-        "codex" => cleaned.lines().map(str::trim).any(|line| {
-            line.starts_with("• Working (") || matches!(line, "• Working..." | "• Working…")
-        }),
+        "codex" => return retained_fence_codex_gate(&cleaned),
         "grok" => cleaned
             .lines()
             .any(|line| matches!(line.trim(), "Thinking..." | "Thinking…")),
@@ -7493,7 +7542,27 @@ fn retained_fence_screen_gate(
     Ok(())
 }
 
-fn retained_fence_codex_onboarding(cleaned: &str) -> bool {
+fn retained_fence_codex_gate(cleaned: &str) -> Result<(), FenceRecoveryOutcome> {
+    use FenceRecoveryOutcome::{Inconclusive, SeatBusy};
+
+    let lines: Vec<_> = cleaned.lines().collect();
+    let composer = codex_composer_range(&lines);
+    // Scan the whole screen when the composer cannot be located. A located
+    // composer bounds the scan so text in an owner's draft is excluded.
+    let status_rows = &lines[..composer.as_ref().map_or(lines.len(), |range| range.start)];
+    if status_rows.iter().any(|row| {
+        let status = row.trim();
+        status.starts_with("• Working (")
+            || status.starts_with("• Working...")
+            || status.starts_with("• Working…")
+            || (row.starts_with("• ") && row.trim_end().ends_with("esc to interrupt)"))
+    }) {
+        return Err(SeatBusy);
+    }
+    composer.map(|_| ()).ok_or(Inconclusive)
+}
+
+fn codex_screen_is_onboarding(cleaned: &str) -> bool {
     let lines: Vec<_> = cleaned.lines().collect();
     // Onboarding replaces the composer. Match the heading and choice as
     // standalone UI rows, so references in an ordinary reply are not a login screen.
@@ -7514,7 +7583,28 @@ fn retained_fence_codex_onboarding(cleaned: &str) -> bool {
             })
 }
 
-fn retained_fence_muse_trust_dialog(cleaned: &str) -> bool {
+fn claude_screen_is_workspace_trust_dialog(cleaned: &str) -> bool {
+    let mut lines = cleaned
+        .lines()
+        .rev()
+        .map(|line| {
+            strip_dialog_box_prefix(line)
+                .trim_end()
+                .trim_end_matches(['│', '┃'])
+                .trim_end()
+        })
+        .filter(|line| !line.is_empty())
+        .take(12);
+    lines.next() == Some("Enter to confirm · Esc to cancel")
+        && lines
+            .by_ref()
+            .take(2)
+            .map(|line| line.trim_start_matches('❯').trim_start())
+            .eq(["Yes, I trust this folder", "No, exit"])
+        && lines.any(|line| line.starts_with("Quick safety check:"))
+}
+
+fn muse_screen_is_hook_trust_dialog(cleaned: &str) -> bool {
     // Muse places its hook-trust choices at the bottom, separated from the title by blank rows.
     let mut lines = cleaned
         .lines()
@@ -7569,12 +7659,12 @@ fn retained_fence_submit_proven(
     {
         // The visible composer exactly matches this Wire paste. Inspect the
         // surrounding UI with an empty prompt so mail text cannot mimic it.
-        let empty_prompt = match vendor {
-            "codex" => "› ",
-            "grok" => "> ",
-            _ => "❯ ",
+        let empty_composer: &[&str] = match vendor {
+            "codex" => &["› ", ""], // Keep the blank separator above the footer.
+            "grok" => &["> "],
+            _ => &["❯ "],
         };
-        lines.splice(composer, [empty_prompt]);
+        lines.splice(composer, empty_composer.iter().copied());
         return retained_fence_screen_gate(route, &lines.join("\n"));
     }
     retained_fence_screen_readiness(route, contents, screen.cursor_state())?;
@@ -8511,8 +8601,14 @@ fn dispatch_message_selected_with_status<S: MessageStore>(
     if let Some(recipient) = recipient {
         receipts.retain(|receipt| receipt.recipient_name.eq_ignore_ascii_case(recipient));
     }
-    if receipts.is_empty() && recovery.is_some() {
-        report.record_failure(FailureStage::InitialReceiptReadMissing);
+    if recovery.is_some() && receipts.len() != 1 {
+        // Imports key receipts by recipient ID. Different IDs can share the
+        // selected name, but recovery must make at most one delivery call.
+        report.record_failure(if receipts.is_empty() {
+            FailureStage::InitialReceiptReadMissing
+        } else {
+            FailureStage::InitialReceiptReadAmbiguous
+        });
         return (Vec::new(), None);
     }
     let deliverable = |rcpt: &DeliveryReceipt| {
@@ -21719,6 +21815,18 @@ exit 1"#,
         assert!(is_composer_occupied_zero_keys_error(&err), "got: {err}");
     }
 
+    // Final rows of two busy Codex 0.172.0 captures from fl host capture --rendered.
+    // Transcript and private footer details omitted. Blank-row padding normalized.
+    const CODEX_BUSY_CAPTURE: &str =
+        include_str!("../tests/fixtures/codex-0.172.0-busy-standard.txt");
+    const CODEX_BUSY_WARNING_CAPTURE: &str =
+        include_str!("../tests/fixtures/codex-0.172.0-busy-warning.txt");
+
+    // The same standard capture with all 40 terminal rows, including the transcript
+    // layout with its content and identifiers replaced.
+    const CODEX_BUSY_FULL_CAPTURE: &str =
+        include_str!("../tests/fixtures/codex-0.172.0-busy-full.txt");
+
     #[test]
     fn retained_fence_recovery_requires_a_located_ready_composer() {
         let codex = VendorRoute::Codex {
@@ -21729,19 +21837,87 @@ exit 1"#,
         let idle = format!("› Ask Codex to do anything\n\n{footer}");
         let draft = format!("› owner draft\n\n{footer}");
         let busy = format!("• Working (4s · esc to interrupt)\n\n{idle}");
+        let busy_with_details = format!(
+            "• Working (4s · esc to interrupt)\n └ Reading source\n   and its tests\n\n{idle}"
+        );
+        let busy_with_tip = format!(
+            "• Working (4s · esc to interrupt)\n  └ Tip: Try /help.\n                                          Copying 5 chars…\n\n{idle}"
+        );
+        let busy_with_toast = format!(
+            "• Working (4s · esc to interrupt)\n                                          Copying 5 chars…\n\n{idle}"
+        );
+        let busy_with_different_header =
+            format!("• Compacting context (4s · esc to interrupt)\n\n{idle}");
+        let queued = "• Queued follow-up inputs\n  ↳ later\n    a wrapped input\n    shift+← edit last queued message";
+        let busy_with_approval_and_queue = format!(
+            "• Working (4s · esc to interrupt)\n └ Checking policy\n  └ Tip text\n\n  ! Approval needed in Robie [explorer]\n    /subagents to review requests\n\n{queued}\n\n{idle}"
+        );
+        let old_busy = format!("• Working…\nPrevious turn completed.\n\n{idle}");
+        let old_busy_with_indented_output =
+            format!("• Working…\n    Previous turn completed.\n\n{idle}");
+        let busy_with_separated_branches =
+            format!("• Working…\n\n └ Checking policy\n  └ Tip text\n\n{idle}");
+        let old_queue = format!("• Working…\n\n{queued}\nPrevious turn completed.\n\n{idle}");
+        let busy_with_blank_rows = format!("• Working...\n\n\n{idle}");
+        let busy_draft = format!("› owner draft\n  • Working...\n\n{footer}");
+        let unlocated_busy = format!("• Working...\n\n{footer}");
         let sign_in =
             "\x1b[1mWelcome to Codex\x1b[0m\n\n  › 1. Sign in with ChatGPT\n    2. Use an API key";
+        assert_eq!(CODEX_BUSY_FULL_CAPTURE.lines().count(), 40);
         for (screen, expected) in [
             (idle.as_str(), Ok(())),
             (draft.as_str(), Err(FenceRecoveryOutcome::ComposerDraft)),
             (busy.as_str(), Err(FenceRecoveryOutcome::SeatBusy)),
+            (
+                busy_with_details.as_str(),
+                Err(FenceRecoveryOutcome::SeatBusy),
+            ),
+            (busy_with_tip.as_str(), Err(FenceRecoveryOutcome::SeatBusy)),
+            (
+                busy_with_toast.as_str(),
+                Err(FenceRecoveryOutcome::SeatBusy),
+            ),
+            (
+                busy_with_different_header.as_str(),
+                Err(FenceRecoveryOutcome::SeatBusy),
+            ),
+            (
+                busy_with_approval_and_queue.as_str(),
+                Err(FenceRecoveryOutcome::SeatBusy),
+            ),
+            (old_busy.as_str(), Err(FenceRecoveryOutcome::SeatBusy)),
+            (
+                old_busy_with_indented_output.as_str(),
+                Err(FenceRecoveryOutcome::SeatBusy),
+            ),
+            (
+                busy_with_separated_branches.as_str(),
+                Err(FenceRecoveryOutcome::SeatBusy),
+            ),
+            (old_queue.as_str(), Err(FenceRecoveryOutcome::SeatBusy)),
+            (
+                busy_with_blank_rows.as_str(),
+                Err(FenceRecoveryOutcome::SeatBusy),
+            ),
+            (CODEX_BUSY_CAPTURE, Err(FenceRecoveryOutcome::SeatBusy)),
+            (CODEX_BUSY_FULL_CAPTURE, Err(FenceRecoveryOutcome::SeatBusy)),
+            (
+                CODEX_BUSY_WARNING_CAPTURE,
+                Err(FenceRecoveryOutcome::SeatBusy),
+            ),
+            (
+                busy_draft.as_str(),
+                Err(FenceRecoveryOutcome::ComposerDraft),
+            ),
+            (unlocated_busy.as_str(), Err(FenceRecoveryOutcome::SeatBusy)),
             (footer, Err(FenceRecoveryOutcome::Inconclusive)),
             ("", Err(FenceRecoveryOutcome::BlankScreen)),
             (sign_in, Err(FenceRecoveryOutcome::VendorSignIn)),
         ] {
             assert_eq!(
                 retained_fence_screen_readiness(&codex, screen, None),
-                expected
+                expected,
+                "{screen:?}"
             );
         }
 
@@ -21839,6 +22015,10 @@ exit 1"#,
             retained_fence_screen_readiness(&codex, onboarding, None),
             Err(FenceRecoveryOutcome::VendorSignIn)
         );
+        assert_eq!(
+            classify_hosted_screen_blocker("codex", onboarding),
+            Some(HostedScreenBlocker::VendorSignIn)
+        );
         let quoted = "• The dialog said Welcome to Codex and Sign in with ChatGPT.\n\n\
                       › Ask Codex to do anything\n\n\
                       \x20 GPT-6.1-Sol medium · ~/project\n\
@@ -21846,6 +22026,85 @@ exit 1"#,
         assert_eq!(
             retained_fence_screen_readiness(&codex, quoted, None),
             Ok(())
+        );
+        assert_eq!(classify_hosted_screen_blocker("codex", quoted), None);
+    }
+
+    #[test]
+    fn hosted_screen_blockers_recognize_real_terminal_captures() {
+        let codex = include_str!("../tests/fixtures/hosted-screen/codex-0.172.0-signin.txt");
+        assert_eq!(
+            classify_hosted_screen_blocker("codex", codex),
+            Some(HostedScreenBlocker::VendorSignIn),
+        );
+
+        let onboarding_rows = codex
+            .lines()
+            .skip_while(|line| !line.trim_start().starts_with("Welcome to Codex"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            classify_hosted_screen_blocker("codex", &onboarding_rows),
+            Some(HostedScreenBlocker::VendorSignIn),
+        );
+        let with_composer = format!(
+            "{onboarding_rows}\n\n› Ask Codex to do anything\n\n  GPT-6.1-Sol medium · ~/project\n"
+        );
+        assert_eq!(
+            classify_hosted_screen_blocker("codex", &with_composer),
+            None
+        );
+
+        let mut terminal = vt100::Parser::new(
+            std::num::NonZeroU16::new(24).unwrap(),
+            std::num::NonZeroU16::new(100).unwrap(),
+            0,
+        );
+        terminal.process(include_bytes!(
+            "../tests/fixtures/hosted-screen/muse-1.4.25-hook-trust.raw"
+        ));
+        assert_eq!(
+            classify_hosted_screen_blocker("muse", &terminal.screen().contents()),
+            Some(HostedScreenBlocker::BlockingDialog),
+        );
+    }
+
+    #[test]
+    fn hosted_screen_blocker_does_not_treat_reply_prose_as_a_prompt() {
+        let codex = VendorRoute::Codex {
+            thread_id: "thread".into(),
+            cwd: None,
+        };
+        for (prose, wire_outcome) in [
+            (
+                "• The page reads:\nSign in to continue",
+                FenceRecoveryOutcome::VendorSignIn,
+            ),
+            (
+                "• The menu says Esc to cancel.",
+                FenceRecoveryOutcome::DialogWaiting,
+            ),
+        ] {
+            let screen = format!(
+                "{prose}\n\n› Ask Codex to do anything\n\n  GPT-6.1-Sol medium · ~/project"
+            );
+            assert_eq!(
+                retained_fence_screen_gate(&codex, &screen),
+                Err(wire_outcome)
+            );
+            assert_eq!(classify_hosted_screen_blocker("codex", &screen), None);
+        }
+    }
+
+    #[test]
+    fn hosted_screen_blocker_ignores_blank_unsupported_and_busy_screens() {
+        let busy = "• Working (4s · esc to interrupt)\n› Ask Codex to do anything\n  GPT-6.1-Sol medium · ~/project";
+
+        assert_eq!(classify_hosted_screen_blocker("codex", busy), None);
+        assert_eq!(classify_hosted_screen_blocker("codex", " \n "), None);
+        assert_eq!(
+            classify_hosted_screen_blocker("unknown", "Sign in to continue"),
+            None
         );
     }
 
@@ -21867,6 +22126,14 @@ exit 1"#,
             retained_fence_screen_readiness(&claude, claude_trust, None),
             Err(FenceRecoveryOutcome::DialogWaiting)
         );
+
+        assert_eq!(
+            classify_hosted_screen_blocker("claude", claude_trust),
+            Some(HostedScreenBlocker::BlockingDialog)
+        );
+
+        let claude_idle = format!("{claude_trust}\n❯ \n  ? for shortcuts");
+        assert_eq!(classify_hosted_screen_blocker("claude", &claude_idle), None);
 
         let muse = VendorRoute::Muse {
             session_id: "session".into(),
@@ -21890,12 +22157,18 @@ exit 1"#,
             Err(FenceRecoveryOutcome::DialogWaiting)
         );
 
+        assert_eq!(
+            classify_hosted_screen_blocker("muse", &muse_trust),
+            Some(HostedScreenBlocker::BlockingDialog)
+        );
+
         let rule = "────────────────────────────────────────";
         let muse_idle = format!("{muse_trust}\n{rule}\n❯ \n{rule}\n  muse-wonder-full-1.0 · idle");
         assert_eq!(
             retained_fence_screen_readiness(&muse, &muse_idle, Some(CursorState::new(20, 2))),
             Ok(())
         );
+        assert_eq!(classify_hosted_screen_blocker("muse", &muse_idle), None);
     }
 
     #[test]
@@ -22023,7 +22296,13 @@ exit 1"#,
             LostCapture,
             ReplacedBeforePayload,
             ReplacedBeforeEnter,
+            BusyBeforePaste,
+            HookAndTipBeforePaste,
+            CapturedBusyBeforePaste,
+            RejectedSteerBeforePaste,
             BusyBeforeEnter,
+            CapturedBusyBeforeEnter,
+            RejectedSteerBeforeEnter,
             AckedBeforeEnter,
             WriteError,
             CodexIncidentMail,
@@ -22055,12 +22334,24 @@ exit 1"#,
         let counts = Arc::new(Mutex::new((0, Vec::<Vec<u8>>::new())));
         let server_counts = Arc::clone(&counts);
         let footer = "  GPT-6.1-Sol medium · ~/project\n  ← for agents · ? for shortcuts";
+        let busy_preview = "• Working (4s · esc to interrupt)\n\n  Queued follow-up inputs\n  ↳ later\n    shift+← edit last queued message";
+        // Codex 0.172.0 indents rejected-steer preview continuations by four spaces.
+        let rejected_steer_preview = "• Working (4s · esc to interrupt)\n\n\
+            • Messages to be submitted at end of turn\n  ↳ first\n    • Working...\n    more";
+        let idle_capture =
+            &CODEX_BUSY_WARNING_CAPTURE[CODEX_BUSY_WARNING_CAPTURE.find("› ").unwrap()..];
         let scenarios = [
             SignIn,
             LostCapture,
             ReplacedBeforePayload,
             ReplacedBeforeEnter,
+            BusyBeforePaste,
+            HookAndTipBeforePaste,
+            CapturedBusyBeforePaste,
+            RejectedSteerBeforePaste,
             BusyBeforeEnter,
+            CapturedBusyBeforeEnter,
+            RejectedSteerBeforeEnter,
             AckedBeforeEnter,
             WriteError,
             CodexIncidentMail,
@@ -22107,14 +22398,46 @@ exit 1"#,
                                     (SignIn, 2, _) => {
                                         "Welcome to Codex\n  › 1. Sign in with ChatGPT".into()
                                     }
+                                    (BusyBeforePaste, 2, _) => {
+                                        format!("{busy_preview}\n\n› Ask Codex to do anything\n\n{footer}")
+                                    }
+                                    (HookAndTipBeforePaste, 2, _) => {
+                                        format!(
+                                            "• Working (35s · esc to interrupt)\n └ Checking policy\n   and its hooks\n  └ Tip text\n\n› Ask Codex to do anything\n\n{footer}"
+                                        )
+                                    }
+                                    (CapturedBusyBeforePaste, 2, _) => CODEX_BUSY_CAPTURE.into(),
+                                    (RejectedSteerBeforePaste, 2, _) => {
+                                        format!("{rejected_steer_preview}\n\n{idle_capture}")
+                                    }
                                     (_, _, 1) => {
                                         let composer = scenario.payload().replace('\n', "\n  ");
-                                        if scenario == BusyBeforeEnter {
-                                            format!("› {composer}\n\n• Working...\n{footer}")
-                                        } else {
-                                            format!("› {composer}\n\n{footer}")
+                                        match scenario {
+                                            BusyBeforeEnter => {
+                                                format!("{busy_preview}\n\n› {composer}\n\n{footer}")
+                                            }
+                                            CapturedBusyBeforeEnter => CODEX_BUSY_WARNING_CAPTURE
+                                                .replacen(CODEX_GHOST_PLACEHOLDER, &composer, 1),
+                                            RejectedSteerBeforeEnter => {
+                                                let pasted = idle_capture.replacen(
+                                                    CODEX_GHOST_PLACEHOLDER,
+                                                    &composer,
+                                                    1,
+                                                );
+                                                format!("{rejected_steer_preview}\n\n{pasted}")
+                                            }
+                                            CodexIncidentMail => idle_capture
+                                                .replacen(CODEX_GHOST_PLACEHOLDER, &composer, 1),
+                                            _ => format!("› {composer}\n\n{footer}"),
                                         }
                                     }
+                                    (
+                                        CapturedBusyBeforeEnter
+                                        | RejectedSteerBeforeEnter
+                                        | CodexIncidentMail,
+                                        _,
+                                        _,
+                                    ) => idle_capture.into(),
                                     _ => format!("› Ask Codex to do anything\n\n{footer}"),
                                 };
                                 if scenario == LostCapture && observed.0 == 2 {
@@ -22211,8 +22534,17 @@ exit 1"#,
             let (reason, expected_writes) = match scenario {
                 SignIn => (Some(FenceRecoveryOutcome::VendorSignIn), 0),
                 LostCapture => (Some(FenceRecoveryOutcome::HostedCaptureUnavailable), 0),
+                BusyBeforePaste
+                | HookAndTipBeforePaste
+                | CapturedBusyBeforePaste
+                | RejectedSteerBeforePaste => (Some(FenceRecoveryOutcome::SeatBusy), 0),
                 ReplacedBeforePayload => (Some(FenceRecoveryOutcome::RouteChanged), 0),
-                ReplacedBeforeEnter | BusyBeforeEnter | AckedBeforeEnter | WriteError => (None, 1),
+                ReplacedBeforeEnter
+                | BusyBeforeEnter
+                | CapturedBusyBeforeEnter
+                | RejectedSteerBeforeEnter
+                | AckedBeforeEnter
+                | WriteError => (None, 1),
                 CodexIncidentMail | GrokIncidentMail => (None, 2),
             };
             match (scenario, outcome) {
@@ -22223,7 +22555,10 @@ exit 1"#,
                         stream.session.as_str(),
                     )]));
                 }
-                (BusyBeforeEnter, Err(RecoveryPasteError::Uncertain(_))) => {
+                (
+                    BusyBeforeEnter | CapturedBusyBeforeEnter | RejectedSteerBeforeEnter,
+                    Err(RecoveryPasteError::Uncertain(_)),
+                ) => {
                     assert_eq!(guard.permission.get(), Err(FenceRecoveryOutcome::SeatBusy));
                 }
                 (ReplacedBeforeEnter | WriteError, Err(RecoveryPasteError::Uncertain(_)))

@@ -2007,6 +2007,8 @@ pub struct HubFenceRecoveryAttempt {
     pub limit: u32,
     pub at: fl_core::at::At,
     pub outcome: fl_wire::dispatch_diagnostics::FenceRecoveryOutcome,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub busy_probe_count: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2223,6 +2225,7 @@ impl HubDispatchDiagnostics {
                         limit: row.limit,
                         at: row.at,
                         outcome: row.outcome,
+                        busy_probe_count: row.busy_probe_count,
                     })
                 })
                 .collect(),
@@ -2232,7 +2235,7 @@ impl HubDispatchDiagnostics {
                     Some(HubFenceRecoveryAttention {
                         recipient: normalize_persona(&row.recipient)?,
                         outcome: row.outcome,
-                        reason_label: row.outcome.label().to_owned(),
+                        reason_label: row.reason_label().into_owned(),
                         exhausted: row.exhausted,
                         busy_since: row.busy_since,
                     })
@@ -8987,6 +8990,7 @@ fn lifecycle_error_response(err: &LifecycleError) -> HttpResponse {
 pub(crate) fn lifecycle_env(state: &HubState) -> LifecycleEnv<'_> {
     let mut env = LifecycleEnv::new(state.config.home_override.as_deref());
     env.workspace_root = state.config.repo_root.parent();
+    env.blocker_evidence = Some(&state.hosted_blocker_evidence);
     env
 }
 
@@ -9336,6 +9340,16 @@ fn handle_post_session_remodel(
     session_id: &str,
     req: &HttpRequest,
 ) -> HttpResponse {
+    handle_post_session_remodel_with_env(state, authority, session_id, req, &lifecycle_env(state))
+}
+
+pub(crate) fn handle_post_session_remodel_with_env(
+    state: &HubState,
+    authority: &HubAuthority,
+    session_id: &str,
+    req: &HttpRequest,
+    env: &LifecycleEnv<'_>,
+) -> HttpResponse {
     if !authority.is_owner() {
         return HttpResponse::json(
             403,
@@ -9352,8 +9366,7 @@ fn handle_post_session_remodel(
     };
     let by = authority.actor_name();
     let persona = target.persona.clone();
-    let env = lifecycle_env(state);
-    match lifecycle::with_lifecycle_fence(&env, &persona, "remodel", |env| {
+    match lifecycle::with_lifecycle_fence(env, &persona, "remodel", |env| {
         #[cfg(test)]
         BEFORE_REMODEL_STORE_READ.with_borrow_mut(|hook| {
             if let Some(f) = hook.take() {
@@ -9361,6 +9374,18 @@ fn handle_post_session_remodel(
             }
         });
         let (store, target) = owned_lifecycle_target(state, session_id, &persona)?;
+        let caller = caller_of(authority);
+        let mut observations = lifecycle::LaunchAuthObservations::new();
+        let (store, target) = if let Some(auth_target) =
+            lifecycle::remodel_auth_target(&*store, env, &target, &payload, caller)?
+        {
+            drop(store);
+            let issue = auth_target.probe(env);
+            observations.insert(auth_target, issue);
+            owned_lifecycle_target(state, session_id, &persona)?
+        } else {
+            (store, target)
+        };
         Ok(
             match run_remodel(
                 state,
@@ -9369,7 +9394,8 @@ fn handle_post_session_remodel(
                 &target,
                 &payload,
                 by,
-                caller_of(authority),
+                caller,
+                &observations,
             ) {
                 RemodelRun::Done { data, .. } => HttpResponse::json(
                     if data["handshake_queue_error"].is_string() {
@@ -9413,6 +9439,7 @@ pub(crate) enum RemodelRun {
 /// handshake queueing for `prepare`, and the `session.remodeled` / `session.remodel_failed`
 /// broadcast. The caller acquires the persona fence before reopening `store` and passes
 /// its borrowed proof in `env`; both remain held until this returns.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn run_remodel(
     state: &HubState,
     store: &AnyStore,
@@ -9421,17 +9448,19 @@ pub(crate) fn run_remodel(
     payload: &RemodelRequest,
     by: &str,
     caller: lifecycle::Caller,
+    observations: &lifecycle::LaunchAuthObservations,
 ) -> RemodelRun {
     // The overrides the teardown clears, as they were, so a restore can put them back.
     let mut cleared_overrides: Vec<(String, ModelOverride)> = Vec::new();
     let queue_watermark = state.queued_prompt_admission_watermark();
-    let result = lifecycle::remodel_session_with_queue_cleanup(
+    let result = lifecycle::remodel_session_with_auth(
         store,
         env,
         target,
         payload,
         by,
         caller,
+        observations,
         |cleanup| match cleanup {
             lifecycle::TeardownQueueCleanup::Started { vendor, persona } => {
                 if vendor == "claude" {
@@ -14249,6 +14278,15 @@ mod council_guidance_tests {
                             limit: 3,
                             at: ts_for_status.clone(),
                             outcome: FenceRecoveryOutcome::VendorSignIn,
+                            busy_probe_count: None,
+                        },
+                        FenceRecoveryAttempt {
+                            recipient: "ada".into(),
+                            attempt: 1,
+                            limit: 3,
+                            at: ts_for_status.clone(),
+                            outcome: FenceRecoveryOutcome::SeatBusy,
+                            busy_probe_count: Some(300),
                         },
                         FenceRecoveryAttempt {
                             recipient: "/secret/recovery-diagnostic".into(),
@@ -14256,6 +14294,7 @@ mod council_guidance_tests {
                             limit: 3,
                             at: ts_for_status.clone(),
                             outcome: FenceRecoveryOutcome::Inconclusive,
+                            busy_probe_count: None,
                         },
                     ],
                     fence_recovery_attention: vec![
@@ -14264,18 +14303,21 @@ mod council_guidance_tests {
                             outcome: FenceRecoveryOutcome::VendorSignIn,
                             exhausted: true,
                             busy_since: None,
+                            busy_elapsed_ms: None,
                         },
                         FenceRecoveryAttention {
                             recipient: "ada".into(),
-                            outcome: FenceRecoveryOutcome::SeatBusy,
+                            outcome: FenceRecoveryOutcome::SeatBusyProlonged,
                             exhausted: false,
                             busy_since: Some(ts_for_status.clone()),
+                            busy_elapsed_ms: Some(341_000),
                         },
                         FenceRecoveryAttention {
                             recipient: "/secret/recovery-diagnostic".into(),
                             outcome: FenceRecoveryOutcome::Inconclusive,
                             exhausted: false,
                             busy_since: None,
+                            busy_elapsed_ms: None,
                         },
                     ],
                 }),
@@ -14381,7 +14423,7 @@ mod council_guidance_tests {
         let attempts = body["dispatch_diagnostics"]["fence_recovery_attempts"]
             .as_array()
             .unwrap();
-        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts.len(), 2);
         assert_eq!(
             attempts[0],
             json!({
@@ -14390,6 +14432,17 @@ mod council_guidance_tests {
                 "limit": 3,
                 "at": ts,
                 "outcome": "vendor_sign_in",
+            })
+        );
+        assert_eq!(
+            attempts[1],
+            json!({
+                "recipient": "ada",
+                "attempt": 1,
+                "limit": 3,
+                "at": ts,
+                "outcome": "seat_busy",
+                "busy_probe_count": 300,
             })
         );
         assert_eq!(
@@ -14403,8 +14456,8 @@ mod council_guidance_tests {
                 },
                 {
                     "recipient": "ada",
-                    "outcome": "seat_busy",
-                    "reason_label": "seat is in a turn",
+                    "outcome": "seat_busy_prolonged",
+                    "reason_label": "seat has been in a turn for 5m 41s",
                     "exhausted": false,
                     "busy_since": ts,
                 },

@@ -59,7 +59,9 @@ pub use rollups::{
     WatchRegretChallenge, WatchRegretSummary, WatchTelemetryReport, build_telemetry,
     build_telemetry_with,
 };
-pub use runtime::{RuntimeSnapshot, WatchHostedSession, read_runtime};
+pub use runtime::{
+    HostedBlock, HostedBlockReason, RuntimeSnapshot, WatchHostedSession, read_runtime,
+};
 
 /// Why a watch report could not be built.
 #[derive(Debug, thiserror::Error)]
@@ -148,10 +150,11 @@ pub fn summarize(
     );
     let mut all_quotas = quotas;
     all_quotas.extend(snapshot.runtime.quotas.iter().cloned());
-    let alerts = evaluate_watch_alerts(
+    let alerts = alerts::evaluate_watch_alerts_with_hosted_sessions(
         &snapshot.telemetry,
         &health,
         &all_quotas,
+        &snapshot.runtime.hosted_sessions,
         thresholds,
         now_ms,
     );
@@ -312,6 +315,116 @@ mod tests {
             deps,
             ["fl-core", "fl-store", "serde", "serde_json", "thiserror"]
         );
+    }
+
+    #[test]
+    fn hosted_blocks_raise_one_alert_per_vendor_and_clear_on_recovery() {
+        use crate::testkit::put_runtime;
+        use serde_json::json;
+
+        let store: AnyStore = fl_store::FerroStore::in_memory().into();
+        let set_seat = |vendor: &str,
+                        persona: &str,
+                        status: &str,
+                        stop_reason: Option<&str>,
+                        block: serde_json::Value| {
+            put_runtime(
+                &store,
+                &format!("hosted-session-{vendor}-{persona}"),
+                json!({
+                    "session_id": format!("{vendor}:{persona}"),
+                    "persona": persona,
+                    "vendor": vendor,
+                    "status": status,
+                    "stop_reason": stop_reason,
+                    "block": block,
+                }),
+            );
+        };
+        let sign_in = json!({"reason": "vendor_sign_in", "observed_at_ms": 123});
+        let dialog = json!({"reason": "blocking_dialog", "observed_at_ms": 124});
+        set_seat("codex", "ada", "running", None, sign_in.clone());
+        set_seat("codex", "bo", "running", None, sign_in.clone());
+        set_seat("codex", "crashed", "stopped", Some("runtime_gone"), sign_in);
+        set_seat(
+            "codex",
+            "stopped",
+            "stopped",
+            Some("startup_blocked"),
+            serde_json::Value::Null,
+        );
+        set_seat("muse", "ada", "running", None, dialog);
+        set_seat("muse", "legacy", "running", None, serde_json::Value::Null);
+
+        let summary = || {
+            build_summary(
+                &store,
+                None,
+                &WatchThresholds::default(),
+                vec![],
+                150,
+                "here",
+                &|_| true,
+            )
+            .unwrap()
+        };
+        let first = summary();
+        let ids_and_counts: Vec<_> = first
+            .alerts
+            .iter()
+            .map(|alert| (alert.id.as_str(), alert.observed))
+            .collect();
+        assert_eq!(
+            ids_and_counts,
+            [
+                ("hosted_block:vendor:codex", 3.0),
+                ("hosted_block:vendor:muse", 1.0)
+            ]
+        );
+        assert!(first.alerts[0].message.contains("2 blocked hosted seats"));
+        assert!(
+            first.alerts[0]
+                .message
+                .contains("1 hosted seat stopped while blocked")
+        );
+        assert!(
+            first.alerts[0]
+                .remediation
+                .contains("`fl agent decommission`")
+        );
+        assert!(first.alerts[1].message.contains("1 blocked hosted seat"));
+        assert!(!first.alerts[1].remediation.contains("decommission"));
+        let codex = first
+            .health
+            .agents
+            .iter()
+            .find(|agent| agent.agent == "bo")
+            .unwrap();
+        let block = serde_json::to_value(codex).unwrap();
+        assert_eq!(block["hosted_session"]["block"]["reason"], "vendor_sign_in");
+        assert_eq!(block["hosted_session"]["block"]["observed_at_ms"], 123);
+
+        set_seat("codex", "ada", "running", None, serde_json::Value::Null);
+        let fewer = summary();
+        assert_eq!(fewer.alerts[0].id, first.alerts[0].id);
+        assert_eq!(fewer.alerts[0].observed, 2.0);
+        set_seat("codex", "bo", "running", None, serde_json::Value::Null);
+        let stopped_only = summary();
+        assert_eq!(stopped_only.alerts[0].id, first.alerts[0].id);
+        assert_eq!(stopped_only.alerts[0].observed, 1.0);
+        assert_eq!(
+            stopped_only.alerts[0].message,
+            "codex has 1 hosted seat stopped while blocked"
+        );
+        assert_eq!(
+            stopped_only.alerts[0].remediation,
+            "Restart the stopped seats after the block is cleared, or remove them with `fl agent decommission`."
+        );
+
+        set_seat("codex", "stopped", "running", None, serde_json::Value::Null);
+        let recovered = summary();
+        assert_eq!(recovered.alerts.len(), 1);
+        assert_eq!(recovered.alerts[0].id, first.alerts[1].id);
     }
 
     #[test]

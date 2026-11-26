@@ -1608,6 +1608,7 @@ fn daemon_hosted_replace_operator_replace_and_foreign_child_replace_e2e() {
         node_id: "local".into(),
         hosted: true,
         status: fl_hub::lifecycle::STATUS_RUNNING.into(),
+        block: None,
         stop_reason: None,
         launch_prerequisite_detail: None,
         restart_policy: "on-failure".into(),

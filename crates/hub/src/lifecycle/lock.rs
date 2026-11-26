@@ -65,7 +65,14 @@ impl LifecycleFence {
         } else {
             None
         };
-        Self::acquire_endpoints(endpoint, tmux, personas, operation)
+        Self::acquire_endpoints(
+            endpoint,
+            tmux,
+            personas,
+            operation,
+            #[cfg(test)]
+            |_| {},
+        )
     }
 
     #[cfg(test)]
@@ -75,7 +82,7 @@ impl LifecycleFence {
         persona: &str,
         operation: &str,
     ) -> Result<Self, LifecycleError> {
-        Self::acquire_endpoints(endpoint, tmux, &[persona.to_string()], operation)
+        Self::acquire_endpoints(endpoint, tmux, &[persona.to_string()], operation, |_| {})
     }
 
     fn acquire_endpoints(
@@ -83,6 +90,7 @@ impl LifecycleFence {
         tmux: Option<PathBuf>,
         personas: &[String],
         operation: &str,
+        #[cfg(test)] mut after_lock: impl FnMut(&File),
     ) -> Result<Self, LifecycleError> {
         let mut personas: Vec<String> = personas
             .iter()
@@ -121,7 +129,16 @@ impl LifecycleFence {
                 paths.push(lock_path(socket, persona, "tmux")?);
             }
         }
-        let mut files = Vec::with_capacity(paths.len());
+        // Arm rollback before acquiring any file. Closing a descriptor alone can
+        // leave its lock in place if a concurrent fork still shares the description.
+        let mut fence = Self {
+            personas,
+            runtime: RuntimePin { endpoint, tmux },
+            files: Vec::with_capacity(paths.len()),
+            #[cfg(test)]
+            paths: Vec::new(),
+            _thread_bound: std::marker::PhantomData,
+        };
         for (index, path) in paths.iter().enumerate() {
             let mut file = safe_open(path)?;
             match file.try_lock() {
@@ -132,7 +149,7 @@ impl LifecycleFence {
                     let detail = holder_diagnostic(&detail);
                     return Err(LifecycleError::Conflict(format!(
                         "lifecycle operation for `{}` is in progress; holder {}",
-                        personas[index % personas.len()],
+                        fence.personas[index % fence.personas.len()],
                         detail
                     )));
                 }
@@ -149,16 +166,15 @@ impl LifecycleFence {
                 .set_len(0)
                 .and_then(|()| file.seek(SeekFrom::Start(0)))
                 .and_then(|_| file.write_all(metadata.to_string().as_bytes()));
-            files.push(file);
-        }
-        Ok(Self {
-            personas,
-            runtime: RuntimePin { endpoint, tmux },
-            files,
             #[cfg(test)]
-            paths,
-            _thread_bound: std::marker::PhantomData,
-        })
+            after_lock(&file);
+            fence.files.push(file);
+        }
+        #[cfg(test)]
+        {
+            fence.paths = paths;
+        }
+        Ok(fence)
     }
 
     pub(crate) fn covers(&self, persona: &str) -> bool {
@@ -391,4 +407,38 @@ fn unsupported_platform_fails_closed_before_runtime_effects() {
     let endpoint = HostEndpoint::windows("fixture", "S-1-5-21-1").unwrap();
     let error = LifecycleFence::acquire_endpoint(endpoint, None, "fiona", "restart").unwrap_err();
     assert!(error.to_string().contains(std::env::consts::OS));
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn partial_acquisition_unlocks_with_shared_file_description() {
+        let root = tempfile::TempDir::new().unwrap();
+        let endpoint = HostEndpoint::unix(root.path().join("host.sock")).unwrap();
+        let tmux = root.path().join("tmux.sock");
+        let canonical_tmux = canonical_socket(&tmux).unwrap();
+        let tmux_lock = safe_open(&lock_path(&canonical_tmux, "fiona", "tmux").unwrap()).unwrap();
+        tmux_lock.try_lock().unwrap();
+
+        // A fork can retain the same open description until exec despite FD_CLOEXEC.
+        // Duplicating the descriptor reproduces that retention without racing a fork.
+        let mut alias = None;
+        let error = LifecycleFence::acquire_endpoints(
+            endpoint.clone(),
+            Some(tmux),
+            &["fiona".into()],
+            "restart",
+            |file| {
+                assert!(alias.is_none());
+                alias = Some(file.try_clone().unwrap());
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error.status(), 409);
+        let _retained_alias = alias.expect("the native lock was acquired before tmux contention");
+
+        LifecycleFence::acquire_endpoint(endpoint, None, "fiona", "restart").unwrap();
+    }
 }
