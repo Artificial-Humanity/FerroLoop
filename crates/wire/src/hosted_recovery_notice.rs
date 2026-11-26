@@ -7,6 +7,7 @@ use fl_core::ferrowire::{
 };
 use fl_core::ids::{AgentId, MessageId};
 use fl_core::iri::Iri;
+pub use fl_core::state::NOTICE_STATE_SLUG_PREFIX;
 use fl_core::state::{
     MergeMode, RuntimeEntry, SensitivityPatch, StateConcern, StatePayload, StateScope,
     UpsertStateArgs, validate_slug,
@@ -15,9 +16,6 @@ use fl_core::store::{AgentRegistry, MessageStore, StateStore, StoreError};
 use fl_host_proto::{MAX_HOSTED_EXIT_TAIL_BYTES, MAX_HOSTED_EXIT_TAIL_LINES};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
-
-/// Workspace runtime keys for the sensitive, local-only notice excerpts.
-pub const NOTICE_STATE_SLUG_PREFIX: &str = "hosted-recovery-notice-";
 
 // Mark the low random bits to screen ordinary mail before querying private state.
 // The v7 timestamp, variant and version are left intact.

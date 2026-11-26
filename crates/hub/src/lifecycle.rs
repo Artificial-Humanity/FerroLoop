@@ -3655,8 +3655,7 @@ pub fn delete_claude_resume_state<S: StateStore>(store: &S, session_id: &str) {
     );
 }
 
-/// Prefix of disjoint runtime entries that record per-session automatic respawn & crash-loop state.
-pub const HOSTED_RESPAWN_STATE_SLUG_PREFIX: &str = "hosted-respawn-state-";
+pub use fl_core::state::HOSTED_RESPAWN_STATE_SLUG_PREFIX;
 
 /// Slug of the disjoint runtime entry for a hosted session's automatic respawn state.
 pub fn hosted_respawn_state_slug(session_id: &str) -> String {
@@ -3668,11 +3667,13 @@ pub fn hosted_respawn_state_slug(session_id: &str) -> String {
         return slug;
     }
     // Keep every valid legacy key. Longer hosted ids could never store a recovery row.
-    const HASH_PREFIX: &str = "hosted-respawn-state-h_";
+    const HASH_MARKER: &str = "h_";
     let digest = crate::auth::sha256_hex(session_id);
+    let digest_len =
+        MAX_STATE_SLUG_LEN - HOSTED_RESPAWN_STATE_SLUG_PREFIX.len() - HASH_MARKER.len();
     format!(
-        "{HASH_PREFIX}{}",
-        &digest[..MAX_STATE_SLUG_LEN - HASH_PREFIX.len()]
+        "{HOSTED_RESPAWN_STATE_SLUG_PREFIX}{HASH_MARKER}{}",
+        &digest[..digest_len]
     )
 }
 

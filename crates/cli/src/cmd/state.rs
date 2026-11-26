@@ -19,16 +19,14 @@ use fl_core::ref_index::{
 use fl_core::state::{
     HandoffEntry, MemoryBasis, MemoryCategory, MemoryEntry, MemoryLifecycle, MergeMode,
     RuntimeEntry, SensitivityPatch, StateConcern, StateEntry, StatePayload, StateScope,
-    StateSearchHit, UpsertStateArgs, validate_slug,
+    StateSearchHit, UpsertStateArgs, is_internal_hosted_runtime_key, validate_slug,
 };
 use fl_core::store::{AgentRegistry, Handles, StateStore};
 use fl_exec::state_sync::{sync_state, verify_state};
-use fl_hub::lifecycle::HOSTED_RESPAWN_STATE_SLUG_PREFIX;
 use fl_store::{
     AnyStore, CodeSession, DEFAULT_CODE_SYNC_BUDGET, IndexPolicy, RankMode, RankedCode, RankedHits,
     SearchMode,
 };
-use fl_wire::hosted_recovery_notice::NOTICE_STATE_SLUG_PREFIX;
 
 use crate::cmd::agent::{now_at, write_atomic_non_symlink};
 use crate::config::Config;
@@ -764,23 +762,16 @@ pub fn parse_merge_mode(s: &str) -> Result<MergeMode, String> {
     })
 }
 
-fn is_internal_hosted_runtime_key(scope: &StateScope, slug: &str) -> bool {
-    scope == &StateScope::Workspace
-        && (slug.starts_with(HOSTED_RESPAWN_STATE_SLUG_PREFIX)
-            || slug.starts_with(NOTICE_STATE_SLUG_PREFIX))
-}
-
 pub(super) fn validate_runtime_key(scope: &StateScope, key: &str) -> Result<String, String> {
     let slug = validate_slug(key).map_err(|e| e.to_string())?;
-    if is_internal_hosted_runtime_key(scope, &slug) {
+    if is_internal_hosted_runtime_key(scope, StateConcern::Runtime, &slug) {
         return Err("reserved internal hosted runtime key".into());
     }
     Ok(slug)
 }
 
 fn is_visible_state_entry(entry: &StateEntry) -> bool {
-    entry.concern != StateConcern::Runtime
-        || !is_internal_hosted_runtime_key(&entry.scope, &entry.slug)
+    !is_internal_hosted_runtime_key(&entry.scope, entry.concern, &entry.slug)
 }
 
 /// Entries exposed by FerroState. Keep internal hosted recovery data out of the

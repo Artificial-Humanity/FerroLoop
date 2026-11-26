@@ -13,6 +13,12 @@ pub const MAX_SUMMARY_CHARS: usize = 240;
 pub const MAX_BODY_BYTES: usize = 256 * 1024;
 pub const MAX_NOTES_BYTES: usize = 64 * 1024;
 
+/// Workspace runtime key prefix for per-session automatic respawn and crash-loop state.
+pub const HOSTED_RESPAWN_STATE_SLUG_PREFIX: &str = "hosted-respawn-state-";
+
+/// Workspace runtime key prefix for sensitive hosted recovery notice excerpts.
+pub const NOTICE_STATE_SLUG_PREFIX: &str = "hosted-recovery-notice-";
+
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum StateError {
     #[error(
@@ -160,6 +166,18 @@ pub enum StateConcern {
     Memory,
     Handoff,
     Runtime,
+}
+
+/// Whether the state key belongs to local-only hosted recovery data.
+pub fn is_internal_hosted_runtime_key(
+    scope: &StateScope,
+    concern: StateConcern,
+    slug: &str,
+) -> bool {
+    scope == &StateScope::Workspace
+        && concern == StateConcern::Runtime
+        && (slug.starts_with(HOSTED_RESPAWN_STATE_SLUG_PREFIX)
+            || slug.starts_with(NOTICE_STATE_SLUG_PREFIX))
 }
 
 crate::wire::wire_names!(StateConcern as state_concern_wire {
