@@ -34,6 +34,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::api::{reforge_role_label, route_matches_session_id, synthesize_decommission_prompt};
 
+mod exit_evidence;
+pub use exit_evidence::HostedExitIncident;
 #[cfg(test)]
 mod fence_tests;
 mod lock;
@@ -503,6 +505,36 @@ pub trait SessionRuntime: std::fmt::Debug {
         launch: Option<&LaunchSpec>,
         hosted_id: &str,
     ) -> bool;
+
+    /// Spawns while preserving the exact native Host epoch when the runtime provides one.
+    fn spawn_with_stream(
+        &self,
+        session: &str,
+        window: &str,
+        cwd: Option<&str>,
+        launch: Option<&LaunchSpec>,
+        hosted_id: &str,
+    ) -> (bool, Option<fl_host_proto::StreamId>) {
+        (self.spawn(session, window, cwd, launch, hosted_id), None)
+    }
+
+    fn rollback_host_spawn(&self, _stream: &fl_host_proto::StreamId, unit: &str, hosted_id: &str) {
+        let _ = self.kill(unit, hosted_id);
+    }
+
+    /// Whether a previously bound epoch is still the live runtime owned by this record.
+    fn owns_host_stream(&self, _stream: &fl_host_proto::StreamId, _hosted_id: &str) -> bool {
+        false
+    }
+
+    fn hosted_exit_evidence(
+        &self,
+        _stream: &fl_host_proto::StreamId,
+        _hosted_id: &str,
+    ) -> fl_host_proto::HostedExitEvidenceStatus {
+        fl_host_proto::HostedExitEvidenceStatus::Unavailable
+    }
+
     /// Stop a runtime unit; `true` when nothing of ours is left of it. A window unit
     /// (`muse:<persona>`) is stopped with `kill-window` on that one window and never takes its
     /// session with it, and only when the window carries the mark `hosted_id`: a window of the
@@ -2045,18 +2077,33 @@ impl SessionRuntime for HostRuntime {
         launch: Option<&LaunchSpec>,
         hosted_id: &str,
     ) -> bool {
+        self.spawn_with_stream(session, window, cwd, launch, hosted_id)
+            .0
+    }
+
+    fn spawn_with_stream(
+        &self,
+        session: &str,
+        window: &str,
+        cwd: Option<&str>,
+        launch: Option<&LaunchSpec>,
+        hosted_id: &str,
+    ) -> (bool, Option<fl_host_proto::StreamId>) {
         if use_legacy_tmux_fallback() {
-            return TmuxRuntime.spawn(session, window, cwd, launch, hosted_id);
+            return (
+                TmuxRuntime.spawn(session, window, cwd, launch, hosted_id),
+                None,
+            );
         }
         let session = session.trim();
         let window = window.trim();
         if session.is_empty()
             || (session == MUSE_SESSION && (window.is_empty() || hosted_id.trim().is_empty()))
         {
-            return false;
+            return (false, None);
         }
         let Some(mut client) = connect_host_client() else {
-            return false;
+            return (false, None);
         };
         // Ownership must be verifiable before a child is created: an older host cannot
         // satisfy the survival check or safely clean up the newly launched runtime.
@@ -2066,10 +2113,10 @@ impl SessionRuntime for HostRuntime {
                 Ok(fl_host_proto::ExtensionResponse::Capabilities { features, .. })
                     if features & fl_host_proto::SESSION_OWNER_FEATURE != 0)
         {
-            return false;
+            return (false, None);
         }
         let Ok(sessions) = client.list_sessions() else {
-            return false;
+            return (false, None);
         };
         let raw_id = if window.is_empty() {
             session.to_string()
@@ -2077,13 +2124,13 @@ impl SessionRuntime for HostRuntime {
             format!("{session}.{window}")
         };
         let Ok(session_id) = fl_host_proto::SessionId::new(&raw_id) else {
-            return false;
+            return (false, None);
         };
         if sessions.iter().any(|s| {
             s.stream.session == session_id
                 && !matches!(s.state, fl_host_proto::ChildState::CleanupComplete(_))
         }) {
-            return false;
+            return (false, None);
         }
         let argv = match launch {
             Some(spec) if !spec.argv.is_empty() => spec.argv.clone(),
@@ -2107,11 +2154,11 @@ impl SessionRuntime for HostRuntime {
                 env_allow: env_allow.clone(),
             };
             match client.spawn_pty_session(pty_spec, None) {
-                Ok(_) => return true,
+                Ok((id, _)) => return (true, Some(id)),
                 Err(err)
                     if matches!(err, fl_host_proto::HostError::Unsupported { .. })
                         || err.to_string().contains("Unsupported") => {}
-                Err(_) => return false,
+                Err(_) => return (false, None),
             }
         }
         env_allow.insert("FL_HOST_PTY".to_string());
@@ -2124,7 +2171,66 @@ impl SessionRuntime for HostRuntime {
             env: env_map,
             env_allow,
         };
-        client.spawn_reliable_session(pipe_spec).is_ok()
+        if let Ok((id, _)) = client.spawn_reliable_session(pipe_spec) {
+            (true, Some(id))
+        } else {
+            (false, None)
+        }
+    }
+
+    fn rollback_host_spawn(&self, stream: &fl_host_proto::StreamId, _unit: &str, hosted_id: &str) {
+        if let Some(mut client) = connect_host_client()
+            && client
+                .check_session_owner(stream.clone(), hosted_id)
+                .unwrap_or(false)
+            && let Ok(grant) = client.claim_controller(stream.clone())
+        {
+            let _ = client.kill_session(stream.clone(), grant.lease);
+        }
+    }
+
+    fn owns_host_stream(&self, stream: &fl_host_proto::StreamId, hosted_id: &str) -> bool {
+        connect_host_client().is_some_and(|mut client| {
+            client
+                .check_session_owner(stream.clone(), hosted_id)
+                .unwrap_or(false)
+        })
+    }
+
+    fn hosted_exit_evidence(
+        &self,
+        stream: &fl_host_proto::StreamId,
+        hosted_id: &str,
+    ) -> fl_host_proto::HostedExitEvidenceStatus {
+        use fl_host_proto::HostedExitEvidenceStatus as Evidence;
+        let endpoint =
+            lock::pinned_endpoint().map_or_else(fl_host_proto::HostEndpoint::discover, Ok);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build();
+        let (Ok(endpoint), Ok(runtime)) = (endpoint, runtime) else {
+            return Evidence::Unavailable;
+        };
+        runtime.block_on(async {
+            // Reconcile normally confirms Gone on two ticks at least ten seconds apart.
+            // Bound the additional wait, including connection and RPC, for immediate deaths.
+            tokio::time::timeout(Duration::from_millis(250), async {
+                let mut client = fl_host_proto::AsyncHostClient::connect(&endpoint).await?;
+                loop {
+                    match client
+                        .hosted_exit_evidence(stream.clone(), hosted_id)
+                        .await?
+                    {
+                        Evidence::Pending => tokio::time::sleep(Duration::from_millis(20)).await,
+                        status => return Ok::<_, fl_host_proto::HostError>(status),
+                    }
+                }
+            })
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .unwrap_or(Evidence::Unavailable)
+        })
     }
 
     fn kill(&self, unit: &str, hosted_id: &str) -> bool {
@@ -2482,6 +2588,8 @@ pub(crate) struct FakeRuntime {
     pub(crate) presence_of: std::cell::RefCell<BTreeMap<String, RuntimePresence>>,
     /// Scripted [`SessionRuntime::recorded_exit_code`] answers.
     pub(crate) exit_codes: std::cell::RefCell<BTreeMap<String, i32>>,
+    hosted_exit_fixture: std::cell::RefCell<Option<fl_host_proto::HostedExitEvidence>>,
+    hosted_exit_lookups: std::cell::RefCell<Vec<(fl_host_proto::StreamId, String)>>,
     /// The [`HOSTED_MARK`] of each window of the shared session that has one, by `muse:<window>`.
     /// A window opened by anyone but a spawn has none. Whatever removes a window removes its
     /// mark ([`Self::close_window`]).
@@ -2745,6 +2853,43 @@ impl SessionRuntime for FakeRuntime {
             }
         }
         started
+    }
+
+    fn spawn_with_stream(
+        &self,
+        session: &str,
+        window: &str,
+        cwd: Option<&str>,
+        launch: Option<&LaunchSpec>,
+        hosted_id: &str,
+    ) -> (bool, Option<fl_host_proto::StreamId>) {
+        if !self.spawn(session, window, cwd, launch, hosted_id) {
+            return (false, None);
+        }
+        let stream = self
+            .hosted_exit_fixture
+            .borrow_mut()
+            .as_mut()
+            .map(|fixture| {
+                fixture.stream.epoch.0 += 1;
+                fixture.stream.clone()
+            });
+        (true, stream)
+    }
+
+    fn hosted_exit_evidence(
+        &self,
+        stream: &fl_host_proto::StreamId,
+        hosted_id: &str,
+    ) -> fl_host_proto::HostedExitEvidenceStatus {
+        use fl_host_proto::HostedExitEvidenceStatus as Evidence;
+        self.hosted_exit_lookups
+            .borrow_mut()
+            .push((stream.clone(), hosted_id.into()));
+        self.hosted_exit_fixture
+            .borrow()
+            .clone()
+            .map_or(Evidence::Unavailable, Evidence::Exited)
     }
 
     fn kill(&self, unit: &str, hosted_id: &str) -> bool {
@@ -3513,9 +3658,19 @@ pub const HOSTED_RESPAWN_STATE_SLUG_PREFIX: &str = "hosted-respawn-state-";
 
 /// Slug of the disjoint runtime entry for a hosted session's automatic respawn state.
 pub fn hosted_respawn_state_slug(session_id: &str) -> String {
-    format!(
+    let slug = format!(
         "{HOSTED_RESPAWN_STATE_SLUG_PREFIX}{}",
         session_id.replace(':', "-")
+    );
+    if slug.len() <= MAX_STATE_SLUG_LEN {
+        return slug;
+    }
+    // Keep every valid legacy key. Longer hosted ids could never store a recovery row.
+    const HASH_PREFIX: &str = "hosted-respawn-state-h_";
+    let digest = crate::auth::sha256_hex(session_id);
+    format!(
+        "{HASH_PREFIX}{}",
+        &digest[..MAX_STATE_SLUG_LEN - HASH_PREFIX.len()]
     )
 }
 
@@ -3537,6 +3692,8 @@ pub struct HostedRespawnState {
     /// Successful deliveries keyed as `recovery:<recipient>` or `exhausted:<recipient>`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub crash_loop_notified_recipients: Vec<String>,
+    #[serde(default, skip_serializing_if = "HostedExitIncident::is_empty")]
+    pub exit_evidence: HostedExitIncident,
 }
 
 fn is_zero_recovery_attempts(value: &u8) -> bool {
@@ -3552,6 +3709,15 @@ impl HostedRespawnState {
             && self.recovery_attempts == 0
             && self.recovery_healthy_since_ms.is_none()
             && self.crash_loop_notified_recipients.is_empty()
+            && self.exit_evidence.is_empty()
+    }
+
+    fn clear_incident(&mut self) {
+        self.exit_evidence.clear_incident();
+        *self = Self {
+            exit_evidence: std::mem::take(&mut self.exit_evidence),
+            ..Self::default()
+        };
     }
 }
 
@@ -3628,8 +3794,8 @@ fn load_hosted_respawn_state_policy<S: StateStore>(
         return Ok(HostedRespawnState::default());
     };
     let decoded = match entry.payload {
-        StatePayload::Runtime(rt) => serde_json::from_value(rt.value).map_err(|err| {
-            LifecycleError::Store(format!("invalid recovery state for `{session_id}`: {err}"))
+        StatePayload::Runtime(rt) => serde_json::from_value(rt.value).map_err(|_| {
+            LifecycleError::Store(format!("invalid recovery state for `{session_id}`"))
         }),
         _ => Err(LifecycleError::Store(format!(
             "invalid recovery payload for `{session_id}`"
@@ -3664,7 +3830,7 @@ pub fn save_hosted_respawn_state<S: StateStore>(
     store.upsert_state(UpsertStateArgs {
         scope: StateScope::Workspace,
         slug,
-        sensitivity: SensitivityPatch::Inherit,
+        sensitivity: SensitivityPatch::SetSensitive,
         payload: StatePayload::Runtime(RuntimeEntry {
             value,
             merge_mode: MergeMode::LastWriter,
@@ -6125,8 +6291,9 @@ where
         previous.as_ref(),
         OwnerGate::SpinUp,
     )?;
+    let mut respawn_state = HostedRespawnState::default();
     if let Some(record) = &previous {
-        load_hosted_respawn_state_policy(store, &record.session_id, true)?;
+        respawn_state = load_hosted_respawn_state_policy(store, &record.session_id, true)?;
     }
     let config_home = preflight_vendor_launch(env, &v.vendor, v.hosted, &mut v.cwd)?;
     let tmux_target = has_runtime.then(|| hosted_tmux_target(&v.vendor, &v.persona));
@@ -6335,7 +6502,16 @@ where
     }
     let dropped_ids = previous.as_ref().map(record_native_ids).unwrap_or_default();
     persist_hosted_session(store, &record, by)?;
-    delete_hosted_respawn_state(store, &session_id);
+    if will_spawn || !record.runtime_spawned {
+        respawn_state.exit_evidence = HostedExitIncident::default();
+    }
+    if env.spawn_runtime {
+        respawn_state
+            .exit_evidence
+            .keep_live_launch(env.runtime, &record);
+    }
+    respawn_state.clear_incident();
+    save_hosted_respawn_state(store, &session_id, &respawn_state, by)?;
     with_dead_streaks(|streaks| {
         streaks.remove(&(env.home_override.map(Path::to_path_buf), session_id.clone()));
     });
@@ -6345,18 +6521,18 @@ where
     // A route left by another vendor would take the hydration prompt.
     purge_cross_vendor_routes(store, env.home_override, &v.persona, &v.vendor);
 
-    let (rt_session, rt_window) = runtime_names(&v.vendor, &v.persona);
     let resume_launch_started_ms = now_ms();
     let mut raw_spawned = has_runtime
         && v.hosted
         && env.spawn_runtime
-        && env.runtime.spawn(
-            &rt_session,
-            &rt_window,
-            v.cwd.as_deref(),
+        && exit_evidence::spawn_and_remember(
+            store,
+            env,
+            &mut respawn_state,
+            &record,
             launch.as_ref(),
-            &session_id,
-        );
+            by,
+        )?;
     if raw_spawned && let Some(target) = tmux_target.as_deref() {
         apply_startup_prompt_rules(env.runtime, &v.vendor, target);
     }
@@ -6455,6 +6631,14 @@ where
             };
             save_claude_resume_state(store, &session_id, &rstate, by)?;
         } else {
+            // Both launches share one recovery reservation. Preserve the resume's exit
+            // if the fallback never creates a child, and sample before any cleanup kill.
+            let failed_resume = raw_spawned.then(|| {
+                (
+                    record.clone(),
+                    respawn_state.exit_evidence.capture(env.runtime, &record),
+                )
+            });
             let _ = env.runtime.kill(&unit, &session_id);
             let failed_sid = resumed_sid;
             push_tombstone(&mut record.tombstone_ids, &failed_sid);
@@ -6506,13 +6690,23 @@ where
             record.pid_start_time = None;
             record.updated_at_ms = now_ms();
             persist_hosted_session(store, &record, by)?;
-            raw_spawned = env.runtime.spawn(
-                &rt_session,
-                &rt_window,
-                v.cwd.as_deref(),
+            raw_spawned = exit_evidence::spawn_and_remember(
+                store,
+                env,
+                &mut respawn_state,
+                &record,
                 launch.as_ref(),
-                &session_id,
-            );
+                by,
+            )?;
+            if !raw_spawned && let Some((failed_record, evidence)) = failed_resume {
+                exit_evidence::save_counted_exit(
+                    store,
+                    &failed_record,
+                    &mut respawn_state,
+                    evidence,
+                    by,
+                )?;
+            }
             if raw_spawned && let Some(target) = tmux_target.as_deref() {
                 apply_startup_prompt_rules(env.runtime, &v.vendor, target);
             }
@@ -7578,17 +7772,17 @@ fn bump_dead_streak(streak_key: &DeadStreakKey) -> u32 {
 fn observe_hosted_recovery_health<S: StateStore>(
     store: &S,
     record: &HostedSessionRecord,
+    state: &mut HostedRespawnState,
     alive: bool,
     by: &str,
 ) -> Result<(), LifecycleError> {
     if !record.hosted || !record.restart_policy.eq_ignore_ascii_case("on-failure") {
         return Ok(());
     }
-    let mut state = load_hosted_respawn_state(store, &record.session_id)?;
     let before = state.clone();
-    recovery::observe_health(&mut state, alive, current_respawn_clock_ms());
-    if state != before {
-        save_hosted_respawn_state(store, &record.session_id, &state, by)?;
+    recovery::observe_health(state, alive, current_respawn_clock_ms());
+    if *state != before {
+        save_hosted_respawn_state(store, &record.session_id, state, by)?;
     }
     Ok(())
 }
@@ -7685,7 +7879,7 @@ fn reconcile_dead_hosted_session_fenced<S: StateStore>(
     if !record.status.eq_ignore_ascii_case(STATUS_RUNNING) || !vendor_has_runtime(&record.vendor) {
         return Ok(());
     }
-    load_hosted_respawn_state(store, &record.session_id)?;
+    let mut respawn_state = load_hosted_respawn_state(store, &record.session_id)?;
     let _ = promote_confirmed_hydration(store, &mut record);
     if record.vendor == "claude" {
         let mut rstate = load_claude_resume_state(store, &record.session_id);
@@ -7703,7 +7897,8 @@ fn reconcile_dead_hosted_session_fenced<S: StateStore>(
     );
     if vendor_route_live_for_record(env.home_override, &record) {
         if env.spawn_runtime
-            && let Err(err) = observe_hosted_recovery_health(store, &record, true, by)
+            && let Err(err) =
+                observe_hosted_recovery_health(store, &record, &mut respawn_state, true, by)
         {
             if should_log_auto_respawn_warning(&record.session_id, current_respawn_clock_ms()) {
                 eprintln!(
@@ -7745,9 +7940,13 @@ fn reconcile_dead_hosted_session_fenced<S: StateStore>(
         .clone()
         .unwrap_or_else(|| hosted_tmux_target(&record.vendor, &record.persona));
     let presence = env.runtime.presence(&target);
-    if let Err(err) =
-        observe_hosted_recovery_health(store, &record, presence == RuntimePresence::Alive, by)
-    {
+    if let Err(err) = observe_hosted_recovery_health(
+        store,
+        &record,
+        &mut respawn_state,
+        presence == RuntimePresence::Alive,
+        by,
+    ) {
         if should_log_auto_respawn_warning(&record.session_id, current_respawn_clock_ms()) {
             eprintln!(
                 "hub: warning ({}): failed recovery health observation: {err}",
@@ -7798,10 +7997,29 @@ fn reconcile_dead_hosted_session_fenced<S: StateStore>(
                         let _ = sync_claude_vendor_session_id_from_route(store, env, &mut record);
                     }
                 }
-                let clean_exit = env
-                    .runtime
-                    .recorded_exit_code(&target, record.runtime_leader_pid.or(record.pid))
-                    == Some(0);
+                let evidence = respawn_state.exit_evidence.capture(env.runtime, &record);
+                let clean_exit = match &evidence {
+                    Some(evidence) => {
+                        evidence.exit.code == Some(0) && evidence.exit.signal.is_none()
+                    }
+                    None => {
+                        env.runtime
+                            .recorded_exit_code(&target, record.runtime_leader_pid.or(record.pid))
+                            == Some(0)
+                    }
+                };
+                if !clean_exit
+                    && record.hosted
+                    && record.restart_policy.eq_ignore_ascii_case("on-failure")
+                {
+                    exit_evidence::save_counted_exit(
+                        store,
+                        &record,
+                        &mut respawn_state,
+                        evidence,
+                        by,
+                    )?;
+                }
                 record.status = STATUS_STOPPED.to_string();
                 record.launch_prerequisite_detail = None;
                 record.stop_reason = Some(
@@ -8532,7 +8750,6 @@ where
         save_hosted_respawn_state(store, &record.session_id, &respawn_state, by)?;
     }
 
-    let (rt_session, rt_window) = runtime_names(&record.vendor, &record.persona);
     let want_target = hosted_tmux_target(&record.vendor, &record.persona);
     let unit = env.runtime.unit(&want_target).to_string();
     let _ = sync_claude_vendor_session_id_from_route(store, env, &mut record);
@@ -8733,6 +8950,9 @@ where
         record.hydration_dispatched = true;
     }
     if will_spawn {
+        if respawn_state.exit_evidence.clear_launch() {
+            save_hosted_respawn_state(store, &record.session_id, &respawn_state, by)?;
+        }
         record.pid = None;
         record.runtime_leader_pid = None;
         record.pid_start_time = None;
@@ -8757,13 +8977,14 @@ where
         && !adopted_old_session
         && vendor_has_runtime(&record.vendor)
         && env.spawn_runtime
-        && env.runtime.spawn(
-            &rt_session,
-            &rt_window,
-            record.cwd.as_deref(),
+        && exit_evidence::spawn_and_remember(
+            store,
+            env,
+            &mut respawn_state,
+            &record,
             launch.as_ref(),
-            &record.session_id,
-        );
+            by,
+        )?;
     let _reopened_guard;
     let store: &S = if is_claude_resume {
         let resumed_sid = record.vendor_session_id.clone().unwrap_or_default();
@@ -8858,6 +9079,14 @@ where
             };
             save_claude_resume_state(store, &record.session_id, &rstate, by)?;
         } else {
+            // Both launches share one recovery reservation. Preserve the resume's exit
+            // if the fallback never creates a child, and sample before any cleanup kill.
+            let failed_resume = raw_spawned.then(|| {
+                (
+                    record.clone(),
+                    respawn_state.exit_evidence.capture(env.runtime, &record),
+                )
+            });
             let _ = env.runtime.kill(&unit, &record.session_id);
             let failed_sid = resumed_sid;
             push_tombstone(&mut record.tombstone_ids, &failed_sid);
@@ -8908,13 +9137,14 @@ where
             )?;
             pin_launch_config(&mut launch, config_home.as_deref());
             persist_hosted_session(store, &record, by)?;
-            let retry_raw = env.runtime.spawn(
-                &rt_session,
-                &rt_window,
-                record.cwd.as_deref(),
+            let retry_raw = exit_evidence::spawn_and_remember(
+                store,
+                env,
+                &mut respawn_state,
+                &record,
                 launch.as_ref(),
-                &record.session_id,
-            );
+                by,
+            )?;
             if retry_raw {
                 if launch.is_some() && !launch_survived(env, &unit, &record.session_id) {
                     launch_died = true;
@@ -8925,6 +9155,15 @@ where
                     launched_with_prompt = launch.is_some();
                 }
             } else {
+                if let Some((failed_record, evidence)) = failed_resume {
+                    exit_evidence::save_counted_exit(
+                        store,
+                        &failed_record,
+                        &mut respawn_state,
+                        evidence,
+                        by,
+                    )?;
+                }
                 launch_died = true;
                 record.runtime_spawned = false;
             }
@@ -8990,6 +9229,10 @@ where
         && let Err(err @ LifecycleError::PrerequisiteUnavailable { .. }) =
             check_vendor_launch_prerequisite(env, &record.vendor, config_home.as_deref())
     {
+        if raw_spawned {
+            let evidence = respawn_state.exit_evidence.capture(env.runtime, &record);
+            exit_evidence::save_counted_exit(store, &record, &mut respawn_state, evidence, by)?;
+        }
         if retry_prerequisite {
             if !raw_spawned {
                 if automatic {
@@ -8999,6 +9242,7 @@ where
                         &before_reservation,
                         now,
                     );
+                    respawn_state.exit_evidence.clear_launch();
                 } else {
                     defer_launch_prerequisite(&mut respawn_state, now);
                 }
@@ -9048,6 +9292,10 @@ where
     record.status = STATUS_RUNNING.to_string();
     record.stop_reason = None;
     if strict_target.is_some() && !runtime_live {
+        if launch_died {
+            let evidence = respawn_state.exit_evidence.capture(env.runtime, &record);
+            exit_evidence::save_counted_exit(store, &record, &mut respawn_state, evidence, by)?;
+        }
         record.status = STATUS_STOPPED.into();
         record.stop_reason = prior_stop_reason.or_else(|| Some(STOP_REASON_RUNTIME_GONE.into()));
         record.runtime_spawned = false;
@@ -9059,12 +9307,13 @@ where
     // A returned Ok alone is insufficient: a launch can have died during survival checks.
     // Reset only after a live manual result and its record have both been persisted.
     if !automatic && !launch_died && env.spawn_runtime && restart_runtime_live {
-        save_hosted_respawn_state(
-            store,
-            &record.session_id,
-            &HostedRespawnState::default(),
-            by,
-        )?;
+        if !will_spawn && !raw_spawned {
+            respawn_state
+                .exit_evidence
+                .keep_live_launch(env.runtime, &record);
+        }
+        respawn_state.clear_incident();
+        save_hosted_respawn_state(store, &record.session_id, &respawn_state, by)?;
     }
     if resumed_existing {
         let baseline_ms = crate::boot_reconcile::hydration_baseline_ms(store, &record);
@@ -9216,17 +9465,21 @@ fn notify_crash_loop_recipients<S: AgentRegistry + MessageStore>(
             fl_core::At::from_unix_millis(state.next_allowed_at_ms.unwrap_or(0))
         )
     };
+    let evidence = exit_evidence::summary(state);
     let body = format!(
-        "Hosted session `{}` (persona `{}`, vendor `{}`) hit the fast crash-loop guard. {schedule} Inspect the failure; after resolving it, run `fl agent restart {}` to restart from saved settings. A prerequisite refusal before any process spawns spends no recovery launch; a real spawn stays charged. FerroLoop does not start the vendor daemon.",
+        "Hosted session `{}` (persona `{}`, vendor `{}`) hit the fast crash-loop guard. {schedule} Inspect the failure; after resolving it, run `fl agent restart {}` to restart from saved settings. A prerequisite refusal before any process spawns spends no recovery launch; a real spawn stays charged. FerroLoop does not start the vendor daemon. {evidence}.",
         fresh.session_id, fresh.persona, fresh.vendor, fresh.session_id
     );
     recovery::deliver_pending(state, &recipients, |recipient| {
+        let Some(agent) = agents.iter().find(|agent| agent.name_key == recipient) else {
+            return false;
+        };
         match store.send_wire(SendWireArgs {
             id: None,
             sender_id: None,
             sender_name: "system".into(),
             sender_host: None,
-            to: WireAddress::AgentName(recipient.to_string()),
+            to: WireAddress::AgentId(agent.id.clone()),
             kind: MessageKind::Mail,
             urgency: MessageUrgency::Normal,
             durable: true,
@@ -9379,9 +9632,10 @@ where
                 }
                 if !was_incident {
                     eprintln!(
-                        "hub: warning ({}): fast crash-loop guard tripped; first slow recovery due {} UTC",
+                        "hub: warning ({}): fast crash-loop guard tripped; first slow recovery due {} UTC; {}",
                         fresh.session_id,
-                        fl_core::At::from_unix_millis(rstate.next_allowed_at_ms.unwrap_or(0))
+                        fl_core::At::from_unix_millis(rstate.next_allowed_at_ms.unwrap_or(0)),
+                        exit_evidence::summary(&rstate),
                     );
                     on_event(
                         "session.crash_loop",
@@ -9390,9 +9644,10 @@ where
                 }
                 if exhaustion_transition {
                     eprintln!(
-                        "hub: warning ({}): recovery exhausted after {} slow launches; left stopped",
+                        "hub: warning ({}): recovery exhausted after {} slow launches; left stopped; {}",
                         fresh.session_id,
-                        recovery::RECOVERY_MAX_ATTEMPTS
+                        recovery::RECOVERY_MAX_ATTEMPTS,
+                        exit_evidence::summary(&rstate),
                     );
                     on_event(
                         "session.recovery_exhausted",
@@ -22027,6 +22282,198 @@ mod tests {
     }
 
     #[test]
+    fn hosted_exit_evidence_follows_counted_launches_without_a_surviving_pid() {
+        use fl_host_proto::{
+            ChildExit, HostInstance, HostedExitEvidence, SessionEpoch, SessionId, StreamId,
+        };
+        let _reset = RecoveryFixtureReset;
+        let home = TempDir::new().unwrap();
+        let _trusted = trusted_codex_home(home.path(), home.path());
+        let store = MemStore::default();
+        register(&store, "recovery-lead", "ferroloop", AgentRole::Lead);
+        let fake = FakeRuntime::default();
+        fake.vanish_windows.borrow_mut().push("codex".into());
+        *fake.hosted_exit_fixture.borrow_mut() = Some(HostedExitEvidence {
+            stream: StreamId {
+                host: HostInstance::new([1; 16]),
+                session: SessionId::new("Early.codex").unwrap(),
+                epoch: SessionEpoch(0),
+            },
+            exit: ChildExit {
+                code: Some(1),
+                signal: None,
+            },
+            started_at_ms: 10,
+            captured_at_ms: 20,
+            terminal_tail: "private fixed terminal failure".into(),
+        });
+        let env = fake.env(home.path());
+        let mut request = req("early", "assistant", "codex");
+        request.cwd = Some(home.path().display().to_string());
+        TEST_RESPAWN_NOW_MS.with(|clock| clock.set(Some(1_000)));
+        let out = spin_up(&store, &env, &request, "owner", Caller::Owner).unwrap();
+        let id = out.session_id.as_str();
+        assert!(!out.runtime_spawned);
+        assert_eq!(
+            get_hosted_session_by_id(&store, id).unwrap().unwrap().pid,
+            None
+        );
+
+        let sweep = |ms| {
+            TEST_RESPAWN_NOW_MS.with(|clock| clock.set(Some(ms)));
+            reconcile_and_respawn_hosted_sessions(&store, &env)
+                .unwrap()
+                .len()
+        };
+        fake.presence_of
+            .borrow_mut()
+            .insert("Early:codex".into(), RuntimePresence::Gone);
+        for launch in 1..=10 {
+            let due = load_hosted_respawn_state(&store, id)
+                .unwrap()
+                .next_allowed_at_ms;
+            let now = match launch {
+                1 => 1_000,
+                2 => 1_001 + DEAD_STREAK_MIN_SPACING_MS,
+                _ => {
+                    let due = due.unwrap();
+                    assert_eq!(sweep(due), 1);
+                    due
+                }
+            };
+            assert_eq!(sweep(now + 1), 0);
+            assert_eq!(
+                sweep(now + DEAD_STREAK_MIN_SPACING_MS + 1),
+                usize::from(launch == 1)
+            );
+            let state = load_hosted_respawn_state(&store, id).unwrap();
+            let evidence = state.exit_evidence.latest_evidence().unwrap();
+            assert_eq!(evidence.stream.epoch, SessionEpoch(launch));
+            assert_eq!(evidence.terminal_tail, "private fixed terminal failure");
+            assert!(!format!("{state:?}").contains("private fixed terminal"));
+        }
+
+        assert_eq!(fake.hosted_exit_lookups.borrow().len(), 10);
+        assert!(
+            fake.hosted_exit_lookups
+                .borrow()
+                .iter()
+                .enumerate()
+                .all(
+                    |(n, (stream, owner))| stream.epoch == SessionEpoch(n as u64 + 1)
+                        && owner == id
+                )
+        );
+        let stored = store
+            .get_state_by_key(
+                &StateScope::Workspace,
+                StateConcern::Runtime,
+                &hosted_respawn_state_slug(id),
+            )
+            .unwrap()
+            .unwrap();
+        assert!(stored.sensitive);
+        let notices = store
+            .list_wire_inbox(&fl_core::ferrowire::WireFilter {
+                recipient: Some("recovery-lead".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(notices.len(), 2);
+        for notice in notices {
+            assert!(matches!(notice.message.to, WireAddress::AgentId(_)));
+            assert!(notice.message.body.contains("deterministic launch failure"));
+            assert!(notice.message.body.contains("exit code 1"));
+            assert!(!notice.message.body.contains("private fixed terminal"));
+        }
+    }
+
+    #[test]
+    fn hosted_exit_evidence_does_not_reuse_a_different_epoch_as_a_clean_exit() {
+        use fl_host_proto::{
+            ChildExit, HostInstance, HostedExitEvidence, SessionEpoch, SessionId, StreamId,
+        };
+        let _reset = RecoveryFixtureReset;
+        for matching in [true, false] {
+            let home = TempDir::new().unwrap();
+            let _trusted = trusted_codex_home(home.path(), home.path());
+            let store = MemStore::default();
+            let fake = FakeRuntime::default();
+            fake.vanish_windows.borrow_mut().push("codex".into());
+            *fake.hosted_exit_fixture.borrow_mut() = Some(HostedExitEvidence {
+                stream: StreamId {
+                    host: HostInstance::new([1; 16]),
+                    session: SessionId::new("Clean.codex").unwrap(),
+                    epoch: SessionEpoch(0),
+                },
+                exit: ChildExit {
+                    code: Some(0),
+                    signal: None,
+                },
+                started_at_ms: 10,
+                captured_at_ms: 20,
+                terminal_tail: "terminal output".into(),
+            });
+            let env = fake.env(home.path());
+            let mut request = req("clean", "assistant", "codex");
+            request.cwd = Some(home.path().display().to_string());
+            TEST_RESPAWN_NOW_MS.with(|clock| clock.set(Some(1_000)));
+            let out = spin_up(&store, &env, &request, "owner", Caller::Owner).unwrap();
+            let id = out.session_id.as_str();
+            let running = get_hosted_session_by_id(&store, id).unwrap().unwrap();
+            if !matching {
+                // The name was reused. Its clean exit cannot classify epoch one.
+                fake.hosted_exit_fixture
+                    .borrow_mut()
+                    .as_mut()
+                    .unwrap()
+                    .stream
+                    .epoch = SessionEpoch(2);
+            }
+            fake.presence_of
+                .borrow_mut()
+                .insert("Clean:codex".into(), RuntimePresence::Gone);
+            let reconcile = |ms| {
+                TEST_RESPAWN_NOW_MS.with(|clock| clock.set(Some(ms)));
+                reconcile_dead_hosted_session_fenced(
+                    &store,
+                    &env,
+                    running.clone(),
+                    AUTO_RESPAWN_ACTOR,
+                )
+                .unwrap();
+            };
+            reconcile(1_001);
+            reconcile(1_001 + DEAD_STREAK_MIN_SPACING_MS);
+            let stopped = get_hosted_session_by_id(&store, id).unwrap().unwrap();
+            assert_eq!(stopped.status, STATUS_STOPPED);
+            assert_eq!(
+                stopped.stop_reason.as_deref(),
+                Some(if matching {
+                    STOP_REASON_CLEAN_EXIT
+                } else {
+                    STOP_REASON_RUNTIME_GONE
+                })
+            );
+            assert_eq!(
+                fake.hosted_exit_lookups.borrow()[0].0.epoch,
+                SessionEpoch(1)
+            );
+
+            if !matching {
+                let state = load_hosted_respawn_state(&store, id).unwrap();
+                assert_eq!(exit_evidence::summary(&state), "evidence: unavailable");
+                // A running-record retry after evidence reached storage reuses the same
+                // counted observation instead of fetching and counting another exit.
+                reconcile(1_002 + DEAD_STREAK_MIN_SPACING_MS);
+                reconcile(1_002 + 2 * DEAD_STREAK_MIN_SPACING_MS);
+                assert_eq!(fake.hosted_exit_lookups.borrow().len(), 1);
+                assert_eq!(load_hosted_respawn_state(&store, id).unwrap(), state);
+            }
+        }
+    }
+
+    #[test]
     fn slow_recovery_stops_after_six_early_deaths_without_refilling_fast_budget() {
         let _reset = RecoveryFixtureReset;
         let home = TempDir::new().unwrap();
@@ -22450,6 +22897,13 @@ mod tests {
                 .unwrap()
         };
         assert_eq!(inbox("coordinator").len(), 1);
+        assert!(
+            inbox("coordinator")[0]
+                .message
+                .body
+                .contains("evidence: unavailable"),
+            "a legacy recovery incident must explicitly report unavailable evidence"
+        );
         assert!(inbox("captain").is_empty());
         assert!(
             inbox("coordinator")[0]

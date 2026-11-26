@@ -2763,6 +2763,7 @@ fn is_reserved_hub_slug(slug: &str) -> bool {
     slug.starts_with("hub-pairing-")
         || slug.starts_with("hub-session-")
         || slug.starts_with("hub-node-")
+        || slug.starts_with(crate::lifecycle::HOSTED_RESPAWN_STATE_SLUG_PREFIX)
 }
 
 fn is_internal_hub_entry(entry: &StateEntry) -> bool {
@@ -3044,10 +3045,7 @@ fn handle_post_state(
 
     let normalized_slug = slug.trim().to_ascii_lowercase();
     if is_reserved_hub_slug(&normalized_slug) {
-        return HttpResponse::json(
-            403,
-            json!({ "error": "reserved internal hub authentication slug prefix" }),
-        );
+        return HttpResponse::json(403, json!({ "error": "reserved internal hub slug prefix" }));
     }
 
     let sensitive_flag = obj.get("sensitive").and_then(Value::as_bool);
@@ -3220,7 +3218,7 @@ fn handle_post_state_checkpoint(
         if is_reserved_hub_slug(&normalized) {
             return HttpResponse::json(
                 403,
-                json!({ "error": "reserved internal hub authentication slug prefix" }),
+                json!({ "error": "reserved internal hub slug prefix" }),
             );
         }
     }
@@ -11126,6 +11124,49 @@ mod tests {
             .unwrap();
         assert_ne!(secret.snippet, "[REDACTED]");
         assert!(owner.iter().all(|h| h.entry.slug != "hub-session-abc123"));
+    }
+
+    #[test]
+    fn private_hosted_exit_evidence_is_excluded_even_from_owner_state_views() {
+        let (_dir, store) = test_store(fl_store::BackendKind::Redb);
+        let slug = crate::lifecycle::hosted_respawn_state_slug("claude:fixture");
+        store
+            .upsert_state(UpsertStateArgs {
+                scope: StateScope::Workspace,
+                slug: slug.clone(),
+                sensitivity: SensitivityPatch::SetSensitive,
+                payload: StatePayload::Runtime(RuntimeEntry {
+                    value: json!({"terminal_tail": "privatecapturedoutput"}),
+                    merge_mode: MergeMode::LastWriter,
+                }),
+                at: stamp::now(),
+                by: "fixture".into(),
+            })
+            .unwrap();
+        let owner = HubAuthority::Owner {
+            login: "owner".into(),
+        };
+        let state = handle_get_state(&store, &owner, &HttpRequest::new("GET", "/api/v1/state"));
+        assert_eq!(state.status, 200);
+        assert_eq!(state.json_value().unwrap()["entries"], json!([]));
+        let entries = store.list_state(None, None).unwrap();
+        let (hits, total) = search_state_for_hub(
+            &store,
+            &entries,
+            "privatecapturedoutput",
+            None,
+            None,
+            10,
+            true,
+        );
+        assert!(hits.is_empty());
+        assert_eq!(total, 0);
+        let write = HttpRequest::new("POST", "/api/v1/state").with_json_body(&json!({
+            "slug": slug,
+            "concern": "runtime",
+            "value": "overwrite attempt",
+        }));
+        assert_eq!(handle_post_state(&store, &owner, &write).status, 403);
     }
 
     fn sensitive_handoff_entry(n: u64) -> StateEntry {

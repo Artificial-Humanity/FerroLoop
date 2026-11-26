@@ -19,6 +19,9 @@ pub(super) fn classify(state: &mut HostedRespawnState, reason: &str, now: u64) -
         state
             .respawn_timestamps_ms
             .retain(|ts| now.saturating_sub(*ts) < AUTO_RESPAWN_WINDOW_MS);
+        state
+            .exit_evidence
+            .prune_fast_exits(&state.respawn_timestamps_ms, now);
         if reason == STOP_REASON_CRASH_LOOP
             || state.respawn_timestamps_ms.len() >= AUTO_RESPAWN_MAX_IN_WINDOW
         {
@@ -84,7 +87,7 @@ pub(super) fn observe_health(state: &mut HostedRespawnState, alive: bool, now: u
     }
     match state.recovery_healthy_since_ms {
         Some(since) if now >= since && now - since >= RECOVERY_INTERVAL_MS => {
-            *state = HostedRespawnState::default()
+            state.clear_incident()
         }
         Some(since) if now >= since => {}
         _ => state.recovery_healthy_since_ms = Some(now),
