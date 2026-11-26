@@ -7424,53 +7424,38 @@ fn retained_fence_codex_gate(cleaned: &str) -> Result<(), FenceRecoveryOutcome> 
 
     let lines: Vec<_> = cleaned.lines().collect();
     let Some(composer) = codex_composer_range(&lines) else {
-        return Err(Inconclusive);
+        return if lines.iter().copied().any(retained_fence_codex_working) {
+            Err(SeatBusy)
+        } else {
+            Err(Inconclusive)
+        };
     };
-    let mut above_composer = &lines[..composer.start];
-    if let Some((last, rest)) = above_composer.split_last()
-        && last.trim().is_empty()
-    {
-        above_composer = rest;
-    }
-    if retained_fence_codex_working(above_composer) {
-        return Err(SeatBusy);
-    }
 
-    // Codex puts queued inputs and thread approval notices in between Working
-    // and the composer. Stay inside the contiguous preview layout near the
-    // prompt, and hold when a preview hides or clips the status.
+    // The rendered status, detail rows and previews can be separated from
+    // each other or the composer by blank rows. An ordinary transcript row
+    // ends this scan, so older Working text does not hold an idle seat.
     let mut saw_preview = false;
-    let mut previous_blank = false;
-    for (index, line) in above_composer.iter().enumerate().rev().take(24) {
-        let trimmed = line.trim();
-        let title = line
-            .strip_prefix("• ")
-            .or_else(|| line.strip_prefix("  "))
-            .unwrap_or_default()
-            .trim_end();
-        let blank = trimmed.is_empty();
-        if matches!(
-            title,
-            "Queued follow-up inputs" | "Messages to be submitted at end of turn"
-        ) || title.starts_with("Messages to be submitted after next tool call")
-            || line.starts_with("  ↳ ")
-            || line.starts_with("  ! Approval needed in ")
-            || (line.starts_with("    ")
-                && (trimmed.ends_with(" edit last queued message")
-                    || trimmed == "/subagents to review requests"))
-        {
-            saw_preview = true;
-        } else if blank {
-            if !saw_preview || previous_blank {
-                break;
-            }
-            if retained_fence_codex_working(&above_composer[..index]) {
+    let mut unanchored_continuation = false;
+    for &row in lines[..composer.start].iter().rev() {
+        if retained_fence_codex_working(row) {
+            if !unanchored_continuation {
                 return Err(SeatBusy);
             }
-        } else if !line.starts_with("  ") {
             break;
         }
-        previous_blank = blank;
+        let preview = retained_fence_codex_preview_row(row);
+        saw_preview |= preview;
+        if preview || row.starts_with(" └ ") || row.starts_with("  └ ") {
+            unanchored_continuation = false;
+        } else if row.trim().is_empty() {
+            continue;
+        } else if row.starts_with("  ") {
+            // A wrapped status detail or preview must lead back to one of
+            // its recognized rows before we treat it as part of the widget.
+            unanchored_continuation = true;
+        } else {
+            break;
+        }
     }
     if saw_preview {
         return Err(Inconclusive);
@@ -7478,25 +7463,27 @@ fn retained_fence_codex_gate(cleaned: &str) -> Result<(), FenceRecoveryOutcome> 
     Ok(())
 }
 
-fn retained_fence_codex_working(rows: &[&str]) -> bool {
-    let mut rows = rows.iter().rev().copied();
-    while let Some(row) = rows.next() {
-        let trimmed = row.trim();
-        if trimmed.starts_with("• Working (") || matches!(trimmed, "• Working..." | "• Working…")
-        {
-            return true;
-        }
+fn retained_fence_codex_working(row: &str) -> bool {
+    let trimmed = row.trim();
+    trimmed.starts_with("• Working (") || matches!(trimmed, "• Working..." | "• Working…")
+}
 
-        // The status detail and working tip can each start a branch. Only
-        // walk contiguous branches and their deeper-indented continuations.
-        let branch = std::iter::once(row)
-            .chain(rows.by_ref())
-            .find(|line| !line.starts_with("   ") || line.trim().is_empty());
-        if !branch.is_some_and(|line| line.starts_with(" └ ") || line.starts_with("  └ ")) {
-            break;
-        }
-    }
-    false
+fn retained_fence_codex_preview_row(row: &str) -> bool {
+    let trimmed = row.trim();
+    let title = row
+        .strip_prefix("• ")
+        .or_else(|| row.strip_prefix("  "))
+        .unwrap_or_default()
+        .trim_end();
+    matches!(
+        title,
+        "Queued follow-up inputs" | "Messages to be submitted at end of turn"
+    ) || title.starts_with("Messages to be submitted after next tool call")
+        || row.starts_with("  ↳ ")
+        || row.starts_with("  ! Approval needed in ")
+        || (row.starts_with("    ")
+            && (trimmed.ends_with(" edit last queued message")
+                || trimmed == "/subagents to review requests"))
 }
 
 fn retained_fence_codex_onboarding(cleaned: &str) -> bool {
@@ -21327,6 +21314,13 @@ exit 1"#,
         assert!(is_composer_occupied_zero_keys_error(&err), "got: {err}");
     }
 
+    // Final rows of two busy Codex 0.172.0 captures from fl host capture --rendered.
+    // Transcript and private footer details omitted. Blank-row padding normalized.
+    const CODEX_BUSY_CAPTURE: &str =
+        include_str!("../tests/fixtures/codex-0.172.0-busy-standard.txt");
+    const CODEX_BUSY_WARNING_CAPTURE: &str =
+        include_str!("../tests/fixtures/codex-0.172.0-busy-warning.txt");
+
     #[test]
     fn retained_fence_recovery_requires_a_located_ready_composer() {
         let codex = VendorRoute::Codex {
@@ -21343,17 +21337,19 @@ exit 1"#,
         let busy_with_tip = format!(
             "• Working (4s · esc to interrupt)\n  └ Tip: Try /help.\n                                          Copying 5 chars…\n\n{idle}"
         );
-        let queued = "• Queued follow-up inputs\n  ↳ later\n    shift+← edit last queued message";
+        let queued = "• Queued follow-up inputs\n  ↳ later\n    a wrapped input\n    shift+← edit last queued message";
         let busy_with_approval_and_queue = format!(
             "• Working (4s · esc to interrupt)\n └ Checking policy\n  └ Tip text\n\n  ! Approval needed in Robie [explorer]\n    /subagents to review requests\n\n{queued}\n\n{idle}"
         );
         let queue_without_status = format!("{queued}\n\n{idle}");
         let clipped_queue = format!("  ↳ later\n\n{idle}");
         let old_busy = format!("• Working…\nPrevious turn completed.\n\n{idle}");
-        let old_busy_with_branches =
-            format!("• Working…\n\n └ Previous detail\n  └ Previous tip\n\n{idle}");
+        let old_busy_with_indented_output =
+            format!("• Working…\n    Previous turn completed.\n\n{idle}");
+        let busy_with_separated_branches =
+            format!("• Working…\n\n └ Checking policy\n  └ Tip text\n\n{idle}");
         let old_queue = format!("• Working…\n\n{queued}\nPrevious turn completed.\n\n{idle}");
-        let distant_busy = format!("• Working...\n\n\n{idle}");
+        let busy_with_blank_rows = format!("• Working...\n\n\n{idle}");
         let busy_draft = format!("› owner draft\n  • Working...\n\n{footer}");
         let unlocated_busy = format!("• Working...\n\n{footer}");
         let sign_in =
@@ -21380,17 +21376,26 @@ exit 1"#,
                 Err(FenceRecoveryOutcome::Inconclusive),
             ),
             (old_busy.as_str(), Ok(())),
-            (old_busy_with_branches.as_str(), Ok(())),
+            (old_busy_with_indented_output.as_str(), Ok(())),
+            (
+                busy_with_separated_branches.as_str(),
+                Err(FenceRecoveryOutcome::SeatBusy),
+            ),
             (old_queue.as_str(), Ok(())),
-            (distant_busy.as_str(), Ok(())),
+            (
+                busy_with_blank_rows.as_str(),
+                Err(FenceRecoveryOutcome::SeatBusy),
+            ),
+            (CODEX_BUSY_CAPTURE, Err(FenceRecoveryOutcome::SeatBusy)),
+            (
+                CODEX_BUSY_WARNING_CAPTURE,
+                Err(FenceRecoveryOutcome::SeatBusy),
+            ),
             (
                 busy_draft.as_str(),
                 Err(FenceRecoveryOutcome::ComposerDraft),
             ),
-            (
-                unlocated_busy.as_str(),
-                Err(FenceRecoveryOutcome::Inconclusive),
-            ),
+            (unlocated_busy.as_str(), Err(FenceRecoveryOutcome::SeatBusy)),
             (footer, Err(FenceRecoveryOutcome::Inconclusive)),
             ("", Err(FenceRecoveryOutcome::BlankScreen)),
             (sign_in, Err(FenceRecoveryOutcome::VendorSignIn)),
@@ -21681,7 +21686,9 @@ exit 1"#,
             ReplacedBeforeEnter,
             BusyBeforePaste,
             HookAndTipBeforePaste,
+            CapturedBusyBeforePaste,
             BusyBeforeEnter,
+            CapturedBusyBeforeEnter,
             AckedBeforeEnter,
             WriteError,
             CodexIncidentMail,
@@ -21714,6 +21721,8 @@ exit 1"#,
         let server_counts = Arc::clone(&counts);
         let footer = "  GPT-6.1-Sol medium · ~/project\n  ← for agents · ? for shortcuts";
         let busy_preview = "• Working (4s · esc to interrupt)\n\n  Queued follow-up inputs\n  ↳ later\n    shift+← edit last queued message";
+        let idle_capture =
+            &CODEX_BUSY_WARNING_CAPTURE[CODEX_BUSY_WARNING_CAPTURE.find("› ").unwrap()..];
         let scenarios = [
             SignIn,
             LostCapture,
@@ -21721,7 +21730,9 @@ exit 1"#,
             ReplacedBeforeEnter,
             BusyBeforePaste,
             HookAndTipBeforePaste,
+            CapturedBusyBeforePaste,
             BusyBeforeEnter,
+            CapturedBusyBeforeEnter,
             AckedBeforeEnter,
             WriteError,
             CodexIncidentMail,
@@ -21776,13 +21787,22 @@ exit 1"#,
                                             "• Working (35s · esc to interrupt)\n └ Checking policy\n   and its hooks\n  └ Tip text\n\n› Ask Codex to do anything\n\n{footer}"
                                         )
                                     }
+                                    (CapturedBusyBeforePaste, 2, _) => CODEX_BUSY_CAPTURE.into(),
                                     (_, _, 1) => {
                                         let composer = scenario.payload().replace('\n', "\n  ");
-                                        if scenario == BusyBeforeEnter {
-                                            format!("{busy_preview}\n\n› {composer}\n\n{footer}")
-                                        } else {
-                                            format!("› {composer}\n\n{footer}")
+                                        match scenario {
+                                            BusyBeforeEnter => {
+                                                format!("{busy_preview}\n\n› {composer}\n\n{footer}")
+                                            }
+                                            CapturedBusyBeforeEnter => CODEX_BUSY_WARNING_CAPTURE
+                                                .replacen(CODEX_GHOST_PLACEHOLDER, &composer, 1),
+                                            CodexIncidentMail => idle_capture
+                                                .replacen(CODEX_GHOST_PLACEHOLDER, &composer, 1),
+                                            _ => format!("› {composer}\n\n{footer}"),
                                         }
+                                    }
+                                    (CapturedBusyBeforeEnter | CodexIncidentMail, _, _) => {
+                                        idle_capture.into()
                                     }
                                     _ => format!("› Ask Codex to do anything\n\n{footer}"),
                                 };
@@ -21880,11 +21900,15 @@ exit 1"#,
             let (reason, expected_writes) = match scenario {
                 SignIn => (Some(FenceRecoveryOutcome::VendorSignIn), 0),
                 LostCapture => (Some(FenceRecoveryOutcome::HostedCaptureUnavailable), 0),
-                BusyBeforePaste | HookAndTipBeforePaste => {
+                BusyBeforePaste | HookAndTipBeforePaste | CapturedBusyBeforePaste => {
                     (Some(FenceRecoveryOutcome::SeatBusy), 0)
                 }
                 ReplacedBeforePayload => (Some(FenceRecoveryOutcome::RouteChanged), 0),
-                ReplacedBeforeEnter | BusyBeforeEnter | AckedBeforeEnter | WriteError => (None, 1),
+                ReplacedBeforeEnter
+                | BusyBeforeEnter
+                | CapturedBusyBeforeEnter
+                | AckedBeforeEnter
+                | WriteError => (None, 1),
                 CodexIncidentMail | GrokIncidentMail => (None, 2),
             };
             match (scenario, outcome) {
@@ -21895,7 +21919,10 @@ exit 1"#,
                         stream.session.as_str(),
                     )]));
                 }
-                (BusyBeforeEnter, Err(RecoveryPasteError::Uncertain(_))) => {
+                (
+                    BusyBeforeEnter | CapturedBusyBeforeEnter,
+                    Err(RecoveryPasteError::Uncertain(_)),
+                ) => {
                     assert_eq!(guard.permission.get(), Err(FenceRecoveryOutcome::SeatBusy));
                 }
                 (ReplacedBeforeEnter | WriteError, Err(RecoveryPasteError::Uncertain(_)))
