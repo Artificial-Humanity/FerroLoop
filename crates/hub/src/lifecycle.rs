@@ -6735,12 +6735,13 @@ where
         } else {
             // Both launches share one recovery reservation. Preserve the resume's exit
             // if the fallback never creates a child, and sample before any cleanup kill.
-            let failed_resume = raw_spawned.then(|| {
-                (
-                    record.clone(),
-                    respawn_state.exit_evidence.capture(env.runtime, &record),
-                )
-            });
+            let failed_resume = if raw_spawned {
+                respawn_state
+                    .exit_evidence
+                    .capture_failed_resume(env.runtime, &record)
+            } else {
+                None
+            };
             let _ = env.runtime.kill(&unit, &session_id);
             let failed_sid = resumed_sid;
             push_tombstone(&mut record.tombstone_ids, &failed_sid);
@@ -6800,14 +6801,8 @@ where
                 launch.as_ref(),
                 by,
             )?;
-            if !raw_spawned && let Some((failed_record, evidence)) = failed_resume {
-                exit_evidence::save_counted_exit(
-                    store,
-                    &failed_record,
-                    &mut respawn_state,
-                    evidence,
-                    by,
-                )?;
+            if !raw_spawned && let Some(exit) = failed_resume {
+                exit.save_after_unspawned_fallback(store, &record, &mut respawn_state, by)?;
             }
             if raw_spawned && let Some(target) = tmux_target.as_deref() {
                 apply_startup_prompt_rules(env.runtime, &v.vendor, target);
@@ -9179,12 +9174,13 @@ where
         } else {
             // Both launches share one recovery reservation. Preserve the resume's exit
             // if the fallback never creates a child, and sample before any cleanup kill.
-            let failed_resume = raw_spawned.then(|| {
-                (
-                    record.clone(),
-                    respawn_state.exit_evidence.capture(env.runtime, &record),
-                )
-            });
+            let failed_resume = if raw_spawned {
+                respawn_state
+                    .exit_evidence
+                    .capture_failed_resume(env.runtime, &record)
+            } else {
+                None
+            };
             let _ = env.runtime.kill(&unit, &record.session_id);
             let failed_sid = resumed_sid;
             push_tombstone(&mut record.tombstone_ids, &failed_sid);
@@ -9253,14 +9249,8 @@ where
                     launched_with_prompt = launch.is_some();
                 }
             } else {
-                if let Some((failed_record, evidence)) = failed_resume {
-                    exit_evidence::save_counted_exit(
-                        store,
-                        &failed_record,
-                        &mut respawn_state,
-                        evidence,
-                        by,
-                    )?;
+                if let Some(exit) = failed_resume {
+                    exit.save_after_unspawned_fallback(store, &record, &mut respawn_state, by)?;
                 }
                 launch_died = true;
                 record.runtime_spawned = false;
@@ -22663,6 +22653,131 @@ mod tests {
             let body = item["message"]["body"].as_str().unwrap();
             assert!(body.contains("exit code 1"));
             assert!(!body.contains("private fixed terminal"));
+        }
+    }
+
+    #[test]
+    fn hosted_exit_evidence_follows_the_only_child_after_claude_resume_fallback() {
+        use fl_host_proto::{
+            ChildExit, HostInstance, HostedExitEvidence, SessionEpoch, SessionId, StreamId,
+        };
+        for fallback_spawns in [false, true] {
+            let _reset = RecoveryFixtureReset;
+            let home = TempDir::new().unwrap();
+            let store = MemStore::default();
+            let fake = std::rc::Rc::new(FakeRuntime::default());
+            let env = fake.env(home.path());
+            *fake.hosted_exit_fixture.borrow_mut() = Some(HostedExitEvidence {
+                stream: StreamId {
+                    host: HostInstance::new([1; 16]),
+                    session: SessionId::new("Ada.claude").unwrap(),
+                    epoch: SessionEpoch(0),
+                },
+                exit: ChildExit {
+                    code: Some(1),
+                    signal: None,
+                },
+                started_at_ms: 10,
+                captured_at_ms: 20,
+                terminal_tail: "private resume failure".into(),
+            });
+            let spun = spin_up(
+                &store,
+                &env,
+                &req("ada", "assistant", "claude"),
+                "owner",
+                Caller::Owner,
+            )
+            .unwrap();
+            let id = &spun.session_id;
+            let generation = spun.hydration_generation.as_deref();
+            record_hydration_ack(&store, "ada", true, generation, Some(id)).unwrap();
+            let mut stopped = get_hosted_session_by_id(&store, id).unwrap().unwrap();
+            let sid = stopped.vendor_session_id.as_deref().unwrap();
+            write_claude_transcript(home.path(), false, sid, "claude-opus-5-5", 10_000, false);
+            stopped.status = STATUS_STOPPED.into();
+            stopped.stop_reason = Some(STOP_REASON_RUNTIME_GONE.into());
+            persist_hosted_session(&store, &stopped, "fixture").unwrap();
+            fake.clear();
+
+            let first_fast = 1_000;
+            let mut state = load_hosted_respawn_state(&store, id).unwrap();
+            state.respawn_timestamps_ms = vec![first_fast, 31_000];
+            save_hosted_respawn_state(&store, id, &state, "fixture").unwrap();
+            let observed_at = first_fast + AUTO_RESPAWN_WINDOW_MS - 1;
+            TEST_RESPAWN_NOW_MS.with(|clock| clock.set(Some(observed_at)));
+            fake.vanish_unit_after_owns_checks("Ada", 1);
+            fake.hosted_exit_pending_epoch.set(Some(SessionEpoch(2)));
+            if !fallback_spawns {
+                let fake = fake.clone();
+                TEST_CLAUDE_RESUME_WATCH_HOOK.with(|hook| {
+                    *hook.borrow_mut() = Some(Box::new(move || {
+                        fake.fail_windows.borrow_mut().push("claude".into());
+                    }));
+                });
+            }
+
+            let restarted = restart_hosted_session(&store, &env, id, AUTO_RESPAWN_ACTOR);
+            TEST_CLAUDE_RESUME_WATCH_HOOK.with(|hook| *hook.borrow_mut() = None);
+            let restarted = restarted.unwrap();
+            assert_eq!(restarted.runtime_live, fallback_spawns);
+            assert_ne!(restarted.record.hydration_generation.as_deref(), generation);
+            assert_eq!(
+                fake.calls
+                    .borrow()
+                    .iter()
+                    .filter(|call| call.as_str() == "spawn Ada:claude")
+                    .count(),
+                3
+            );
+            let state = load_hosted_respawn_state(&store, id).unwrap();
+            assert_eq!(
+                state.respawn_timestamps_ms,
+                [first_fast, 31_000, observed_at]
+            );
+            if fallback_spawns {
+                assert_eq!(
+                    state
+                        .exit_evidence
+                        .bound_stream(&restarted.record)
+                        .unwrap()
+                        .epoch,
+                    SessionEpoch(3)
+                );
+                assert!(state.exit_evidence.latest_evidence().is_none());
+                continue;
+            }
+
+            fake.presence_of
+                .borrow_mut()
+                .insert("Ada:claude".into(), RuntimePresence::Gone);
+            let sweep = |ms| {
+                TEST_RESPAWN_NOW_MS.with(|clock| clock.set(Some(ms)));
+                assert!(
+                    reconcile_and_respawn_hosted_sessions(&store, &env)
+                        .unwrap()
+                        .is_empty()
+                );
+            };
+            sweep(observed_at + 1);
+            sweep(observed_at + 2);
+            let state = load_hosted_respawn_state(&store, id).unwrap();
+            assert_eq!(
+                state.respawn_timestamps_ms,
+                [first_fast, 31_000, observed_at]
+            );
+            assert_eq!(state.recovery_started_at_ms, None);
+            fake.hosted_exit_pending_epoch.set(None);
+            sweep(observed_at + 3);
+            let state = load_hosted_respawn_state(&store, id).unwrap();
+            assert_eq!(state.recovery_started_at_ms, Some(observed_at));
+            assert_eq!(
+                state.next_allowed_at_ms,
+                Some(observed_at + recovery::RECOVERY_INTERVAL_MS)
+            );
+            let evidence = state.exit_evidence.latest_evidence().unwrap();
+            assert_eq!(evidence.stream.epoch, SessionEpoch(2));
+            assert_eq!(evidence.terminal_tail, "private resume failure");
         }
     }
 

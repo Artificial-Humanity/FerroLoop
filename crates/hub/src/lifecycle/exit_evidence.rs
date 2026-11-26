@@ -31,6 +31,53 @@ struct CountedExit {
     pending: bool,
 }
 
+impl CountedExit {
+    fn new(launch: &HostedLaunch, status: HostedExitEvidenceStatus, observed_at_ms: u64) -> Self {
+        let (evidence, pending) = match status {
+            HostedExitEvidenceStatus::Exited(evidence) => (Some(evidence), false),
+            HostedExitEvidenceStatus::Pending => (None, true),
+            HostedExitEvidenceStatus::Unavailable => (None, false),
+        };
+        Self {
+            stream: launch.stream.clone(),
+            attempt: launch.attempt,
+            observed_at_ms,
+            evidence,
+            pending,
+        }
+    }
+}
+
+pub(super) struct FailedResumeExit {
+    launch: HostedLaunch,
+    exit: CountedExit,
+}
+
+impl FailedResumeExit {
+    pub(super) fn save_after_unspawned_fallback<S: StateStore>(
+        self,
+        store: &S,
+        record: &HostedSessionRecord,
+        state: &mut HostedRespawnState,
+        by: &str,
+    ) -> Result<(), LifecycleError> {
+        let incident = &mut state.exit_evidence;
+        if let Some(generation) = &record.hydration_generation
+            && incident.launch.as_ref() == Some(&self.launch)
+            && incident.push_counted_exit(self.exit)
+        {
+            // This resume was the only child in the attempt. Carry its exact stream
+            // forward with the fallback generation in the same write as its exit.
+            incident.launch = Some(HostedLaunch {
+                generation: generation.clone(),
+                ..self.launch
+            });
+            persist_counted_exit(store, record, state, by)?;
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostedExitIncident {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -152,6 +199,20 @@ impl HostedExitIncident {
         capture_exact(runtime, stream, &record.session_id)
     }
 
+    pub(super) fn capture_failed_resume(
+        &self,
+        runtime: &dyn SessionRuntime,
+        record: &HostedSessionRecord,
+    ) -> Option<FailedResumeExit> {
+        let launch = self.matching_launch(record)?;
+        let observed_at_ms = current_respawn_clock_ms();
+        let exit = CountedExit::new(launch, self.capture(runtime, record), observed_at_ms);
+        Some(FailedResumeExit {
+            launch: launch.clone(),
+            exit,
+        })
+    }
+
     /// Resolve Pending for the current launch, retaining its original observation time.
     pub(super) fn refresh_for_recovery(
         &mut self,
@@ -201,7 +262,7 @@ impl HostedExitIncident {
         }
     }
 
-    pub(super) fn count_exit(
+    fn count_exit(
         &mut self,
         record: &HostedSessionRecord,
         status: HostedExitEvidenceStatus,
@@ -210,25 +271,17 @@ impl HostedExitIncident {
         let Some(launch) = self.matching_launch(record) else {
             return false;
         };
-        if self.exits.iter().any(|entry| entry.stream == launch.stream) {
+        self.push_counted_exit(CountedExit::new(launch, status, now))
+    }
+
+    fn push_counted_exit(&mut self, exit: CountedExit) -> bool {
+        if self.exits.iter().any(|entry| entry.stream == exit.stream) {
             return false;
         }
-        let (evidence, pending) = match status {
-            HostedExitEvidenceStatus::Exited(evidence) => (Some(evidence), false),
-            HostedExitEvidenceStatus::Pending => (None, true),
-            HostedExitEvidenceStatus::Unavailable => (None, false),
-        };
-        let entry = CountedExit {
-            stream: launch.stream.clone(),
-            attempt: launch.attempt,
-            observed_at_ms: now,
-            evidence,
-            pending,
-        };
         if self.exits.len() >= MAX_EXITS {
             self.exits.drain(..self.exits.len() - MAX_EXITS + 1);
         }
-        self.exits.push(entry);
+        self.exits.push(exit);
         true
     }
 }
@@ -289,18 +342,28 @@ pub(super) fn save_counted_exit<S: StateStore>(
         .exit_evidence
         .count_exit(record, status, current_respawn_clock_ms())
     {
-        save_hosted_respawn_state(store, &record.session_id, state, by)?;
-        if let Some(exit) = state.exit_evidence.exits.last() {
-            let detail = match &exit.evidence {
-                Some(evidence) => exit_status(evidence),
-                None if exit.pending => "evidence: pending".into(),
-                None => "evidence: unavailable".into(),
-            };
-            eprintln!(
-                "hub: warning ({}): counted hosted child exit at epoch {}. {detail}",
-                record.session_id, exit.stream.epoch.0,
-            );
-        }
+        persist_counted_exit(store, record, state, by)?;
+    }
+    Ok(())
+}
+
+fn persist_counted_exit<S: StateStore>(
+    store: &S,
+    record: &HostedSessionRecord,
+    state: &HostedRespawnState,
+    by: &str,
+) -> Result<(), LifecycleError> {
+    save_hosted_respawn_state(store, &record.session_id, state, by)?;
+    if let Some(exit) = state.exit_evidence.exits.last() {
+        let detail = match &exit.evidence {
+            Some(evidence) => exit_status(evidence),
+            None if exit.pending => "evidence: pending".into(),
+            None => "evidence: unavailable".into(),
+        };
+        eprintln!(
+            "hub: warning ({}): counted hosted child exit at epoch {}. {detail}",
+            record.session_id, exit.stream.epoch.0,
+        );
     }
     Ok(())
 }
