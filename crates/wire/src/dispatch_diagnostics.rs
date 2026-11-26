@@ -60,6 +60,7 @@ pub enum FenceRecoveryOutcome {
     NonHostedRoute,
     UnsupportedRoute,
     SeatBusy,
+    SeatBusyProlonged,
     DialogWaiting,
     ComposerDraft,
     BlankScreen,
@@ -93,6 +94,7 @@ impl FenceRecoveryOutcome {
             Self::NonHostedRoute => "non-hosted route",
             Self::UnsupportedRoute => "timed recovery unsupported for this route",
             Self::SeatBusy => "seat is in a turn",
+            Self::SeatBusyProlonged => "seat is still in a turn after 12 consecutive probes",
             Self::DialogWaiting => "a dialog waits for input",
             Self::ComposerDraft => "the composer holds a draft",
             Self::BlankScreen => "hosted screen is blank",
@@ -120,6 +122,7 @@ impl FenceRecoveryOutcome {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FenceRecoveryAttempt {
     pub recipient: String,
+    /// Reserved attempt number. A zero-write busy probe returns this slot to the budget.
     pub attempt: u32,
     pub limit: u32,
     pub at: At,
@@ -131,6 +134,8 @@ pub struct FenceRecoveryAttention {
     pub recipient: String,
     pub outcome: FenceRecoveryOutcome,
     pub exhausted: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub busy_since: Option<At>,
 }
 
 /// An observation of the existing suppression phase, not a scheduling state.
@@ -588,6 +593,25 @@ impl DiagnosticsState {
         outcome: FenceRecoveryOutcome,
         exhausted: bool,
     ) {
+        self.set_fence_recovery_status(recipient, outcome, exhausted, None);
+    }
+
+    pub(crate) fn set_busy_fence_recovery_status(
+        &mut self,
+        recipient: &str,
+        outcome: FenceRecoveryOutcome,
+        busy_since: At,
+    ) {
+        self.set_fence_recovery_status(recipient, outcome, false, Some(busy_since));
+    }
+
+    fn set_fence_recovery_status(
+        &mut self,
+        recipient: &str,
+        outcome: FenceRecoveryOutcome,
+        exhausted: bool,
+        busy_since: Option<At>,
+    ) {
         let Some(recipient) = normalize_persona(recipient) else {
             return;
         };
@@ -596,6 +620,7 @@ impl DiagnosticsState {
             recipient,
             outcome,
             exhausted,
+            busy_since,
         };
         if let Some(existing) = attention
             .iter_mut()
@@ -1325,6 +1350,7 @@ mod tests {
                 recipient: "feira".into(),
                 outcome: FenceRecoveryOutcome::VendorSignIn,
                 exhausted: true,
+                busy_since: None,
             }]
         );
 

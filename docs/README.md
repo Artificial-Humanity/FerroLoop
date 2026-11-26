@@ -68,7 +68,10 @@ In addition to the guides above, `fl --help` documents the full command surface:
 * `fl wire` — FerroWire agent-to-agent messaging, receipts, native vendor push dispatch, and WebSocket relay.
   When an unresolved route delivery causes a retained fence, the daemon runs a read-only
   readiness check after `FL_WIRE_FENCE_RECOVERY_DELAY_SECS` (default 300 seconds). It checks at
-  most once per delay period, up to `FL_WIRE_FENCE_RECOVERY_MAX_ATTEMPTS` (default 3) per fence.
+  most once per delay period, with a budget of `FL_WIRE_FENCE_RECOVERY_MAX_ATTEMPTS` (default 3)
+  per fence. A read-only result that confirms the seat is in a turn does not use that budget.
+  Status shows the seat as waiting, then raises it to needs-attention after 12 consecutive busy
+  probes while continuing to check at the configured delay.
   Set `FL_WIRE_FENCE_RECOVERY_MAX_ATTEMPTS=0` to disable timed recovery. The delay must be
   positive. Invalid values use the defaults and log a warning.
   After the daemon verifies readiness, it sends the first held message with a warning that an
