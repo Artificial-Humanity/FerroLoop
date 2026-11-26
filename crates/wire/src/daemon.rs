@@ -1157,6 +1157,20 @@ struct RetainedFenceRecovery {
 }
 
 impl RetainedFenceRecovery {
+    fn new(route: Option<RouteEntry>, since: At, phase: RetainedFencePhase) -> Self {
+        Self {
+            token: Arc::new(()),
+            route,
+            pending: VecDeque::new(),
+            pending_capacity_exhausted: false,
+            since,
+            last_attempt: None,
+            attempts: 0,
+            phase,
+            deferred_release: DeferredFenceRelease::default(),
+        }
+    }
+
     fn hold(&mut self, id: MessageId) {
         if self.pending.contains(&id) {
             return;
@@ -1996,15 +2010,37 @@ where
                 if queue.overflowed || queue.pending.len() >= queue_limit {
                     self.track_fence_message(&name, msg.id.clone());
                     if !queue.overflowed {
-                        if queue.recovery.is_none() {
-                            self.record_fence_route(&name);
-                        }
-                        let _blocked = lock(&self.overflow_recipients);
-                        let mut diagnostics = lock(&self.dispatch_diagnostics);
-                        let mut row = evidence.clone();
-                        row.hold_observed_at = now_at();
                         queue.overflowed = true;
-                        if let Some(log) = diagnostics.retain(row) {
+                        let first_hold = if let Some(route) = &queue.released_route
+                            && queue.recovery.is_none()
+                        {
+                            // The ordinary drain can still lose a receipt write. Hold
+                            // ACK releases until it finishes, even if overflow began
+                            // after the timed submit had already cleared the fence.
+                            let (first_hold, since) =
+                                self.retain_overflow_fence_at(&name, evidence.clone(), None, false);
+                            if lock(&self.overflow_recipients).contains(&name) {
+                                lock(&self.fence_recoveries).insert(
+                                    name.clone(),
+                                    RetainedFenceRecovery::new(
+                                        Some(route.clone()),
+                                        since,
+                                        RetainedFencePhase::OverflowOnly,
+                                    ),
+                                );
+                            }
+                            first_hold
+                        } else {
+                            if queue.recovery.is_none() {
+                                self.record_fence_route(&name);
+                            }
+                            let _blocked = lock(&self.overflow_recipients);
+                            let mut diagnostics = lock(&self.dispatch_diagnostics);
+                            let mut row = evidence.clone();
+                            row.hold_observed_at = now_at();
+                            diagnostics.retain(row)
+                        };
+                        if let Some(log) = first_hold {
                             first_holds.push(log);
                         }
                     }
@@ -2275,6 +2311,14 @@ where
             let mut queues = lock(&self.dispatch_queues);
             if let Some(queue) = queues.get_mut(&recipient) {
                 queue.in_flight = None;
+                if recovery.is_none() && released_route.is_some() && queue.overflowed {
+                    replay_stop = replay_stop_outcome(&report);
+                    // An ACK can resolve the receipt while the push's receipt
+                    // write is failing. The overflow fence still needs that fault.
+                    if replay_stop.is_some() {
+                        outcome = DispatchOutcome::Unconfirmed;
+                    }
+                }
                 match outcome {
                     DispatchOutcome::RecoverySubmitted | DispatchOutcome::Unconfirmed => {
                         if matches!(outcome, DispatchOutcome::RecoverySubmitted)
@@ -2405,6 +2449,13 @@ where
                             .unwrap_or(FenceRecoveryOutcome::ReplayFailed),
                         false,
                     );
+                } else if let Some(reason) = replay_stop {
+                    if let Some(state) = lock(&self.fence_recoveries).get_mut(&recipient) {
+                        state.phase = RetainedFencePhase::ReplayStopped;
+                        state.pending.clear();
+                        lock(&self.dispatch_diagnostics)
+                            .set_fence_recovery_attention(&recipient, reason, false);
+                    }
                 } else if retryable
                     && normalize_persona(&recipient).as_deref() == Some(recipient.as_str())
                     && lock(&self.overflow_recipients).contains(&recipient)
@@ -2422,17 +2473,11 @@ where
                             },
                             false,
                         );
-                        RetainedFenceRecovery {
-                            token: Arc::new(()),
-                            route: exhausted_busy_route.cloned().or(attempted_route),
-                            pending: VecDeque::new(),
-                            pending_capacity_exhausted: false,
-                            since: since.1,
-                            last_attempt: None,
-                            attempts: 0,
-                            phase: RetainedFencePhase::Waiting,
-                            deferred_release: DeferredFenceRelease::default(),
-                        }
+                        RetainedFenceRecovery::new(
+                            exhausted_busy_route.cloned().or(attempted_route),
+                            since.1,
+                            RetainedFencePhase::Waiting,
+                        )
                     });
                     recovery.hold(message_id.clone());
                     for (id, _) in held_jobs {
@@ -2454,7 +2499,11 @@ where
                 return;
             }
             if unresolved {
-                if is_composer_occupied_hold && recovery.is_none() && !composer_exhausted {
+                if is_composer_occupied_hold
+                    && recovery.is_none()
+                    && replay_stop.is_none()
+                    && !composer_exhausted
+                {
                     self.schedule_composer_occupied_reprobe(
                         &recipient,
                         &job_at,
@@ -2710,7 +2759,9 @@ where
                 .is_some_and(|run| run.is_current(state))
                 || (wait_for_overflow_prefix && state.phase == RetainedFencePhase::OverflowOnly)
         }) else {
-            return false;
+            // A saturated fence map cannot retain the ACK. It still must not
+            // release a post-replay overflow while the prefix is running.
+            return wait_for_overflow_prefix && queue.overflowed && queue.released_route.is_some();
         };
         update(&mut state.deferred_release);
         true
@@ -6038,6 +6089,116 @@ mod tests {
             );
             assert_eq!(
                 inner.diagnostics_snapshot().fence_recovery_attempts.len(),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn timed_fence_recovery_stops_after_overflow_prefix_receipt_write_failure() {
+        for overflow_during_tail in [false, true] {
+            let (tmp, inner, listener, first, since) = timed_recovery_fixture();
+            let block_receipt_write = || {
+                let (entered_tx, entered_rx) = mpsc::channel();
+                let (resume_tx, resume_rx) = mpsc::channel();
+                *lock(&inner.store.before_receipt_write) = Some(Box::new(move || {
+                    entered_tx.send(()).unwrap();
+                    resume_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                }));
+                (entered_rx, resume_tx)
+            };
+            let ack = |id: &MessageId| {
+                let (response, _) = inner.handle_local_request(LocalRequest::Ack {
+                    recipient: "held".into(),
+                    message_ids: vec![id.clone()],
+                });
+                assert!(matches!(response, LocalResponse::Acked { .. }));
+            };
+            let (first_write, finish_first) = block_receipt_write();
+            *lock(&inner.fence_recovery_probe_hook) = Some(Box::new(|| {
+                RecoveryReadiness::Ready(RecoveryTarget::FixtureWebhook)
+            }));
+            inner.queue_limit_override.store(1, Ordering::SeqCst);
+            let due = since.unix_millis() + 300_000;
+            inner.poll_retained_fences(At::from_unix_millis(due));
+            first_write.recv_timeout(Duration::from_secs(5)).unwrap();
+
+            let tail = send_to_held_recipient(&inner, "admitted prefix tail");
+            let (tail_write, finish_tail) = block_receipt_write();
+            lock(&inner.store.writes).push_back(Fault::Error);
+            if overflow_during_tail {
+                finish_first.send(()).unwrap();
+                tail_write.recv_timeout(Duration::from_secs(5)).unwrap();
+                send_to_held_recipient(&inner, "queued behind in-flight tail");
+            }
+            let overflow = send_to_held_recipient(&inner, "stored beyond the prefix");
+            assert!(lock(&inner.dispatch_queues)["held"].overflowed);
+            if overflow_during_tail {
+                // Resolve the receipt while its ordinary delivery write is failing.
+                ack(&tail);
+                assert!(lock(&inner.dispatch_queues)["held"].overflowed);
+            } else {
+                finish_first.send(()).unwrap();
+                tail_write.recv_timeout(Duration::from_secs(5)).unwrap();
+            }
+            finish_tail.send(()).unwrap();
+            wait_on_recovery(|| !lock(&inner.dispatch_queues).contains_key("held"));
+
+            for expected in [&first, &tail] {
+                let (stream, _) = listener.accept().unwrap();
+                let mut line = String::new();
+                BufReader::new(stream).read_line(&mut line).unwrap();
+                let sent: WireMessage = serde_json::from_str(&line).unwrap();
+                assert_eq!(&sent.id, expected);
+            }
+
+            ack(&first);
+            inner.poll_retained_fences(At::from_unix_millis(due + 300_000));
+            wait_on_recovery(|| !lock(&inner.dispatch_queues).contains_key("held"));
+
+            assert_eq!(
+                listener.accept().unwrap_err().kind(),
+                io::ErrorKind::WouldBlock
+            );
+            assert!(inner.is_recipient_fenced("held"));
+            for id in [&tail, &overflow] {
+                assert_eq!(inner.store.list_wire_receipts(id).unwrap()[0].attempts, 0);
+            }
+            let status = inner.diagnostics_snapshot();
+            let hold = status
+                .records
+                .iter()
+                .find(|hold| hold.recipient.as_deref() == Some("held"))
+                .unwrap();
+            assert_eq!(hold.first_reason, FenceReason::ReceiptWriteError);
+            assert_eq!(
+                status.fence_recovery_attention[0].outcome,
+                FenceRecoveryOutcome::ReceiptBookkeepingFailed
+            );
+            assert_eq!(status.fence_recovery_attempts.len(), 1);
+
+            let replacement_path = tmp.path().join("overflow-receipt-replacement.sock");
+            let replacement = crate::test_isolation::bind_unix_fixture(&replacement_path).unwrap();
+            replacement.set_nonblocking(true).unwrap();
+            inner.queue_limit_override.store(8, Ordering::SeqCst);
+            let (response, _) = inner.handle_local_request(LocalRequest::RegisterRoute {
+                persona: "held".into(),
+                route: VendorRoute::Webhook {
+                    socket_path: replacement_path,
+                },
+                explicit: true,
+                replace: true,
+                hosted_id: None,
+                hydration_generation: None,
+                hosted_session_verified: false,
+                unverified_process: false,
+            });
+            assert!(matches!(response, LocalResponse::RouteRegistered));
+            wait_on_recovery(|| !lock(&inner.dispatch_queues).contains_key("held"));
+            assert!(!inner.is_recipient_fenced("held"));
+            assert!(replacement.accept().is_ok());
+            assert_eq!(
+                inner.store.list_wire_receipts(&overflow).unwrap()[0].attempts,
                 1
             );
         }
