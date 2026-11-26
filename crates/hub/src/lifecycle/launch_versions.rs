@@ -24,6 +24,23 @@ const SETTLE_MS: u64 = 250;
 const MAX_WRAPPER_CHILDREN: usize = 8;
 const DIRECT_COMMIT_WAIT: Duration = Duration::from_millis(100);
 
+#[cfg(test)]
+thread_local! {
+    // A test-only wait for the Hub sampler's commit lock. Production does not wait.
+    static TEST_HUB_COMMIT_WAIT: std::cell::Cell<Duration> =
+        const { std::cell::Cell::new(Duration::ZERO) };
+    // A test-only override of the manual CLI probe limit.
+    static TEST_MANUAL_PROBE_TIMEOUT: std::cell::Cell<Option<Duration>> =
+        const { std::cell::Cell::new(None) };
+}
+
+fn hub_commit_wait() -> Duration {
+    #[cfg(test)]
+    return TEST_HUB_COMMIT_WAIT.with(std::cell::Cell::get);
+    #[cfg(not(test))]
+    Duration::ZERO
+}
+
 static ADAPTERS: OnceLock<VendorVersionRegistry> = OnceLock::new();
 
 pub fn set_global_vendor_version_adapters(
@@ -99,6 +116,12 @@ impl ProcessIdentity {
         use std::time::Duration;
 
         const TIMEOUT: Duration = Duration::from_millis(500);
+        #[cfg(test)]
+        let timeout = TEST_MANUAL_PROBE_TIMEOUT
+            .with(std::cell::Cell::get)
+            .unwrap_or(TIMEOUT);
+        #[cfg(not(test))]
+        let timeout = TIMEOUT;
 
         let executable = self.executable()?;
         let probe = adapter.manual_cli_version_probe(&executable)?;
@@ -134,7 +157,7 @@ impl ProcessIdentity {
             .env("PATH", "")
             .envs(probe.env.iter().copied())
             .current_dir(home.path());
-        let output = crate::runtime_matrix::run_version_command(command, TIMEOUT).ok()?;
+        let output = crate::runtime_matrix::run_version_command(command, timeout).ok()?;
         (probe.parse)(&output).map(str::to_owned)
     }
 
@@ -791,11 +814,17 @@ pub(super) fn forget_session<S: StateStore>(
     store: &S,
     session_id: &str,
 ) -> Result<(), LifecycleError> {
-    update_pending(store, |pending| {
+    // Version evidence never blocks decommission. An invalid or busy queue keeps its
+    // entries, and the receipt keys below are still removed.
+    if let Err(error) = update_pending(store, |pending| {
         let before = pending.len();
         pending.retain(|receipt| receipt.session_id != session_id);
         pending.len() != before
-    })?;
+    }) {
+        eprintln!(
+            "hub: error removing queued hosted launch version evidence ({session_id}): {error}"
+        );
+    }
     let slug = session_index_slug(session_id);
     if let Some(index) = read::<_, SessionReceipts>(store, &slug)? {
         for receipt in &index.slugs {
@@ -1113,7 +1142,7 @@ impl VersionObserver {
             let vendor = receipt.vendor.clone();
             let applied = {
                 let _commit = if target.engine == BackendKind::Ferro {
-                    let Some(guard) = lock::try_version_commit(&target.file, Duration::ZERO)?
+                    let Some(guard) = lock::try_version_commit(&target.file, hub_commit_wait())?
                     else {
                         return Ok(());
                     };
@@ -1691,6 +1720,26 @@ mod tests {
     }
 
     #[test]
+    fn versions_decommission_completes_with_an_invalid_launch_queue() {
+        let store = MemStore::default();
+        let saved = receipt(1);
+        seed(&store, &saved);
+        commit(&store, saved, sample(Some("1.0.0"), None), true).unwrap();
+        assert_eq!(receipt_keys(&store, "codex:ada").len(), 2);
+        write(&store, queue_slug(), &"not a launch queue").unwrap();
+        assert!(load_revision::<_, Vec<LaunchReceipt>>(&store, &queue_slug()).is_err());
+
+        delete_hosted_respawn_state(&store, "codex:ada").unwrap();
+
+        assert!(receipt_keys(&store, "codex:ada").is_empty());
+        assert!(
+            read::<_, SessionReceipts>(&store, &session_index_slug("codex:ada"))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
     fn versions_observer_reopens_a_local_store_after_an_operation_error() {
         let dir = tempfile::tempdir().unwrap();
         let mut state = crate::HubState::new(crate::HubServerConfig {
@@ -1768,11 +1817,25 @@ mod tests {
         std::fs::create_dir(dir.path().join("bin")).unwrap();
         std::fs::copy("/bin/sleep", &executable).unwrap();
         symlink(&executable, &installed).unwrap();
-        let mut child = Command::new(&installed).arg("10").spawn().unwrap();
+        // A process that another test thread forks during the copy inherits the write
+        // descriptor until it calls exec. Until then exec of the copy fails with ETXTBSY.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut child = loop {
+            match Command::new(&installed).arg("10").spawn() {
+                Err(error)
+                    if error.raw_os_error() == Some(libc::ETXTBSY) && Instant::now() < deadline =>
+                {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                spawned => break spawned.unwrap(),
+            }
+        };
         let process = ProcessIdentity::capture(child.id()).unwrap();
         std::fs::remove_file(&installed).unwrap();
         symlink("/bin/true", &installed).unwrap();
 
+        // The probe outcome must not depend on machine load.
+        TEST_MANUAL_PROBE_TIMEOUT.with(|timeout| timeout.set(Some(Duration::from_secs(30))));
         let probes = Arc::new(AtomicUsize::new(0));
         let mut adapters = VendorVersionRegistry::default();
         adapters.register(FixtureAdapter(probes.clone()));
@@ -1889,6 +1952,9 @@ mod tests {
         let mut competitor_events = competitor.subscribe();
         let worker = std::thread::scope(|threads| {
             let first_worker = threads.spawn(|| {
+                // A process that another test thread forks while the direct CLI below holds
+                // the commit lock keeps that lock until it calls exec. Wait for it to clear.
+                TEST_HUB_COMMIT_WAIT.with(|wait| wait.set(Duration::from_secs(10)));
                 let mut worker = VersionObserver::default();
                 worker.observe_with_adapters(&observer, &adapters).unwrap();
                 worker
