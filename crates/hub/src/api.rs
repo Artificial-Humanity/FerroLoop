@@ -6278,8 +6278,8 @@ enum OperatorPromptError {
     Steer(CodexSteerError),
     #[error("Claude terminal delivery refused: {0}; re-register and resubmit")]
     ClaudeRefused(String),
-    #[error("{0}")]
-    ClaudeUnconfirmed(String),
+    #[error("Claude delivery is unconfirmed. Check the session before resending.")]
+    ClaudeUnconfirmed,
     #[error("{reason}")]
     Held {
         reason: String,
@@ -6367,9 +6367,7 @@ fn dispatch_operator_prompt_with_intent_for_session(
             .map(|()| OperatorPromptOutcome::TransportAccepted)
             .map_err(|error| match error {
                 ClaudeBoundError::Refused(message) => OperatorPromptError::ClaudeRefused(message),
-                ClaudeBoundError::Delivery(message) => {
-                    OperatorPromptError::ClaudeUnconfirmed(message)
-                }
+                ClaudeBoundError::Delivery(_) => OperatorPromptError::ClaudeUnconfirmed,
                 ClaudeBoundError::Held { reason, stream } => {
                     OperatorPromptError::Held { reason, stream }
                 }
@@ -6628,8 +6626,8 @@ fn complete_operator_queue_item(
         Err(error @ OperatorPromptError::ClaudeRefused(_)) => {
             state.hold_refused_queued_prompt(key, id, error.to_string(), Some("target_unverified"))
         }
-        Err(OperatorPromptError::ClaudeUnconfirmed(message)) => {
-            state.finish_unconfirmed_queued_prompt(key, id, message.clone())
+        Err(error @ OperatorPromptError::ClaudeUnconfirmed) => {
+            state.finish_unconfirmed_queued_prompt(key, id, error.to_string())
         }
         Err(OperatorPromptError::Push(
             PushError::NotConnected(message) | PushError::Failed(message),
@@ -6892,22 +6890,21 @@ pub fn drain_ready_session_queues(state: &HubState) {
                         | OperatorPromptError::Push(PushError::NotConnected(_)))
                 )
             {
-                let after =
-                    if matches!(delivery_res, Err(OperatorPromptError::ClaudeUnconfirmed(_))) {
-                        None
-                    } else {
-                        transcript_observation_from_sessions(
-                            &canonical_id,
-                            &sessions,
-                            &snap,
-                            home,
-                            &mut files,
-                        )
-                    };
+                let after = if matches!(delivery_res, Err(OperatorPromptError::ClaudeUnconfirmed)) {
+                    None
+                } else {
+                    transcript_observation_from_sessions(
+                        &canonical_id,
+                        &sessions,
+                        &snap,
+                        home,
+                        &mut files,
+                    )
+                };
                 state.mark_session_in_flight_from_observation(&canonical_id, after.as_deref());
                 if matches!(
                     delivery_res,
-                    Err(OperatorPromptError::ClaudeUnconfirmed(_)
+                    Err(OperatorPromptError::ClaudeUnconfirmed
                         | OperatorPromptError::Push(PushError::Failed(_)))
                 ) {
                     state.associate_unconfirmed_queue(&canonical_id, &session_id, &item.id);
@@ -7090,7 +7087,7 @@ fn handle_post_queued_prompt_send_now(
     {
         if matches!(
             delivery_res,
-            Err(OperatorPromptError::ClaudeUnconfirmed(_)
+            Err(OperatorPromptError::ClaudeUnconfirmed
                 | OperatorPromptError::Steer(CodexSteerError::Unconfirmed { .. }))
         ) {
             state.mark_session_in_flight_from_observation(&canonical_id, None);
@@ -7710,7 +7707,7 @@ fn handle_post_session_prompt(
         }
         Ok(OperatorPromptOutcome::AppServerAccepted { .. })
         | Err(
-            OperatorPromptError::ClaudeUnconfirmed(_)
+            OperatorPromptError::ClaudeUnconfirmed
             | OperatorPromptError::Steer(CodexSteerError::Unconfirmed { .. }),
         ) => {
             // A post-dispatch transcript cannot establish completion of an uncertain write.
@@ -7754,7 +7751,7 @@ fn handle_post_session_prompt(
     if (rejected && !legacy_not_connected)
         || matches!(
             delivery_res,
-            Err(OperatorPromptError::Steer(_) | OperatorPromptError::ClaudeUnconfirmed(_))
+            Err(OperatorPromptError::Steer(_) | OperatorPromptError::ClaudeUnconfirmed)
         )
     {
         data["status"] = json!("delivery_failed");
@@ -14326,6 +14323,8 @@ mod claude_registration_binding_tests {
 
     const CLAUDE_CHANGED_AFTER_KEYS: &str =
         "prompt submission unconfirmed: Claude conversation changed; re-register and resubmit";
+    const EXPECTED_CLAUDE_UNCONFIRMED: &str =
+        "Claude delivery is unconfirmed. Check the session before resending.";
 
     fn owner_post_with_attachment(state: &HubState, owner: &HubAuthority) -> HttpResponse {
         let request = HttpRequest::new("POST", "/unused").with_json_body(&json!({
@@ -14350,7 +14349,7 @@ mod claude_registration_binding_tests {
         let receipt = response.json_value().unwrap();
         assert_eq!(receipt["delivery_stage"], "unconfirmed");
         assert!(receipt["refusal_reason"].is_null());
-        assert_eq!(receipt["delivery_error"], CLAUDE_CHANGED_AFTER_KEYS);
+        assert_eq!(receipt["delivery_error"], EXPECTED_CLAUDE_UNCONFIRMED);
         assert_eq!(receipt["in_flight_unconfirmed"], true);
         let path = receipt["attachments"][0]["path"].as_str().unwrap();
         assert_eq!(std::fs::read(path).unwrap(), b"hello");
@@ -14388,6 +14387,7 @@ mod claude_registration_binding_tests {
                 let result = response.json_value().unwrap();
                 assert_eq!(result["delivery_stage"], "unconfirmed");
                 assert!(result["refusal_reason"].is_null());
+                assert_eq!(result["delivery_error"], EXPECTED_CLAUDE_UNCONFIRMED);
             } else {
                 let _probes = stub_composer_probes(vec![Some(true)]);
                 drain_ready_session_queues(&state);
@@ -14402,7 +14402,7 @@ mod claude_registration_binding_tests {
             );
             assert_eq!(
                 queue[0].delivery_error.as_deref(),
-                Some(CLAUDE_CHANGED_AFTER_KEYS)
+                Some(EXPECTED_CLAUDE_UNCONFIRMED)
             );
             assert!(queue[0].refusal_reason.is_none());
             assert_eq!(
