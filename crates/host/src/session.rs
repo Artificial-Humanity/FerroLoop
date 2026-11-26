@@ -7,14 +7,22 @@ use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use fl_host_proto::{
-    ChildExit, ChildRecord, ChildState, HostError, InputState, MAX_STDOUT_BACKLOG,
-    STDERR_TAIL_BYTES, SessionEpoch, SessionId, SpawnKind,
+    ChildExit, ChildRecord, ChildState, HostError, HostedExitEvidence, HostedExitEvidenceStatus,
+    InputState, MAX_STDOUT_BACKLOG, STDERR_TAIL_BYTES, SessionEpoch, SessionId, SpawnKind,
 };
 
 use crate::child::{CleanupReport, DescendantExit};
+use crate::exit_evidence::TerminalPrefix;
 
 // A total completion order, independent of map iteration and session names.
 static COMPLETION_ORDER: AtomicU64 = AtomicU64::new(1);
+
+fn unix_time_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as u64)
+        .unwrap_or(0)
+}
 
 pub struct Session {
     pub session: SessionId,
@@ -64,6 +72,9 @@ pub struct Session {
 struct OutBuf {
     bytes: Vec<u8>,
     eof: bool,
+    terminal_eof: bool,
+    terminal_prefix: TerminalPrefix,
+    evidence_capture_ms: Option<u64>,
 }
 
 pub(crate) struct SessionParts {
@@ -97,8 +108,11 @@ impl Session {
     }
 
     pub(crate) fn owned_by(&self, hosted_id: &str) -> bool {
-        self.hosted_owner_len != 0
-            && self.hosted_owner[..self.hosted_owner_len] == *hosted_id.as_bytes()
+        self.hosted_owner_len != 0 && self.hosted_owner() == hosted_id.as_bytes()
+    }
+
+    pub(crate) fn hosted_owner(&self) -> &[u8] {
+        &self.hosted_owner[..self.hosted_owner_len]
     }
 
     pub(crate) fn has_hosted_owner(&self) -> bool {
@@ -259,10 +273,6 @@ impl Session {
             control,
             stdin,
         } = parts;
-        let started_at_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
         Self {
             session,
             epoch,
@@ -272,7 +282,7 @@ impl Session {
             supervisor_start,
             pgid,
             control_inode,
-            started_at_ms,
+            started_at_ms: unix_time_ms(),
             hosted_owner: [0; fl_host_proto::MAX_HOSTED_OWNER_BYTES],
             hosted_owner_len: 0,
             control: Mutex::new(control),
@@ -286,6 +296,9 @@ impl Session {
             stdout: Mutex::new(OutBuf {
                 bytes: Vec::new(),
                 eof: false,
+                terminal_eof: false,
+                terminal_prefix: TerminalPrefix::default(),
+                evidence_capture_ms: None,
             }),
             stdout_cv: Condvar::new(),
             stderr: Mutex::new(Vec::new()),
@@ -497,18 +510,71 @@ impl Session {
 
     pub fn push_stdout_tail(&self, chunk: &[u8], max_cap: usize) {
         let mut buf = self.stdout.lock().unwrap_or_else(|err| err.into_inner());
+        let track_prefix =
+            self.has_hosted_owner() && self.mode() == fl_host_proto::SessionMode::Pty;
+        let OutBuf {
+            bytes,
+            terminal_prefix,
+            ..
+        } = &mut *buf;
         if chunk.len() >= max_cap {
-            buf.bytes.clear();
-            buf.bytes.extend_from_slice(&chunk[chunk.len() - max_cap..]);
-        } else {
-            let total = buf.bytes.len().saturating_add(chunk.len());
-            if total > max_cap {
-                let drop_n = total - max_cap;
-                buf.bytes.drain(..drop_n);
+            let drop_n = chunk.len() - max_cap;
+            if track_prefix {
+                terminal_prefix.skip(bytes);
+                terminal_prefix.skip(&chunk[..drop_n]);
             }
-            buf.bytes.extend_from_slice(chunk);
+            bytes.clear();
+            bytes.extend_from_slice(&chunk[drop_n..]);
+        } else {
+            let drop_n = bytes
+                .len()
+                .saturating_add(chunk.len())
+                .saturating_sub(max_cap);
+            if track_prefix {
+                terminal_prefix.skip(&bytes[..drop_n]);
+            }
+            if drop_n > 0 {
+                bytes.drain(..drop_n);
+            }
+            bytes.extend_from_slice(chunk);
         }
         self.stdout_cv.notify_all();
+    }
+
+    pub(crate) fn capture_hosted_exit(&self) -> HostedExitEvidenceStatus {
+        use HostedExitEvidenceStatus::{Exited, Pending, Unavailable};
+
+        let Some(journal) = self.reliable().filter(|_| self.has_hosted_owner()) else {
+            return Unavailable;
+        };
+        let exit = self.leader_exit();
+        let mut out = self.stdout.lock().unwrap_or_else(|err| err.into_inner());
+        if !out.eof {
+            return Pending;
+        }
+        if !out.terminal_eof {
+            return Unavailable;
+        }
+        let Some(exit) = exit else {
+            return Pending;
+        };
+        if exit.code.is_some() == exit.signal.is_some() {
+            return Unavailable;
+        }
+        let captured_at_ms = *out
+            .evidence_capture_ms
+            .get_or_insert_with(|| unix_time_ms().max(self.started_at_ms));
+        Exited(HostedExitEvidence {
+            stream: journal.stream().clone(),
+            exit,
+            started_at_ms: self.started_at_ms,
+            captured_at_ms,
+            terminal_tail: if journal.pty_mode() {
+                out.terminal_prefix.tail(&out.bytes)
+            } else {
+                String::new()
+            },
+        })
     }
 
     pub fn stdout_tail(&self, max_bytes: usize) -> String {
@@ -527,10 +593,13 @@ impl Session {
     }
 
     pub fn stdout_eof(&self) {
-        self.stdout
-            .lock()
-            .unwrap_or_else(|err| err.into_inner())
-            .eof = true;
+        self.finish_stdout(false);
+    }
+
+    fn finish_stdout(&self, terminal_eof: bool) {
+        let mut out = self.stdout.lock().unwrap_or_else(|err| err.into_inner());
+        out.eof = true;
+        out.terminal_eof = terminal_eof;
         self.stdout_cv.notify_all();
     }
 
@@ -829,16 +898,17 @@ pub(crate) fn pump_reliable_stdout_with(
     journal: &crate::reliable::ReliableJournal,
     mut read: impl FnMut(&mut [u8]) -> std::io::Result<usize>,
 ) {
-    loop {
+    let drained = loop {
         if session.io_stop.load(Ordering::SeqCst) || sink.stopped() {
-            break;
+            break false;
         }
         let mut buffer = match journal.prepare_read() {
             Ok(buffer) => buffer,
             Err(_) if journal.pty_mode() => {
                 let mut scratch = [0u8; 4096];
                 match read(&mut scratch) {
-                    Ok(0) | Err(_) => break,
+                    Ok(0) => break true,
+                    Err(_) => break false,
                     Ok(len) => {
                         session.drop_pty_output(journal, &scratch[..len]);
                         continue;
@@ -853,17 +923,18 @@ pub(crate) fn pump_reliable_stdout_with(
         };
         session.set_stalled(false);
         match read(buffer.as_mut_slice()) {
-            Ok(0) | Err(_) => break,
+            Ok(0) => break true,
+            Err(_) => break false,
             Ok(len) => {
                 buffer.truncate(len);
                 if session.accept_output(journal, buffer).is_err() {
-                    break;
+                    break false;
                 }
             }
         }
-    }
+    };
     sink.eof();
-    session.stdout_eof();
+    session.finish_stdout(drained && !session.io_stop.load(Ordering::SeqCst));
 }
 
 pub fn pump_stderr(mut file: File, session: std::sync::Arc<Session>) {
@@ -908,6 +979,15 @@ fn pump_read(file: &mut File, buf: &mut [u8], session: &Session) -> std::io::Res
                 return Err(err);
             }
             match file.read(buf) {
+                // A drained PTY master on Linux reports EIO when the final
+                // slave closes. Other read errors do not establish EOF.
+                #[cfg(any(target_os = "linux", target_os = "android"))]
+                Err(err)
+                    if session.mode() == fl_host_proto::SessionMode::Pty
+                        && err.raw_os_error() == Some(libc::EIO) =>
+                {
+                    return Ok(0);
+                }
                 Err(err)
                     if matches!(
                         err.kind(),
