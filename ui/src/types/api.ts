@@ -1327,6 +1327,7 @@ export interface WireDispatchDiagnostics {
     outcome: string;
     reason_label?: string;
     exhausted: boolean;
+    busy_since?: string;
   }[];
 }
 

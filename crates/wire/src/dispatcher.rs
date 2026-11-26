@@ -21677,6 +21677,7 @@ exit 1"#,
             LostCapture,
             ReplacedBeforePayload,
             ReplacedBeforeEnter,
+            BusyBeforeEnter,
             AckedBeforeEnter,
             WriteError,
             CodexIncidentMail,
@@ -21713,6 +21714,7 @@ exit 1"#,
             LostCapture,
             ReplacedBeforePayload,
             ReplacedBeforeEnter,
+            BusyBeforeEnter,
             AckedBeforeEnter,
             WriteError,
             CodexIncidentMail,
@@ -21761,7 +21763,11 @@ exit 1"#,
                                     }
                                     (_, _, 1) => {
                                         let composer = scenario.payload().replace('\n', "\n  ");
-                                        format!("› {composer}\n\n{footer}")
+                                        if scenario == BusyBeforeEnter {
+                                            format!("› {composer}\n\n• Working...\n{footer}")
+                                        } else {
+                                            format!("› {composer}\n\n{footer}")
+                                        }
                                     }
                                     _ => format!("› Ask Codex to do anything\n\n{footer}"),
                                 };
@@ -21860,7 +21866,7 @@ exit 1"#,
                 SignIn => (Some(FenceRecoveryOutcome::VendorSignIn), 0),
                 LostCapture => (Some(FenceRecoveryOutcome::HostedCaptureUnavailable), 0),
                 ReplacedBeforePayload => (Some(FenceRecoveryOutcome::RouteChanged), 0),
-                ReplacedBeforeEnter | AckedBeforeEnter | WriteError => (None, 1),
+                ReplacedBeforeEnter | BusyBeforeEnter | AckedBeforeEnter | WriteError => (None, 1),
                 CodexIncidentMail | GrokIncidentMail => (None, 2),
             };
             match (scenario, outcome) {
@@ -21870,6 +21876,9 @@ exit 1"#,
                         "host:{}",
                         stream.session.as_str(),
                     )]));
+                }
+                (BusyBeforeEnter, Err(RecoveryPasteError::Uncertain(_))) => {
+                    assert_eq!(guard.permission.get(), Err(FenceRecoveryOutcome::SeatBusy));
                 }
                 (ReplacedBeforeEnter | WriteError, Err(RecoveryPasteError::Uncertain(_)))
                 | (CodexIncidentMail | GrokIncidentMail, Ok(())) => {}

@@ -68,7 +68,10 @@ In addition to the guides above, `fl --help` documents the full command surface:
 * `fl wire` — FerroWire agent-to-agent messaging, receipts, native vendor push dispatch, and WebSocket relay.
   When an unresolved route delivery causes a retained fence, the daemon runs a read-only
   readiness check after `FL_WIRE_FENCE_RECOVERY_DELAY_SECS` (default 300 seconds). It checks at
-  most once per delay period, up to `FL_WIRE_FENCE_RECOVERY_MAX_ATTEMPTS` (default 3) per fence.
+  most once per delay period, with a budget of `FL_WIRE_FENCE_RECOVERY_MAX_ATTEMPTS` (default 3)
+  per fence. A read-only result that confirms the seat is in a turn does not use that budget.
+  Status shows the seat as waiting, then raises it to needs-attention after 12 consecutive busy
+  probes while continuing to check at the configured delay.
   Set `FL_WIRE_FENCE_RECOVERY_MAX_ATTEMPTS=0` to disable timed recovery. The delay must be
   positive. Invalid values use the defaults and log a warning.
   After the daemon verifies readiness, it sends the first held message with a warning that an
@@ -78,9 +81,11 @@ In addition to the guides above, `fl --help` documents the full command surface:
   view show the reason, including while recovery waits for the delay or a delivery worker.
   Timed recovery supports hosted Claude, Codex, and Muse routes. Non-hosted, Antigravity, Grok,
   and webhook routes stay fenced and report the reason. Fences caused by queue overflow,
-  receipt bookkeeping errors, or global capacity limits do not start timed recovery. If a replay
-  encounters a bookkeeping fault or cannot confirm a successful submission in the store, timed
-  recovery stops and the fence remains held with the failure reason.
+  receipt bookkeeping errors, or global capacity limits do not start timed recovery. If the replay
+  worker fails, receipt bookkeeping fails, or the store cannot confirm a successful submission,
+  timed recovery stops and the fence remains held with the failure reason. Acknowledging mail or
+  re-registering the same route leaves the fence in place. Change the route identity or restart
+  the Wire daemon to clear it.
 * `fl github pr` — pull-request review and merge policy evaluation, structured review markers, and gated merges.
 * `fl flow` — DAG workflow validation, import, step execution, review loops, and human approval sign-off.
 * `fl arch` — `.fl/architecture.toml` validation, Cargo workspace dependency/source conformance checks, and LikeC4 export.

@@ -1390,7 +1390,7 @@ export const WireMailPane: React.FC<WireMailPaneProps> = ({
                   </span>
                 ) : null}
 
-                {recoveryAttention.map(({ recipient, outcome, reason_label, exhausted }) => (
+                {recoveryAttention.map(({ recipient, outcome, reason_label, exhausted, busy_since }) => (
                   <span
                     key={recipient}
                     data-testid={`wire-fence-recovery-attention-${recipient}`}
@@ -1402,10 +1402,12 @@ export const WireMailPane: React.FC<WireMailPaneProps> = ({
                     }}
                   >
                     {`${recipient}: Wire recovery ${
-                      outcome === "waiting_for_delay" || outcome === "waiting_for_worker"
+                      outcome === "waiting_for_delay" ||
+                      outcome === "waiting_for_worker" ||
+                      (outcome === "seat_busy" && !exhausted)
                         ? "pending"
                         : "needs attention"
-                    } (${reason_label ?? outcome.replace(/_/g, " ")}${
+                    } (${reason_label ?? outcome.replace(/_/g, " ")}${busy_since ? ` since ${busy_since}` : ""}${
                       exhausted ? ", attempt limit reached" : ""
                     })`}
                   </span>
