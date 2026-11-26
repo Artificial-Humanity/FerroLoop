@@ -597,6 +597,7 @@ fn transcript_response_reference(
             "is_busy": is_busy,
             "in_flight_unconfirmed": state.session_in_flight_unconfirmed(&canonical_id),
             "queue": queue,
+        "queue_epoch": state.queue_epoch,
             "context_usage": context_usage,
             "quota_usage": quota_usage,
         }),

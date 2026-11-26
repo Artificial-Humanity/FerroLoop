@@ -60,10 +60,10 @@ use fl_gate::{
 };
 use fl_store::AnyStore;
 use fl_wire::dispatcher::{
-    CodexSteerError, MAX_DELIVER, OperatorPromptError, OperatorPromptIntent, OperatorPromptOutcome,
-    PushError, SessionResetMode, clear_or_reforge_session, deliver_to_live_grok_pane,
-    preflight_session_reset, push_operator_prompt_to_route, push_operator_prompt_with_intent,
-    push_to_route_for_recipient,
+    ClaudeBoundError, CodexSteerError, MAX_DELIVER, OperatorPromptError as WireOperatorPromptError,
+    OperatorPromptIntent, OperatorPromptOutcome, PushError, SessionResetMode,
+    clear_or_reforge_session, deliver_to_live_grok_pane, preflight_session_reset,
+    push_operator_prompt_to_route, push_operator_prompt_with_intent, push_to_route_for_recipient,
 };
 use fl_wire::identity::{RouteTable, normalize_persona};
 use serde::{Deserialize, Serialize};
@@ -5645,6 +5645,7 @@ fn handle_dynamic_api_routes(
                     "is_busy": is_busy,
                     "in_flight_unconfirmed": state.session_in_flight_unconfirmed(&canonical_id),
                     "queue": queue,
+                    "queue_epoch": state.queue_epoch,
                     "context_usage": context_usage,
                     "quota_usage": quota_usage,
                 });
@@ -5655,9 +5656,15 @@ fn handle_dynamic_api_routes(
             }
             ("GET", "queue") => {
                 drain_ready_session_queues(state);
-                let (canonical_id, _persona) = resolve_session_target(state, &session_id);
+                let mut queue = state.session_queue(&session_id);
+                let canonical_id = if queue.is_empty() {
+                    let (id, _) = resolve_session_target(state, &session_id);
+                    queue = state.session_queue(&id);
+                    id
+                } else {
+                    session_id
+                };
                 let is_busy = state.is_session_busy_released(&canonical_id);
-                let queue = state.session_queue(&canonical_id);
                 return HttpResponse::json(
                     200,
                     json!({
@@ -5665,6 +5672,7 @@ fn handle_dynamic_api_routes(
                         "is_busy": is_busy,
                         "in_flight_unconfirmed": state.session_in_flight_unconfirmed(&canonical_id),
                         "queue": queue,
+                        "queue_epoch": state.queue_epoch,
                     }),
                 );
             }
@@ -6137,9 +6145,15 @@ pub(crate) fn stub_queued_delivery_error(msg: &str) -> StubQueuedError {
 thread_local! {
     static COMPOSER_PROBE_STUB: std::cell::RefCell<Option<std::collections::VecDeque<Option<bool>>>> =
         const { std::cell::RefCell::new(None) };
+    static CLAUDE_DISPATCH_STUB: std::cell::RefCell<Option<Box<StubClaudeDispatch>>> =
+        const { std::cell::RefCell::new(None) };
     static COMPOSER_PROBE_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static QUEUED_DELIVERY_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
+#[cfg(test)]
+type StubClaudeDispatch =
+    dyn FnMut(Option<&fl_host_proto::StreamId>, &str) -> Result<(), ClaudeBoundError>;
+
 #[cfg(test)]
 pub(crate) struct StubComposerProbes;
 #[cfg(test)]
@@ -6206,6 +6220,24 @@ fn drain_composer_probe(
     .and_then(|route| fl_wire::dispatcher::probe_route_composer_ready(&route))
 }
 
+fn drain_bound_composer_probe(
+    binding: &fl_wire::vendor_adapter::ClaudeRegistrationBinding,
+    stream: &fl_host_proto::StreamId,
+) -> Result<(), ClaudeBoundError> {
+    #[cfg(test)]
+    if let Some(ready) =
+        COMPOSER_PROBE_STUB.with(|s| s.borrow_mut().as_mut().and_then(|q| q.pop_front()))
+    {
+        COMPOSER_PROBE_CALLS.with(|c| c.set(c.get() + 1));
+        return if ready == Some(true) {
+            Ok(())
+        } else {
+            Err(ClaudeBoundError::Delivery("synthetic not ready".into()))
+        };
+    }
+    fl_wire::dispatcher::probe_bound_claude_composer_ready(binding, stream)
+}
+
 #[cfg(test)]
 pub(crate) fn before_next_prompt_dispatch(f: impl FnOnce() + 'static) {
     BEFORE_PROMPT_DISPATCH.with(|hook| *hook.borrow_mut() = Some(Box::new(f)));
@@ -6238,6 +6270,43 @@ fn require_intended_vendor(
     }
 }
 
+#[derive(Debug, Clone, thiserror::Error)]
+enum OperatorPromptError {
+    #[error("{0}")]
+    Push(PushError),
+    #[error("{0}")]
+    Steer(CodexSteerError),
+    #[error("{reason}")]
+    Held {
+        reason: String,
+        stream: fl_host_proto::StreamId,
+    },
+}
+
+pub(crate) fn operator_prompt_log(session_id: &str, stage: &str, reason: &str) {
+    // The session id and reason are encoded so control characters cannot inject log lines.
+    // Callers only pass known reason codes or reason strings from a closed set.
+    eprintln!("hub: operator prompt session={session_id:?} stage={stage} reason={reason:?}");
+}
+
+fn operator_prompt_refusal(
+    session_id: &str,
+    status: u16,
+    reason: &str,
+    message: &str,
+) -> HttpResponse {
+    operator_prompt_log(session_id, "refused", reason);
+    HttpResponse::json(
+        status,
+        json!({
+            "error": message,
+            "delivered": false,
+            "delivery_stage": "refused",
+            "refusal_reason": reason,
+        }),
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 fn dispatch_operator_prompt_with_intent_for_session(
     state: &HubState,
@@ -6249,6 +6318,7 @@ fn dispatch_operator_prompt_with_intent_for_session(
     intended_codex_thread_id: Option<&str>,
     claude_terminal: bool,
     claude_binding: Option<&fl_wire::vendor_adapter::ClaudeRegistrationBinding>,
+    claude_stream: Option<&fl_host_proto::StreamId>,
     intended_vendor: Option<&str>,
     #[cfg(test)] queued: bool,
 ) -> Result<OperatorPromptOutcome, OperatorPromptError> {
@@ -6264,24 +6334,46 @@ fn dispatch_operator_prompt_with_intent_for_session(
                 "Claude registration is unbound; re-register and resubmit".into(),
             ))
         })?;
-        return fl_wire::dispatcher::dispatch_bound_claude_operator_prompt(
-            binding,
-            sender_name,
-            body,
-        )
-        .map(|()| OperatorPromptOutcome::TransportAccepted)
-        .map_err(|e| {
-            OperatorPromptError::Push(match e {
-                fl_wire::dispatcher::ClaudeBoundError::Refused(message) => {
-                    PushError::NotConnected(format!(
-                        "Claude terminal delivery refused: {message}; re-register and resubmit"
-                    ))
-                }
-                fl_wire::dispatcher::ClaudeBoundError::Delivery(message) => {
-                    PushError::Failed(message)
-                }
-            })
+        #[cfg(test)]
+        let stubbed = CLAUDE_DISPATCH_STUB.with(|stub| {
+            stub.borrow_mut()
+                .as_mut()
+                .map(|dispatch| dispatch(claude_stream, body))
         });
+        #[cfg(not(test))]
+        let stubbed: Option<Result<(), ClaudeBoundError>> = None;
+        let result = stubbed.unwrap_or_else(|| {
+            if let Some(stream) = claude_stream {
+                fl_wire::dispatcher::dispatch_parked_claude_operator_prompt(
+                    binding,
+                    stream,
+                    sender_name,
+                    body,
+                    intent,
+                )
+            } else {
+                fl_wire::dispatcher::dispatch_bound_claude_operator_prompt(
+                    binding,
+                    sender_name,
+                    body,
+                )
+            }
+        });
+        return result
+            .map(|()| OperatorPromptOutcome::TransportAccepted)
+            .map_err(|error| match error {
+                ClaudeBoundError::Refused(message) => {
+                    OperatorPromptError::Push(PushError::NotConnected(format!(
+                        "Claude terminal delivery refused: {message}; re-register and resubmit"
+                    )))
+                }
+                ClaudeBoundError::Delivery(message) => {
+                    OperatorPromptError::Push(PushError::Failed(message))
+                }
+                ClaudeBoundError::Held { reason, stream } => {
+                    OperatorPromptError::Held { reason, stream }
+                }
+            });
     }
     // Preserve typed steering failures across the ordinary transport's rediscovery boundary.
     // Every steering failure is final: mapping it to Failed prevents a second route attempt.
@@ -6350,8 +6442,8 @@ fn dispatch_operator_prompt_with_intent_for_session(
             }
             let delivery = push_operator_prompt_with_intent(route, sender_name, body, intent);
             delivery.map_err(|e| match e {
-                OperatorPromptError::Push(e) => e,
-                OperatorPromptError::Steer(e) => {
+                WireOperatorPromptError::Push(e) => e,
+                WireOperatorPromptError::Steer(e) => {
                     let message = e.to_string();
                     steering_error = Some(e);
                     PushError::Failed(message)
@@ -6396,6 +6488,7 @@ fn dispatch_queued_operator_prompt_with_intent_for_session(
     intended_codex_thread_id: Option<&str>,
     claude_terminal: bool,
     claude_binding: Option<&fl_wire::vendor_adapter::ClaudeRegistrationBinding>,
+    claude_stream: Option<&fl_host_proto::StreamId>,
     intended_vendor: Option<&str>,
 ) -> Result<OperatorPromptOutcome, OperatorPromptError> {
     #[cfg(test)]
@@ -6429,6 +6522,7 @@ fn dispatch_queued_operator_prompt_with_intent_for_session(
         intended_codex_thread_id,
         claude_terminal,
         claude_binding,
+        claude_stream,
         intended_vendor,
         #[cfg(test)]
         true,
@@ -6451,7 +6545,13 @@ fn with_operator_delivery(
         Err(error) => {
             let stage = match error {
                 OperatorPromptError::Steer(CodexSteerError::Refused { .. }) => "refused",
+                OperatorPromptError::Push(PushError::NotConnected(message))
+                    if message.contains("re-register and resubmit") =>
+                {
+                    "refused"
+                }
                 OperatorPromptError::Push(PushError::NotConnected(_)) => "not_connected",
+                OperatorPromptError::Held { .. } => "held",
                 OperatorPromptError::Push(PushError::Failed(e))
                     if fl_wire::is_composer_occupied_zero_keys_error(e) =>
                 {
@@ -6460,6 +6560,11 @@ fn with_operator_delivery(
                 _ => "unconfirmed",
             };
             let mut fields = json!({"delivery_stage":stage, "delivered":false, "delivery_error":error.to_string()});
+            if stage == "held" {
+                fields["hold_reason"] = json!(crate::composer_hold_reason(&error.to_string()));
+            } else if stage == "refused" && matches!(error, OperatorPromptError::Push(_)) {
+                fields["refusal_reason"] = json!("target_unverified");
+            }
             if let OperatorPromptError::Steer(error) = error {
                 fields["failure_stage"] = json!(format!("{:?}", error.stage()));
                 fields["refusal_reason"] = error
@@ -6476,33 +6581,66 @@ fn with_operator_delivery(
     data
 }
 
-#[allow(clippy::too_many_arguments)]
-fn dispatch_operator_prompt_for_session_typed(
+fn operator_prompt_rejected(data: &Value) -> bool {
+    let Some(stage @ ("held" | "refused" | "not_connected")) = data["delivery_stage"].as_str()
+    else {
+        return false;
+    };
+    let reason = data["hold_reason"]
+        .as_str()
+        .or_else(|| data["refusal_reason"].as_str())
+        .unwrap_or(stage);
+    if let Some(session_id) = data["session_id"].as_str() {
+        operator_prompt_log(session_id, stage, reason);
+    }
+    true
+}
+
+fn apply_queued_refusal(data: &mut Value, queue: &[crate::QueuedOperatorPrompt], prompt_id: &str) {
+    if let Some(item) = queue.iter().find(|item| item.id == prompt_id)
+        && let Some(reason) = item.refusal_reason.as_deref()
+    {
+        data["delivery_stage"] = json!("refused");
+        data["refusal_reason"] = json!(reason);
+        data["delivery_error"] = json!(item.delivery_error);
+        if let Some(fields) = data.as_object_mut() {
+            fields.remove("hold_reason");
+        }
+    }
+}
+
+fn complete_operator_queue_item(
     state: &HubState,
-    persona: Option<&str>,
-    session_id: &str,
-    sender_name: &str,
-    body: &str,
-    claude_terminal: bool,
-    claude_binding: Option<&fl_wire::vendor_adapter::ClaudeRegistrationBinding>,
-    intended_vendor: Option<&str>,
-) -> Result<OperatorPromptOutcome, PushError> {
-    dispatch_queued_operator_prompt_with_intent_for_session(
-        state,
-        persona,
-        session_id,
-        sender_name,
-        body,
-        OperatorPromptIntent::Ordinary,
-        None,
-        claude_terminal,
-        claude_binding,
-        intended_vendor,
-    )
-    .map_err(|e| match e {
-        OperatorPromptError::Push(e) => e,
-        OperatorPromptError::Steer(e) => PushError::Failed(e.to_string()),
-    })
+    item: &crate::QueuedOperatorPrompt,
+    result: &Result<OperatorPromptOutcome, OperatorPromptError>,
+) -> Vec<crate::QueuedOperatorPrompt> {
+    let (key, id) = (item.session_id.as_str(), item.id.as_str());
+    match result {
+        Err(OperatorPromptError::Held { reason, stream }) => {
+            state.finish_bound_claude_hold(key, id, reason.clone(), stream.clone())
+        }
+        Err(OperatorPromptError::Push(
+            PushError::NotConnected(message) | PushError::Failed(message),
+        )) if message.contains("re-register and resubmit") => {
+            let reason = if item.claude_binding.is_some() {
+                "session_replaced"
+            } else {
+                "target_unverified"
+            };
+            state.hold_refused_queued_prompt(key, id, message.clone(), Some(reason))
+        }
+        Err(OperatorPromptError::Steer(error @ CodexSteerError::Refused { .. })) => {
+            state.hold_refused_queued_prompt(key, id, error.to_string(), None)
+        }
+        _ => state.finish_queued_prompt(
+            key,
+            id,
+            result.clone().map(|_| ()).map_err(|error| match error {
+                OperatorPromptError::Push(error) => error,
+                other => PushError::Failed(other.to_string()),
+            }),
+        ),
+    }
 }
 
 fn dispatch_operator_prompt_for_session(
@@ -6553,7 +6691,9 @@ pub fn drain_ready_session_queues(state: &HubState) {
                     &session_id,
                     &item.id,
                     "Queue destination is unverified; re-register and resubmit".into(),
+                    Some("target_unverified"),
                 );
+                operator_prompt_log(&session_id, "refused", "target_unverified");
                 claim.finish();
                 state.broadcast(
                     "session",
@@ -6624,7 +6764,9 @@ pub fn drain_ready_session_queues(state: &HubState) {
                     &session_id,
                     prompt_id,
                     "Claude registration is unbound; re-register and resubmit".into(),
+                    Some("target_unverified"),
                 );
+                operator_prompt_log(&canonical_id, "refused", "target_unverified");
                 claim.finish();
                 state.broadcast(
                     "session",
@@ -6643,35 +6785,66 @@ pub fn drain_ready_session_queues(state: &HubState) {
         if let Some(prompt_id) = &next
             && state.is_composer_held_prompt(&session_id, prompt_id)
         {
-            // Retained hosted Claude prompts stay held until explicit Send Now;
-            // the generic probe is not bound to their registration or host stream.
-            if state
-                .session_queue(&session_id)
-                .first()
-                .is_some_and(|item| item.claude_terminal)
-            {
+            let Some(held) = head.as_ref().filter(|item| &item.id == prompt_id) else {
+                continue;
+            };
+            if held.claude_terminal && held.claude_stream.is_none() {
+                // Legacy Claude holds lack a stream pin and cannot auto-retry.
                 continue;
             }
             let now_ms = stamp::now().unix_millis() as i64;
-            if !state.composer_hold_probe_due(prompt_id, now_ms) {
+            let Some(probes) = state.note_composer_hold_probe(prompt_id, now_ms) else {
                 continue;
-            }
-            let head = state.session_queue(&session_id).into_iter().next();
-            let ready = head
+            };
+            let ready = if let Some((binding, stream)) = held
+                .claude_binding
                 .as_ref()
-                .and_then(|item| drain_composer_probe(home, item, &canonical_id));
-            match state.note_composer_hold_probe(prompt_id, now_ms) {
-                Some(probes) => eprintln!(
-                    "hub: composer-held prompt {prompt_id} for {canonical_id}: reprobe {probes}/{} ready={ready:?}",
-                    crate::COMPOSER_HELD_MAX_PROBES
-                ),
-                None => {
-                    state.mark_hold_retries_exhausted(&session_id, prompt_id);
-                    eprintln!(
-                        "hub: composer-held prompt {prompt_id} for {canonical_id}: reprobes exhausted after {} probes; holding until owner action",
-                        crate::COMPOSER_HELD_MAX_PROBES
-                    );
+                .zip(held.claude_stream.as_ref())
+            {
+                match drain_bound_composer_probe(binding, stream) {
+                    Ok(()) => Some(true),
+                    Err(ClaudeBoundError::Refused(_)) => {
+                        if let Some((_, claim)) = state.claim_queued_for_dispatch(
+                            &canonical_id,
+                            &session_id,
+                            prompt_id,
+                            false,
+                        ) {
+                            let queue = state.hold_refused_queued_prompt(
+                                &session_id,
+                                prompt_id,
+                                crate::PARKED_PROMPT_REPLACED.into(),
+                                Some("session_replaced"),
+                            );
+                            claim.finish();
+                            operator_prompt_log(&canonical_id, "refused", "session_replaced");
+                            state.broadcast(
+                                "session",
+                                "queue_updated",
+                                json!({
+                                    "session_id": session_id, "persona": held.persona,
+                                    "is_busy": true, "queue": queue,
+                                }),
+                            );
+                        }
+                        continue;
+                    }
+                    Err(ClaudeBoundError::Delivery(_) | ClaudeBoundError::Held { .. }) => None,
                 }
+            } else {
+                drain_composer_probe(home, held, &canonical_id)
+            };
+            if probes == crate::COMPOSER_HELD_MAX_PROBES && ready != Some(true) {
+                state.mark_hold_retries_exhausted(&session_id, prompt_id);
+                operator_prompt_log(&canonical_id, "held", "retries_exhausted");
+                state.broadcast(
+                    "session",
+                    "queue_updated",
+                    json!({
+                        "session_id": session_id, "persona": held.persona,
+                        "is_busy": true, "queue": state.session_queue(&session_id),
+                    }),
+                );
             }
             if !state.release_composer_held_prompt(&session_id, prompt_id, ready) {
                 continue;
@@ -6683,34 +6856,34 @@ pub fn drain_ready_session_queues(state: &HubState) {
                 state.claim_queued_for_dispatch(&canonical_id, &session_id, &prompt_id, true)
         {
             let accepted_at = stamp::now().to_string();
-            let delivery_res = dispatch_operator_prompt_for_session_typed(
+            let delivery_res = dispatch_queued_operator_prompt_with_intent_for_session(
                 state,
                 item.persona.as_deref(),
                 &canonical_id,
                 &item.by,
                 &item.effective_body,
+                OperatorPromptIntent::Ordinary,
+                None,
                 item.claude_terminal,
                 item.claude_binding.as_ref(),
+                item.claude_stream.as_ref(),
                 queued_non_claude_vendor(&item).or(item.intended_vendor.as_deref()),
             );
-            let queue = if matches!(&delivery_res, Err(PushError::NotConnected(message) | PushError::Failed(message)) if message.contains("re-register and resubmit"))
-            {
-                state.hold_refused_queued_prompt(
-                    &session_id,
-                    &item.id,
-                    delivery_res.as_ref().unwrap_err().to_string(),
-                )
-            } else {
-                state.finish_queued_prompt(&session_id, &item.id, delivery_res.clone().map(|_| ()))
-            };
+            let queue = complete_operator_queue_item(state, &item, &delivery_res);
             #[cfg(test)]
             AFTER_QUEUE_FINISH.with(|hook| {
                 if let Some(f) = hook.borrow_mut().take() {
                     f();
                 }
             });
-            let zero_key_hold = state.is_composer_held_prompt(&session_id, &item.id);
-            if !zero_key_hold && !matches!(delivery_res, Err(PushError::NotConnected(_))) {
+            let zero_key_hold = matches!(delivery_res, Err(OperatorPromptError::Held { .. }))
+                || state.is_composer_held_prompt(&session_id, &item.id);
+            if !zero_key_hold
+                && !matches!(
+                    delivery_res,
+                    Err(OperatorPromptError::Push(PushError::NotConnected(_)))
+                )
+            {
                 let after = transcript_observation_from_sessions(
                     &canonical_id,
                     &sessions,
@@ -6719,12 +6892,15 @@ pub fn drain_ready_session_queues(state: &HubState) {
                     &mut files,
                 );
                 state.mark_session_in_flight_from_observation(&canonical_id, after.as_deref());
-                if matches!(delivery_res, Err(PushError::Failed(_))) {
+                if matches!(
+                    delivery_res,
+                    Err(OperatorPromptError::Push(PushError::Failed(_)))
+                ) {
                     state.associate_unconfirmed_queue(&canonical_id, &session_id, &item.id);
                 }
             }
             claim.finish();
-            let sent_data = with_operator_delivery(
+            let mut sent_data = with_operator_delivery(
                 json!({
                     "session_id": item.session_id,
                     "persona": item.persona,
@@ -6739,9 +6915,12 @@ pub fn drain_ready_session_queues(state: &HubState) {
                     "queue": queue,
                     "attachments": item.attachments,
                 }),
-                &delivery_res.map_err(OperatorPromptError::Push),
+                &delivery_res,
             );
-            state.broadcast("session", "prompt_sent", sent_data);
+            apply_queued_refusal(&mut sent_data, &queue, &item.id);
+            if !operator_prompt_rejected(&sent_data) {
+                state.broadcast("session", "prompt_sent", sent_data);
+            }
             state.broadcast(
                 "session",
                 "queue_updated",
@@ -6773,7 +6952,9 @@ fn queued_prompt_refusal(
         .chain(state.session_queue(raw_session_id))
         .find(|item| item.id == prompt_id)?;
     if authority.is_owner()
-        || (!fl_wire::dispatcher::is_owner_sender(&item.by) && authority.actor_name() == item.by)
+        || (!item.claude_terminal
+            && !fl_wire::dispatcher::is_owner_sender(&item.by)
+            && authority.actor_name() == item.by)
     {
         return None;
     }
@@ -6871,6 +7052,7 @@ fn handle_post_queued_prompt_send_now(
             intended_codex_thread_id,
             item.claude_terminal,
             item.claude_binding.as_ref(),
+            item.claude_stream.as_ref(),
             queued_non_claude_vendor(&item).or(item.intended_vendor.as_deref()),
         )
     };
@@ -6878,29 +7060,17 @@ fn handle_post_queued_prompt_send_now(
         delivery_res,
         Err(OperatorPromptError::Steer(CodexSteerError::Refused { .. }))
     ) || matches!(&delivery_res, Err(OperatorPromptError::Push(PushError::NotConnected(message) | PushError::Failed(message))) if message.contains("re-register and resubmit"));
-    let queue = if refused {
-        state.hold_refused_queued_prompt(
-            &queue_key,
-            prompt_id,
-            delivery_res.as_ref().unwrap_err().to_string(),
-        )
-    } else {
-        let legacy = delivery_res.clone().map(|_| ()).map_err(|e| match e {
-            OperatorPromptError::Push(e) => e,
-            OperatorPromptError::Steer(e) => PushError::Failed(e.to_string()),
-        });
-        state.finish_queued_prompt(&queue_key, prompt_id, legacy)
-    };
-    // Owner Send-now that lands on an occupied composer arms a new hold: reset its
-    // bounded re-probe budget instead of inheriting an exhausted one.
-    if !refused && !item.claude_terminal && state.is_composer_held_prompt(&queue_key, prompt_id) {
+    let queue = complete_operator_queue_item(state, &item, &delivery_res);
+    // Owner Send Now can renew the bounded retry budget of an exact held target.
+    if !refused && state.is_composer_held_prompt(&queue_key, prompt_id) {
         state.reset_composer_hold_probe(prompt_id, stamp::now().unix_millis() as i64);
     }
     if !refused
         && !state.is_composer_held_prompt(&queue_key, prompt_id)
         && !matches!(
             delivery_res,
-            Err(OperatorPromptError::Push(PushError::NotConnected(_)))
+            Err(OperatorPromptError::Held { .. }
+                | OperatorPromptError::Push(PushError::NotConnected(_)))
         )
     {
         if matches!(
@@ -6919,7 +7089,7 @@ fn handle_post_queued_prompt_send_now(
     }
     claim.finish();
 
-    let data = with_operator_delivery(
+    let mut data = with_operator_delivery(
         json!({
             "session_id": canonical_id,
             "persona": item.persona.clone().or(target_persona.clone()),
@@ -6936,7 +7106,10 @@ fn handle_post_queued_prompt_send_now(
         }),
         &delivery_res,
     );
-    state.broadcast("session", "prompt_sent", data.clone());
+    apply_queued_refusal(&mut data, &queue, prompt_id);
+    if !operator_prompt_rejected(&data) {
+        state.broadcast("session", "prompt_sent", data.clone());
+    }
     state.broadcast(
         "session",
         "queue_updated",
@@ -6978,9 +7151,15 @@ fn handle_patch_queued_prompt(
     if trimmed.is_empty() {
         return HttpResponse::json(400, json!({ "error": "prompt must not be empty" }));
     }
-    let updated = state
-        .update_queued_prompt(&canonical_id, prompt_id, trimmed.clone())
-        .or_else(|| state.update_queued_prompt(raw_session_id, prompt_id, trimmed));
+    let updated = match state.update_queued_prompt(&canonical_id, prompt_id, trimmed.clone()) {
+        Ok(None) if canonical_id != raw_session_id => {
+            state.update_queued_prompt(raw_session_id, prompt_id, trimmed)
+        }
+        other => other,
+    };
+    let Ok(updated) = updated else {
+        return oversized_queued_prompt_refusal(&canonical_id);
+    };
     let Some((item, queue)) = updated else {
         return HttpResponse::json(404, json!({ "error": "queued prompt not found" }));
     };
@@ -7051,6 +7230,47 @@ fn handle_delete_queued_prompt(
     )
 }
 
+fn oversized_queued_prompt_refusal(session_id: &str) -> HttpResponse {
+    operator_prompt_refusal(
+        session_id,
+        413,
+        "queued_prompt_too_large",
+        "This prompt is too large to queue. Shorten the prompt or wait until the session is idle.",
+    )
+}
+
+fn operator_prompt_queued(
+    state: &HubState,
+    item: &crate::QueuedOperatorPrompt,
+    queue: &[crate::QueuedOperatorPrompt],
+) -> HttpResponse {
+    let mut data = json!({
+        "session_id": item.session_id, "persona": item.persona, "status": "queued",
+        "queued": true, "is_busy": true, "queued_prompt": item, "queue": queue,
+        "queue_epoch": state.queue_epoch, "attachments": item.attachments,
+    });
+    if let Some(reason) = item.hold_reason.as_deref() {
+        data["delivery_stage"] = json!("held");
+        data["delivered"] = json!(false);
+        data["hold_reason"] = json!(reason);
+        operator_prompt_log(&item.session_id, "held", reason);
+    } else if let Some(reason) = item.refusal_reason.as_deref() {
+        data["delivery_stage"] = json!("refused");
+        data["delivered"] = json!(false);
+        data["refusal_reason"] = json!(reason);
+        data["delivery_error"] = json!(item.delivery_error);
+        operator_prompt_log(&item.session_id, "refused", reason);
+    }
+    state.broadcast(
+        "session",
+        "queue_updated",
+        json!({
+            "session_id": item.session_id, "persona": item.persona, "is_busy": true, "queue": queue,
+        }),
+    );
+    HttpResponse::json(200, data)
+}
+
 fn handle_post_session_prompt(
     state: &HubState,
     authority: &HubAuthority,
@@ -7081,13 +7301,15 @@ fn handle_post_session_prompt(
 
     let payload: PromptPayload = match req.json() {
         Ok(p) => p,
-        Err(e) => return HttpResponse::json(400, json!({ "error": e })),
+        Err(e) => return operator_prompt_refusal(session_id.trim(), 400, "invalid_request", &e),
     };
 
     if payload.prompt.trim().is_empty() && payload.attachments.is_empty() {
-        return HttpResponse::json(
+        return operator_prompt_refusal(
+            session_id.trim(),
             400,
-            json!({ "error": "prompt or attachments must not be empty" }),
+            "empty_prompt",
+            "Enter a prompt or add an attachment.",
         );
     }
 
@@ -7106,9 +7328,11 @@ fn handle_post_session_prompt(
     });
     use fl_wire::vendor_adapter::{ClaudeRegistrationBinding, ClaudeRegistrationError};
     let refuse = |error: &dyn std::fmt::Display| {
-        HttpResponse::json(
+        operator_prompt_refusal(
+            session_id.trim(),
             409,
-            json!({"error": error.to_string(), "delivered": false, "delivery_stage": "refused"}),
+            "registration_unverified",
+            &error.to_string(),
         )
     };
     let claude_binding = if authority.is_owner() {
@@ -7138,6 +7362,14 @@ fn handle_post_session_prompt(
         None
     };
 
+    let request_target = claude_binding
+        .as_ref()
+        .map(ClaudeRegistrationBinding::native_session)
+        .unwrap_or_else(|| session_id.trim());
+    let attachment_refused = |refusal: crate::attachment_policy::AttachmentRefusal| {
+        operator_prompt_log(request_target, "refused", "attachment_policy");
+        refusal.into_response()
+    };
     let mut saved_attachments: Vec<SavedPromptAttachment> =
         Vec::with_capacity(payload.attachments.len());
     if !payload.attachments.is_empty() {
@@ -7148,7 +7380,7 @@ fn handle_post_session_prompt(
         if let Err(refusal) =
             policy::check_attachment_names(payload.attachments.iter().map(|att| att.name.as_str()))
         {
-            return refusal.into_response();
+            return attachment_refused(refusal);
         }
         let mut total_bytes = 0usize;
         let mut decoded_files = Vec::with_capacity(payload.attachments.len());
@@ -7161,24 +7393,28 @@ fn handle_post_session_prompt(
             }
             .trim();
             if raw_b64.len() > policy::MAX_ATTACHMENT_BASE64_CHARS {
-                return policy::AttachmentRefusal::FileTooLarge {
+                return attachment_refused(policy::AttachmentRefusal::FileTooLarge {
                     name: att.name.clone(),
-                }
-                .into_response();
+                });
             }
             let decoded = match base64::engine::general_purpose::STANDARD.decode(raw_b64) {
                 Ok(b) => b,
                 Err(e) => {
-                    return HttpResponse::json(
+                    return operator_prompt_refusal(
+                        request_target,
                         400,
-                        json!({ "error": format!("invalid base64 in attachment `{}`: {e}", att.name) }),
+                        "attachment_encoding",
+                        &format!(
+                            "Attach the file again. Invalid base64 in attachment `{}`: {e}",
+                            att.name
+                        ),
                     );
                 }
             };
             if let Err(refusal) =
                 policy::check_attachment_size(&att.name, decoded.len(), &mut total_bytes)
             {
-                return refusal.into_response();
+                return attachment_refused(refusal);
             }
             decoded_files.push(decoded);
         }
@@ -7238,6 +7474,12 @@ fn handle_post_session_prompt(
         ));
     }
 
+    let cleanup_undelivered_attachments = || {
+        for saved in &saved_attachments {
+            let _ = fs::remove_file(&saved.path);
+        }
+    };
+
     let sender_name = resolve_prompt_sender(authority, payload.by.as_deref());
 
     // Most prompts target a live route. Its identity needs agent ordering but not the
@@ -7272,28 +7514,37 @@ fn handle_post_session_prompt(
         && claude_binding.is_none()
         && observed_target.is_some_and(|s| s.adapter == "claude")
     {
-        return HttpResponse::json(
+        cleanup_undelivered_attachments();
+        return operator_prompt_refusal(
+            &observed_target.unwrap().id,
             409,
-            json!({"error": "Claude registration is unbound; re-register and resubmit", "delivered": false, "delivery_stage": "refused"}),
+            "registration_unverified",
+            "Claude registration is unbound; re-register and resubmit",
         );
     }
     let retained_target = if observed_target.is_none() && claude_binding.is_none() {
         match state.prompt_queue_target(session_id.trim()) {
             Ok(target) => target,
             Err(()) => {
-                return HttpResponse::json(409, json!({"error": "ambiguous queued session alias"}));
+                cleanup_undelivered_attachments();
+                return operator_prompt_refusal(
+                    request_target,
+                    409,
+                    "ambiguous_queue",
+                    "Queued session alias is ambiguous. Open the original session and try again.",
+                );
             }
         }
     } else {
         None
     };
     if payload.send_now && retained_target.is_some() {
-        return HttpResponse::json(
+        cleanup_undelivered_attachments();
+        return operator_prompt_refusal(
+            request_target,
             409,
-            json!({
-                "error": "no active vendor route for the queued session", "delivered": false,
-                "delivery_stage": "transport_failed",
-            }),
+            "no_active_route",
+            "No active vendor route for the queued session. Reconnect the session and try again.",
         );
     }
     let (canonical_session_id, target_persona) = claude_binding
@@ -7336,66 +7587,63 @@ fn handle_post_session_prompt(
         state.is_session_busy_from_observation(&canonical_session_id, turns.as_deref())
     };
 
+    let input = crate::DirectPromptInput {
+        claude_terminal: claude_binding.is_some(),
+        claude_binding: claude_binding.clone(),
+        intended_vendor: intended_vendor.clone(),
+        queue_target: observed_target
+            .and_then(|session| crate::PromptQueueTarget::observed(session, session_id)),
+        intended_codex_thread_id: intended_codex_thread_id.clone(),
+        persona: target_persona.clone(),
+        prompt: prompt_text.clone(),
+        effective_body: effective_body.clone(),
+        by: sender_name.clone(),
+        attachments: saved_attachments.clone(),
+    };
     let claim = match state.admit_direct_prompt(
         &canonical_session_id,
         session_id,
         payload.send_now,
         busy,
-        crate::DirectPromptInput {
-            claude_terminal: claude_binding.is_some(),
-            claude_binding: claude_binding.clone(),
-            intended_vendor: intended_vendor.clone(),
-            queue_target: observed_target
-                .and_then(|session| crate::PromptQueueTarget::observed(session, session_id)),
-            intended_codex_thread_id: intended_codex_thread_id.clone(),
-            persona: target_persona.clone(),
-            prompt: prompt_text.clone(),
-            effective_body: effective_body.clone(),
-            by: sender_name.clone(),
-            attachments: saved_attachments.clone(),
-        },
+        input.clone(),
     ) {
         crate::DirectPromptDecision::Dispatch(claim) => claim,
         crate::DirectPromptDecision::FencedAlias(original) => {
-            return HttpResponse::json(
+            cleanup_undelivered_attachments();
+            return operator_prompt_refusal(
+                &canonical_session_id,
                 409,
-                json!({
-                    "error": format!("{} has fenced queued prompts on {original}; resolve or discard that queue", session_id.trim()),
-                    "delivered": false,
-                    "delivery_stage": "refused",
-                }),
+                "queue_fenced",
+                &format!(
+                    "{} has fenced queued prompts on {original}; resolve or discard that queue",
+                    session_id.trim()
+                ),
             );
         }
         crate::DirectPromptDecision::DispatchBusy => {
-            return HttpResponse::json(
+            cleanup_undelivered_attachments();
+            return operator_prompt_refusal(
+                &canonical_session_id,
                 409,
-                json!({ "error": "another prompt is being dispatched to this session" }),
+                "dispatch_busy",
+                "Another prompt is being dispatched to this session. Wait and try again.",
             );
         }
+        crate::DirectPromptDecision::QueueFull => {
+            cleanup_undelivered_attachments();
+            return operator_prompt_refusal(
+                &canonical_session_id,
+                409,
+                "queue_full",
+                "The prompt queue is full. Wait for it to drain or remove an item before resubmitting.",
+            );
+        }
+        crate::DirectPromptDecision::PromptTooLarge => {
+            cleanup_undelivered_attachments();
+            return oversized_queued_prompt_refusal(&canonical_session_id);
+        }
         crate::DirectPromptDecision::Queued(item, queue) => {
-            state.broadcast(
-                "session",
-                "queue_updated",
-                json!({
-                    "session_id": canonical_session_id,
-                    "persona": target_persona,
-                    "is_busy": true,
-                    "queue": queue,
-                }),
-            );
-            return HttpResponse::json(
-                200,
-                json!({
-                    "session_id": canonical_session_id,
-                    "persona": target_persona,
-                    "status": "queued",
-                    "queued": true,
-                    "is_busy": true,
-                    "queued_prompt": item,
-                    "queue": queue,
-                    "attachments": saved_attachments,
-                }),
-            );
+            return operator_prompt_queued(state, &item, &queue);
         }
     };
 
@@ -7410,15 +7658,39 @@ fn handle_post_session_prompt(
         intended_codex_thread_id.as_deref(),
         claude_binding.is_some(),
         claude_binding.as_ref(),
+        None,
         intended_vendor.as_deref(),
         #[cfg(test)]
         false,
     );
+    if !payload.send_now
+        && let Err(OperatorPromptError::Held { reason, stream }) = &delivery_res
+    {
+        if !input.fits_queue() {
+            claim.finish();
+            cleanup_undelivered_attachments();
+            return oversized_queued_prompt_refusal(&canonical_session_id);
+        }
+        let (item, queue) = claim.park_claude_prompt(input, reason.clone(), stream.clone());
+        claim.finish();
+        return operator_prompt_queued(state, &item, &queue);
+    }
     match &delivery_res {
-        Err(OperatorPromptError::Steer(CodexSteerError::Refused { .. })) => {}
-        Err(OperatorPromptError::Push(
-            PushError::NotConnected(message) | PushError::Failed(message),
-        )) if message.contains("re-register and resubmit") => {}
+        Err(
+            OperatorPromptError::Held { .. }
+            | OperatorPromptError::Steer(CodexSteerError::Refused { .. }),
+        ) => {
+            cleanup_undelivered_attachments();
+        }
+        Err(OperatorPromptError::Push(PushError::Failed(message)))
+            if fl_wire::is_composer_occupied_zero_keys_error(message)
+                || message.contains("re-register and resubmit") =>
+        {
+            cleanup_undelivered_attachments();
+        }
+        Err(OperatorPromptError::Push(PushError::NotConnected(_))) if claude_binding.is_some() => {
+            cleanup_undelivered_attachments();
+        }
         Err(OperatorPromptError::Push(PushError::NotConnected(_))) if retained_target.is_some() => {
         }
         Ok(OperatorPromptOutcome::AppServerAccepted { .. })
@@ -7440,11 +7712,11 @@ fn handle_post_session_prompt(
     claim.finish();
     let queue = state.session_queue(&canonical_session_id);
 
-    let data = with_operator_delivery(
+    let mut data = with_operator_delivery(
         json!({
             "session_id": canonical_session_id,
             "persona": target_persona,
-            "status": if matches!(delivery_res, Err(OperatorPromptError::Steer(_))) { "delivery_failed" } else { "sent" },
+            "status": "sent",
             "queued": false,
             "is_busy": true,
             "accepted_at": accepted_at,
@@ -7457,7 +7729,16 @@ fn handle_post_session_prompt(
         }),
         &delivery_res,
     );
-    state.broadcast("session", "prompt_sent", data.clone());
+    let rejected = operator_prompt_rejected(&data);
+    let legacy_not_connected =
+        claude_binding.is_none() && data["delivery_stage"] == "not_connected";
+    if (rejected && !legacy_not_connected)
+        || matches!(delivery_res, Err(OperatorPromptError::Steer(_)))
+    {
+        data["status"] = json!("delivery_failed");
+    } else {
+        state.broadcast("session", "prompt_sent", data.clone());
+    }
     HttpResponse::json(200, data)
 }
 
@@ -7665,8 +7946,9 @@ fn handle_post_session_clear(
 }
 
 /// Clear or reforge one session: select and preflight its route, prepare guidance, then drop
-/// queued prompts and model overrides and reset the live vendor route. `mode` is `"clear"` or `"reforge"`. `raw_session_id`
-/// is the id the caller used (its queue is dropped too); `canonical_id` and `persona` come from
+/// prompts from the active queue, clear model overrides and reset the live vendor route.
+/// `mode` is `"clear"` or `"reforge"`. `raw_session_id` is the caller's queue alias;
+/// `canonical_id` and `persona` come from
 /// the saved reset target metadata. Returns the response body, or `(status, error)`: 404 when there
 /// is no agent record (reforge) or no live route, 409 for an unsupported reset, and 502
 /// when the dispatch itself fails. Error bodies retain structured refusal fields.
@@ -7744,6 +8026,18 @@ fn reset_session_with_prompt(
         None
     };
 
+    let reset_claim = if let fl_wire::identity::VendorRoute::Claude { session_id, .. } = &route {
+        let Some(claim) = state.claim_claude_clear(session_id, raw_session_id) else {
+            return Err((
+                409,
+                json!({"error": "A prompt is being sent to this Claude session. Wait, then try clearing it again."}),
+            ));
+        };
+        state.clear_session_prompt_queue(session_id);
+        Some(claim)
+    } else {
+        None
+    };
     state.clear_session_prompt_queue(canonical_id);
     if raw_session_id != canonical_id {
         state.clear_session_prompt_queue(raw_session_id);
@@ -7770,6 +8064,9 @@ fn reset_session_with_prompt(
     // A reset runs once: after its `/clear` or `/new` lands the session has changed, so a reset
     // that then fails is never run again on another route.
     let reset = clear_or_reforge_session(&route, reset_mode, actor, prompt.as_deref());
+    if let Some(claim) = reset_claim {
+        claim.finish();
+    }
     // A clear can start a new vendor session (a new id) behind the same persona.
     crate::discovery::invalidate_route_discovery_cache();
     if let Err(e) = reset {
@@ -8842,30 +9139,33 @@ fn handle_post_session_decommission(
                 Ok(out) => out,
                 Err(e) => return lifecycle_error_response(&e),
             };
+            let mut data = serde_json::to_value(&out).unwrap_or_default();
             if let (DecommissionMode::Prepare, false, Some(prompt)) =
                 (mode, out.handshake_dispatched, out.prompt.as_ref())
             {
                 // No live route took the handshake: leave it on the session queue for the next idle turn.
-                let (_, queue) = state.enqueue_session_prompt(
+                if let Some((_, queue)) = state.try_enqueue_session_prompt(
                     &target.session_id,
                     Some(target.persona.clone()),
                     prompt.clone(),
                     prompt.clone(),
                     by.to_string(),
                     Vec::new(),
-                );
-                state.broadcast(
-                    "session",
-                    "queue_updated",
-                    json!({
-                        "session_id": target.session_id,
-                        "persona": target.persona,
-                        "is_busy": true,
-                        "queue": queue,
-                    }),
-                );
+                ) {
+                    state.broadcast(
+                        "session",
+                        "queue_updated",
+                        json!({
+                            "session_id": target.session_id, "persona": target.persona,
+                            "is_busy": true, "queue": queue,
+                        }),
+                    );
+                } else {
+                    data["handshake_queue_error"] = json!(
+                        "The handshake exceeds the prompt queue limit. Review the prompt and resubmit it when the session is available."
+                    );
+                }
             }
-            let data = serde_json::to_value(&out).unwrap_or_default();
             state.broadcast("sessions", "session.decommission", data.clone());
             HttpResponse::json(200, data)
         })())
@@ -9017,28 +9317,32 @@ pub(crate) fn run_remodel(
         }
         Err(e) => return RemodelRun::Refused(e),
     };
+    let mut data = serde_json::to_value(&out).unwrap_or_default();
     match out.mode {
         RemodelMode::Prepare => {
             if let (false, Some(prompt)) = (out.handshake_dispatched, out.prompt.as_ref()) {
                 // No live route took the handshake: leave it on the queue for the next idle turn.
-                let (_, queue) = state.enqueue_session_prompt(
+                if let Some((_, queue)) = state.try_enqueue_session_prompt(
                     &out.session_id,
                     Some(out.persona.clone()),
                     prompt.clone(),
                     prompt.clone(),
                     by.to_string(),
                     Vec::new(),
-                );
-                state.broadcast(
-                    "session",
-                    "queue_updated",
-                    json!({
-                        "session_id": out.session_id,
-                        "persona": out.persona,
-                        "is_busy": true,
-                        "queue": queue,
-                    }),
-                );
+                ) {
+                    state.broadcast(
+                        "session",
+                        "queue_updated",
+                        json!({
+                            "session_id": out.session_id, "persona": out.persona,
+                            "is_busy": true, "queue": queue,
+                        }),
+                    );
+                } else {
+                    data["handshake_queue_error"] = json!(
+                        "The handshake exceeds the prompt queue limit. Review the prompt and resubmit it when the session is available."
+                    );
+                }
             }
         }
         RemodelMode::Execute => {
@@ -9060,7 +9364,6 @@ pub(crate) fn run_remodel(
             }
         }
     }
-    let data = serde_json::to_value(&out).unwrap_or_default();
     state.broadcast("sessions", "session.remodeled", data.clone());
     RemodelRun::Done {
         out: Box::new(out),
@@ -13950,6 +14253,194 @@ mod claude_registration_binding_tests {
         entry.hydration_generation = Some("replacement".into());
         entry
     }
+    fn parking_fixture() -> (tempfile::TempDir, HubState, String, fl_host_proto::StreamId) {
+        let (tmp, mut state, _source, entry, binding) = fixture();
+        state.store_backend = Some(fl_store::BackendKind::Redb);
+        let primary = tmp.path().join(".cache/agent-bus/routes.json");
+        std::fs::create_dir_all(primary.parent().unwrap()).unwrap();
+        write(&primary, &entry);
+        let stream = fl_host_proto::StreamId {
+            host: fl_host_proto::HostInstance::new([7; 16]),
+            session: fl_host_proto::SessionId::new("claude-ada").unwrap(),
+            epoch: fl_host_proto::SessionEpoch(1),
+        };
+        (tmp, state, binding.native_session().into(), stream)
+    }
+
+    fn owner_post(state: &HubState, prompt: &str) -> HttpResponse {
+        let owner = HubAuthority::Owner {
+            login: "owner".into(),
+        };
+        let request =
+            HttpRequest::new("POST", "/unused").with_json_body(&json!({"prompt": prompt}));
+        handle_post_session_prompt(state, &owner, "claude:ada", &request)
+    }
+
+    struct ClaudeDispatchStub;
+    impl Drop for ClaudeDispatchStub {
+        fn drop(&mut self) {
+            CLAUDE_DISPATCH_STUB.with(|slot| *slot.borrow_mut() = None);
+        }
+    }
+    fn stub_claude_dispatch(
+        dispatch: impl FnMut(Option<&fl_host_proto::StreamId>, &str) -> Result<(), ClaudeBoundError>
+        + 'static,
+    ) -> ClaudeDispatchStub {
+        CLAUDE_DISPATCH_STUB.with(|slot| *slot.borrow_mut() = Some(Box::new(dispatch)));
+        ClaudeDispatchStub
+    }
+    fn busy_hold(stream: &fl_host_proto::StreamId) -> ClaudeBoundError {
+        ClaudeBoundError::Held {
+            reason: "composer_occupied_by_non_wire_input: session_busy: Claude session is not idle; holding delivery without sending keys".into(),
+            stream: stream.clone(),
+        }
+    }
+
+    #[test]
+    fn direct_claude_zero_key_hold_drains_once_when_idle_and_in_admission_order() {
+        let (_tmp, state, native, stream) = parking_fixture();
+        let successful = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let writes = successful.clone();
+        let mut direct = true;
+        let _dispatch = stub_claude_dispatch(move |pinned, body| {
+            if std::mem::take(&mut direct) {
+                assert_eq!(pinned, None);
+                return Err(busy_hold(&stream));
+            }
+            if body == "first" {
+                assert_eq!(pinned, Some(&stream));
+            }
+            writes.borrow_mut().push(body.to_owned());
+            Ok(())
+        });
+        let mut events = state.subscribe();
+        let admitting = state.clone();
+        before_next_prompt_dispatch(move || {
+            let response = owner_post(&admitting, "later");
+            assert_eq!(response.status, 200);
+            assert_eq!(response.json_value().unwrap()["queued"], true);
+        });
+        let parked = owner_post(&state, "first").json_value().unwrap();
+        assert_eq!(parked["status"], "queued");
+        assert_eq!(parked["delivery_stage"], "held");
+        assert_eq!(parked["hold_reason"], "session_busy");
+        assert_eq!(parked["queue_epoch"], json!(state.queue_epoch));
+        assert_eq!(parked["session_id"], native);
+        assert_eq!(parked["queue"][0]["prompt"], "first");
+        assert_eq!(parked["queue"][1]["prompt"], "later");
+        assert!(!state.is_session_busy_from_observation(&native, Some(&[])));
+        assert_eq!(events.try_recv().unwrap().event, "queue_updated");
+        assert_eq!(events.try_recv().unwrap().event, "queue_updated");
+        assert!(events.try_recv().is_err());
+
+        // An intentional repeat may queue as a separate item, visible in the same receipt.
+        let repeated = owner_post(&state, "first").json_value().unwrap();
+        assert_eq!(repeated["queue"][0]["prompt"], "first");
+        assert_eq!(repeated["queue"][2]["prompt"], "first");
+        assert_ne!(repeated["queue"][0]["id"], repeated["queue"][2]["id"]);
+
+        let probes = stub_composer_probes(vec![Some(false)]);
+        drain_ready_session_queues(&state);
+        assert_eq!(composer_probe_calls(), 1);
+        drain_ready_session_queues(&state);
+        assert!(successful.borrow().is_empty());
+        assert_eq!(composer_probe_calls(), 1, "busy retry must honor backoff");
+        drop(probes);
+
+        let first = parked["queued_prompt"]["id"].as_str().unwrap();
+        state.reset_composer_hold_probe(first, 0);
+        let _probes = stub_composer_probes(vec![Some(true)]);
+        drain_ready_session_queues(&state);
+        assert_eq!(&*successful.borrow(), &["first"]);
+        assert_eq!(state.session_queue(&native)[0].prompt, "later");
+        state.clear_session_in_flight(&native);
+        drain_ready_session_queues(&state);
+        assert_eq!(&*successful.borrow(), &["first", "later"]);
+    }
+
+    #[test]
+    fn claude_clear_retains_a_sending_row_only_as_a_refusal_after_zero_keys() {
+        let (_tmp, state, native, stream) = parking_fixture();
+        let first = {
+            let _dispatch = stub_claude_dispatch({
+                let stream = stream.clone();
+                move |_, _| Err(busy_hold(&stream))
+            });
+            let first = owner_post(&state, "keep this draft").json_value().unwrap();
+            first["queued_prompt"]["id"].as_str().unwrap().to_owned()
+        };
+        let (_, claim) = state
+            .claim_queued_for_dispatch(&native, &native, &first, false)
+            .unwrap();
+        state.clear_session_prompt_queue(&native);
+        assert_eq!(
+            state.session_queue(&native)[0].delivery_state,
+            crate::QueuedDeliveryState::Sending
+        );
+        let ClaudeBoundError::Held { reason, stream } = busy_hold(&stream) else {
+            unreachable!()
+        };
+        let after = state.finish_bound_claude_hold(&native, &first, reason, stream);
+        claim.finish();
+        assert_eq!(after[0].delivery_state, crate::QueuedDeliveryState::Refused);
+        assert_eq!(after[0].refusal_reason.as_deref(), Some("session_replaced"));
+        assert_eq!(after[0].prompt, "keep this draft");
+        assert!(
+            state
+                .claim_queued_for_dispatch(&native, &native, &first, false)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn peer_label_does_not_grant_owner_claude_queue_authority() {
+        let (_tmp, state, _native, stream) = parking_fixture();
+        let _dispatch = stub_claude_dispatch(move |_, _| Err(busy_hold(&stream)));
+        let owner = HubAuthority::Owner {
+            login: "owner".into(),
+        };
+        let peer = HubAuthority::Peer {
+            agent: Some("alice".into()),
+        };
+        let request = HttpRequest::new("POST", "/unused")
+            .with_json_body(&json!({"prompt": "keep this draft", "by": "alice"}));
+        let response = handle_post_session_prompt(&state, &owner, "claude:ada", &request);
+        let item = response.json_value().unwrap()["queued_prompt"].clone();
+        assert_eq!(item["by"], "alice");
+        let queue_id = item["id"].as_str().unwrap();
+        let native = item["session_id"].as_str().unwrap();
+        assert_eq!(
+            handle_post_queued_prompt_send_now(&state, &peer, native, queue_id).status,
+            403
+        );
+        assert_eq!(
+            state.session_queue(native)[0].hold_reason.as_deref(),
+            Some("session_busy")
+        );
+    }
+
+    #[test]
+    fn claude_queue_limit_includes_the_direct_park_reservation() {
+        let (_tmp, state, native, stream) = parking_fixture();
+        let _dispatch = stub_claude_dispatch(move |_, _| Err(busy_hold(&stream)));
+        let admitting = state.clone();
+        before_next_prompt_dispatch(move || {
+            for _ in 1..crate::MAX_SESSION_QUEUED_PROMPTS {
+                assert_eq!(owner_post(&admitting, "later").status, 200);
+            }
+            let refusal = owner_post(&admitting, "too many");
+            assert_eq!(refusal.status, 409);
+            let body = refusal.json_value().unwrap();
+            assert_eq!(body["delivery_stage"], "refused");
+            assert_eq!(body["refusal_reason"], "queue_full");
+        });
+        let first = owner_post(&state, "first").json_value().unwrap();
+        assert_eq!(first["delivery_stage"], "held");
+        let queue = state.session_queue(&native);
+        assert_eq!(queue.len(), crate::MAX_SESSION_QUEUED_PROMPTS);
+        assert_eq!(queue[0].prompt, "first");
+    }
+
     #[test]
     fn invalid_primary_refuses_unclassified_before_scans_or_attachment_writes() {
         let (tmp, state, _source, entry, _binding) = fixture();
@@ -14043,6 +14534,7 @@ mod claude_registration_binding_tests {
             false,
             None,
             None,
+            None,
         );
         assert!(matches!(
             codex,
@@ -14062,6 +14554,7 @@ mod claude_registration_binding_tests {
             OperatorPromptIntent::Ordinary,
             None,
             false,
+            None,
             None,
             Some("codex"),
         );
@@ -14100,6 +14593,7 @@ mod claude_registration_binding_tests {
             false,
             None,
             None,
+            None,
         );
         assert!(matches!(
             result,
@@ -14136,10 +14630,11 @@ mod claude_registration_binding_tests {
                 true,
                 Some(&binding),
                 None,
+                None,
                 false,
             );
             assert!(
-                matches!(direct, Err(OperatorPromptError::Push(PushError::NotConnected(ref error))) if error.contains("session is unavailable or changed"))
+                matches!(direct, Err(OperatorPromptError::Push(PushError::NotConnected(ref error))) if error.contains("session record is unavailable") || error.contains("conversation changed"))
             );
             let queued = dispatch_queued_operator_prompt_with_intent_for_session(
                 &state,
@@ -14152,9 +14647,10 @@ mod claude_registration_binding_tests {
                 true,
                 Some(&binding),
                 None,
+                None,
             );
             assert!(
-                matches!(queued, Err(OperatorPromptError::Push(PushError::NotConnected(ref error))) if error.contains("session is unavailable or changed"))
+                matches!(queued, Err(OperatorPromptError::Push(PushError::NotConnected(ref error))) if error.contains("session record is unavailable") || error.contains("conversation changed"))
             );
         }
     }
@@ -14226,6 +14722,7 @@ mod claude_registration_binding_tests {
             true,
             Some(&binding),
             None,
+            None,
             false,
         );
         assert!(
@@ -14250,6 +14747,7 @@ mod claude_registration_binding_tests {
                 None,
                 true,
                 Some(&binding),
+                None,
                 None,
             );
             assert!(
@@ -14473,6 +14971,7 @@ mod claude_registration_binding_tests {
             None,
             restored.claude_terminal,
             restored.claude_binding.as_ref(),
+            None,
             restored.intended_vendor.as_deref(),
         );
         assert!(

@@ -125,6 +125,12 @@ pub struct QueuedOperatorPrompt {
     pub(crate) claude_terminal: bool,
     #[serde(skip)]
     pub(crate) claude_binding: Option<fl_wire::vendor_adapter::ClaudeRegistrationBinding>,
+    /// The exact Host epoch that returned a proven zero-key hold.
+    #[serde(skip)]
+    pub(crate) claude_stream: Option<fl_host_proto::StreamId>,
+    /// A lifecycle replacement raced with a dispatch whose outcome was still unknown.
+    #[serde(skip)]
+    claude_invalidated: bool,
     /// Process-local admission evidence; a deserialized item must not manufacture it.
     #[serde(skip)]
     pub(crate) admitted_current: bool,
@@ -144,6 +150,8 @@ pub struct QueuedOperatorPrompt {
     pub delivery_error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hold_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refusal_reason: Option<String>,
     #[serde(default)]
     pub retries_exhausted: bool,
 }
@@ -223,7 +231,7 @@ fn is_composer_occupied_error(error: &str) -> bool {
 /// Hold reason stored on a queue item for a zero-keys wire hold (#545-3): exactly
 /// `composer_occupied`, `composer_unlocated`, or `session_busy`. A generic zero-keys
 /// hold (including the legacy generic text) is an occupied composer.
-fn composer_hold_reason(error: &str) -> &'static str {
+pub(crate) fn composer_hold_reason(error: &str) -> &'static str {
     if error.contains("composer_unlocated") {
         "composer_unlocated"
     } else if error.contains("session_busy") {
@@ -233,11 +241,22 @@ fn composer_hold_reason(error: &str) -> &'static str {
     }
 }
 
+const MAX_SESSION_QUEUED_PROMPTS: usize = 16;
+const MAX_HUB_QUEUED_PROMPTS: usize = 128;
+const MAX_QUEUED_PROMPT_BYTES: usize = 256 * 1024;
+pub(crate) struct QueuedPromptTooLarge;
+pub(crate) const PARKED_PROMPT_REPLACED: &str =
+    "The original conversation changed. Review the retained draft before resubmitting.";
+
 #[derive(Debug, Default)]
 struct PromptQueueState {
     queues: BTreeMap<String, Vec<QueuedOperatorPrompt>>,
     in_flight: BTreeMap<String, InFlightPrompt>,
     active_queue_sends: std::collections::BTreeSet<String>,
+    active_claude_clears: std::collections::BTreeSet<String>,
+    // An ordinary direct Claude dispatch may turn into a zero-key hold.
+    // Reserve room up front. The flag records a concurrent lifecycle invalidation.
+    direct_park_reservations: BTreeMap<String, bool>,
     next_seq: u64,
     targets: BTreeMap<String, PromptQueueTarget>,
     /// Per-prompt `(probes_run, next_probe_at_ms)` for composer-occupied holds.
@@ -255,6 +274,34 @@ pub(crate) struct SessionDispatchGuard<'a> {
 }
 
 impl SessionDispatchGuard<'_> {
+    pub(crate) fn park_claude_prompt(
+        &self,
+        input: DirectPromptInput,
+        reason: String,
+        stream: fl_host_proto::StreamId,
+    ) -> (QueuedOperatorPrompt, Vec<QueuedOperatorPrompt>) {
+        let mut queues = self
+            .state
+            .prompt_queues
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let invalidated = queues
+            .direct_park_reservations
+            .remove(&self.canonical)
+            .expect("direct Claude park has reserved capacity");
+        let mut item = queues.make_item(&self.canonical, input);
+        item.claude_stream = Some(stream);
+        if invalidated {
+            item.refuse(PARKED_PROMPT_REPLACED.into(), Some("session_replaced"));
+        } else {
+            item.hold(reason);
+        }
+        let queue = queues.queues.entry(self.canonical.clone()).or_default();
+        // Other submissions may have queued while this first dispatch was in progress.
+        queue.insert(0, item.clone());
+        (item, queue.clone())
+    }
+
     /// The caller has recorded an in-flight observation or proved no delivery occurred.
     pub(crate) fn finish(mut self) {
         self.completed = true;
@@ -296,11 +343,14 @@ impl Drop for SessionDispatchGuard<'_> {
                 },
             );
         }
+        queues.direct_park_reservations.remove(&self.canonical);
         queues.active_queue_sends.remove(&self.canonical);
         queues.active_queue_sends.remove(&self.raw);
+        queues.active_claude_clears.remove(&self.canonical);
     }
 }
 
+#[derive(Clone)]
 pub(crate) struct DirectPromptInput {
     pub queue_target: Option<PromptQueueTarget>,
     pub claude_terminal: bool,
@@ -314,14 +364,49 @@ pub(crate) struct DirectPromptInput {
     pub attachments: Vec<SavedPromptAttachment>,
 }
 
+impl DirectPromptInput {
+    pub(crate) fn fits_queue(&self) -> bool {
+        self.effective_body.len() <= MAX_QUEUED_PROMPT_BYTES
+    }
+}
+
 pub(crate) enum DirectPromptDecision<'a> {
     Dispatch(SessionDispatchGuard<'a>),
     Queued(Box<QueuedOperatorPrompt>, Vec<QueuedOperatorPrompt>),
     DispatchBusy,
+    QueueFull,
+    PromptTooLarge,
     FencedAlias(String),
 }
 
+impl QueuedOperatorPrompt {
+    fn hold(&mut self, reason: String) {
+        self.delivery_state = QueuedDeliveryState::Pending;
+        self.hold_reason = Some(composer_hold_reason(&reason).into());
+        self.refusal_reason = None;
+        self.delivery_error = Some(reason);
+        self.retries_exhausted = self.claude_terminal && self.claude_stream.is_none();
+    }
+
+    fn refuse(&mut self, error: String, reason: Option<&str>) {
+        self.delivery_state = QueuedDeliveryState::Refused;
+        self.hold_reason = None;
+        self.refusal_reason = reason.map(str::to_owned);
+        self.delivery_error = Some(error);
+        self.retries_exhausted = false;
+    }
+}
+
 impl PromptQueueState {
+    fn has_room(&self, session_key: &str) -> bool {
+        self.queues.get(session_key).map_or(0, Vec::len)
+            + usize::from(self.direct_park_reservations.contains_key(session_key))
+            < MAX_SESSION_QUEUED_PROMPTS
+            && self.queues.values().map(Vec::len).sum::<usize>()
+                + self.direct_park_reservations.len()
+                < MAX_HUB_QUEUED_PROMPTS
+    }
+
     fn remember_target(&mut self, target: Option<PromptQueueTarget>) {
         if let Some(target) = target {
             self.targets
@@ -336,15 +421,24 @@ impl PromptQueueState {
         session_key: &str,
         input: DirectPromptInput,
     ) -> (QueuedOperatorPrompt, Vec<QueuedOperatorPrompt>) {
+        let item = self.make_item(session_key, input);
+        let queue = self.queues.entry(session_key.to_string()).or_default();
+        queue.push(item.clone());
+        (item, queue.clone())
+    }
+
+    fn make_item(&mut self, session_key: &str, input: DirectPromptInput) -> QueuedOperatorPrompt {
         self.remember_target(input.queue_target);
         let now = stamp::now();
         self.next_seq += 1;
-        let item = QueuedOperatorPrompt {
+        QueuedOperatorPrompt {
             id: format!("qp-{}-{}", now.unix_millis(), self.next_seq),
             session_id: session_key.to_string(),
             intended_codex_thread_id: input.intended_codex_thread_id,
             claude_terminal: input.claude_terminal,
             claude_binding: input.claude_binding,
+            claude_stream: None,
+            claude_invalidated: false,
             admitted_current: true,
             intended_vendor: input.intended_vendor,
             persona: input.persona,
@@ -356,11 +450,9 @@ impl PromptQueueState {
             delivery_state: QueuedDeliveryState::Pending,
             delivery_error: None,
             hold_reason: None,
+            refusal_reason: None,
             retries_exhausted: false,
-        };
-        let queue = self.queues.entry(session_key.to_string()).or_default();
-        queue.push(item.clone());
-        (item, queue.clone())
+        }
     }
 }
 
@@ -429,6 +521,7 @@ pub struct HubState {
     /// One lock per per-project store file (see [`HubState::open_project_store_at`]).
     path_locks: Arc<Mutex<HashMap<PathBuf, Arc<PathLock>>>>,
     prompt_queues: Arc<Mutex<PromptQueueState>>,
+    pub(crate) queue_epoch: uuid::Uuid,
     model_overrides: Arc<Mutex<BTreeMap<String, session_actions::ModelOverride>>>,
     /// Login throttling and passkey challenges, in memory only.
     login_guard: Arc<operators::LoginGuard>,
@@ -604,6 +697,7 @@ impl HubState {
             balance_apply_lock: Arc::new(Mutex::new(())),
             path_locks: Arc::new(Mutex::new(HashMap::new())),
             prompt_queues: Arc::new(Mutex::new(PromptQueueState::default())),
+            queue_epoch: uuid::Uuid::now_v7(),
             model_overrides: Arc::new(Mutex::new(BTreeMap::new())),
             login_guard: Arc::new(operators::LoginGuard::default()),
             probe_gate: Arc::new(runtime_matrix::ProbeGate::default()),
@@ -787,6 +881,7 @@ impl HubState {
             .collect()
     }
 
+    #[cfg(test)]
     pub fn enqueue_session_prompt(
         &self,
         session_key: &str,
@@ -796,6 +891,26 @@ impl HubState {
         by: String,
         attachments: Vec<SavedPromptAttachment>,
     ) -> (QueuedOperatorPrompt, Vec<QueuedOperatorPrompt>) {
+        self.try_enqueue_session_prompt(
+            session_key,
+            persona,
+            prompt,
+            effective_body,
+            by,
+            attachments,
+        )
+        .expect("fixture should fit the prompt queue")
+    }
+
+    pub(crate) fn try_enqueue_session_prompt(
+        &self,
+        session_key: &str,
+        persona: Option<String>,
+        prompt: String,
+        effective_body: String,
+        by: String,
+        attachments: Vec<SavedPromptAttachment>,
+    ) -> Option<(QueuedOperatorPrompt, Vec<QueuedOperatorPrompt>)> {
         let observed = discovery::lookup_one_route_session(
             &discovery::DiscoveryStoreSnapshot::default(),
             self.config.home_override.as_deref(),
@@ -807,23 +922,28 @@ impl HubState {
             None => session_key.strip_prefix("codex-").map(str::to_string),
         };
         let mut guard = self.prompt_queues.lock().unwrap_or_else(|e| e.into_inner());
-        guard.enqueue(
-            session_key,
-            DirectPromptInput {
-                queue_target: observed
-                    .as_ref()
-                    .and_then(|session| PromptQueueTarget::observed(session, session_key)),
-                intended_codex_thread_id,
-                claude_terminal: observed.as_ref().is_some_and(|s| s.adapter == "claude")
-                    && fl_wire::dispatcher::is_owner_sender(&by),
-                claude_binding: None,
-                intended_vendor: None,
-                persona,
-                prompt,
-                effective_body,
-                by,
-                attachments,
-            },
+        if !guard.has_room(session_key) || effective_body.len() > MAX_QUEUED_PROMPT_BYTES {
+            return None;
+        }
+        Some(
+            guard.enqueue(
+                session_key,
+                DirectPromptInput {
+                    queue_target: observed
+                        .as_ref()
+                        .and_then(|session| PromptQueueTarget::observed(session, session_key)),
+                    intended_codex_thread_id,
+                    claude_terminal: observed.as_ref().is_some_and(|s| s.adapter == "claude")
+                        && fl_wire::dispatcher::is_owner_sender(&by),
+                    claude_binding: None,
+                    intended_vendor: None,
+                    persona,
+                    prompt,
+                    effective_body,
+                    by,
+                    attachments,
+                },
+            ),
         )
     }
 
@@ -864,16 +984,17 @@ impl HubState {
             } else {
                 raw
             };
-            let item = guard
-                .queues
-                .get_mut(queue_key)?
-                .iter_mut()
-                .find(|item| item.id == prompt_id)?;
+            let queue = guard.queues.get_mut(queue_key)?;
+            if require_idle && queue.first().is_none_or(|item| item.id != prompt_id) {
+                return None;
+            }
+            let item = queue.iter_mut().find(|item| item.id == prompt_id)?;
             if item.delivery_state != QueuedDeliveryState::Pending {
                 return None;
             }
             item.delivery_state = QueuedDeliveryState::Sending;
             item.delivery_error = None;
+            item.hold_reason = None;
             item.clone()
         };
         guard.active_queue_sends.insert(canonical.to_string());
@@ -901,6 +1022,29 @@ impl HubState {
                 completed: false,
             },
         ))
+    }
+
+    /// Hold the same claim used by prompt dispatch while a Claude clear changes its conversation.
+    pub(crate) fn claim_claude_clear<'a>(
+        &'a self,
+        native: &str,
+        requested: &str,
+    ) -> Option<SessionDispatchGuard<'a>> {
+        let mut guard = self.prompt_queues.lock().unwrap_or_else(|e| e.into_inner());
+        if guard.active_queue_sends.contains(native) || guard.active_queue_sends.contains(requested)
+        {
+            return None;
+        }
+        guard.active_queue_sends.insert(native.to_owned());
+        guard.active_queue_sends.insert(requested.to_owned());
+        guard.active_claude_clears.insert(native.to_owned());
+        Some(SessionDispatchGuard {
+            state: self,
+            canonical: native.into(),
+            raw: requested.into(),
+            prompt_id: None,
+            completed: false,
+        })
     }
 
     /// Atomically check queue/flight state and claim the same gate used by queued sends.
@@ -931,7 +1075,7 @@ impl HubState {
         }
         let active =
             guard.active_queue_sends.contains(canonical) || guard.active_queue_sends.contains(raw);
-        if force && active {
+        if (force && active) || guard.active_claude_clears.contains(canonical) {
             return DirectPromptDecision::DispatchBusy;
         }
         if !force
@@ -942,8 +1086,22 @@ impl HubState {
                 || guard.queues.get(canonical).is_some_and(|q| !q.is_empty())
                 || guard.queues.get(raw).is_some_and(|q| !q.is_empty()))
         {
+            if !guard.has_room(canonical) {
+                return DirectPromptDecision::QueueFull;
+            }
+            if !input.fits_queue() {
+                return DirectPromptDecision::PromptTooLarge;
+            }
             let (item, queue) = guard.enqueue(canonical, input);
             return DirectPromptDecision::Queued(Box::new(item), queue);
+        }
+        if !force && input.claude_binding.is_some() {
+            if !guard.has_room(canonical) {
+                return DirectPromptDecision::QueueFull;
+            }
+            guard
+                .direct_park_reservations
+                .insert(canonical.into(), false);
         }
         guard.remember_target(input.queue_target);
         guard.active_queue_sends.insert(canonical.into());
@@ -1010,12 +1168,7 @@ impl HubState {
                 }
                 Err(fl_wire::dispatcher::PushError::Failed(error)) => {
                     if is_composer_occupied_error(&error) {
-                        queue[pos].delivery_state = QueuedDeliveryState::Pending;
-                        queue[pos].hold_reason = Some(composer_hold_reason(&error).to_string());
-                        queue[pos].delivery_error = Some(error);
-                        // Bound Claude holds do not use the generic composer probe.
-                        // The UI's exhausted state provides the Send Now guidance.
-                        queue[pos].retries_exhausted = queue[pos].claude_terminal;
+                        queue[pos].hold(error);
                     } else {
                         queue[pos].delivery_state = QueuedDeliveryState::Unconfirmed;
                         queue[pos].delivery_error = Some(error);
@@ -1034,6 +1187,9 @@ impl HubState {
         let out = queue.clone();
         if finished_ok {
             guard.composer_hold_probes.remove(prompt_id);
+            if out.is_empty() {
+                guard.queues.remove(session_key);
+            }
         }
         if composer_held {
             guard
@@ -1042,6 +1198,35 @@ impl HubState {
                 .or_insert((0, stamp::now().unix_millis() as i64));
         }
         out
+    }
+
+    pub(crate) fn finish_bound_claude_hold(
+        &self,
+        session_key: &str,
+        prompt_id: &str,
+        reason: String,
+        stream: fl_host_proto::StreamId,
+    ) -> Vec<QueuedOperatorPrompt> {
+        let mut queues = self.prompt_queues.lock().unwrap_or_else(|e| e.into_inner());
+        let retries_exhausted = queues
+            .composer_hold_probes
+            .get(prompt_id)
+            .is_some_and(|(probes, _)| *probes >= COMPOSER_HELD_MAX_PROBES);
+        let Some(queue) = queues.queues.get_mut(session_key) else {
+            return Vec::new();
+        };
+        if let Some(item) = queue.iter_mut().find(|item| {
+            item.id == prompt_id && item.delivery_state == QueuedDeliveryState::Sending
+        }) {
+            if item.claude_invalidated {
+                item.refuse(PARKED_PROMPT_REPLACED.into(), Some("session_replaced"));
+            } else {
+                item.claude_stream = Some(stream);
+                item.hold(reason);
+                item.retries_exhausted = retries_exhausted;
+            }
+        }
+        queue.clone()
     }
 
     /// Reset the bounded re-probe budget for a composer-held prompt; used when an
@@ -1062,7 +1247,10 @@ impl HubState {
     pub(crate) fn mark_hold_retries_exhausted(&self, session_key: &str, prompt_id: &str) {
         let mut guard = self.prompt_queues.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(q) = guard.queues.get_mut(session_key) {
-            for i in q.iter_mut().filter(|i| i.id == prompt_id) {
+            for i in q
+                .iter_mut()
+                .filter(|i| i.id == prompt_id && i.hold_reason.is_some())
+            {
                 i.retries_exhausted = true;
             }
         }
@@ -1084,6 +1272,7 @@ impl HubState {
     }
 
     /// Whether the bounded re-probe for a composer-held prompt is due at `now_ms`.
+    #[cfg(test)]
     pub(crate) fn composer_hold_probe_due(&self, prompt_id: &str, now_ms: i64) -> bool {
         let guard = self.prompt_queues.lock().unwrap_or_else(|e| e.into_inner());
         match guard.composer_hold_probes.get(prompt_id) {
@@ -1109,7 +1298,7 @@ impl HubState {
             .composer_hold_probes
             .entry(prompt_id.to_string())
             .or_insert((0, now_ms));
-        if entry.0 >= COMPOSER_HELD_MAX_PROBES {
+        if entry.0 >= COMPOSER_HELD_MAX_PROBES || now_ms < entry.1 {
             return None;
         }
         entry.0 += 1;
@@ -1148,7 +1337,9 @@ impl HubState {
         item.delivery_error = None;
         item.hold_reason = None;
         item.retries_exhausted = false;
-        guard.composer_hold_probes.remove(prompt_id);
+        if item.claude_stream.is_none() {
+            guard.composer_hold_probes.remove(prompt_id);
+        }
         true
     }
 
@@ -1158,6 +1349,7 @@ impl HubState {
         session_key: &str,
         prompt_id: &str,
         error: String,
+        reason: Option<&str>,
     ) -> Vec<QueuedOperatorPrompt> {
         let mut guard = self.prompt_queues.lock().unwrap_or_else(|e| e.into_inner());
         let Some(queue) = guard.queues.get_mut(session_key) else {
@@ -1167,23 +1359,42 @@ impl HubState {
             .iter_mut()
             .find(|q| q.id == prompt_id && q.delivery_state == QueuedDeliveryState::Sending)
         {
-            item.delivery_state = QueuedDeliveryState::Refused;
-            item.delivery_error = Some(error);
+            item.refuse(error, reason);
         }
-        queue.clone()
+        let remaining = queue.clone();
+        guard.composer_hold_probes.remove(prompt_id);
+        remaining
     }
 
     /// Clearing a session cannot erase an in-progress or uncertain delivery.
     pub fn clear_session_prompt_queue(&self, session_key: &str) {
         let mut guard = self.prompt_queues.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(invalidated) = guard.direct_park_reservations.get_mut(session_key) {
+            *invalidated = true;
+        }
         if let Some(queue) = guard.queues.get_mut(session_key) {
-            let dropped: Vec<String> = queue
-                .iter()
-                .filter(|q| q.delivery_state == QueuedDeliveryState::Pending)
-                .map(|q| q.id.clone())
-                .collect();
-            queue.retain(|q| q.delivery_state != QueuedDeliveryState::Pending);
-            for id in dropped {
+            let mut invalidated = Vec::new();
+            queue.retain_mut(|item| {
+                if item.delivery_state == QueuedDeliveryState::Sending
+                    && item.claude_binding.is_some()
+                {
+                    item.claude_invalidated = true;
+                }
+                if item.delivery_state != QueuedDeliveryState::Pending {
+                    return true;
+                }
+                invalidated.push(item.id.clone());
+                if item.claude_binding.is_some() {
+                    item.refuse(PARKED_PROMPT_REPLACED.into(), Some("session_replaced"));
+                    api::operator_prompt_log(session_key, "refused", "session_replaced");
+                    return true;
+                }
+                false
+            });
+            if queue.is_empty() {
+                guard.queues.remove(session_key);
+            }
+            for id in invalidated {
                 guard.composer_hold_probes.remove(&id);
             }
         }
@@ -1206,6 +1417,9 @@ impl HubState {
         })?;
         let item = queue.remove(pos);
         let remaining = queue.clone();
+        if remaining.is_empty() {
+            guard.queues.remove(session_key);
+        }
         guard.composer_hold_probes.remove(prompt_id);
         if item.delivery_state == QueuedDeliveryState::Unconfirmed {
             // Only unwind-owned fences carry queue aliases. Do not clear a later direct
@@ -1240,17 +1454,22 @@ impl HubState {
         Some((item, remaining))
     }
 
-    pub fn update_queued_prompt(
+    pub(crate) fn update_queued_prompt(
         &self,
         session_key: &str,
         prompt_id: &str,
         new_prompt: String,
-    ) -> Option<(QueuedOperatorPrompt, Vec<QueuedOperatorPrompt>)> {
+    ) -> Result<Option<(QueuedOperatorPrompt, Vec<QueuedOperatorPrompt>)>, QueuedPromptTooLarge>
+    {
         let mut guard = self.prompt_queues.lock().unwrap_or_else(|e| e.into_inner());
-        let queue = guard.queues.get_mut(session_key)?;
-        let item = queue.iter_mut().find(|item| {
+        let Some(queue) = guard.queues.get_mut(session_key) else {
+            return Ok(None);
+        };
+        let Some(item) = queue.iter_mut().find(|item| {
             item.id == prompt_id && item.delivery_state == QueuedDeliveryState::Pending
-        })?;
+        }) else {
+            return Ok(None);
+        };
         let mut effective_body = new_prompt.clone();
         for saved in &item.attachments {
             effective_body.push_str(&format!(
@@ -1258,11 +1477,14 @@ impl HubState {
                 saved.path, saved.url
             ));
         }
+        if effective_body.len() > MAX_QUEUED_PROMPT_BYTES {
+            return Err(QueuedPromptTooLarge);
+        }
         item.prompt = new_prompt;
         item.effective_body = effective_body;
         let updated = item.clone();
         let snapshot = queue.clone();
-        Some((updated, snapshot))
+        Ok(Some((updated, snapshot)))
     }
 
     pub fn is_session_busy(&self, store: &AnyStore, session_id: &str) -> bool {
@@ -1995,8 +2217,9 @@ mod tests {
         // Bounded probe budget.
         let now_ms = stamp::now().unix_millis() as i64;
         assert!(state.composer_hold_probe_due(&item.id, now_ms));
-        for _ in 0..COMPOSER_HELD_MAX_PROBES {
-            assert!(state.note_composer_hold_probe(&item.id, now_ms).is_some());
+        for index in 0..COMPOSER_HELD_MAX_PROBES {
+            let next_at = now_ms + i64::from(index) * COMPOSER_HELD_MAX_BACKOFF_MS;
+            assert!(state.note_composer_hold_probe(&item.id, next_at).is_some());
         }
         assert!(state.note_composer_hold_probe(&item.id, now_ms).is_none());
         assert!(!state.composer_hold_probe_due(&item.id, now_ms + 1_000_000));
@@ -2036,8 +2259,9 @@ mod tests {
         );
         claim.finish();
         let now_ms = stamp::now().unix_millis() as i64;
-        for _ in 0..COMPOSER_HELD_MAX_PROBES {
-            assert!(state.note_composer_hold_probe(&item.id, now_ms).is_some());
+        for index in 0..COMPOSER_HELD_MAX_PROBES {
+            let next_at = now_ms + i64::from(index) * COMPOSER_HELD_MAX_BACKOFF_MS;
+            assert!(state.note_composer_hold_probe(&item.id, next_at).is_some());
         }
         assert!(state.note_composer_hold_probe(&item.id, now_ms).is_none());
         // Owner re-arm resets the exhausted budget.
@@ -2278,14 +2502,21 @@ mod tests {
             stream.read_exact(&mut byte).unwrap();
             drop(stream);
         });
-        let payload = "x".repeat(4 * 1024 * 1024);
-        let (item, _) = state.enqueue_session_prompt(
+        // Inject a payload larger than a socket's send buffer to force a partial write.
+        let (item, _) = state.prompt_queues.lock().unwrap().enqueue(
             "ada",
-            Some("ada".into()),
-            "message".into(),
-            payload,
-            "owner".into(),
-            vec![],
+            DirectPromptInput {
+                queue_target: None,
+                claude_terminal: false,
+                claude_binding: None,
+                intended_codex_thread_id: None,
+                intended_vendor: None,
+                persona: Some("ada".into()),
+                prompt: "message".into(),
+                effective_body: "x".repeat(4 * 1024 * 1024),
+                by: "owner".into(),
+                attachments: vec![],
+            },
         );
         state.mark_session_in_flight_from_observation("ada", None);
         let response = handle_http_request(
