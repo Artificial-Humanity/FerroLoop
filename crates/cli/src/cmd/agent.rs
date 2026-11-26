@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -442,6 +442,18 @@ fn blocked_seat_for<'a>(
                     && vendor.is_none_or(|vendor| seat.vendor.eq_ignore_ascii_case(vendor)))
         })
         .max_by_key(|seat| (seat.is_running(), seat.updated_at_ms))
+}
+
+fn take_running_block<'a>(
+    seats: &[&'a WatchHostedSession],
+    persona: &str,
+    vendor: &str,
+    reported_blocks: &mut BTreeSet<&'a str>,
+) -> HostedLivenessBlock {
+    blocked_seat_for(seats, persona, Some(vendor))
+        .filter(|seat| seat.is_running() && reported_blocks.insert(seat.session_id.as_str()))
+        .map(HostedLivenessBlock::from_session)
+        .unwrap_or_default()
 }
 
 fn format_verdict_label(verdict: &LivenessVerdict) -> String {
@@ -1230,12 +1242,19 @@ pub fn run<S: AgentRegistry + Handles + StateStore + Catalog + fl_core::MessageS
                     }
                 }
                 let mut items = Vec::new();
-                let mut seen_agents = std::collections::BTreeSet::new();
+                let mut seen_agents = BTreeSet::new();
+                let mut reported_blocks = BTreeSet::new();
                 for (_, (slug, hb)) in dedup {
                     let verdict =
                         evaluate_liveness(Some(&hb), &now, stale_after_ms, &host, pid_is_alive);
                     let label = hb.agent.clone().unwrap_or(slug);
                     seen_agents.insert(label.to_ascii_lowercase());
+                    let hosted_block = take_running_block(
+                        &blocked_seats,
+                        &label,
+                        &hb.adapter,
+                        &mut reported_blocks,
+                    );
                     if json {
                         items.push(LivenessReportItem {
                             target: label,
@@ -1243,23 +1262,16 @@ pub fn run<S: AgentRegistry + Handles + StateStore + Catalog + fl_core::MessageS
                             record: Some(hb.record),
                             adapter: Some(hb.adapter),
                             agent: hb.agent,
-                            hosted_block: HostedLivenessBlock::default(),
+                            hosted_block,
                             verdict,
                         });
                     } else {
-                        println!(
-                            "{}",
-                            format_liveness_line(
-                                &label,
-                                Some(&hb),
-                                Some(hb.adapter.as_str()),
-                                &verdict,
-                            )
-                        );
+                        let line =
+                            format_liveness_line(&label, Some(&hb), Some(&hb.adapter), &verdict);
+                        println!("{}", hosted_block.append_to(line));
                     }
                 }
                 let host_sessions = discover_live_host_sessions_for_liveness();
-                let mut reported_blocks = std::collections::BTreeSet::new();
                 for summary in &host_sessions {
                     if !matches!(summary.state, fl_host_proto::ChildState::Running(_)) {
                         continue;
@@ -1277,13 +1289,12 @@ pub fn run<S: AgentRegistry + Handles + StateStore + Catalog + fl_core::MessageS
                         if !seen_agents.insert(agent.to_ascii_lowercase()) {
                             continue;
                         }
-                        let hosted_block = blocked_seat_for(&blocked_seats, &agent, Some(&adapter))
-                            .filter(|seat| seat.is_running())
-                            .map(|seat| {
-                                reported_blocks.insert(seat.session_id.as_str());
-                                HostedLivenessBlock::from_session(seat)
-                            })
-                            .unwrap_or_default();
+                        let hosted_block = take_running_block(
+                            &blocked_seats,
+                            &agent,
+                            &adapter,
+                            &mut reported_blocks,
+                        );
                         if json {
                             items.push(LivenessReportItem {
                                 target: agent.clone(),
@@ -1655,6 +1666,50 @@ mod tests {
             },
         );
         assert!(matches!(second_lead, Err((2, _))));
+    }
+
+    #[test]
+    fn liveness_list_claims_the_matching_running_block_for_only_one_row() {
+        let block = HostedBlock {
+            reason: fl_watch::HostedBlockReason::VendorSignIn,
+            observed_at_ms: 100,
+        };
+        let codex = WatchHostedSession {
+            session_id: "codex:ada".into(),
+            persona: "ada".into(),
+            vendor: "codex".into(),
+            status: "running".into(),
+            block: Some(block),
+            ..WatchHostedSession::default()
+        };
+        let muse = WatchHostedSession {
+            session_id: "muse:ada".into(),
+            vendor: "muse".into(),
+            ..codex.clone()
+        };
+        let claude = WatchHostedSession {
+            session_id: "claude:ada".into(),
+            persona: "ada".into(),
+            vendor: "claude".into(),
+            status: "stopped".into(),
+            stop_reason: Some(lifecycle::STOP_REASON_STARTUP_BLOCKED.into()),
+            ..WatchHostedSession::default()
+        };
+        let seats = [&codex, &muse, &claude];
+        let mut reported_blocks = BTreeSet::new();
+        assert_eq!(
+            take_running_block(&seats, "Ada", "CODEX", &mut reported_blocks).block,
+            Some(block)
+        );
+        assert_eq!(
+            take_running_block(&seats, "ada", "codex", &mut reported_blocks).block,
+            None
+        );
+        assert_eq!(
+            take_running_block(&seats, "ada", "claude", &mut reported_blocks).stop_reason,
+            None
+        );
+        assert_eq!(reported_blocks, BTreeSet::from(["codex:ada"]));
     }
 
     #[test]

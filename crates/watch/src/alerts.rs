@@ -553,7 +553,7 @@ pub(crate) fn evaluate_watch_alerts_with_hosted_sessions(
                     "{vendor} has {stopped} hosted {} stopped while blocked",
                     seat_word(stopped)
                 ),
-                "Restart the stopped seats after the block is cleared.",
+                "Restart the stopped seats after the block is cleared, or remove them with `fl agent decommission`.",
             ),
             (_, 0) => (
                 format!(
@@ -568,7 +568,7 @@ pub(crate) fn evaluate_watch_alerts_with_hosted_sessions(
                     seat_word(running),
                     seat_word(stopped),
                 ),
-                "Inspect the affected hosted sessions and restart the stopped seats after the block is cleared.",
+                "Inspect the affected hosted sessions. Restart the stopped seats after the block is cleared, or remove them with `fl agent decommission`.",
             ),
         };
         push(

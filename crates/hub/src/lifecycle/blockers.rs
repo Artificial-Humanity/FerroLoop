@@ -345,11 +345,8 @@ impl Sampler {
             // Sign-in may animate, and a flagged seat needs an actual clear sample.
             // Unconfirmed hydration still needs liveness for its deadline.
             if record.block.is_some()
-                || matches!(
-                    record.hydration_status,
-                    HydrationStatus::Unconfirmed | HydrationStatus::Failed
-                )
-                || (quiet && !known_clear)
+                || record.hydration_status == HydrationStatus::Unconfirmed
+                || ((record.hydration_status == HydrationStatus::Failed || quiet) && !known_clear)
             {
                 eligible.push((index, session, child));
             }
@@ -670,10 +667,14 @@ mod tests {
         }
         assert_eq!(eligible(&mut sampler, &sessions), [0, 1]);
         assert_eq!(eligible(&mut sampler, &sessions), [0, 1, 2]);
-        sampler.clear_captures.insert(
-            records[2].session_id.clone(),
-            (sessions[2].stream.clone(), sessions[2].latest),
-        );
+        for (record, session) in records.iter().zip(&sessions) {
+            sampler.clear_captures.insert(
+                record.session_id.clone(),
+                (session.stream.clone(), session.latest),
+            );
+        }
+        assert_eq!(eligible(&mut sampler, &sessions), [0]);
+        sessions[1].latest += 1;
         assert_eq!(eligible(&mut sampler, &sessions), [0, 1]);
     }
 

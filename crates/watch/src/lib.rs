@@ -387,7 +387,13 @@ mod tests {
                 .message
                 .contains("1 hosted seat stopped while blocked")
         );
+        assert!(
+            first.alerts[0]
+                .remediation
+                .contains("`fl agent decommission`")
+        );
         assert!(first.alerts[1].message.contains("1 blocked hosted seat"));
+        assert!(!first.alerts[1].remediation.contains("decommission"));
         let codex = first
             .health
             .agents
@@ -412,7 +418,7 @@ mod tests {
         );
         assert_eq!(
             stopped_only.alerts[0].remediation,
-            "Restart the stopped seats after the block is cleared."
+            "Restart the stopped seats after the block is cleared, or remove them with `fl agent decommission`."
         );
 
         set_seat("codex", "stopped", "running", None, serde_json::Value::Null);
