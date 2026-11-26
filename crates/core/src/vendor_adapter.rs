@@ -693,6 +693,24 @@ pub struct VendorCliVersionProbe {
 pub trait VendorVersionAdapter: fmt::Debug + Send + Sync {
     fn vendor_id(&self) -> &'static str;
 
+    fn cli_binary_name(&self) -> &'static str {
+        self.vendor_id()
+    }
+
+    /// The supported environment setting that suppresses the CLI's own auto-updater, if any.
+    fn auto_update_disable_env(&self) -> Option<(&'static str, &'static str)> {
+        None
+    }
+
+    /// Apply the CLI's startup update policy to a command (with the executable in argv[0]).
+    /// Only touches argv and the child environment. Safe to apply more than once.
+    fn apply_cli_update_policy(&self, _argv: &mut Vec<String>, env: &mut Vec<(String, String)>) {
+        if let Some((name, value)) = self.auto_update_disable_env() {
+            env.retain(|(key, _)| key != name);
+            env.push((name.into(), value.into()));
+        }
+    }
+
     /// Read passive evidence for an executable the caller has already resolved to its absolute,
     /// canonical path. This may read install metadata but must not start a process.
     fn version_from_executable(&self, executable: &Path) -> Option<String>;
@@ -741,6 +759,13 @@ impl VendorVersionRegistry {
 
     pub fn lookup(&self, vendor_id: &str) -> Option<&dyn VendorVersionAdapter> {
         self.adapters.get(vendor_id).map(Arc::as_ref)
+    }
+
+    pub fn lookup_by_binary_name(&self, name: &str) -> Option<&dyn VendorVersionAdapter> {
+        self.adapters
+            .values()
+            .find(|adapter| adapter.cli_binary_name() == name)
+            .map(Arc::as_ref)
     }
 }
 

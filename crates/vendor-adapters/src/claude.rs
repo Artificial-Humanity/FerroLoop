@@ -303,6 +303,10 @@ impl fl_core::VendorVersionAdapter for ClaudeHostAdapter {
         "claude"
     }
 
+    fn auto_update_disable_env(&self) -> Option<(&'static str, &'static str)> {
+        Some(("DISABLE_AUTOUPDATER", "1"))
+    }
+
     fn version_from_executable(&self, executable: &Path) -> Option<String> {
         if !executable.is_absolute()
             || !executable

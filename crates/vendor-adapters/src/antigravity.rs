@@ -13,6 +13,14 @@ impl VendorVersionAdapter for AntigravityVersionAdapter {
         "antigravity"
     }
 
+    fn cli_binary_name(&self) -> &'static str {
+        "agy"
+    }
+
+    fn auto_update_disable_env(&self) -> Option<(&'static str, &'static str)> {
+        Some(AUTO_UPDATE_DISABLED)
+    }
+
     fn version_from_executable(&self, _executable: &Path) -> Option<String> {
         // The native installer overwrites a plain `agy` executable. Its updater status
         // records the last check, which does not identify the currently selected image.

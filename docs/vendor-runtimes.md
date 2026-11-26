@@ -7,7 +7,8 @@ the store lock. A home override, as in unit tests, does not run the host binarie
 unless `FL_HUB_MUSE_BIN` or `FL_HUB_CLAUDE_BIN` is set.
 
 Versions seen on a live host: Claude Code 2.1.312, OpenAI Codex 0.165.0, xAI Grok CLI 1.0.70.
-Antigravity and Meta Muse do not write a version file.
+The native Muse launcher records its selected release in the install directory's
+`.muse-version` marker.
 
 Paths below are under the user's home directory. Do not copy live tokens, CSRF values,
 peer credentials, or request ids into this document or into tests.
@@ -167,6 +168,37 @@ from adapter id (`claude`, `codex`, `grok`, `antigravity`, `muse`) to a `Session
 For each selected vendor the reading is the one with the most data among its newest route
 sessions (four at most are read from disk), else the account probe above. A vendor whose
 allowance is unknown has no entry. A hub with a home override never reads the real home.
+
+### Hosted startup updates
+
+FerroLoop sets the vendor's update control on fresh and resumed hosted CLI launches. The
+runtime matrix's `--version` probes use the same control. The explicit updates below still
+run the vendor's update command.
+
+| CLI | What FerroLoop passes | Vendor reference |
+| --- | --- | --- |
+| Claude Code | `DISABLE_AUTOUPDATER=1` | [Claude Code setup](https://code.claude.com/docs/en/setup#disable-auto-updates) |
+| Antigravity (`agy`) | `AGY_CLI_DISABLE_AUTO_UPDATE=true` | [Antigravity CLI troubleshooting](https://antigravity.google/docs/cli/troubleshooting) |
+| Grok | `GROK_DISABLE_AUTOUPDATER=1` | [Grok update check suppression](https://github.com/xai-org/grok-build/blob/main/crates/codegen/xai-grok-pager/docs/user-guide/14-headless-mode.md#update-check-suppression) |
+| Muse | `MUSE_NO_AUTO_UPDATE=1` | The Muse installer launcher in `~/.local/bin/muse` checks this before both background and synchronous updates. |
+| Codex client | `-c check_for_update_on_startup=false` | [Codex configuration reference](https://developers.openai.com/codex/config-reference) |
+
+For unhosted interactive commands, add these lines to the shell startup file for the account
+that runs them, typically `~/.zshrc` or `~/.bashrc`. For other services, set the corresponding
+environment values in the service that starts the CLI.
+
+```sh
+export DISABLE_AUTOUPDATER=1
+export AGY_CLI_DISABLE_AUTO_UPDATE=true
+export GROK_DISABLE_AUTOUPDATER=1
+export MUSE_NO_AUTO_UPDATE=1
+```
+
+For unhosted Codex clients, add `check_for_update_on_startup = false` at the top level of
+`~/.codex/config.toml` (or `$CODEX_HOME/config.toml`). Codex exposes this as a configuration
+setting. Its shared daemon has [its own updater configuration](#codex-daemon-updater).
+
+### Explicit updates
 
 `POST /api/v1/runtimes/update` (owner only) runs a CLI's own update command. The body is
 `{"runtime": "claude" | "codex" | "grok" | "agy" | "muse" | "all"}`; any other body is `400`.
@@ -358,6 +390,30 @@ the reference manual recovery command: `start` is a no-op after daemon death whi
 oneshot unit remains active. Avoid starting another daemon from an agent shell. Restarting a
 shared daemon can interrupt active clients and requires coordinated workload handling.
 
+### Codex daemon updater
+
+The client startup setting controls the Codex client's startup update check. The shared
+daemon schedules its own updates through `pid-update-loop`.
+
+The host operator sets `updater.autoUpdateEnabled` to `false` in
+`~/.codex/app-server-daemon/settings.json`, or in
+`$CODEX_HOME/app-server-daemon/settings.json` for the home used by the daemon service.
+Merge this field into the existing JSON and preserve the other settings.
+
+```json
+{
+  "updater": {
+    "autoUpdateEnabled": false
+  }
+}
+```
+
+Codex 0.172.0 defaults this setting to enabled and rereads it on the scheduled update cycle.
+Explicit daemon updates remain available. The setting belongs to the daemon's JSON file
+when using the [systemd unit above](#hosted-launch-prerequisite).
+[Daemon setting](https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/app-server-daemon/src/settings.rs) ·
+[Update loop](https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/app-server-daemon/src/update_loop.rs)
+
 ### Session discovery and liveness
 
 * Rollout: `sessions/YYYY/MM/DD/rollout-<timestamp>-<thread-id>.jsonl`.
@@ -456,8 +512,9 @@ once, which creates it. `-s` alone fails on a session id that is already in use.
 
 ## Meta Muse
 
-Home: `~/.local/share/muse/`. No version file. The catalog context limit is about 1007997
-tokens. A default model id is `muse-wonder-1.0`.
+Home: `~/.local/share/muse/`. The native launcher normally reads `~/.local/bin/.muse-version`
+and selects the sibling `muse-bin-<version>` executable. The catalog context limit is about
+1007997 tokens. A default model id is `muse-wonder-1.0`.
 
 ### Session discovery and liveness
 

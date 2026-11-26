@@ -1958,6 +1958,45 @@ mod tests {
         assert_eq!(claude.default_binary(), "claude");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn runtime_version_probes_use_composed_startup_update_controls() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let _ = composed_vendor_host_adapters();
+        let root = tempfile::tempdir().unwrap();
+        for (binary, check) in [
+            (
+                "muse",
+                r#"test "$MUSE_NO_AUTO_UPDATE" = "1" && test "$1" = "--version""#,
+            ),
+            (
+                "codex",
+                r#"test "$1" = "-c" && test "$2" = "check_for_update_on_startup=false" && test "$3" = "--version""#,
+            ),
+        ] {
+            let path = root.path().join(binary);
+            std::fs::write(&path, format!("#!/bin/sh\n{check} && printf '1.2.3\\n'\n")).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let version = (0..200)
+                .find_map(|_| {
+                    match fl_hub::runtime_matrix::run_version(
+                        &path,
+                        std::time::Duration::from_secs(5),
+                    ) {
+                        Err(e) if e.contains("Text file busy") => {
+                            std::thread::sleep(std::time::Duration::from_millis(10));
+                            None
+                        }
+                        result => Some(result),
+                    }
+                })
+                .expect("spawn fixture")
+                .expect("fixture verified the update control");
+            assert_eq!(version, "1.2.3");
+        }
+    }
+
     #[test]
     fn spin_up_and_teardown_with_composed_claude_host_adapter_binds_and_archives_session_uuid() {
         if std::env::var_os("FL_TEST_COMPOSED_ADAPTER_CHILD").is_none() {

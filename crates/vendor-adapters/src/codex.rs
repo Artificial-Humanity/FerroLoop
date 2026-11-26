@@ -256,9 +256,50 @@ fn codex_prerequisite_refusal(socket: &Path, result: &str) -> LaunchPrerequisite
     }
 }
 
+const CLI_STARTUP_UPDATE_KEY: &str = "check_for_update_on_startup";
+
+fn is_startup_update_override(arg: &str) -> bool {
+    arg.split_once('=')
+        .is_some_and(|(key, _)| key.trim() == CLI_STARTUP_UPDATE_KEY)
+}
+
 impl fl_core::VendorVersionAdapter for CodexHostAdapter {
     fn vendor_id(&self) -> &'static str {
         "codex"
+    }
+
+    fn apply_cli_update_policy(&self, argv: &mut Vec<String>, _env: &mut Vec<(String, String)>) {
+        if argv.is_empty() {
+            return;
+        }
+        // Codex reads this as a client config override. The managed app-server
+        // updater owns a separate setting and never receives this command.
+        let mut index = 1;
+        while let Some(arg) = argv.get(index).filter(|arg| *arg != "--") {
+            if matches!(arg.as_str(), "-c" | "--config") {
+                if argv
+                    .get(index + 1)
+                    .is_some_and(|value| is_startup_update_override(value))
+                {
+                    argv.drain(index..index + 2);
+                } else {
+                    index += 2;
+                }
+            } else if arg
+                .strip_prefix("--config=")
+                .or_else(|| arg.strip_prefix("-c="))
+                .or_else(|| arg.strip_prefix("-c"))
+                .is_some_and(is_startup_update_override)
+            {
+                argv.remove(index);
+            } else {
+                index += 1;
+            }
+        }
+        argv.splice(
+            1..1,
+            ["-c".into(), format!("{CLI_STARTUP_UPDATE_KEY}=false")],
+        );
     }
 
     fn version_from_executable(&self, executable: &Path) -> Option<String> {

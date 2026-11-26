@@ -30,6 +30,10 @@ pub fn set_global_vendor_version_adapters(
     ADAPTERS.get_or_init(|| registry)
 }
 
+pub(crate) fn vendor_version_adapters() -> Option<&'static VendorVersionRegistry> {
+    ADAPTERS.get()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HostedVendorVersionComponent {
@@ -121,6 +125,7 @@ impl ProcessIdentity {
             .env("PATH", "")
             .envs(probe.env.iter().copied())
             .current_dir(home.path());
+        command.arg("--version");
         let output = crate::runtime_matrix::run_version_command(command, TIMEOUT).ok()?;
         (probe.parse)(&output).map(str::to_owned)
     }

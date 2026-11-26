@@ -12,6 +12,10 @@ impl VendorVersionAdapter for MuseVersionAdapter {
         "muse"
     }
 
+    fn auto_update_disable_env(&self) -> Option<(&'static str, &'static str)> {
+        Some(("MUSE_NO_AUTO_UPDATE", "1"))
+    }
+
     fn version_from_executable(&self, executable: &Path) -> Option<String> {
         if !executable.is_absolute() {
             return None;

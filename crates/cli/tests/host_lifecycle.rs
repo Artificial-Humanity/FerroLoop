@@ -959,8 +959,8 @@ fn claude_resume_and_child_env_isolation_prevent_session_start_hook_from_hijacki
             "#!/bin/sh\n\
              root=$(dirname \"$0\")\n\
              printf '%s\\n' \"$@\" > \"$root/arguments\"\n\
-             printf 'AGENT_PERSONA=%s\\nAGENT_NAME=%s\\nFL_HOSTED_ID=%s\\nAGENT_HYDRATION_GENERATION=%s\\n' \\\n\
-               \"${{AGENT_PERSONA:-<unset>}}\" \"${{AGENT_NAME:-<unset>}}\" \"${{FL_HOSTED_ID:-<unset>}}\" \"${{AGENT_HYDRATION_GENERATION:-<unset>}}\" \\\n\
+             printf 'AGENT_PERSONA=%s\\nAGENT_NAME=%s\\nFL_HOSTED_ID=%s\\nAGENT_HYDRATION_GENERATION=%s\\nDISABLE_AUTOUPDATER=%s\\n' \\\n\
+               \"${{AGENT_PERSONA:-<unset>}}\" \"${{AGENT_NAME:-<unset>}}\" \"${{FL_HOSTED_ID:-<unset>}}\" \"${{AGENT_HYDRATION_GENERATION:-<unset>}}\" \"${{DISABLE_AUTOUPDATER:-<unset>}}\" \\\n\
                > \"$root/child_env\"\n\
              case \" $* \" in\n\
                *\" --resume \"*)\n\
@@ -1055,7 +1055,7 @@ fn claude_resume_and_child_env_isolation_prevent_session_start_hook_from_hijacki
     assert_eq!(
         spin_child_env,
         format!(
-            "AGENT_PERSONA=ada\nAGENT_NAME=<unset>\nFL_HOSTED_ID=claude:ada\nAGENT_HYDRATION_GENERATION={ada_gen}\n"
+            "AGENT_PERSONA=ada\nAGENT_NAME=<unset>\nFL_HOSTED_ID=claude:ada\nAGENT_HYDRATION_GENERATION={ada_gen}\nDISABLE_AUTOUPDATER=1\n"
         ),
         "spawned child process on spin_up must receive ada's identity and never polluted parent feira vars"
     );
@@ -1185,7 +1185,7 @@ fn claude_resume_and_child_env_isolation_prevent_session_start_hook_from_hijacki
     assert_eq!(
         restart_child_env,
         format!(
-            "AGENT_PERSONA=ada\nAGENT_NAME=<unset>\nFL_HOSTED_ID=claude:ada\nAGENT_HYDRATION_GENERATION={ada_gen}\n"
+            "AGENT_PERSONA=ada\nAGENT_NAME=<unset>\nFL_HOSTED_ID=claude:ada\nAGENT_HYDRATION_GENERATION={ada_gen}\nDISABLE_AUTOUPDATER=1\n"
         ),
         "spawned child process on restart_hosted_session must receive ada's identity and never polluted parent feira vars"
     );
@@ -1230,6 +1230,9 @@ fn hub_restart_claude_resume_child() {
     let Some(root) = std::env::var_os("F433_RESTART_CHILD").map(std::path::PathBuf::from) else {
         return;
     };
+    lifecycle::set_global_vendor_version_adapters(
+        fl_vendor_adapters::default_vendor_version_registry(),
+    );
     let store = fl_store::open_store(&root.join("fl.fls")).unwrap();
     let mut env = lifecycle::LifecycleEnv::new(Some(&root));
     env.spawn_runtime = true;
@@ -1274,6 +1277,13 @@ fn real_host_live_vendor_hydration_register_confirms_and_routes() {
         let script = format!(
             r##"#!/bin/sh
 root='{root}'
+case '{vendor}' in
+  claude) printf '%s\n' "${{DISABLE_AUTOUPDATER:-missing}}" ;;
+  antigravity) printf '%s\n' "${{AGY_CLI_DISABLE_AUTO_UPDATE:-missing}}" ;;
+  grok) printf '%s\n' "${{GROK_DISABLE_AUTOUPDATER:-missing}}" ;;
+  muse) printf '%s\n' "${{MUSE_NO_AUTO_UPDATE:-missing}}" ;;
+  codex) [ "$1" != --fixture-app-server ] && printf '%s\n' "$1" "$2" ;;
+esac >> "$root/startup-policy"
 if [ '{vendor}' = codex ] && [ "$1" != --fixture-app-server ]; then /bin/cat; exit; fi
 while [ ! -f "$root/go" ]; do sleep 0.05; done
 export HOME="$root" XDG_RUNTIME_DIR="$root" XDG_CONFIG_HOME="$root/config" XDG_DATA_HOME="$root/data"
@@ -1380,6 +1390,13 @@ exec /bin/cat
             }
             let _ = server.wait();
         }
+        let policy = std::fs::read_to_string(root.join("startup-policy")).unwrap();
+        let expected = match vendor {
+            "antigravity" => "true\n",
+            "codex" => "-c\ncheck_for_update_on_startup=false\n",
+            _ => "1\n",
+        };
+        assert_eq!(policy, expected, "{vendor} startup update policy");
         assert_eq!(
             status.trim(),
             "0",
