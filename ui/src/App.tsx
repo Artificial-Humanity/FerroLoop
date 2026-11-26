@@ -2526,7 +2526,7 @@ export const App: React.FC<AppProps> = ({
   const activeHostedSession = activeAgentKey
     ? hostedSessionsByAgent[activeAgentKey]
     : undefined;
-  const versionSessionId = selectedSessionId ?? activeSession?.id;
+  const versionSessionId = activeSession?.id ?? selectedSessionId;
   const matchesVersionSession = (session: HostedSessionSummary) =>
     session.hosted !== false && session.persona.trim().toLowerCase() === activeAgentKey &&
     (!versionSessionId || session.session_id === versionSessionId ||

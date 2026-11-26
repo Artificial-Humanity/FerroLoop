@@ -340,13 +340,18 @@ describe("Phone shell (< 768px)", () => {
     ).toBeVisible();
   });
 
-  it("shows the version of the selected concrete session for a persona", async () => {
-    setViewport(1280, 844);
+  it.each([390, 1280])("shows the version of the effective concrete session at %ipx", async (width) => {
+    setViewport(width, 844);
     const hosted = {
       persona: "jarvis", project: "AI-Lab-AMD", role: "lab_manager",
       hydration_dispatched: true, hosted: true, node_id: "lab", status: "running",
     };
     const versions = (cli: string) => ({ cli, daemon: null, daemon_expected: false, changes: [] });
+    const discovery = { sessions: [
+      { id: "codex-native", persona: "jarvis", adapter: "codex", source: "route", status: "active" },
+      { id: "claude-native", persona: "jarvis", adapter: "claude", source: "route", status: "active" },
+      { id: "external", persona: "jarvis", adapter: "grok", source: "route", status: "active" },
+    ] };
     const apiClient = makeRoutedApiClient({
       "/api/v1/auth/session": { authenticated: true, authority: { tier: "owner", login: "owner" } },
       "/api/v1/agents": { agents: TEST_WORKSPACE_AGENTS, routes: [] },
@@ -356,19 +361,36 @@ describe("Phone shell (< 768px)", () => {
         { ...hosted, session_id: "claude:jarvis", vendor_session_id: "claude-native", vendor: "claude", vendor_versions: versions("2.0.0") },
         { ...hosted, session_id: "grok:jarvis", vendor_session_id: "external", vendor: "grok", hosted: false, vendor_versions: versions("9.0.0") },
       ] },
-      "/api/v1/sessions": { sessions: [
-        { id: "codex-native", persona: "jarvis", adapter: "codex", source: "route", status: "active" },
-        { id: "claude-native", persona: "jarvis", adapter: "claude", source: "route", status: "active" },
-        { id: "external", persona: "jarvis", adapter: "grok", source: "route", status: "active" },
-      ] },
+      "/api/v1/sessions": discovery,
     });
-    render(<App apiClient={apiClient} wsClient={makeStubWsClient()} />);
+    const subscriptions = new Map<string, WsFrameHandler>();
+    const wsClient = Object.assign(makeStubWsClient(), {
+      subscribe: (channel: string, handler: WsFrameHandler) => {
+        subscriptions.set(channel, handler);
+        return () => subscriptions.delete(channel);
+      },
+    });
+    render(<App apiClient={apiClient} wsClient={wsClient} />);
+    if (width < 768) fireEvent.click(screen.getByTestId("phone-tab-agents"));
     fireEvent.click(await screen.findByTestId("agent-row-jarvis"));
     expect(await screen.findByText("CLI version 1.0.0")).toBeVisible();
-    const selector = screen.getByTestId("session-selector");
+    const selector = screen.getByTestId(width < 768 ? "phone-session-selector" : "session-selector");
     fireEvent.change(selector, { target: { value: "claude-native" } });
     expect(await screen.findByText("CLI version 2.0.0")).toBeVisible();
     expect(screen.queryByText("CLI version 1.0.0")).not.toBeInTheDocument();
+
+    discovery.sessions = discovery.sessions.filter((session) => session.id !== "claude-native");
+    act(() => {
+      subscriptions.get("sessions")!({
+        channel: "sessions",
+        event: "session.vendor_versions_observed",
+        data: { session_id: "codex:jarvis" },
+      });
+    });
+    await waitFor(() => expect(selector).toHaveValue("codex-native"));
+    expect(screen.getByText("CLI version 1.0.0")).toBeVisible();
+    expect(screen.queryByText("CLI version 2.0.0")).not.toBeInTheDocument();
+
     fireEvent.change(selector, { target: { value: "external" } });
     expect(screen.queryByText(/CLI version/)).not.toBeInTheDocument();
   });
