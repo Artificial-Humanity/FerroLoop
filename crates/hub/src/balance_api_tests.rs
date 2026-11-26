@@ -737,6 +737,89 @@ fn balance_excludes_unusable_codex_sign_in_and_releases_the_store_for_the_probe(
 }
 
 #[test]
+fn balance_probes_in_planner_order_within_the_sign_in_budget() {
+    use crate::lifecycle::{Caller, FakeRuntime, SpinUpRequest, TEST_LAUNCH_AUTH};
+    use fl_core::LaunchSignInIssue;
+
+    let tmp = TempDir::new().unwrap();
+    // Each destination has a different cwd, all trusted by the same project entry.
+    std::fs::create_dir(tmp.path().join(".git")).unwrap();
+    let _trusted = lifecycle::trusted_codex_home(tmp.path(), tmp.path());
+    let state = hub(&tmp);
+    quota(&state, "claude", 95.0);
+    quota(&state, "codex", 10.0);
+    let fake = FakeRuntime::default();
+    let env = fake.env(tmp.path());
+    let mut directories = Vec::new();
+    {
+        let store = state.open_store().unwrap();
+        for index in 0..12 {
+            // The first persona has the last path in lexical order.
+            let cwd = tmp.path().join(format!("cwd-{:02}", 11 - index));
+            std::fs::create_dir(&cwd).unwrap();
+            lifecycle::spin_up(
+                &*store,
+                &env,
+                &SpinUpRequest {
+                    persona: format!("seat-{index:02}"),
+                    project: "FerroLoop".into(),
+                    role: "assistant".into(),
+                    vendor: "claude".into(),
+                    cwd: Some(cwd.display().to_string()),
+                    ..SpinUpRequest::default()
+                },
+                "owner",
+                Caller::Owner,
+            )
+            .unwrap();
+            directories.push(cwd.canonicalize().unwrap());
+        }
+    }
+    let policy = serde_json::from_value(json!({"allowed_target_vendors": ["codex"]})).unwrap();
+    for (refusals, probes_expected, seat) in [
+        (0, 1, Some("seat-00")),
+        (1, 2, Some("seat-01")),
+        (usize::MAX, 4, None),
+    ] {
+        let probes = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let seen = probes.clone();
+        TEST_LAUNCH_AUTH.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move |target| {
+                let mut seen = seen.borrow_mut();
+                seen.push(target.cwd.clone());
+                (seen.len() <= refusals).then_some(LaunchSignInIssue::Rejected)
+            }));
+        });
+        let (plan, observations) = crate::balance_api::checked_plan_with_auth(
+            &state,
+            &env,
+            &[],
+            Caller::Owner,
+            Some(&policy),
+            &[],
+            1_000,
+        )
+        .unwrap_or_else(|_| panic!("the plan failed"));
+
+        assert_eq!(probes.borrow().as_slice(), &directories[..probes_expected]);
+        assert_eq!(observations.len(), probes_expected);
+        assert_eq!(
+            plan.switches
+                .iter()
+                .map(|s| s.persona.as_str())
+                .collect::<Vec<_>>(),
+            seat.into_iter().collect::<Vec<_>>(),
+        );
+        if seat.is_none() {
+            assert!(plan.skipped.iter().any(|s| {
+                s.detail
+                    .contains("The balance plan reached its sign-in probe limit.")
+            }));
+        }
+    }
+}
+
+#[test]
 fn a_switch_its_remodel_would_refuse_is_skipped_and_the_next_agent_moves() {
     use crate::lifecycle::{Caller, FakeRuntime, SpinUpRequest};
     let tmp = TempDir::new().unwrap();

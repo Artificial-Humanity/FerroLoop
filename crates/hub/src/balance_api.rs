@@ -51,6 +51,7 @@
 //! for a peer, a missing directory, ...) is a `not_remodelable` skip with the refusal, and the
 //! next triggered agent takes its run slot. Managed Codex sign-in is observed outside the store
 //! guard and checked against each candidate's resolved configuration home and working directory.
+//! A plan skips any remaining unobserved destinations after reaching the sign-in probe limit.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -91,6 +92,9 @@ pub(crate) const BALANCE: &str = "/api/v1/watch/balance";
 pub(crate) const POLICY: &str = "/api/v1/watch/balance/policy";
 pub(crate) const PLAN: &str = "/api/v1/watch/balance/plan";
 pub(crate) const APPLY: &str = "/api/v1/watch/balance/apply";
+
+// Each managed daemon account check can spend a second. Keep that cost bounded per request.
+const MAX_SIGN_IN_PROBES_PER_PLAN: usize = 4;
 
 /// The response for a `/api/v1/watch/balance*` request, or `None` for any other request.
 pub(crate) fn route(
@@ -369,9 +373,9 @@ struct PlanBody {
     policy: Option<Map<String, Value>>,
 }
 
-/// Collect daemon destinations as provisional refusals. They use no switch slot, so the
-/// planner visits later candidates if the first one's sign-in is unusable. Only candidates
-/// passing the ordinary remodel checks are probed, once per config home and cwd.
+/// Tentatively select moves using the ordinary run limit and the sign-in results already known.
+/// Check selected destinations outside the store guard, then replan to backfill refused moves.
+/// Return only a plan whose selected Codex destinations all have an observation.
 pub(crate) fn checked_plan_with_auth(
     state: &HubState,
     env: &LifecycleEnv<'_>,
@@ -382,7 +386,8 @@ pub(crate) fn checked_plan_with_auth(
     now_ms: u64,
 ) -> Result<(BalancePlan, LaunchAuthObservations), HttpResponse> {
     let evaluate = |observations: &LaunchAuthObservations,
-                    mut missing: Option<&mut BTreeSet<LaunchAuthTarget>>| {
+                    remaining_probes: usize,
+                    missing: &mut Vec<LaunchAuthTarget>| {
         let store = state.open_store().map_err(store_error)?;
         let inputs = read_store_inputs(&store)?;
         let policy = match policy_patch {
@@ -398,27 +403,38 @@ pub(crate) fn checked_plan_with_auth(
             &inputs,
             live,
             now_ms,
-            &mut |target| {
-                if let Some(missing) = &mut missing {
-                    missing.insert(target.clone());
+            &mut |target| match observations.get(target) {
+                Some(issue) => Ok(*issue),
+                None if remaining_probes > 0 => {
+                    // Precheck observes sign-in last, so a tentative success takes the next
+                    // switch slot. Preserve that order when selecting distinct probes.
+                    if missing.len() < remaining_probes && !missing.contains(target) {
+                        missing.push(target.clone());
+                    }
+                    Ok(None)
                 }
-                lifecycle::observed_launch_auth(observations, target)
+                None => Err(LifecycleError::Conflict(format!(
+                    "{} The balance plan reached its sign-in probe limit.",
+                    LaunchSignInIssue::Inconclusive.message()
+                ))),
             },
         )
         .map(|(plan, _)| plan)
     };
-    let mut missing = BTreeSet::new();
     let mut observations = LaunchAuthObservations::new();
-    let plan = evaluate(&observations, Some(&mut missing))?;
-    if missing.is_empty() {
-        return Ok((plan, observations));
+    let mut remaining_probes = MAX_SIGN_IN_PROBES_PER_PLAN;
+    loop {
+        let mut missing = Vec::new();
+        let plan = evaluate(&observations, remaining_probes, &mut missing)?;
+        if missing.is_empty() {
+            return Ok((plan, observations));
+        }
+        remaining_probes -= missing.len();
+        for target in missing {
+            let issue = target.probe(env);
+            observations.insert(target, issue);
+        }
     }
-    for target in missing {
-        let issue = target.probe(env);
-        observations.insert(target, issue);
-    }
-    let plan = evaluate(&observations, None)?;
-    Ok((plan, observations))
 }
 
 fn handle_plan(state: &HubState, authority: &HubAuthority, req: &HttpRequest) -> HttpResponse {
