@@ -1449,7 +1449,7 @@ impl HubState {
         remaining
     }
 
-    /// Capture the queue admission boundary before starting a hosted restart.
+    /// Capture the queue admission boundary before starting a session replacement.
     pub(crate) fn queued_prompt_admission_watermark(&self) -> u64 {
         self.prompt_queues
             .lock()
@@ -1457,7 +1457,7 @@ impl HubState {
             .next_seq
     }
 
-    /// A hosted restart invalidates the old registration's queued drafts. A newer
+    /// A session replacement invalidates the old registration's queued drafts. A newer
     /// registration may reuse the same native ID, so leave later admissions alone.
     pub(crate) fn invalidate_restarted_claude_prompts(&self, persona: &str, watermark: u64) {
         let mut guard = self.prompt_queues.lock().unwrap_or_else(|e| e.into_inner());
@@ -1489,15 +1489,26 @@ impl HubState {
 
     /// Clearing a session cannot erase an in-progress or uncertain delivery.
     pub fn clear_session_prompt_queue(&self, session_key: &str) {
+        self.clear_session_prompt_queue_entries(session_key, true);
+    }
+
+    /// Remodel invalidates bound Claude drafts by original persona and admission.
+    pub(crate) fn clear_legacy_session_prompt_queue(&self, session_key: &str) {
+        self.clear_session_prompt_queue_entries(session_key, false);
+    }
+
+    fn clear_session_prompt_queue_entries(&self, session_key: &str, include_bound_claude: bool) {
         let mut guard = self.prompt_queues.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(reservation) = guard.direct_park_reservations.get_mut(session_key) {
+        if include_bound_claude
+            && let Some(reservation) = guard.direct_park_reservations.get_mut(session_key)
+        {
             reservation.invalidated = true;
         }
         if let Some(queue) = guard.queues.get_mut(session_key) {
             let mut invalidated = Vec::new();
             queue.retain_mut(|item| {
                 if item.claude_binding.is_some() {
-                    if item.invalidate_claude_target() {
+                    if include_bound_claude && item.invalidate_claude_target() {
                         invalidated.push(item.id.clone());
                     }
                     return true;
@@ -1515,7 +1526,14 @@ impl HubState {
                 guard.composer_hold_probes.remove(&id);
             }
         }
-        guard.in_flight.remove(session_key);
+        if include_bound_claude
+            || !guard
+                .in_flight
+                .get(session_key)
+                .is_some_and(|flight| flight.require_observed_completion)
+        {
+            guard.in_flight.remove(session_key);
+        }
     }
 
     pub fn remove_queued_prompt(

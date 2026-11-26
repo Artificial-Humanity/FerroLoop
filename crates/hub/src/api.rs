@@ -9294,17 +9294,33 @@ pub(crate) fn run_remodel(
 ) -> RemodelRun {
     // The overrides the teardown clears, as they were, so a restore can put them back.
     let mut cleared_overrides: Vec<(String, ModelOverride)> = Vec::new();
-    let result = lifecycle::remodel_session(store, env, target, payload, by, caller, |key| {
-        for k in [key.to_string(), key.to_ascii_lowercase()] {
-            if let Some(o) = state.session_model_override(&k)
-                && !cleared_overrides.iter().any(|(seen, _)| *seen == k)
-            {
-                cleared_overrides.push((k, o));
+    let queue_watermark = state.queued_prompt_admission_watermark();
+    let result = lifecycle::remodel_session_with_queue_cleanup(
+        store,
+        env,
+        target,
+        payload,
+        by,
+        caller,
+        |cleanup| match cleanup {
+            lifecycle::TeardownQueueCleanup::Started { vendor, persona } => {
+                if vendor == "claude" {
+                    state.invalidate_restarted_claude_prompts(persona, queue_watermark);
+                }
             }
-        }
-        state.clear_session_prompt_queue(key);
-        state.clear_session_model_override(key);
-    });
+            lifecycle::TeardownQueueCleanup::Key(key) => {
+                for k in [key.to_string(), key.to_ascii_lowercase()] {
+                    if let Some(o) = state.session_model_override(&k)
+                        && !cleared_overrides.iter().any(|(seen, _)| *seen == k)
+                    {
+                        cleared_overrides.push((k, o));
+                    }
+                }
+                state.clear_legacy_session_prompt_queue(key);
+                state.clear_session_model_override(key);
+            }
+        },
+    );
     // Teardown and spin-up dropped the route scan; the store snapshot is dropped for every
     // write request. Drop the scan here too, so a failed remodel's restore shows at once.
     crate::discovery::invalidate_route_discovery_cache();
@@ -9368,7 +9384,7 @@ pub(crate) fn run_remodel(
             // Nothing queued for, or chosen for, the old run applies to the new one: the old
             // vendor's model override must never mask the new vendor's model.
             for key in [&out.previous_session_id, &out.session_id, &out.persona] {
-                state.clear_session_prompt_queue(key);
+                state.clear_legacy_session_prompt_queue(key);
                 state.clear_session_model_override(key);
             }
             if let Some(model) = &out.model {
@@ -14423,16 +14439,16 @@ mod claude_registration_binding_tests {
         }
     }
 
-    #[test]
-    fn hosted_claude_restart_refuses_exhausted_hold_by_original_native_id() {
-        let (_tmp, state, native, stream) = parking_fixture();
-        let owner = HubAuthority::Owner {
-            login: "owner".into(),
-        };
+    fn park_exhausted_hosted_claude_prompt(
+        state: &HubState,
+        owner: &HubAuthority,
+        native: &str,
+        stream: fl_host_proto::StreamId,
+    ) -> String {
         let spin_up = HttpRequest::new("POST", "/unused").with_json_body(&json!({
             "persona": "ada", "project": "FerroLoop", "role": "assistant", "vendor": "claude"
         }));
-        let response = handle_post_session_spin_up(&state, &owner, &spin_up);
+        let response = handle_post_session_spin_up(state, owner, &spin_up);
         assert_eq!(response.status, 200, "{:?}", response.json_value());
         {
             let store = state.open_store().unwrap();
@@ -14443,7 +14459,7 @@ mod claude_registration_binding_tests {
             lifecycle::persist_hosted_session(&*store, &hosted, "owner").unwrap();
         }
         let _dispatch = stub_claude_dispatch(move |_, _| Err(busy_hold(&stream)));
-        let response = owner_post_with_attachment(&state, &owner);
+        let response = owner_post_with_attachment(state, owner);
         assert_eq!(response.status, 200, "{:?}", response.json_value());
         let receipt = response.json_value().unwrap();
         let id = receipt["queued_prompt"]["id"].as_str().unwrap();
@@ -14454,10 +14470,19 @@ mod claude_registration_binding_tests {
                 Some(index + 1)
             );
         }
-        state.mark_hold_retries_exhausted(&native, id);
-        drain_ready_session_queues(&state);
-        assert!(state.session_queue(&native)[0].retries_exhausted);
+        state.mark_hold_retries_exhausted(native, id);
+        drain_ready_session_queues(state);
+        assert!(state.session_queue(native)[0].retries_exhausted);
+        id.to_owned()
+    }
 
+    #[test]
+    fn hosted_claude_restart_refuses_exhausted_hold_by_original_native_id() {
+        let (_tmp, state, native, stream) = parking_fixture();
+        let owner = HubAuthority::Owner {
+            login: "owner".into(),
+        };
+        let id = park_exhausted_hosted_claude_prompt(&state, &owner, &native, stream);
         let response = handle_post_hosted_session_restart(&state, &owner, "claude:ada");
         assert_eq!(response.status, 200, "{:?}", response.json_value());
         let queue = state.session_queue(&native);
@@ -14470,6 +14495,54 @@ mod claude_registration_binding_tests {
             std::fs::read(&queue[0].attachments[0].path).unwrap(),
             b"hello"
         );
+    }
+
+    #[test]
+    fn hosted_claude_remodel_refuses_exhausted_hold_by_original_native_id() {
+        for (target, launch_fails) in [("claude:ada", false), ("ada", true)] {
+            let (_tmp, state, native, stream) = parking_fixture();
+            let owner = HubAuthority::Owner {
+                login: "owner".into(),
+            };
+            let id = park_exhausted_hosted_claude_prompt(&state, &owner, &native, stream);
+            assert!(state.session_queue(target).is_empty());
+            let remodel = |body| {
+                let req = HttpRequest::new("POST", "/unused").with_json_body(&body);
+                handle_post_session_remodel(&state, &owner, target, &req)
+            };
+            for (body, status) in [
+                (json!({"vendor": "unknown"}), 400),
+                (json!({"vendor": "codex", "mode": "prepare"}), 200),
+            ] {
+                let response = remodel(body);
+                assert_eq!(response.status, status, "{:?}", response.json_value());
+                let queue = state.session_queue(&native);
+                assert_eq!(queue[0].delivery_state, crate::QueuedDeliveryState::Pending);
+                assert!(queue[0].retries_exhausted);
+            }
+
+            if launch_fails {
+                lifecycle::FAIL_SPIN_UP_VENDORS.with_borrow_mut(|v| v.push("codex".into()));
+            }
+            let response = remodel(json!({"vendor": "codex"}));
+            lifecycle::FAIL_SPIN_UP_VENDORS.with_borrow_mut(Vec::clear);
+            let status = if launch_fails { 502 } else { 200 };
+            let body = response.json_value().unwrap();
+            assert_eq!(response.status, status, "{body}");
+            if launch_fails {
+                assert_eq!(body["outcome"], "restored");
+            }
+            let queue = state.session_queue(&native);
+            assert_eq!(queue.len(), 1);
+            assert_eq!(queue[0].id, id);
+            assert_eq!(queue[0].delivery_state, crate::QueuedDeliveryState::Refused);
+            assert_eq!(queue[0].refusal_reason.as_deref(), Some("session_replaced"));
+            assert_eq!(queue[0].prompt, "check this file");
+            assert_eq!(
+                std::fs::read(&queue[0].attachments[0].path).unwrap(),
+                b"hello"
+            );
+        }
     }
 
     #[test]
