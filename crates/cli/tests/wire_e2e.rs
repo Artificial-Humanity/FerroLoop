@@ -168,6 +168,144 @@ fn register_json_reports_discarded_hydration_context() {
 }
 
 #[test]
+fn daemon_binds_codex_native_route_from_generation_only_registration() {
+    use fl_hub::lifecycle::{
+        HostedSessionRecord, HydrationStatus, STATUS_RUNNING, next_hydration_generation,
+        persist_hosted_session,
+    };
+    use fl_wire::identity::{RouteTable, VendorRoute};
+    use std::sync::Arc;
+
+    let env = TestEnv::new();
+    let store_path = env.data_dir.join("fl/fl.redb");
+    let store = Arc::new(fl_store::open_store(&store_path).unwrap());
+    let generation = next_hydration_generation();
+    let mut hosted = HostedSessionRecord {
+        session_id: "codex:feira".into(),
+        persona: "feira".into(),
+        project: "ferroloop".into(),
+        role: "assistant".into(),
+        vendor: "codex".into(),
+        model: None,
+        thinking_level: None,
+        node_id: "local".into(),
+        hosted: true,
+        status: STATUS_RUNNING.into(),
+        block: None,
+        stop_reason: None,
+        launch_prerequisite_detail: None,
+        restart_policy: "on-failure".into(),
+        restart_count: 0,
+        tmux_target: None,
+        host_session_id: Some("Feira.codex".into()),
+        cwd: None,
+        context_window: None,
+        posture: fl_core::permissions::Posture::Auto,
+        hydration_dispatched: true,
+        hydration_status: HydrationStatus::Unconfirmed,
+        hydration_generation: Some(generation.clone()),
+        runtime_spawned: true,
+        tombstone_ids: Vec::new(),
+        vendor_session_id: None,
+        pid: Some(u32::MAX),
+        runtime_leader_pid: None,
+        pid_start_time: None,
+        created_at_ms: 1,
+        updated_at_ms: 1,
+        decommission_prepared_at_ms: None,
+    };
+    persist_hosted_session(&*store, &hosted, "owner").unwrap();
+    let mut daemon = fl_wire::daemon::spawn_daemon(
+        Arc::clone(&store),
+        fl_wire::daemon::DaemonConfig {
+            node_id: "node-generation-only".into(),
+            host: "local".into(),
+            socket_path: env.sock_file.clone(),
+            routes_path: Some(env.routes_file.clone()),
+            home_override: Some(env.root.clone()),
+            listen_addr: None,
+            peers: vec![],
+            psk: vec![],
+        },
+    )
+    .unwrap();
+
+    let register = |thread: &str| {
+        let mut cmd = env.fl();
+        cmd.args([
+            "wire",
+            "register",
+            "Feira",
+            "--project",
+            "ferroloop",
+            "--role",
+            "assistant",
+            "--replace",
+            "--json",
+        ])
+        .env("AGENT_PERSONA", "feira")
+        .env("CODEX_THREAD_ID", thread);
+        cmd
+    };
+    // Codex supplies the thread ID. Hosted hydration adds only persona and generation.
+    let mut current = register("hosted-native-thread");
+    current.env("AGENT_HYDRATION_GENERATION", &generation);
+    assert_eq!(run_json(current)["hydration_ack"], "written");
+
+    let table = RouteTable::load(Some(&env.routes_file));
+    assert_eq!(
+        table
+            .get("feira")
+            .unwrap()
+            .registered_hosted_launch("feira"),
+        Some(("codex:feira", generation.as_str()))
+    );
+
+    let newer_generation = next_hydration_generation();
+    hosted.hydration_generation = Some(newer_generation.clone());
+    persist_hosted_session(&*store, &hosted, "owner").unwrap();
+    let stale = register("stale-native-thread")
+        .env("AGENT_HYDRATION_GENERATION", &generation)
+        .output()
+        .unwrap();
+    assert_eq!(stale.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&stale.stderr).contains("superseded by a newer launch"));
+    let table = RouteTable::load(Some(&env.routes_file));
+    assert!(matches!(
+        &table.get("feira").unwrap().route,
+        VendorRoute::Codex { thread_id, .. } if thread_id == "hosted-native-thread"
+    ));
+
+    let foreign = register("foreign-native-thread")
+        .env("AGENT_PERSONA", "someone-else")
+        .env("AGENT_HYDRATION_GENERATION", &newer_generation)
+        .output()
+        .unwrap();
+    assert_eq!(foreign.status.code(), Some(3));
+    let table = RouteTable::load(Some(&env.routes_file));
+    assert_eq!(
+        table
+            .get("feira")
+            .unwrap()
+            .registered_hosted_launch("feira"),
+        None
+    );
+
+    assert_eq!(
+        run_json(register("external-native-thread"))["hydration_ack"],
+        "not_written"
+    );
+    let table = RouteTable::load(Some(&env.routes_file));
+    let external = table.get("feira").unwrap();
+    assert!(matches!(
+        &external.route,
+        VendorRoute::Codex { thread_id, .. } if thread_id == "external-native-thread"
+    ));
+    assert_eq!(external.registered_hosted_launch("feira"), None);
+    daemon.stop();
+}
+
+#[test]
 fn fl_wire_cli_send_broadcast_ask_reply_read_ack_wait_status_and_prune() {
     let env = TestEnv::new();
 
