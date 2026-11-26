@@ -14,6 +14,8 @@ fn main() {
     let rest: Vec<String> = args.collect();
     match mode.as_str() {
         #[cfg(unix)]
+        "cursor-query" => cursor_query(rest.first().map(std::path::Path::new)),
+        #[cfg(unix)]
         "rendered-resize" => rendered_resize(std::path::Path::new(
             rest.first().expect("resize fixture directory"),
         )),
@@ -922,6 +924,67 @@ fn export_pipe_writers(args: &[String]) {
     let mut ack = [0u8];
     stream.read_exact(&mut ack).expect("receiver ready");
     assert_eq!(ack, [1]);
+}
+
+#[cfg(unix)]
+fn cursor_query(gate: Option<&std::path::Path>) {
+    use std::os::fd::AsRawFd;
+    use std::time::{Duration, Instant};
+
+    let fd = io::stdin().as_raw_fd();
+    // SAFETY: termios is valid once tcgetattr succeeds; the fixture owns this PTY.
+    unsafe {
+        let mut termios = std::mem::MaybeUninit::uninit();
+        assert_eq!(libc::tcgetattr(fd, termios.as_mut_ptr()), 0);
+        let mut termios = termios.assume_init();
+        libc::cfmakeraw(&mut termios);
+        assert_eq!(libc::tcsetattr(fd, libc::TCSANOW, &termios), 0);
+    }
+
+    if let Some(gate) = gate {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !gate.exists() {
+            assert!(Instant::now() < deadline, "client did not attach");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    let mut out = io::stdout().lock();
+    out.write_all(b"\x1b[4;9H\x1b[6n\x1b[1;1H").unwrap();
+    out.flush().unwrap();
+    let readable = |timeout: Duration| {
+        let mut pollfd = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: pollfd describes the open stdin of this fixture.
+        let result = unsafe { libc::poll(&mut pollfd, 1, timeout.as_millis() as i32) };
+        assert!(result >= 0, "poll stdin: {}", io::Error::last_os_error());
+        result > 0
+    };
+    const EXPECTED: &[u8] = b"\x1b[4;9R";
+    let mut reply = [0; EXPECTED.len()];
+    let mut received = 0;
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while received < reply.len() {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if !readable(remaining) {
+            eprintln!("timed out waiting for cursor report");
+            exit(1);
+        }
+        let rest = &mut reply[received..];
+        // SAFETY: stdin is this PTY and rest is a writable slice. Read
+        // directly so buffered input cannot hide a duplicate from poll.
+        let count = unsafe { libc::read(fd, rest.as_mut_ptr().cast(), rest.len()) };
+        assert!(count > 0, "stdin closed or unreadable before cursor report");
+        received += count as usize;
+    }
+    assert_eq!(&reply, EXPECTED);
+    assert!(
+        !readable(Duration::from_millis(250)),
+        "received duplicate cursor report or unexpected input"
+    );
 }
 
 // Finite redraw producer. Gates split actual PTY writes at escape and UTF-8
