@@ -880,8 +880,9 @@ fn load_json_override(raw: &str) -> Option<(Value, Option<u64>)> {
 
 /// Runs `bin` and returns its stdout. The child gets a scrubbed environment (see
 /// [`fl_exec::child_env`]): the baseline plus `kind`'s own vendor variables, or the baseline alone
-/// when `kind` is `None` (`curl`). It never sees `FL_VAULT_MASTER_KEY`, `FL_HUB_*`, GitHub
-/// credentials, another vendor's keys or a proxy.
+/// when `kind` is `None` (`curl`). Vendor probes also apply the composed CLI update policy.
+/// The child never sees `FL_VAULT_MASTER_KEY`, `FL_HUB_*`, GitHub credentials, another vendor's
+/// keys or a proxy.
 pub(crate) fn command_stdout(
     bin: &Path,
     args: &[&str],
@@ -892,10 +893,22 @@ pub(crate) fn command_stdout(
         Some(kind) => child_env(kind, &[], &[]),
         None => helper_env(&[], &[]),
     };
-    let mut child = Command::new(bin)
-        .args(args)
-        .env_clear()
-        .envs(env)
+    let mut command = Command::new(bin);
+    command.env_clear().envs(env);
+    if let Some(adapter) = kind.and_then(|kind| {
+        crate::lifecycle::launch_versions::vendor_version_adapters()?.lookup(kind.vendor_id())
+    }) {
+        let mut argv = std::iter::once(adapter.cli_binary_name())
+            .chain(args.iter().copied())
+            .map(str::to_owned)
+            .collect();
+        let mut policy_env = Vec::new();
+        adapter.apply_cli_update_policy(&mut argv, &mut policy_env);
+        command.args(&argv[1..]).envs(policy_env);
+    } else {
+        command.args(args);
+    }
+    let mut child = command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())

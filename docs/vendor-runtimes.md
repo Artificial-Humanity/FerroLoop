@@ -172,8 +172,8 @@ allowance is unknown has no entry. A hub with a home override never reads the re
 ### Hosted startup updates
 
 FerroLoop sets the vendor's update control on fresh and resumed hosted CLI launches. The
-runtime matrix's `--version` probes use the same control. The explicit updates below still
-run the vendor's update command.
+runtime matrix's version and CLI account probes use the same control. Explicit updates run
+the vendor's update command.
 
 | CLI | What FerroLoop passes | Vendor reference |
 | --- | --- | --- |
