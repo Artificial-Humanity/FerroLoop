@@ -569,10 +569,10 @@ pub fn read_hosted_vendor_versions(
         .collect())
 }
 
-/// Read the most recent known hosted versions for vendors on this machine from one snapshot.
+/// Read the most recent known hosted versions for vendors on this machine across the stores.
 /// A store that cannot be read, or an invalid or absent baseline, supplies no version.
-pub(crate) fn read_local_vendor_baselines(
-    path: Option<&Path>,
+pub(crate) fn read_local_vendor_baselines<'a>(
+    paths: impl IntoIterator<Item = &'a Path>,
     backend: Option<fl_store::BackendKind>,
     vendors: impl IntoIterator<Item = &'static str>,
 ) -> Vec<(Option<String>, Option<String>)> {
@@ -580,33 +580,48 @@ pub(crate) fn read_local_vendor_baselines(
         .into_iter()
         .map(|vendor| baseline_slug(local_host_key(), vendor))
         .collect();
-    let entries = path
-        .and_then(|path| {
-            fl_store::health::read_state_keys(
-                path,
-                backend,
-                &StateScope::Workspace,
-                StateConcern::Runtime,
-                &keys,
-                0,
-            )
-            .ok()
-        })
-        .unwrap_or_else(|| vec![None; keys.len()]);
-    entries
-        .into_iter()
-        .map(|entry| {
+    let mut baselines: Vec<[Option<KnownVersion>; 2]> = vec![[None, None]; keys.len()];
+    for path in paths {
+        let Ok(entries) = fl_store::health::read_state_keys(
+            path,
+            backend,
+            &StateScope::Workspace,
+            StateConcern::Runtime,
+            &keys,
+            0,
+        ) else {
+            continue;
+        };
+        for (entry, latest) in entries.into_iter().zip(&mut baselines) {
             let Some(StatePayload::Runtime(runtime)) = entry.map(|entry| entry.payload) else {
-                return (None, None);
+                continue;
             };
             let mut baseline = runtime.value;
-            let mut version = |component: &str| {
-                let known: KnownVersion =
-                    serde_json::from_value(baseline.get_mut(component)?.take()).ok()?;
-                valid_release_version(&known.version)?;
-                Some(known.version)
-            };
-            (version("cli"), version("daemon"))
+            for (component, current) in ["cli", "daemon"].into_iter().zip(latest) {
+                let candidate = baseline
+                    .get_mut(component)
+                    .and_then(|value| serde_json::from_value::<KnownVersion>(value.take()).ok());
+                if let Some(candidate) = candidate
+                    // Launch IDs are time-ordered UUIDv7. Other UUID versions cannot order history.
+                    && candidate.launch.get_version_num() == 7
+                    && candidate.launch.get_variant() == uuid::Variant::RFC4122
+                    && valid_release_version(&candidate.version).is_some()
+                    && current
+                        .as_ref()
+                        .is_none_or(|known| known.launch < candidate.launch)
+                {
+                    *current = Some(candidate);
+                }
+            }
+        }
+    }
+    baselines
+        .into_iter()
+        .map(|[cli, daemon]| {
+            (
+                cli.map(|known| known.version),
+                daemon.map(|known| known.version),
+            )
         })
         .collect()
 }

@@ -10,20 +10,20 @@ use fl_core::{
 
 use crate::lifecycle::launch_versions::read_local_vendor_baselines;
 
-/// Append passive local vendor observations. The only history read is a keyed snapshot of
-/// the selected store. Unknown or unavailable evidence cannot fail a report.
-pub fn with_vendor_doctor_checks(
+/// Append passive local vendor observations using one keyed snapshot per selected store.
+/// Unknown or unavailable evidence cannot fail a report.
+pub fn with_vendor_doctor_checks<'a>(
     report: DoctorReport,
     registry: Option<&VendorVersionRegistry>,
     context: &VendorDoctorContext<'_>,
-    store: Option<&Path>,
+    stores: impl IntoIterator<Item = &'a Path>,
     backend: Option<fl_store::BackendKind>,
 ) -> DoctorReport {
     let facts = registry
         .map(|registry| registry.doctor_facts(context))
         .unwrap_or_default();
     let baselines =
-        read_local_vendor_baselines(store, backend, facts.iter().map(|fact| fact.vendor));
+        read_local_vendor_baselines(stores, backend, facts.iter().map(|fact| fact.vendor));
     let mut versions = Observations::default();
     let mut updates = Observations::default();
     for (fact, (cli_baseline, daemon_baseline)) in facts.into_iter().zip(baselines) {

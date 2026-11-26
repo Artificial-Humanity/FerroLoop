@@ -612,12 +612,28 @@ fn the_human_report_lists_every_check_and_the_overall() {
     assert!(text.contains("nothing was changed"), "{text}");
 }
 
+const FIRST_VENDOR_LAUNCH: u128 = 0x0193_6a64_ae00_7000_8000_0000_0000_0001;
+
 /// Seed the host-local writer's persisted baseline shape without starting a hosted session.
 fn seed_vendor_baseline(
     store: &impl StateStore,
     vendor: &str,
     cli: Option<&str>,
     daemon: Option<&str>,
+) {
+    seed_vendor_baseline_with_launches(
+        store,
+        vendor,
+        cli.map(|version| (version, FIRST_VENDOR_LAUNCH)),
+        daemon.map(|version| (version, FIRST_VENDOR_LAUNCH)),
+    );
+}
+
+fn seed_vendor_baseline_with_launches(
+    store: &impl StateStore,
+    vendor: &str,
+    cli: Option<(&str, u128)>,
+    daemon: Option<(&str, u128)>,
 ) {
     let identity = std::fs::read_to_string("/etc/machine-id")
         .ok()
@@ -626,7 +642,7 @@ fn seed_vendor_baseline(
         .unwrap_or_else(|| "workspace-local".into());
     let host = sha(identity.trim().as_bytes());
     let digest = sha(format!("{}/{vendor}", &host[..40]).as_bytes());
-    let known = |version: &str| json!({ "version": version, "launch": "01936a64-ae00-7000-8000-000000000001" });
+    let known = |(version, launch): (&str, u128)| json!({ "version": version, "launch": uuid::Uuid::from_u128(launch) });
     store
         .upsert_state(UpsertStateArgs {
             scope: StateScope::Workspace,
@@ -718,6 +734,87 @@ fn vendor_checks_use_passive_facts_and_the_selected_hub_history() {
         detail(&report, VENDOR_VERSION_DRIFT)
             .contains("muse CLI: installed 1.4.25-R1, last hosted unknown")
     );
+    assert!(!w.home.path().join("vendor-executed").exists());
+}
+
+#[test]
+fn vendor_history_uses_the_latest_component_across_both_default_stores() {
+    let w = World::new();
+    let cli = w.fake_vendor(
+        ".codex/packages/standalone/releases/0.171.0-x86_64-unknown-linux-gnu/bin/codex",
+    );
+    let cli_link = w.home.path().join(".local/bin/codex");
+    std::fs::create_dir_all(cli_link.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(&cli, cli_link).unwrap();
+    let daemon = w.fake_vendor(
+        ".codex/packages/app-server-daemon/releases/0.172.0-x86_64-unknown-linux-gnu/bin/codex",
+    );
+    let release = daemon.parent().unwrap().parent().unwrap();
+    let package = release.parent().unwrap().parent().unwrap();
+    std::os::unix::fs::symlink(release, package.join("current")).unwrap();
+
+    let project = w.cwd.path().join("project.fls");
+    let workspace = w.home.path().join(".local/share/fl/fl.fls");
+    let config = w.home.path().join(".config/fl/config.toml");
+    std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+    std::fs::write(
+        &config,
+        format!(
+            "[[project]]\nroot = {:?}\nstore = {project:?}\n",
+            w.cwd.path()
+        ),
+    )
+    .unwrap();
+    std::fs::create_dir_all(workspace.parent().unwrap()).unwrap();
+    let launch = |order: u128| FIRST_VENDOR_LAUNCH + order - 1;
+    for (path, cli, daemon) in [
+        (&project, ("0.170.0", launch(2)), ("0.172.0", launch(3))),
+        (&workspace, ("0.171.0", launch(4)), ("0.169.0", launch(1))),
+    ] {
+        let store = fl_store::FerroStore::open(path).unwrap();
+        seed_vendor_baseline_with_launches(&store, "codex", Some(cli), Some(daemon));
+    }
+
+    let (_, report) = w.doctor(&[]);
+    assert_eq!(status(&report, VENDOR_VERSION_DRIFT), "pass");
+    let versions = detail(&report, VENDOR_VERSION_DRIFT);
+    assert!(versions.contains("codex CLI: installed 0.171.0, last hosted 0.171.0 |"));
+    assert!(versions.contains("codex daemon: installed 0.172.0, last hosted 0.172.0 |"));
+
+    let mut command = w.fl();
+    command.env("FL_DB", &workspace);
+    let (_, report) = w.doctor_with(command, &[]);
+    let versions = detail(&report, VENDOR_VERSION_DRIFT);
+    assert!(versions.contains("codex CLI: installed 0.171.0, last hosted 0.171.0 |"));
+    assert!(versions.contains("codex daemon: installed 0.172.0, last hosted 0.169.0 (changed)"));
+
+    let mut command = w.fl();
+    command.env("FL_DB", &workspace);
+    let (_, report) = w.doctor_with(command, &["--db", project.to_str().unwrap()]);
+    let versions = detail(&report, VENDOR_VERSION_DRIFT);
+    assert!(versions.contains("codex CLI: installed 0.171.0, last hosted 0.170.0 (changed)"));
+    assert!(versions.contains("codex daemon: installed 0.172.0, last hosted 0.172.0 |"));
+
+    for invalid in [
+        ("invalid", launch(5)),
+        ("0.169.0", 0xf193_6a64_ae00_4000_8000_0000_0000_0005),
+        ("0.169.0", 0xf193_6a64_ae00_7000_f000_0000_0000_0005),
+    ] {
+        let store = fl_store::FerroStore::open(&workspace).unwrap();
+        seed_vendor_baseline_with_launches(
+            &store,
+            "codex",
+            Some(("0.171.0", launch(4))),
+            Some(invalid),
+        );
+        drop(store);
+        let (_, report) = w.doctor(&[]);
+        assert_eq!(status(&report, VENDOR_VERSION_DRIFT), "pass");
+        assert!(
+            detail(&report, VENDOR_VERSION_DRIFT)
+                .contains("codex daemon: installed 0.172.0, last hosted 0.172.0 |")
+        );
+    }
     assert!(!w.home.path().join("vendor-executed").exists());
 }
 

@@ -212,6 +212,26 @@ pub(super) fn configured_hub_store_path(
     .map(|entry| entry.store)
 }
 
+/// Hosted launches can be recorded by the Hub or by a direct `fl agent` command.
+pub(super) fn hosted_version_store_paths(
+    cfg: Option<&crate::config::Config>,
+    cwd: Option<&Path>,
+    default: Option<&Path>,
+) -> Vec<PathBuf> {
+    let mut paths: Vec<_> = cfg
+        .and_then(|cfg| configured_hub_store_path(cfg, cwd))
+        .into_iter()
+        .collect();
+    if let Some(workspace) = default.map(|path| match cfg {
+        Some(cfg) => cfg.workspace_state_store(path),
+        None => path.to_path_buf(),
+    }) && !paths.contains(&workspace)
+    {
+        paths.push(workspace);
+    }
+    paths
+}
+
 /// Open the hub's store on whichever engine the path and `FL_STORE_BACKEND` select.
 fn open_hub_store_with_retry(store_path: &Path) -> Result<AnyStore, (i32, String)> {
     open_hub_store_with_options(store_path, &StoreOptions::default())

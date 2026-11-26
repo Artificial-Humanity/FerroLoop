@@ -85,7 +85,7 @@ pub(crate) fn report(state: &HubState) -> Result<Value, String> {
                 }
             },
         },
-        Some(store),
+        [store.as_path()],
         state.store_backend,
     );
     serde_json::to_value(&report).map_err(|e| e.to_string())

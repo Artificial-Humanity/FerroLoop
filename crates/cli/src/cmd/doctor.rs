@@ -63,13 +63,14 @@ pub fn run(cmd: Cmd, db: Option<PathBuf>) -> anyhow::Result<i32> {
     let config = crate::config::load(crate::config::path().as_deref()).ok();
     let default = crate::default_state_store_path().ok();
     let report_stores = stores(db.as_deref(), config.as_ref(), default.as_deref());
-    let history_store = db.or_else(|| {
-        let cwd = std::env::current_dir().ok();
-        config
-            .as_ref()
-            .and_then(|cfg| super::hub::configured_hub_store_path(cfg, cwd.as_deref()))
-            .or(default)
-    });
+    let history_stores = match db {
+        Some(path) => vec![path],
+        None => super::hub::hosted_version_store_paths(
+            config.as_ref(),
+            std::env::current_dir().ok().as_deref(),
+            default.as_deref(),
+        ),
+    };
     let config_ui = config.and_then(|c| c.hub).and_then(|h| h.ui_dir);
     let home = std::env::var_os("HOME")
         .filter(|h| !h.is_empty())
@@ -95,7 +96,7 @@ pub fn run(cmd: Cmd, db: Option<PathBuf>) -> anyhow::Result<i32> {
             path: path.as_deref(),
             env: &|key| std::env::var_os(key),
         },
-        history_store.as_deref(),
+        history_stores.iter().map(PathBuf::as_path),
         None,
     );
     if cmd.json {

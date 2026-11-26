@@ -128,6 +128,11 @@ version difference is `warn`. An opaque installation or missing, unreadable, or 
 history is shown as `unknown`. Doctor reads selected files and package paths and makes no
 vendor CLI call or daemon connection.
 
+The CLI finds the latest valid observation for each component across the configured Hub store
+and the workspace store. The Hub store resolves to `[state].store` when configured, or to the
+project store bound to the current directory when present. `--db` or `FL_DB` confines the CLI to
+the named store. FerroDeck uses its serving Hub's store.
+
 **`vendor.update-policy`.** Shows the update setting observed in this invocation's environment
 or the vendor's user configuration, alongside the policy applied to hosted CLI launches.
 A documented enabled setting on an available runtime is `warn`. The Codex client startup
