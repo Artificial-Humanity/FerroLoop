@@ -1,6 +1,8 @@
 //! Bounded, volatile observations of dispatch fences. These snapshots confer no
 //! delivery, recovery, liveness or authorization authority.
 
+use std::borrow::Cow;
+
 use fl_core::{at::At, ids::MessageId};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -95,7 +97,7 @@ impl FenceRecoveryOutcome {
             Self::NonHostedRoute => "non-hosted route",
             Self::UnsupportedRoute => "timed recovery unsupported for this route",
             Self::SeatBusy => "seat is in a turn",
-            Self::SeatBusyProlonged => "seat is still in a turn after 12 consecutive probes",
+            Self::SeatBusyProlonged => "seat is still in a turn",
             Self::DialogWaiting => "a dialog waits for input",
             Self::ComposerDraft => "the composer holds a draft",
             Self::BlankScreen => "hosted screen is blank",
@@ -141,6 +143,27 @@ pub struct FenceRecoveryAttention {
     pub exhausted: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub busy_since: Option<At>,
+    /// Observed duration at the latest busy probe once escalation is reached.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub busy_elapsed_ms: Option<u64>,
+}
+
+impl FenceRecoveryAttention {
+    pub fn reason_label(&self) -> Cow<'static, str> {
+        if let (FenceRecoveryOutcome::SeatBusyProlonged, Some(elapsed_ms)) =
+            (self.outcome, self.busy_elapsed_ms)
+        {
+            let seconds = elapsed_ms / 1000;
+            let minutes = seconds / 60;
+            let elapsed = match minutes {
+                0 => format!("{seconds}s"),
+                1..=59 => format!("{minutes}m {}s", seconds % 60),
+                _ => format!("{}h {}m {}s", minutes / 60, minutes % 60, seconds % 60),
+            };
+            return format!("seat has been in a turn for {elapsed}").into();
+        }
+        self.outcome.label().into()
+    }
 }
 
 /// An observation of the existing suppression phase, not a scheduling state.
@@ -610,7 +633,7 @@ impl DiagnosticsState {
         outcome: FenceRecoveryOutcome,
         exhausted: bool,
     ) {
-        self.set_fence_recovery_status(recipient, outcome, exhausted, None);
+        self.set_fence_recovery_status(recipient, outcome, exhausted, None, None);
     }
 
     pub(crate) fn set_busy_fence_recovery_status(
@@ -618,8 +641,20 @@ impl DiagnosticsState {
         recipient: &str,
         outcome: FenceRecoveryOutcome,
         busy_since: At,
+        observed_at: &At,
     ) {
-        self.set_fence_recovery_status(recipient, outcome, false, Some(busy_since));
+        let busy_elapsed_ms = (outcome == FenceRecoveryOutcome::SeatBusyProlonged).then(|| {
+            observed_at
+                .unix_millis()
+                .saturating_sub(busy_since.unix_millis())
+        });
+        self.set_fence_recovery_status(
+            recipient,
+            outcome,
+            false,
+            Some(busy_since),
+            busy_elapsed_ms,
+        );
     }
 
     fn set_fence_recovery_status(
@@ -628,6 +663,7 @@ impl DiagnosticsState {
         outcome: FenceRecoveryOutcome,
         exhausted: bool,
         busy_since: Option<At>,
+        busy_elapsed_ms: Option<u64>,
     ) {
         let Some(recipient) = normalize_persona(recipient) else {
             return;
@@ -638,6 +674,7 @@ impl DiagnosticsState {
             outcome,
             exhausted,
             busy_since,
+            busy_elapsed_ms,
         };
         if let Some(existing) = attention
             .iter_mut()
@@ -1336,6 +1373,21 @@ mod tests {
     }
 
     #[test]
+    fn fence_recovery_busy_elapsed_saturates_on_clock_rollback() {
+        let mut state = DiagnosticsState::new(At::from_unix_millis(0), None);
+        state.set_busy_fence_recovery_status(
+            "feira",
+            FenceRecoveryOutcome::SeatBusyProlonged,
+            At::from_unix_millis(31_000),
+            &At::from_unix_millis(30_000),
+        );
+        assert_eq!(
+            state.snapshot.fence_recovery_attention[0].busy_elapsed_ms,
+            Some(0)
+        );
+    }
+
+    #[test]
     fn fence_recovery_history_coalesces_interleaved_busy_streaks() {
         use FenceRecoveryOutcome::{Inconclusive, SeatBusy, VendorSignIn};
 
@@ -1420,6 +1472,7 @@ mod tests {
                 outcome: FenceRecoveryOutcome::VendorSignIn,
                 exhausted: true,
                 busy_since: None,
+                busy_elapsed_ms: None,
             }]
         );
 

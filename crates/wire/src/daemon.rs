@@ -2506,6 +2506,7 @@ where
                                 &recipient,
                                 FenceRecoveryOutcome::SeatBusy,
                                 busy_since,
+                                &state.since,
                             );
                         } else {
                             diagnostics.set_fence_recovery_attention(
@@ -2687,7 +2688,12 @@ where
                 } else {
                     FenceRecoveryOutcome::SeatBusy
                 };
-                diagnostics.set_busy_fence_recovery_status(recipient, status, busy_since.clone());
+                diagnostics.set_busy_fence_recovery_status(
+                    recipient,
+                    status,
+                    busy_since.clone(),
+                    &run.at,
+                );
                 outcome
             }
             Some(_) if outcome == FenceRecoveryOutcome::Released => {
@@ -7315,7 +7321,11 @@ mod tests {
 
     #[test]
     fn timed_fence_recovery_refunds_worker_busy_and_resets_streak_on_other_outcomes() {
-        let (_tmp, inner, listener, first, since) = timed_recovery_fixture();
+        let (_tmp, mut inner, listener, first, since) = timed_recovery_fixture();
+        Arc::get_mut(&mut inner)
+            .unwrap()
+            .fence_recovery_policy
+            .delay_ms = 31_000;
         let mut call = 0;
         *lock(&inner.fence_recovery_probe_hook) = Some(Box::new(move || {
             call += 1;
@@ -7323,7 +7333,7 @@ mod tests {
                 // The twelfth timed poll sees readiness, but its worker's
                 // second read-only check sees busy before attempting delivery.
                 12 => RecoveryReadiness::Ready(RecoveryTarget::FixtureWebhook),
-                14 => RecoveryReadiness::Hold(FenceRecoveryOutcome::Inconclusive),
+                15 => RecoveryReadiness::Hold(FenceRecoveryOutcome::Inconclusive),
                 _ => RecoveryReadiness::Hold(FenceRecoveryOutcome::SeatBusy),
             }
         }));
@@ -7342,18 +7352,30 @@ mod tests {
         let busy = &diagnostics.fence_recovery_attention[0];
         assert_eq!(busy.outcome, FenceRecoveryOutcome::SeatBusyProlonged);
         assert_eq!(busy.busy_since, Some(due(1)));
+        assert_eq!(busy.busy_elapsed_ms, Some(341_000));
+        assert_eq!(busy.reason_label(), "seat has been in a turn for 5m 41s");
         assert_eq!(lock(&inner.fence_recoveries)["held"].attempts, 0);
 
         inner.poll_retained_fences(due(13));
+        let diagnostics = inner.diagnostics_snapshot();
+        let busy = &diagnostics.fence_recovery_attention[0];
+        assert_eq!(busy.busy_since, Some(due(1)));
+        assert_eq!(busy.busy_elapsed_ms, Some(372_000));
+
+        inner.poll_retained_fences(due(14));
         let diagnostics = inner.diagnostics_snapshot();
         assert_eq!(
             diagnostics.fence_recovery_attention[0].outcome,
             FenceRecoveryOutcome::Inconclusive
         );
         assert_eq!(diagnostics.fence_recovery_attention[0].busy_since, None);
+        assert_eq!(
+            diagnostics.fence_recovery_attention[0].busy_elapsed_ms,
+            None
+        );
         assert_eq!(lock(&inner.fence_recoveries)["held"].attempts, 1);
 
-        inner.poll_retained_fences(due(14));
+        inner.poll_retained_fences(due(15));
         let diagnostics = inner.diagnostics_snapshot();
         assert_eq!(diagnostics.fence_recovery_attempts.len(), 3);
         assert_eq!(
@@ -7366,7 +7388,7 @@ mod tests {
         );
         assert_eq!(
             diagnostics.fence_recovery_attention[0].busy_since,
-            Some(due(14))
+            Some(due(15))
         );
         assert_eq!(lock(&inner.fence_recoveries)["held"].attempts, 1);
         assert_eq!(

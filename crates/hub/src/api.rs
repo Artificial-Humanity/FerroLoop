@@ -2234,7 +2234,7 @@ impl HubDispatchDiagnostics {
                     Some(HubFenceRecoveryAttention {
                         recipient: normalize_persona(&row.recipient)?,
                         outcome: row.outcome,
-                        reason_label: row.outcome.label().to_owned(),
+                        reason_label: row.reason_label().into_owned(),
                         exhausted: row.exhausted,
                         busy_since: row.busy_since,
                     })
@@ -13535,18 +13535,21 @@ mod council_guidance_tests {
                             outcome: FenceRecoveryOutcome::VendorSignIn,
                             exhausted: true,
                             busy_since: None,
+                            busy_elapsed_ms: None,
                         },
                         FenceRecoveryAttention {
                             recipient: "ada".into(),
-                            outcome: FenceRecoveryOutcome::SeatBusy,
+                            outcome: FenceRecoveryOutcome::SeatBusyProlonged,
                             exhausted: false,
                             busy_since: Some(ts_for_status.clone()),
+                            busy_elapsed_ms: Some(341_000),
                         },
                         FenceRecoveryAttention {
                             recipient: "/secret/recovery-diagnostic".into(),
                             outcome: FenceRecoveryOutcome::Inconclusive,
                             exhausted: false,
                             busy_since: None,
+                            busy_elapsed_ms: None,
                         },
                     ],
                 }),
@@ -13685,8 +13688,8 @@ mod council_guidance_tests {
                 },
                 {
                     "recipient": "ada",
-                    "outcome": "seat_busy",
-                    "reason_label": "seat is in a turn",
+                    "outcome": "seat_busy_prolonged",
+                    "reason_label": "seat has been in a turn for 5m 41s",
                     "exhausted": false,
                     "busy_since": ts,
                 },
