@@ -1120,6 +1120,7 @@ where
     default
 }
 
+#[derive(Clone)]
 struct RouteFenceRelease {
     winning: VendorRoute,
     explicit: bool,
@@ -2424,10 +2425,14 @@ where
                 let retryable = replay_stop.is_none()
                     && !prefix_overflowed
                     && (exhausted_busy_route.is_some() || transport_fence_can_recover(&evidence));
+                // The normal drain may have switched routes after the timed submit.
+                // A deferred registration for the route that received this push
+                // must not release a stopped fence.
                 let fenced_route = recovery
                     .as_ref()
                     .and_then(|run| run.route.as_ref())
-                    .or(exhausted_busy_route);
+                    .or(exhausted_busy_route)
+                    .or(attempted_route.as_ref().filter(|_| replay_stop.is_some()));
                 let since = self.retain_overflow_fence_at(
                     &recipient,
                     evidence,
@@ -2611,10 +2616,12 @@ where
 
     fn is_recipient_fenced(&self, recipient: &str) -> bool {
         let queues = lock(&self.dispatch_queues);
+        self.has_recipient_fence(recipient, queues.get(recipient))
+    }
+
+    fn has_recipient_fence(&self, recipient: &str, queue: Option<&RecipientDispatchQueue>) -> bool {
         lock(&self.overflow_recipients).contains(recipient)
-            || queues
-                .get(recipient)
-                .is_some_and(|queue| queue.overflowed && queue.recovery.is_none())
+            || queue.is_some_and(|queue| queue.overflowed && queue.recovery.is_none())
     }
 
     fn clear_recovery_fence(&self, recipient: &str) {
@@ -2744,30 +2751,31 @@ where
         readiness_result(readiness, binding.startup_confirmed).map(|target| (target, Some(binding)))
     }
 
-    /// The caller holds the enqueue gate. Keep manual releases until the timed replay
-    /// ends. An ACK also waits for an overflow prefix because pending receipts in that
-    /// queue may still have earlier delivery attempts.
+    /// The caller holds the enqueue gate and queue lock. Keep manual releases until
+    /// the timed replay ends. An ACK waits for the whole overflow prefix, while a
+    /// route change waits for an in-flight prefix job's receipt result.
     fn defer_fence_release(
         &self,
         recipient: &str,
+        queue: Option<&RecipientDispatchQueue>,
         wait_for_overflow_prefix: bool,
         update: impl FnOnce(&mut DeferredFenceRelease),
     ) -> bool {
-        let queues = lock(&self.dispatch_queues);
-        let Some(queue) = queues.get(recipient) else {
+        let Some(queue) = queue else {
             return false;
         };
+        let wait_for_overflow = wait_for_overflow_prefix || queue.in_flight.is_some();
         let mut recoveries = lock(&self.fence_recoveries);
         let Some(state) = recoveries.get_mut(recipient).filter(|state| {
             queue
                 .recovery
                 .as_ref()
                 .is_some_and(|run| run.is_current(state))
-                || (wait_for_overflow_prefix && state.phase == RetainedFencePhase::OverflowOnly)
+                || (wait_for_overflow && state.phase == RetainedFencePhase::OverflowOnly)
         }) else {
-            // A saturated fence map cannot retain the ACK. It still must not
+            // A saturated fence map cannot retain a release. It still must not
             // release a post-replay overflow while the prefix is running.
-            return wait_for_overflow_prefix && queue.overflowed && queue.released_route.is_some();
+            return wait_for_overflow && queue.overflowed && queue.released_route.is_some();
         };
         update(&mut state.deferred_release);
         true
@@ -3002,26 +3010,32 @@ where
             return;
         }
         let _order = lock(&self.enqueue_gate);
-        if !self.recovery_fence_matches(&name, expected)
-            || !lock(&self.routes)
+        let still_winning = |routes: &RouteTable| {
+            routes
                 .get(&name)
                 .is_some_and(|current| current.route == release.winning)
-            || !self.should_release_fence_for(
-                &name,
-                &release.winning,
-                release.explicit,
-                release.route_gone_before,
-            )
-        {
+        };
+        let can_release = |queue: Option<&RecipientDispatchQueue>| {
+            self.recovery_fence_matches(&name, expected)
+                && self.should_release_fence_for(
+                    &name,
+                    &release.winning,
+                    release.explicit,
+                    release.route_gone_before,
+                )
+                && !self.defer_fence_release(&name, queue, false, |deferred| {
+                    deferred.route = Some(release.clone());
+                })
+                && self.has_recipient_fence(&name, queue)
+        };
+        if !still_winning(&lock(&self.routes)) {
             return;
         }
-        let at = release.at.clone();
-        if self.defer_fence_release(&name, false, |deferred| deferred.route = Some(release))
-            || !self.is_recipient_fenced(&name)
-        {
+        if !can_release(lock(&self.dispatch_queues).get(&name)) {
             return;
         }
-        // Fallible store read first: do not drop re-probe/fence state before it succeeds.
+        // Do not hold scheduler locks across the store read. Recheck before opening
+        // the fence because the ordinary drain may have recorded a receipt fault.
         let Ok(unread) = self.store.list_wire_inbox(&WireFilter {
             recipient: Some(name.clone()),
             unread_only: true,
@@ -3029,19 +3043,27 @@ where
         }) else {
             return;
         };
+        {
+            let routes = lock(&self.routes);
+            let mut queues = lock(&self.dispatch_queues);
+            if !still_winning(&routes) || !can_release(queues.get(&name)) {
+                return;
+            }
+            lock(&self.composer_occupied_reprobes).remove(&name);
+            lock(&self.fence_routes).remove(&name);
+            self.clear_recovery_fence(&name);
+            lock(&self.dispatch_diagnostics).clear_recipient(&name);
+            lock(&self.overflow_recipients).remove(&name);
+            if let Some(queue) = queues.get_mut(&name) {
+                queue.overflowed = false;
+            }
+        }
         warn(&format!(
             "released retained fence for {}: route identity replaced by remodel/vendor change; rescheduling pending delivery to the new route (at-least-once)",
             sanitize_for_warning(&name)
         ));
-        lock(&self.composer_occupied_reprobes).remove(&name);
-        lock(&self.fence_routes).remove(&name);
-        self.clear_recovery_fence(&name);
-        lock(&self.dispatch_diagnostics).clear_recipient(&name);
         let mut first_holds = Vec::new();
-        lock(&self.overflow_recipients).remove(&name);
-        if let Some(queue) = lock(&self.dispatch_queues).get_mut(&name) {
-            queue.overflowed = false;
-        }
+        let at = release.at;
         for item in &unread {
             if item.receipt.status == DeliveryStatus::Pending {
                 if item.receipt.attempts > 0 {
@@ -3107,7 +3129,12 @@ where
         }
         let _order = lock(&self.enqueue_gate);
         if !self.recovery_fence_matches(&name, expected)
-            || self.defer_fence_release(&name, true, |deferred| deferred.ack = Some(now.clone()))
+            || {
+                let queues = lock(&self.dispatch_queues);
+                self.defer_fence_release(&name, queues.get(&name), true, |deferred| {
+                    deferred.ack = Some(now.clone());
+                })
+            }
             || !self.is_recipient_fenced(&name)
             || lock(&self.fence_recoveries)
                 .get(&name)
@@ -6244,6 +6271,22 @@ mod tests {
     fn timed_fence_recovery_stops_after_overflow_prefix_receipt_write_failure() {
         for overflow_during_tail in [false, true] {
             let (tmp, inner, listener, first, since) = timed_recovery_fixture();
+            let register = |socket_path| {
+                let (response, _) = inner.handle_local_request(LocalRequest::RegisterRoute {
+                    persona: "held".into(),
+                    route: VendorRoute::Webhook { socket_path },
+                    explicit: true,
+                    replace: true,
+                    hosted_id: None,
+                    hydration_generation: None,
+                    hosted_session_verified: false,
+                    unverified_process: false,
+                });
+                assert!(matches!(response, LocalResponse::RouteRegistered));
+            };
+            let tail_path = tmp.path().join("overflow-receipt-tail.sock");
+            let tail_listener = crate::test_isolation::bind_unix_fixture(&tail_path).unwrap();
+            tail_listener.set_nonblocking(true).unwrap();
             let block_receipt_write = || {
                 let (entered_tx, entered_rx) = mpsc::channel();
                 let (resume_tx, resume_rx) = mpsc::channel();
@@ -6269,6 +6312,13 @@ mod tests {
             inner.poll_retained_fences(At::from_unix_millis(due));
             first_write.recv_timeout(Duration::from_secs(5)).unwrap();
 
+            register(tail_path.clone());
+            assert!(
+                lock(&inner.fence_recoveries)["held"]
+                    .deferred_release
+                    .route
+                    .is_some()
+            );
             let tail = send_to_held_recipient(&inner, "admitted prefix tail");
             let (tail_write, finish_tail) = block_receipt_write();
             lock(&inner.store.writes).push_back(Fault::Error);
@@ -6291,11 +6341,16 @@ mod tests {
                 finish_first.send(()).unwrap();
                 tail_write.recv_timeout(Duration::from_secs(5)).unwrap();
             }
+            // The previously deferred route and an explicit re-registration of it
+            // must both wait until the in-flight job has a receipt result.
+            inner.poll_retained_fences(At::from_unix_millis(due + 1));
+            register(tail_path.clone());
+            assert!(lock(&inner.dispatch_queues)["held"].overflowed);
             finish_tail.send(()).unwrap();
             wait_on_recovery(|| !lock(&inner.dispatch_queues).contains_key("held"));
 
-            for expected in [&first, &tail] {
-                let (stream, _) = listener.accept().unwrap();
+            for (receiver, expected) in [(&listener, &first), (&tail_listener, &tail)] {
+                let (stream, _) = receiver.accept().unwrap();
                 let mut line = String::new();
                 BufReader::new(stream).read_line(&mut line).unwrap();
                 let sent: WireMessage = serde_json::from_str(&line).unwrap();
@@ -6303,14 +6358,24 @@ mod tests {
             }
 
             ack(&first);
+            inner.queue_limit_override.store(8, Ordering::SeqCst);
             inner.poll_retained_fences(At::from_unix_millis(due + 300_000));
             wait_on_recovery(|| !lock(&inner.dispatch_queues).contains_key("held"));
+            assert!(
+                inner.is_recipient_fenced("held"),
+                "deferred tail route must keep the fence"
+            );
+            register(tail_path);
+            wait_on_recovery(|| !lock(&inner.dispatch_queues).contains_key("held"));
+            assert!(
+                inner.is_recipient_fenced("held"),
+                "re-registering the tail route must keep the fence"
+            );
 
             assert_eq!(
-                listener.accept().unwrap_err().kind(),
+                tail_listener.accept().unwrap_err().kind(),
                 io::ErrorKind::WouldBlock
             );
-            assert!(inner.is_recipient_fenced("held"));
             for id in [&tail, &overflow] {
                 assert_eq!(inner.store.list_wire_receipts(id).unwrap()[0].attempts, 0);
             }
@@ -6330,20 +6395,7 @@ mod tests {
             let replacement_path = tmp.path().join("overflow-receipt-replacement.sock");
             let replacement = crate::test_isolation::bind_unix_fixture(&replacement_path).unwrap();
             replacement.set_nonblocking(true).unwrap();
-            inner.queue_limit_override.store(8, Ordering::SeqCst);
-            let (response, _) = inner.handle_local_request(LocalRequest::RegisterRoute {
-                persona: "held".into(),
-                route: VendorRoute::Webhook {
-                    socket_path: replacement_path,
-                },
-                explicit: true,
-                replace: true,
-                hosted_id: None,
-                hydration_generation: None,
-                hosted_session_verified: false,
-                unverified_process: false,
-            });
-            assert!(matches!(response, LocalResponse::RouteRegistered));
+            register(replacement_path);
             wait_on_recovery(|| !lock(&inner.dispatch_queues).contains_key("held"));
             assert!(!inner.is_recipient_fenced("held"));
             assert!(replacement.accept().is_ok());
