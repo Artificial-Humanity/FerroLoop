@@ -27,6 +27,8 @@ const TAIL_HEADING: &str = "\n\nSanitized terminal excerpt from the captured exi
 struct Attachment {
     recipient_id: AgentId,
     project: String,
+    #[serde(default)]
+    session_id: Option<String>,
     terminal_tail: String,
 }
 
@@ -45,6 +47,7 @@ pub fn prepare(
     store: &impl StateStore,
     recipient: &AgentId,
     project: &str,
+    session_id: &str,
     terminal_tail: &str,
     at: At,
     by: &str,
@@ -69,6 +72,7 @@ pub fn prepare(
             value: serde_json::json!(Attachment {
                 recipient_id: recipient.clone(),
                 project,
+                session_id: Some(session_id.into()),
                 terminal_tail: terminal_tail.into(),
             }),
             merge_mode: MergeMode::Conflict,
@@ -90,6 +94,32 @@ pub fn discard_unsent(store: &(impl StateStore + MessageStore), id: &MessageId) 
             &attachment_slug(uuid),
         );
     }
+}
+
+/// Drop current local attachment rows for this exact session, including writes
+/// whose corresponding notice was never queued. Safe to repeat after a failure.
+pub fn discard_for_session(store: &impl StateStore, session_id: &str) -> Result<(), StoreError> {
+    for entry in store.list_state(Some(&StateScope::Workspace), Some(StateConcern::Runtime))? {
+        if !entry.sensitive || !entry.slug.starts_with(NOTICE_STATE_SLUG_PREFIX) {
+            continue;
+        }
+        let StatePayload::Runtime(runtime) = entry.payload else {
+            continue;
+        };
+        if runtime
+            .value
+            .get("session_id")
+            .and_then(serde_json::Value::as_str)
+            == Some(session_id)
+        {
+            store.delete_state_by_key(
+                &StateScope::Workspace,
+                StateConcern::Runtime,
+                &entry.slug,
+            )?;
+        }
+    }
+    Ok(())
 }
 
 fn attachment_slug(uuid: Uuid) -> String {

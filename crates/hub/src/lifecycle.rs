@@ -1906,24 +1906,34 @@ fn connect_host_client() -> Option<fl_host_proto::BlockingHostClient> {
     fl_host_proto::BlockingHostClient::connect(&endpoint).ok()
 }
 
-fn query_host_exit<T>(
-    read: impl AsyncFnOnce(&mut fl_host_proto::AsyncHostClient) -> Result<T, fl_host_proto::HostError>,
-) -> Option<T> {
-    let endpoint = lock::pinned_endpoint()
-        .map_or_else(fl_host_proto::HostEndpoint::discover, Ok)
-        .ok()?;
-    let runtime = tokio::runtime::Builder::new_current_thread()
+fn query_host_exit(
+    stream: &fl_host_proto::StreamId,
+    hosted_id: &str,
+) -> fl_host_proto::HostedExitEvidenceStatus {
+    use fl_host_proto::{HostError, HostedExitEvidenceStatus as Evidence};
+
+    let Ok(endpoint) =
+        lock::pinned_endpoint().map_or_else(fl_host_proto::HostEndpoint::discover, Ok)
+    else {
+        return Evidence::Unavailable;
+    };
+    let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
-        .ok()?;
+    else {
+        return Evidence::Unavailable;
+    };
     runtime.block_on(async {
-        tokio::time::timeout(Duration::from_millis(250), async {
+        match tokio::time::timeout(Duration::from_millis(250), async {
             let mut client = fl_host_proto::AsyncHostClient::connect(&endpoint).await?;
-            read(&mut client).await
+            client.hosted_exit_evidence(stream.clone(), hosted_id).await
         })
         .await
-        .ok()?
-        .ok()
+        {
+            Ok(Ok(status)) => status,
+            Err(_) | Ok(Err(HostError::FrameTimeout)) => Evidence::Pending,
+            Ok(Err(_)) => Evidence::Unavailable,
+        }
     })
 }
 
@@ -2235,8 +2245,7 @@ impl SessionRuntime for HostRuntime {
         stream: &fl_host_proto::StreamId,
         hosted_id: &str,
     ) -> fl_host_proto::HostedExitEvidenceStatus {
-        query_host_exit(async |client| client.hosted_exit_evidence(stream.clone(), hosted_id).await)
-            .unwrap_or(fl_host_proto::HostedExitEvidenceStatus::Unavailable)
+        query_host_exit(stream, hosted_id)
     }
 
     fn kill(&self, unit: &str, hosted_id: &str) -> bool {
@@ -2429,7 +2438,7 @@ impl SessionRuntime for HostRuntime {
     ) -> Option<i32> {
         // The owner RPC is limited to running sessions. Inventory can supply the status
         // of our durable launch binding, which includes the Host instance and epoch.
-        let sessions = query_host_exit(async |client| client.list_sessions().await)?;
+        let sessions = connect_host_client()?.list_sessions().ok()?;
         select_host_stream_exit_code(&sessions, stream, expected_pid)
     }
 
@@ -3935,12 +3944,29 @@ pub fn save_hosted_respawn_state<S: StateStore>(
     Ok(())
 }
 
-pub fn delete_hosted_respawn_state<S: StateStore>(store: &S, session_id: &str) {
-    let _ = store.delete_state_by_key(
+fn save_cleared_hosted_incident<S: StateStore>(
+    store: &S,
+    session_id: &str,
+    state: &HostedRespawnState,
+    by: &str,
+) -> Result<(), LifecycleError> {
+    // The incident stays durable until its attachments are gone. A partial cleanup
+    // can be retried even if the notice-state save never completed.
+    hosted_recovery_notice::discard_for_session(store, session_id)?;
+    save_hosted_respawn_state(store, session_id, state, by)
+}
+
+fn delete_hosted_respawn_state<S: StateStore>(
+    store: &S,
+    session_id: &str,
+) -> Result<(), LifecycleError> {
+    hosted_recovery_notice::discard_for_session(store, session_id)?;
+    store.delete_state_by_key(
         &StateScope::Workspace,
         StateConcern::Runtime,
         &hosted_respawn_state_slug(session_id),
-    );
+    )?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -6637,7 +6663,7 @@ where
             .keep_live_launch(env.runtime, &record);
     }
     respawn_state.clear_incident();
-    save_hosted_respawn_state(store, &session_id, &respawn_state, by)?;
+    save_cleared_hosted_incident(store, &session_id, &respawn_state, by)?;
     with_dead_streaks(|streaks| {
         streaks.remove(&(env.home_override.map(Path::to_path_buf), session_id.clone()));
     });
@@ -7902,7 +7928,9 @@ fn observe_hosted_recovery_health<S: StateStore>(
     }
     let before = state.clone();
     recovery::observe_health(state, alive, current_respawn_clock_ms());
-    if *state != before {
+    if before.recovery_started_at_ms.is_some() && state.recovery_started_at_ms.is_none() {
+        save_cleared_hosted_incident(store, &record.session_id, state, by)?;
+    } else if *state != before {
         save_hosted_respawn_state(store, &record.session_id, state, by)?;
     }
     Ok(())
@@ -8118,6 +8146,7 @@ fn reconcile_dead_hosted_session_fenced<S: StateStore>(
                         let _ = sync_claude_vendor_session_id_from_route(store, env, &mut record);
                     }
                 }
+                let observed_at_ms = current_respawn_clock_ms();
                 let evidence = respawn_state.exit_evidence.capture(env.runtime, &record);
                 let expected_pid = record.runtime_leader_pid.or(record.pid);
                 let clean_exit = match &evidence {
@@ -8143,6 +8172,7 @@ fn reconcile_dead_hosted_session_fenced<S: StateStore>(
                         &record,
                         &mut respawn_state,
                         evidence,
+                        observed_at_ms,
                         by,
                     )?;
                 }
@@ -8469,7 +8499,7 @@ fn teardown_session_fenced<S: AgentRegistry + StateStore>(
     record.updated_at_ms = updated_ms;
     persist_hosted_session(store, &record, by)?;
     delete_claude_resume_state(store, &record.session_id);
-    delete_hosted_respawn_state(store, &record.session_id);
+    delete_hosted_respawn_state(store, &record.session_id)?;
     for mut sib in same_vendor_siblings {
         if !is_decommissioned(&sib) {
             sib.status = STATUS_DECOMMISSIONED.to_string();
@@ -8484,7 +8514,7 @@ fn teardown_session_fenced<S: AgentRegistry + StateStore>(
             persist_hosted_session(store, &sib, by)?;
         }
         delete_claude_resume_state(store, &sib.session_id);
-        delete_hosted_respawn_state(store, &sib.session_id);
+        delete_hosted_respawn_state(store, &sib.session_id)?;
     }
     // The native conversation id is tombstoned above. Conversation files stay.
     refresh_decommission_tombstones(store, env.home_override);
@@ -9342,8 +9372,16 @@ where
             check_vendor_launch_prerequisite(env, &record.vendor, config_home.as_deref())
     {
         if raw_spawned {
+            let observed_at_ms = current_respawn_clock_ms();
             let evidence = respawn_state.exit_evidence.capture(env.runtime, &record);
-            exit_evidence::save_counted_exit(store, &record, &mut respawn_state, evidence, by)?;
+            exit_evidence::save_counted_exit(
+                store,
+                &record,
+                &mut respawn_state,
+                evidence,
+                observed_at_ms,
+                by,
+            )?;
         }
         if retry_prerequisite {
             if !raw_spawned {
@@ -9405,8 +9443,16 @@ where
     record.stop_reason = None;
     if strict_target.is_some() && !runtime_live {
         if launch_died {
+            let observed_at_ms = current_respawn_clock_ms();
             let evidence = respawn_state.exit_evidence.capture(env.runtime, &record);
-            exit_evidence::save_counted_exit(store, &record, &mut respawn_state, evidence, by)?;
+            exit_evidence::save_counted_exit(
+                store,
+                &record,
+                &mut respawn_state,
+                evidence,
+                observed_at_ms,
+                by,
+            )?;
         }
         record.status = STATUS_STOPPED.into();
         record.stop_reason = prior_stop_reason.or_else(|| Some(STOP_REASON_RUNTIME_GONE.into()));
@@ -9425,7 +9471,7 @@ where
                 .keep_live_launch(env.runtime, &record);
         }
         respawn_state.clear_incident();
-        save_hosted_respawn_state(store, &record.session_id, &respawn_state, by)?;
+        save_cleared_hosted_incident(store, &record.session_id, &respawn_state, by)?;
     }
     if resumed_existing {
         let baseline_ms = crate::boot_reconcile::hydration_baseline_ms(store, &record);
@@ -9612,6 +9658,7 @@ fn notify_crash_loop_recipients<S: AgentRegistry + MessageStore + StateStore>(
                 store,
                 &agent.id,
                 &fresh.project,
+                &fresh.session_id,
                 tail,
                 at.clone(),
                 AUTO_RESPAWN_ACTOR,
@@ -22479,6 +22526,201 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn slow_host_exit_lookup_retries_and_inventory_still_reads_clean_exit() {
+        use fl_host_proto::{
+            ChildExit, ChildRecord, ChildState, ExtensionRequest, ExtensionResponse, HostConfig,
+            HostEndpoint, HostInstance, HostListener, HostRequest, HostResponse,
+            HostedExitEvidence, HostedExitEvidenceStatus as Evidence, InputState, SessionEpoch,
+            SessionId, SessionMode, SessionSummary, SpawnKind, StreamId,
+        };
+        use std::os::unix::fs::PermissionsExt;
+
+        let _reset = RecoveryFixtureReset;
+        let home = TempDir::new().unwrap();
+        std::fs::set_permissions(home.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let socket = home.path().join("slow-host.sock");
+        let endpoint = HostEndpoint::unix(&socket).unwrap();
+        let _fixture = fl_host_proto::register_hub_test_host_fixture(&socket).unwrap();
+        let fence =
+            lock::LifecycleFence::acquire_endpoint(endpoint.clone(), None, "slow-host", "evidence")
+                .unwrap();
+        let _pin = fence.pin();
+
+        let store = MemStore::default();
+        let fake = FakeRuntime::default();
+        let env = fake.env(home.path());
+        let mut record = hosted_record("codex", "slow-host", STATUS_STOPPED, false);
+        record.hydration_generation = Some(next_hydration_generation());
+        record.stop_reason = Some(STOP_REASON_RUNTIME_GONE.into());
+        let mut state = HostedRespawnState::default();
+        let stream = StreamId {
+            host: HostInstance::new([1; 16]),
+            session: SessionId::new("Slow-host.codex").unwrap(),
+            epoch: SessionEpoch(1),
+        };
+        let exit = ChildExit {
+            code: Some(0),
+            signal: None,
+        };
+        let evidence = HostedExitEvidence {
+            stream: stream.clone(),
+            exit: exit.clone(),
+            started_at_ms: 10,
+            captured_at_ms: 20,
+            terminal_tail: "synthetic clean exit".into(),
+        };
+        *fake.hosted_exit_fixture.borrow_mut() = Some(HostedExitEvidence {
+            stream: StreamId {
+                epoch: SessionEpoch(0),
+                ..stream.clone()
+            },
+            ..evidence.clone()
+        });
+        assert!(
+            exit_evidence::spawn_and_remember(&store, &env, &mut state, &record, None, "owner",)
+                .unwrap()
+        );
+        let summary = SessionSummary {
+            stream: stream.clone(),
+            mode: SessionMode::Pty,
+            state: ChildState::CleanupComplete(ChildRecord {
+                pid: 10,
+                session: stream.session.clone(),
+                session_epoch: stream.epoch,
+                kind: SpawnKind::Pty,
+                input: InputState::Fenced,
+                started_at_ms: 10,
+                exit: Some(exit),
+                consumer_stalled: false,
+            }),
+            acked: 0,
+            latest: 0,
+            input: InputState::Fenced,
+        };
+
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    let mut listener = HostListener::bind(HostConfig::new(endpoint)).await.unwrap();
+                    ready_tx.send(()).unwrap();
+                    let mut clients = tokio::task::JoinSet::new();
+                    for index in 0..4 {
+                        let mut conn = listener.accept().await.unwrap();
+                        let (evidence, summary) = (evidence.clone(), summary.clone());
+                        clients.spawn(async move {
+                            while let Ok(HostRequest::Extended { id, request }) = conn.recv().await
+                            {
+                                let response = match request {
+                                    ExtensionRequest::Capabilities => {
+                                        ExtensionResponse::Capabilities {
+                                            host: evidence.stream.host.clone(),
+                                            limits: fl_host_proto::ExtensionLimits::default(),
+                                            features: fl_host_proto::HOSTED_EXIT_EVIDENCE_FEATURE,
+                                        }
+                                    }
+                                    ExtensionRequest::HostedExitEvidence { stream, hosted_id } => {
+                                        assert_eq!(stream, evidence.stream);
+                                        assert_eq!(hosted_id, "codex:slow-host");
+                                        if matches!(index, 0 | 3) {
+                                            tokio::time::sleep(Duration::from_millis(350)).await;
+                                        }
+                                        ExtensionResponse::HostedExitEvidence {
+                                            status: Evidence::Exited(evidence.clone()),
+                                        }
+                                    }
+                                    ExtensionRequest::ListSessions => {
+                                        tokio::time::sleep(Duration::from_millis(350)).await;
+                                        ExtensionResponse::Sessions {
+                                            records: vec![summary.clone()],
+                                        }
+                                    }
+                                    _ => panic!("unexpected fixture request"),
+                                };
+                                if conn
+                                    .respond(&HostResponse::Extended { id, response })
+                                    .await
+                                    .is_err()
+                                {
+                                    break;
+                                }
+                            }
+                        });
+                    }
+                    while let Some(client) = clients.join_next().await {
+                        client.unwrap();
+                    }
+                });
+        });
+        ready_rx.recv().unwrap();
+
+        let observed_at_ms = 1_000;
+        let initial = state.exit_evidence.capture(&HostRuntime, &record);
+        assert!(matches!(initial, Evidence::Pending));
+        exit_evidence::save_counted_exit(
+            &store,
+            &record,
+            &mut state,
+            initial,
+            observed_at_ms,
+            "test",
+        )
+        .unwrap();
+        let (mut unresolved_record, mut unresolved_state) = (record.clone(), state.clone());
+        assert_eq!(
+            classify_automatic_recovery(
+                &store,
+                &HostRuntime,
+                &mut record,
+                &mut state,
+                observed_at_ms,
+            )
+            .unwrap(),
+            None
+        );
+        assert_eq!(
+            record.stop_reason.as_deref(),
+            Some(STOP_REASON_RUNTIME_GONE)
+        );
+        assert_eq!(
+            classify_automatic_recovery(&store, &HostRuntime, &mut record, &mut state, 1_500)
+                .unwrap(),
+            None
+        );
+        assert_eq!(record.stop_reason.as_deref(), Some(STOP_REASON_CLEAN_EXIT));
+        assert!(state.respawn_timestamps_ms.is_empty());
+        assert_eq!(
+            HostRuntime.recorded_host_exit_code(&stream, Some(10)),
+            Some(0)
+        );
+
+        // A Host that never answers the evidence RPC within the bounded window
+        // falls through to recovery after the final lookup.
+        assert_eq!(
+            classify_automatic_recovery(
+                &MemStore::default(),
+                &HostRuntime,
+                &mut unresolved_record,
+                &mut unresolved_state,
+                observed_at_ms + exit_evidence::PENDING_EXIT_EVIDENCE_MS,
+            )
+            .unwrap(),
+            Some(recovery::Decision::FastLaunch),
+        );
+        assert!(matches!(
+            unresolved_state
+                .exit_evidence
+                .capture(&HostRuntime, &unresolved_record),
+            Evidence::Unavailable
+        ));
+        server.join().unwrap();
+    }
+
     #[test]
     fn hosted_exit_evidence_follows_counted_launches_without_a_surviving_pid() {
         for resolve_directly in [false, true] {
@@ -23268,6 +23510,7 @@ mod tests {
             ..Default::default()
         };
         save_hosted_respawn_state(&store, &record.session_id, &incident, "owner").unwrap();
+        let notice = prepare_recovery_notice_fixture(&store, &record.session_id);
         TEST_RESPAWN_NOW_MS.with(|clock| clock.set(Some(1_000)));
         TEST_LAUNCH_PREREQUISITE.with(|slot| {
             *slot.borrow_mut() = Some(Err(fl_core::LaunchPrerequisiteRefusal {
@@ -23308,6 +23551,7 @@ mod tests {
             incident
         );
         TEST_RUNNING_RECORD_SAVE_FAILURE.with(|fail| fail.set(None));
+        assert!(recovery_notice_fixture_exists(&store, &notice));
         fake.live.borrow_mut().clear();
         let live = restart_hosted_session(&store, &env, &record.session_id, "owner").unwrap();
         assert!(live.record.runtime_spawned);
@@ -23315,6 +23559,7 @@ mod tests {
             load_hosted_respawn_state(&store, &record.session_id).unwrap(),
             HostedRespawnState::default()
         );
+        assert!(!recovery_notice_fixture_exists(&store, &notice));
     }
 
     // CI only: store-backed lifecycle regression; do not run under the local #539 hold.
@@ -23374,6 +23619,7 @@ mod tests {
             "owner",
         )
         .unwrap();
+        let notice = prepare_recovery_notice_fixture(&store, &record.session_id);
         for (now, presence) in [
             (1_000, RuntimePresence::Alive),
             (601_000, RuntimePresence::Unknown),
@@ -23390,6 +23636,7 @@ mod tests {
                     .recovery_attempts,
                 2
             );
+            assert!(recovery_notice_fixture_exists(&store, &notice));
         }
         TEST_RESPAWN_NOW_MS.with(|clock| clock.set(Some(1_202_000)));
         reconcile_dead_hosted_sessions(&store, &env, "owner").unwrap();
@@ -23397,6 +23644,70 @@ mod tests {
             load_hosted_respawn_state(&store, &record.session_id).unwrap(),
             HostedRespawnState::default()
         );
+        assert!(!recovery_notice_fixture_exists(&store, &notice));
+    }
+
+    fn prepare_recovery_notice_fixture(store: &MemStore, session_id: &str) -> String {
+        let recipient = store
+            .agent_by_name("coordinator")
+            .unwrap()
+            .unwrap_or_else(|| {
+                register(store, "coordinator", "workspace", AgentRole::LabManager);
+                store.agent_by_name("coordinator").unwrap().unwrap()
+            });
+        let id = hosted_recovery_notice::prepare(
+            store,
+            &recipient.id,
+            "ferroloop",
+            session_id,
+            "synthetic terminal excerpt",
+            stamp::now(),
+            "test",
+        )
+        .unwrap();
+        format!(
+            "{}{}",
+            hosted_recovery_notice::NOTICE_STATE_SLUG_PREFIX,
+            id.as_str().strip_prefix("urn:uuid:").unwrap(),
+        )
+    }
+
+    fn recovery_notice_fixture_exists(store: &MemStore, slug: &str) -> bool {
+        store
+            .get_state_by_key(&StateScope::Workspace, StateConcern::Runtime, slug)
+            .unwrap()
+            .is_some()
+    }
+
+    #[test]
+    fn teardown_discards_orphaned_recovery_notices_for_only_the_exact_session() {
+        let home = TempDir::new().unwrap();
+        let store = MemStore::default();
+        let env = env(&home);
+        let record = hosted_record("claude", "worker", STATUS_STOPPED, false);
+        persist_hosted_session(&store, &record, "owner").unwrap();
+        let target = SessionTarget::resolve(&store, &record.session_id, None).unwrap();
+        let excerpt = prepare_recovery_notice_fixture(&store, &record.session_id);
+        let sibling = prepare_recovery_notice_fixture(&store, "codex:worker");
+        let prepare = prepare_decommission(&store, &env, &target, "owner", Caller::Owner).unwrap();
+        assert_eq!(prepare.mode, DecommissionMode::Prepare);
+        assert!(recovery_notice_fixture_exists(&store, &excerpt));
+
+        // Failures before notice send or notice-state save can leave only an attachment.
+        assert!(
+            load_hosted_respawn_state(&store, &record.session_id)
+                .unwrap()
+                .is_empty()
+        );
+        teardown_session(&store, &env, &target, "owner", Caller::Owner, |_| {}).unwrap();
+        assert!(!recovery_notice_fixture_exists(&store, &excerpt));
+        assert!(recovery_notice_fixture_exists(&store, &sibling));
+
+        // An already-decommissioned record can retry an interrupted cleanup.
+        let missed = prepare_recovery_notice_fixture(&store, &record.session_id);
+        teardown_session(&store, &env, &target, "owner", Caller::Owner, |_| {}).unwrap();
+        assert!(!recovery_notice_fixture_exists(&store, &missed));
+        assert!(recovery_notice_fixture_exists(&store, &sibling));
     }
 
     #[test]
@@ -23509,10 +23820,16 @@ mod tests {
             )
             .unwrap()
         );
-        TEST_RESPAWN_NOW_MS.with(|clock| clock.set(Some(20)));
         let evidence = state.exit_evidence.capture(&fake, &record);
-        exit_evidence::save_counted_exit(&store, &record, &mut state, evidence, AUTO_RESPAWN_ACTOR)
-            .unwrap();
+        exit_evidence::save_counted_exit(
+            &store,
+            &record,
+            &mut state,
+            evidence,
+            20,
+            AUTO_RESPAWN_ACTOR,
+        )
+        .unwrap();
         assert!(state.exit_evidence.latest_evidence().is_some());
 
         let recipient_filter = |name: &str| fl_core::ferrowire::WireFilter {

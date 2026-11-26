@@ -10592,6 +10592,7 @@ mod tests {
             store,
             &lead.id,
             "ferroloop",
+            "codex:fixture",
             TAIL,
             at.clone(),
             "system",

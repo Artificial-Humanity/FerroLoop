@@ -5,7 +5,7 @@ use fl_host_proto::{HostedExitEvidence, HostedExitEvidenceStatus, StreamId};
 const MAX_EXITS: usize = 1 + AUTO_RESPAWN_MAX_IN_WINDOW + recovery::RECOVERY_MAX_ATTEMPTS as usize;
 // Allow the Host's post-leader-exit cleanup and terminal drain to finish. A normal
 // monitor tick can land later, so it still gets one final lookup before giving up.
-const PENDING_EXIT_EVIDENCE_MS: u64 = 2_000;
+pub(super) const PENDING_EXIT_EVIDENCE_MS: u64 = 2_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 enum LaunchAttempt {
@@ -336,11 +336,12 @@ pub(super) fn save_counted_exit<S: StateStore>(
     record: &HostedSessionRecord,
     state: &mut HostedRespawnState,
     status: HostedExitEvidenceStatus,
+    observed_at_ms: u64,
     by: &str,
 ) -> Result<(), LifecycleError> {
     if state
         .exit_evidence
-        .count_exit(record, status, current_respawn_clock_ms())
+        .count_exit(record, status, observed_at_ms)
     {
         persist_counted_exit(store, record, state, by)?;
     }
@@ -417,14 +418,11 @@ fn complete_failure(evidence: &HostedExitEvidence) -> bool {
     }
 }
 
-fn deterministic(state: &HostedRespawnState, first: &HostedExitEvidence) -> bool {
+fn complete_launch_set(state: &HostedRespawnState) -> bool {
     let exits = &state.exit_evidence.exits;
     let fast = &state.respawn_timestamps_ms;
     let slow = state.recovery_attempts;
-    if exits.len() < 2
-        || exits.len() != 1 + fast.len() + usize::from(slow)
-        || !complete_failure(first)
-    {
+    if exits.len() < 2 || exits.len() != 1 + fast.len() + usize::from(slow) {
         return false;
     }
     let exactly_one = |attempt| {
@@ -437,11 +435,6 @@ fn deterministic(state: &HostedRespawnState, first: &HostedExitEvidence) -> bool
     exactly_one(LaunchAttempt::Baseline)
         && fast.iter().all(|at| exactly_one(LaunchAttempt::Fast(*at)))
         && (1..=slow).all(|n| exactly_one(LaunchAttempt::Slow(n)))
-        && exits.iter().all(|entry| {
-            entry.evidence.as_ref().is_some_and(|evidence| {
-                evidence.exit == first.exit && evidence.terminal_tail == first.terminal_tail
-            })
-        })
 }
 
 fn exit_status(evidence: &HostedExitEvidence) -> String {
@@ -457,10 +450,17 @@ pub(super) fn summary(state: &HostedRespawnState) -> String {
     let Some(evidence) = state.exit_evidence.latest_evidence() else {
         return "evidence: unavailable".into();
     };
-    let assessment = if deterministic(state, evidence) {
-        "deterministic launch failure"
-    } else {
-        "mixed or incomplete launch evidence"
+    let exits = &state.exit_evidence.exits;
+    let mut available = exits.iter().filter_map(|entry| entry.evidence.as_ref());
+    let statuses_match =
+        complete_failure(evidence) && available.clone().all(|other| other.exit == evidence.exit);
+    let all_available = available.clone().count() == exits.len() && complete_launch_set(state);
+    let output_differs = available.any(|other| other.terminal_tail != evidence.terminal_tail);
+    let assessment = match (statuses_match, output_differs, all_available) {
+        (true, false, true) => "deterministic launch failure",
+        (true, true, true) => "exit status identical, output differs",
+        (true, true, false) => "exit status identical, output differs (available evidence only)",
+        _ => "mixed or incomplete launch evidence",
     };
     format!(
         "evidence: {assessment}. Latest available {}, launched {} UTC, captured {} UTC",
@@ -579,11 +579,16 @@ mod tests {
         };
         assert!(summary(&state).contains("deterministic launch failure"));
         assert!(!summary(&state).contains(fixed_tail));
-        for second in [
-            Some(evidence(2, Some(1), None, "another terminal line")),
-            Some(evidence(2, None, Some(1), fixed_tail)),
-            None,
-        ] {
+        let differing = evidence(2, Some(1), None, "another terminal line");
+        state.exit_evidence.exits[1].evidence = Some(differing);
+        let changed = summary(&state);
+        assert!(changed.contains("exit status identical, output differs"));
+        assert!(!changed.contains("available evidence only"));
+        assert!(!changed.contains("another terminal line"));
+        state.recovery_attempts = 1;
+        assert!(summary(&state).contains("available evidence only"));
+        state.recovery_attempts = 0;
+        for second in [Some(evidence(2, None, Some(1), fixed_tail)), None] {
             state.exit_evidence.exits[1].evidence = second;
             assert!(summary(&state).contains("mixed or incomplete launch evidence"));
         }

@@ -43,9 +43,9 @@ pub(super) fn classify_at_exit(
             .exit_evidence
             .prune_fast_exits(&state.respawn_timestamps_ms, prune_at_ms);
         if guard_tripped {
-            state.recovery_started_at_ms = Some(observed_at_ms);
+            state.recovery_started_at_ms = Some(budget_at_ms);
             state.recovery_attempts = 0;
-            state.next_allowed_at_ms = Some(observed_at_ms.saturating_add(RECOVERY_INTERVAL_MS));
+            state.next_allowed_at_ms = Some(budget_at_ms.saturating_add(RECOVERY_INTERVAL_MS));
             return Decision::Wait;
         }
     }
@@ -252,6 +252,17 @@ mod tests {
             Decision::Wait
         );
         assert_eq!(overdue.recovery_attempts, 1);
+    }
+
+    #[test]
+    fn delayed_exit_after_clock_rollback_uses_current_time_for_first_slow_deadline() {
+        let mut state = HostedRespawnState::default();
+        assert_eq!(
+            classify_at_exit(&mut state, STOP_REASON_CRASH_LOOP, 1_000, 2_000),
+            Decision::Wait
+        );
+        assert_eq!(state.recovery_started_at_ms, Some(1_000));
+        assert_eq!(state.next_allowed_at_ms, Some(1_000 + RECOVERY_INTERVAL_MS));
     }
 
     #[test]
