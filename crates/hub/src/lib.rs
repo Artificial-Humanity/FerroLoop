@@ -398,7 +398,7 @@ pub(crate) enum DirectPromptDecision<'a> {
     Dispatch(SessionDispatchGuard<'a>),
     Queued(Box<QueuedOperatorPrompt>, Vec<QueuedOperatorPrompt>),
     DispatchBusy,
-    QueueFull,
+    QueueFull { refused_drafts_hold_room: bool },
     PromptTooLarge,
     FencedAlias(String),
 }
@@ -474,15 +474,25 @@ impl PromptQueueState {
         changed
     }
 
-    fn has_room(&mut self, session_key: &str) -> bool {
-        self.expire_refused_claude_drafts(Instant::now());
+    fn session_full(&self, session_key: &str) -> bool {
         self.queues.get(session_key).map_or(0, Vec::len)
             + usize::from(self.direct_park_reservations.contains_key(session_key))
-            < MAX_SESSION_QUEUED_PROMPTS
+            >= MAX_SESSION_QUEUED_PROMPTS
+    }
+
+    fn has_room(&mut self, session_key: &str) -> bool {
+        self.expire_refused_claude_drafts(Instant::now());
+        !self.session_full(session_key)
             && self.queues.values().map(Vec::len).sum::<usize>()
                 + self.refused_claude_drafts.len()
                 + self.direct_park_reservations.len()
                 < MAX_HUB_QUEUED_PROMPTS
+    }
+
+    /// After `has_room` refuses: true when retained refused drafts count toward the
+    /// hub-wide limit that blocks this session, so dismissing them frees room.
+    fn refused_drafts_hold_room(&self, session_key: &str) -> bool {
+        !self.refused_claude_drafts.is_empty() && !self.session_full(session_key)
     }
 
     fn remember_target(&mut self, target: Option<PromptQueueTarget>) {
@@ -1230,7 +1240,9 @@ impl HubState {
                 || guard.queues.get(raw).is_some_and(|q| !q.is_empty()))
         {
             if !guard.has_room(canonical) {
-                return DirectPromptDecision::QueueFull;
+                return DirectPromptDecision::QueueFull {
+                    refused_drafts_hold_room: guard.refused_drafts_hold_room(canonical),
+                };
             }
             if !input.fits_queue() {
                 return DirectPromptDecision::PromptTooLarge;
@@ -1240,7 +1252,9 @@ impl HubState {
         }
         if !force && let Some(binding) = &input.claude_binding {
             if !guard.has_room(canonical) {
-                return DirectPromptDecision::QueueFull;
+                return DirectPromptDecision::QueueFull {
+                    refused_drafts_hold_room: guard.refused_drafts_hold_room(canonical),
+                };
             }
             let admission_seq = guard.next_admission_seq();
             guard.direct_park_reservations.insert(
@@ -1377,10 +1391,18 @@ impl HubState {
             }
         }
         if let Some(busy) = busy_hold {
+            // A changed hold reason starts a fresh probe budget, as in
+            // `update_bound_hold_reason`.
+            let fresh = (0, stamp::now().unix_millis() as i64, busy);
             guard
                 .composer_hold_probes
                 .entry(prompt_id.to_string())
-                .or_insert((0, stamp::now().unix_millis() as i64, busy));
+                .and_modify(|probe| {
+                    if probe.2 != busy {
+                        *probe = fresh;
+                    }
+                })
+                .or_insert(fresh);
         }
         out
     }
@@ -2582,6 +2604,47 @@ mod tests {
             let guard = state.prompt_queues.lock().unwrap();
             assert!(!guard.composer_hold_probes.contains_key(&item.id));
         }
+    }
+
+    #[test]
+    fn completion_with_changed_hold_kind_resets_the_composer_probe_budget() {
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        let (item, _) = state.enqueue_session_prompt(
+            "ada",
+            None,
+            "hello".into(),
+            "hello".into(),
+            "owner".into(),
+            vec![],
+        );
+        // An earlier busy hold left a spent, busy probe entry behind.
+        state
+            .prompt_queues
+            .lock()
+            .unwrap()
+            .composer_hold_probes
+            .insert(item.id.clone(), (COMPOSER_HELD_MAX_PROBES + 4, 0, true));
+        let (_c, claim) = state
+            .claim_queued_for_dispatch("ada", "ada", &item.id, false)
+            .unwrap();
+        state.finish_queued_prompt(
+            "ada",
+            &item.id,
+            Err(fl_wire::dispatcher::PushError::Failed(
+                "composer_occupied_by_non_wire_input: composer holds non-wire input or active dialog; holding delivery without sending keys".into(),
+            )),
+        );
+        claim.finish();
+        let (count, _, busy) = state.prompt_queues.lock().unwrap().composer_hold_probes[&item.id];
+        assert_eq!((count, busy), (0, false));
+        // The non-busy hold is bounded by the probe limit again.
+        let now_ms = stamp::now().unix_millis() as i64;
+        for index in 0..COMPOSER_HELD_MAX_PROBES {
+            let next_at = now_ms + i64::from(index) * COMPOSER_HELD_MAX_BACKOFF_MS;
+            assert!(state.note_composer_hold_probe(&item.id, next_at).is_some());
+        }
+        assert!(!state.composer_hold_probe_due(&item.id, now_ms + 1_000_000));
     }
 
     #[test]

@@ -7282,10 +7282,14 @@ fn handle_delete_queued_prompt(
             state.dismiss_refused_claude_draft(&canonical_id, draft_persona.as_deref(), prompt_id)
         })
         .flatten();
-    let removed = archived
-        .map(|item| (item, Vec::new()))
-        .or_else(|| state.remove_queued_prompt(&canonical_id, prompt_id))
-        .or_else(|| state.remove_queued_prompt(raw_session_id, prompt_id));
+    // A dismissed draft leaves the live queue unchanged, so its broadcast carries no
+    // `queue` and clients refetch rather than adopt an empty list.
+    let removed = archived.map(|item| (item, None)).or_else(|| {
+        state
+            .remove_queued_prompt(&canonical_id, prompt_id)
+            .or_else(|| state.remove_queued_prompt(raw_session_id, prompt_id))
+            .map(|(item, queue)| (item, Some(queue)))
+    });
     let Some((item, queue)) = removed else {
         return HttpResponse::json(404, json!({ "error": "queued prompt not found" }));
     };
@@ -7299,16 +7303,15 @@ fn handle_delete_queued_prompt(
         };
         state.session_prompt_queue_view(key, draft_persona.as_deref(), true)
     });
-    state.broadcast(
-        "session",
-        "queue_updated",
-        json!({
-            "session_id": canonical_id,
-            "persona": item.persona.or(target_persona),
-            "is_busy": is_busy,
-            "queue": queue,
-        }),
-    );
+    let mut event = json!({
+        "session_id": canonical_id,
+        "persona": item.persona.or(target_persona),
+        "is_busy": is_busy,
+    });
+    if let Some(queue) = &queue {
+        event["queue"] = json!(queue);
+    }
+    state.broadcast("session", "queue_updated", event);
     HttpResponse::json(
         200,
         json!({
@@ -7316,7 +7319,7 @@ fn handle_delete_queued_prompt(
             "status": "cancelled",
             "prompt_id": prompt_id,
             "is_busy": is_busy,
-            "queue": archived_queue.unwrap_or(queue),
+            "queue": archived_queue.or(queue).unwrap_or_default(),
             "queue_epoch": state.queue_epoch,
         }),
     )
@@ -7721,14 +7724,16 @@ fn handle_post_session_prompt(
                 "Another prompt is being dispatched to this session. Wait and try again.",
             );
         }
-        crate::DirectPromptDecision::QueueFull => {
+        crate::DirectPromptDecision::QueueFull {
+            refused_drafts_hold_room,
+        } => {
             cleanup_undelivered_attachments();
-            return operator_prompt_refusal(
-                &canonical_session_id,
-                409,
-                "queue_full",
-                "The prompt queue is full. Wait for it to drain or remove an item before resubmitting.",
-            );
+            let message = if refused_drafts_hold_room {
+                "The prompt queue is full. Refused drafts still count toward the limit; dismiss refused drafts to free room, or wait for the queue to drain."
+            } else {
+                "The prompt queue is full. Wait for it to drain or remove an item before resubmitting."
+            };
+            return operator_prompt_refusal(&canonical_session_id, 409, "queue_full", message);
         }
         crate::DirectPromptDecision::PromptTooLarge => {
             cleanup_undelivered_attachments();
@@ -15367,6 +15372,34 @@ mod claude_registration_binding_tests {
     }
 
     #[test]
+    fn dismissing_a_refused_draft_does_not_broadcast_an_empty_live_queue() {
+        let (_tmp, state, native, stream) = parking_fixture();
+        let owner = HubAuthority::Owner {
+            login: "owner".into(),
+        };
+        let _dispatch = stub_claude_dispatch(move |_, _| Err(busy_hold(&stream)));
+        let receipt = owner_post(&state, "retire this prompt")
+            .json_value()
+            .unwrap();
+        let draft_id = receipt["queued_prompt"]["id"].as_str().unwrap().to_owned();
+        state.clear_session_prompt_queue(&native);
+        assert_eq!(owner_post(&state, "live row").status, 200);
+        assert_eq!(state.session_queue(&native).len(), 1);
+
+        let mut events = state.subscribe();
+        let response = handle_delete_queued_prompt(&state, &owner, "claude:ada", &draft_id);
+        assert_eq!(response.status, 200, "{:?}", response.json_value());
+        let event = events.try_recv().unwrap();
+        assert_eq!(event.event, "queue_updated");
+        assert!(
+            event.data.get("queue").is_none(),
+            "dismissed draft must not broadcast a queue: {:?}",
+            event.data
+        );
+        assert_eq!(state.session_queue(&native)[0].prompt, "live row");
+    }
+
+    #[test]
     fn retired_claude_drafts_age_out_and_release_the_hub_queue_limit() {
         let (_tmp, state, native, stream) = parking_fixture();
         let _dispatch = stub_claude_dispatch(move |_, _| Err(busy_hold(&stream)));
@@ -15384,9 +15417,14 @@ mod claude_registration_binding_tests {
         }
         let response = owner_post(&state, "at capacity");
         assert_eq!(response.status, 409);
-        assert_eq!(
-            response.json_value().unwrap()["refusal_reason"],
-            "queue_full"
+        let body = response.json_value().unwrap();
+        assert_eq!(body["refusal_reason"], "queue_full");
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap()
+                .contains("dismiss refused drafts"),
+            "{body:?}"
         );
         state
             .prompt_queues
