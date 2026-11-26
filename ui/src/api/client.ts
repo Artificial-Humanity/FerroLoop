@@ -20,6 +20,7 @@ import {
   type DecommissionSessionResponse,
   type DiscoveredSessionSummary,
   type HealthResponse,
+  type HostedRecoveryEvidenceResponse,
   type HostedSessionSummary,
   type HubAuthority,
   type HubSettings,
@@ -1067,6 +1068,16 @@ export class HubApiClient {
       hydration_status: normalizeHydrationStatus(s.hydration_status),
     }));
     return { sessions };
+  }
+
+  public async getHostedRecoveryEvidence(
+    sessionId: string,
+    signal: AbortSignal,
+  ): Promise<HostedRecoveryEvidenceResponse> {
+    return this.request<HostedRecoveryEvidenceResponse>(
+      `/api/v1/hosted-sessions/${encodeURIComponent(sessionId)}/recovery-evidence`,
+      { cache: "no-store", signal },
+    );
   }
 
   public async getSessionTranscript(sessionId: string): Promise<SessionTranscriptResponse> {

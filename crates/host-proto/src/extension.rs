@@ -5,8 +5,8 @@ use base64::Engine;
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 
 use crate::{
-    ChildState, ControlEvent, ControllerLease, HostError, InputState, SendOutcome, SessionEpoch,
-    SessionId, SignalKind, SpawnKind, SpawnSpec,
+    ChildExit, ChildState, ControlEvent, ControllerLease, HostError, InputState, SendOutcome,
+    SessionEpoch, SessionId, SignalKind, SpawnKind, SpawnSpec,
 };
 
 pub const MAX_EXTENSION_PART: usize = 32 * 1024;
@@ -20,6 +20,13 @@ pub const RENDERED_PTY_FEATURE: u64 = 8;
 pub const SESSION_OWNER_FEATURE: u64 = 16;
 /// Opt-in completed PTY retention and projection accounting diagnostics.
 pub const PTY_RETENTION_FEATURE: u64 = 32;
+/// Opt-in, private evidence for an exact owned hosted launch.
+pub const HOSTED_EXIT_EVIDENCE_FEATURE: u64 = 64;
+pub const MAX_HOSTED_EXIT_TAIL_BYTES: usize = 4 * 1024;
+pub const MAX_HOSTED_EXIT_TAIL_LINES: usize = 40;
+// The tail may double under JSON escaping. The validated StreamId, integers
+// and framing fields fit within the fixed envelope.
+pub const HOSTED_EXIT_EVIDENCE_FRAME_BYTES: usize = 2 * MAX_HOSTED_EXIT_TAIL_BYTES + 1024;
 pub const MAX_RECENT_PTY_EVICTIONS: usize = 64;
 pub const MAX_HOSTED_OWNER_BYTES: usize = 128;
 pub const MAX_RENDERED_TEXT: usize = 196_608;
@@ -455,6 +462,11 @@ pub enum ExtensionRequest {
         #[serde(deserialize_with = "bounded_hosted_owner")]
         hosted_id: String,
     },
+    HostedExitEvidence {
+        stream: StreamId,
+        #[serde(deserialize_with = "bounded_hosted_owner")]
+        hosted_id: String,
+    },
     SpawnSession {
         spec: SpawnSpec,
         mode: SessionMode,
@@ -520,6 +532,7 @@ impl ExtensionRequest {
     pub fn validate(&self) -> Result<(), HostError> {
         match self {
             Self::CheckSessionOwner { hosted_id, .. }
+            | Self::HostedExitEvidence { hosted_id, .. }
                 if hosted_id.len() > MAX_HOSTED_OWNER_BYTES =>
             {
                 return Err(HostError::EventTooLarge);
@@ -625,9 +638,81 @@ fn bounded_sessions<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<SessionSummar
     }
     d.deserialize_seq(Visitor)
 }
+/// Sensitive terminal evidence. Only the explicitly authorized response may carry the tail.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostedExitEvidence {
+    pub stream: StreamId,
+    pub exit: ChildExit,
+    pub started_at_ms: u64,
+    pub captured_at_ms: u64,
+    #[serde(deserialize_with = "bounded_hosted_exit_tail")]
+    pub terminal_tail: String,
+}
+
+impl fmt::Debug for HostedExitEvidence {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HostedExitEvidence")
+            .field("stream", &self.stream)
+            .field("exit", &self.exit)
+            .field("started_at_ms", &self.started_at_ms)
+            .field("captured_at_ms", &self.captured_at_ms)
+            .finish_non_exhaustive()
+    }
+}
+
+fn validate_hosted_exit_tail(tail: &str) -> Result<(), HostError> {
+    if tail.len() > MAX_HOSTED_EXIT_TAIL_BYTES || tail.lines().count() > MAX_HOSTED_EXIT_TAIL_LINES
+    {
+        return Err(HostError::EventTooLarge);
+    }
+    if tail
+        .chars()
+        .any(|ch| ch.is_control() && !matches!(ch, '\n' | '\t'))
+    {
+        return Err(HostError::Protocol(
+            "terminal control in exit evidence".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn bounded_hosted_exit_tail<'de, D: Deserializer<'de>>(d: D) -> Result<String, D::Error> {
+    struct Visitor;
+    impl de::Visitor<'_> for Visitor {
+        type Value = String;
+
+        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("bounded terminal text")
+        }
+
+        fn visit_str<E: de::Error>(self, value: &str) -> Result<String, E> {
+            validate_hosted_exit_tail(value).map_err(E::custom)?;
+            Ok(value.to_owned())
+        }
+    }
+    d.deserialize_str(Visitor)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "state",
+    content = "evidence",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
+pub enum HostedExitEvidenceStatus {
+    Unavailable,
+    Pending,
+    Exited(HostedExitEvidence),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ExtensionResponse {
+    HostedExitEvidence {
+        status: HostedExitEvidenceStatus,
+    },
     PtyRetentionStatus {
         status: PtyRetentionStatus,
     },
@@ -694,6 +779,16 @@ impl ExtensionResponse {
     pub(crate) fn validate(&self) -> Result<(), HostError> {
         match self {
             Self::HostStatus { build } => build.validate(),
+            Self::HostedExitEvidence {
+                status: HostedExitEvidenceStatus::Exited(evidence),
+            } => {
+                if evidence.captured_at_ms < evidence.started_at_ms
+                    || evidence.exit.code.is_some() == evidence.exit.signal.is_some()
+                {
+                    return Err(HostError::Protocol("invalid hosted exit evidence".into()));
+                }
+                validate_hosted_exit_tail(&evidence.terminal_tail)
+            }
             Self::PtyRetentionStatus { status }
                 if status.recent_evictions.len() > MAX_RECENT_PTY_EVICTIONS =>
             {
@@ -1008,6 +1103,69 @@ impl ReliableReassembler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn hosted_exit_frame(tail: &str) -> crate::Frame {
+        crate::Frame {
+            kind: crate::FrameKind::Response,
+            payload: serde_json::to_vec(&serde_json::json!({
+                "op": "extended",
+                "id": 3,
+                "response": {
+                    "op": "hosted_exit_evidence",
+                    "status": {
+                        "state": "exited",
+                        "evidence": {
+                            "stream": {
+                                "host": "00000000000000000000000000000001",
+                                "session": "owned",
+                                "epoch": 13,
+                            },
+                            "exit": {"code": 1, "signal": null},
+                            "started_at_ms": 1000,
+                            "captured_at_ms": 1001,
+                            "terminal_tail": tail,
+                        }
+                    }
+                }
+            }))
+            .unwrap(),
+        }
+    }
+
+    #[test]
+    fn hosted_exit_evidence_round_trips_over_negotiated_extension() {
+        let frame = hosted_exit_frame("fixed exit-1 line\n");
+        let response = crate::decode_response_for_minor(1, &frame).unwrap();
+        let encoded = crate::encode_response_for_minor(1, &response).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&encoded.payload).unwrap(),
+            serde_json::from_slice::<serde_json::Value>(&frame.payload).unwrap()
+        );
+        assert!(crate::decode_response_for_minor(0, &frame).is_err());
+    }
+
+    #[test]
+    fn hosted_exit_evidence_wire_limits_and_diagnostics() {
+        const PRIVATE: &str = "private-terminal-line";
+        let frame = hosted_exit_frame(PRIVATE);
+        let response = crate::decode_response_for_minor(1, &frame).unwrap();
+        assert!(!format!("{response:?}").contains(PRIVATE));
+        let debug = format!("{frame:?}");
+        assert!(!debug.contains(PRIVATE));
+        assert!(!debug.contains("112, 114, 105, 118, 97, 116, 101"));
+
+        for invalid in ["é".repeat(2049), "x\n".repeat(41), "\x1b[31m".into()] {
+            assert!(crate::decode_response_for_minor(1, &hosted_exit_frame(&invalid)).is_err());
+        }
+        let mut invalid = serde_json::from_slice::<serde_json::Value>(&frame.payload).unwrap();
+        invalid["response"]["status"]["evidence"]["exit"] = PRIVATE.into();
+        let malformed = crate::Frame {
+            kind: crate::FrameKind::Response,
+            payload: serde_json::to_vec(&invalid).unwrap(),
+        };
+        let error = crate::decode_response_for_minor(1, &malformed).unwrap_err();
+        assert!(!format!("{error:?} {error}").contains(PRIVATE));
+    }
+
     // A request cannot retain an unbounded owner string during deserialization.
     #[test]
     fn owner_query_bounds_id_before_retaining_it() {

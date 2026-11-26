@@ -417,6 +417,57 @@ impl AsyncHostClient {
         }
     }
 
+    /// Look up private evidence from the exact hosted launch. Older hosts and
+    /// a different current Host instance report unavailable without a lookup.
+    pub async fn hosted_exit_evidence(
+        &mut self,
+        stream: crate::StreamId,
+        hosted_id: &str,
+    ) -> Result<crate::HostedExitEvidenceStatus, HostError> {
+        use crate::HostedExitEvidenceStatus as E;
+        use crate::{ExtensionRefusal as F, ExtensionRequest as R, ExtensionResponse as S};
+        if self.minor < 1 || hosted_id.is_empty() || hosted_id.len() > crate::MAX_HOSTED_OWNER_BYTES
+        {
+            return Ok(E::Unavailable);
+        }
+        match self.extension_request(R::Capabilities).await? {
+            S::Capabilities { host, features, .. } => {
+                if host != stream.host || features & crate::HOSTED_EXIT_EVIDENCE_FEATURE == 0 {
+                    return Ok(E::Unavailable);
+                }
+            }
+            S::Refused {
+                code: F::Unsupported,
+            } => return Ok(E::Unavailable),
+            _ => return Err(HostError::Protocol("capabilities response required".into())),
+        }
+        match self
+            .extension_request(R::HostedExitEvidence {
+                stream: stream.clone(),
+                hosted_id: hosted_id.to_owned(),
+            })
+            .await?
+        {
+            S::HostedExitEvidence { status } => {
+                if matches!(&status, E::Exited(evidence) if evidence.stream != stream) {
+                    return Err(HostError::Protocol(
+                        "hosted exit evidence stream mismatch".into(),
+                    ));
+                }
+                Ok(status)
+            }
+            S::Refused {
+                code: F::Unsupported,
+            } => Ok(E::Unavailable),
+            S::Refused { code } => Err(HostError::Protocol(format!(
+                "hosted exit evidence refused ({code:?})"
+            ))),
+            _ => Err(HostError::Protocol(
+                "hosted exit evidence response required".into(),
+            )),
+        }
+    }
+
     pub async fn claim_controller(
         &mut self,
         stream: crate::StreamId,
@@ -846,6 +897,15 @@ impl BlockingHostClient {
             .block_on(self.inner.check_session_owner(stream, hosted_id))
     }
 
+    pub fn hosted_exit_evidence(
+        &mut self,
+        stream: crate::StreamId,
+        hosted_id: &str,
+    ) -> Result<crate::HostedExitEvidenceStatus, HostError> {
+        self.runtime
+            .block_on(self.inner.hosted_exit_evidence(stream, hosted_id))
+    }
+
     pub fn list_sessions(&mut self) -> Result<Vec<crate::SessionSummary>, HostError> {
         self.runtime.block_on(self.inner.list_sessions())
     }
@@ -1178,6 +1238,124 @@ mod tests {
         let (mut events, server) = memory_stream();
         events.client.mode = SessionMode::Rpc;
         (events.client, server)
+    }
+
+    #[tokio::test]
+    async fn hosted_exit_evidence_skips_unsupported_hosts_and_rejects_wrong_launches() {
+        use crate::{ExtensionRequest as R, ExtensionResponse as S, HostedExitEvidenceStatus as E};
+        for (minor, supported, wrong_host, wrong_epoch) in [
+            (0, false, false, false),
+            (1, false, false, false),
+            (1, true, true, false),
+            (1, true, false, true),
+            (1, true, false, false),
+        ] {
+            let (mut client, mut server) = memory_rpc();
+            client.minor = minor;
+            let stream = crate::StreamId {
+                host: crate::HostInstance::new([1; 16]),
+                session: SessionId::new("owned").unwrap(),
+                epoch: SessionEpoch(13),
+            };
+            let caller = async {
+                let result = client.hosted_exit_evidence(stream.clone(), "agent").await;
+                if wrong_epoch {
+                    assert!(matches!(result, Err(HostError::Protocol(_))));
+                } else if minor == 0 || !supported || wrong_host {
+                    assert_eq!(result.unwrap(), E::Unavailable);
+                } else {
+                    let E::Exited(evidence) = result.unwrap() else {
+                        panic!("expected evidence from a capable Host");
+                    };
+                    assert_eq!(evidence.terminal_tail, "fixed line");
+                }
+                client
+                    .request(list(client.correlator.last + 1))
+                    .await
+                    .unwrap();
+            };
+            let daemon = async {
+                loop {
+                    let frame = auth::read_frame_async(
+                        &mut server,
+                        Instant::now() + Duration::from_secs(2),
+                        false,
+                    )
+                    .await
+                    .unwrap();
+                    let request = crate::decode_request_for_minor(minor, &frame).unwrap();
+                    let done = matches!(request, HostRequest::List { .. });
+                    let response = match request {
+                        HostRequest::Extended {
+                            id,
+                            request: R::Capabilities,
+                        } if minor > 0 => HostResponse::Extended {
+                            id,
+                            response: S::Capabilities {
+                                host: if wrong_host {
+                                    crate::HostInstance::new([2; 16])
+                                } else {
+                                    stream.host.clone()
+                                },
+                                features: if supported {
+                                    crate::HOSTED_EXIT_EVIDENCE_FEATURE
+                                } else {
+                                    0
+                                },
+                                limits: Default::default(),
+                            },
+                        },
+                        HostRequest::Extended {
+                            id,
+                            request:
+                                R::HostedExitEvidence {
+                                    stream: requested,
+                                    hosted_id,
+                                },
+                        } if minor > 0 && supported && !wrong_host => {
+                            assert_eq!(requested, stream);
+                            assert_eq!(hosted_id, "agent");
+                            let mut returned = requested;
+                            if wrong_epoch {
+                                returned.epoch.0 += 1;
+                            }
+                            HostResponse::Extended {
+                                id,
+                                response: S::HostedExitEvidence {
+                                    status: E::Exited(crate::HostedExitEvidence {
+                                        stream: returned,
+                                        exit: ChildExit {
+                                            code: Some(1),
+                                            signal: None,
+                                        },
+                                        started_at_ms: 3,
+                                        captured_at_ms: 4,
+                                        terminal_tail: "fixed line".into(),
+                                    }),
+                                },
+                            }
+                        }
+                        HostRequest::List { id } => HostResponse::Listed {
+                            id,
+                            children: vec![],
+                        },
+                        other => panic!("unexpected request {other:?}"),
+                    };
+                    let response = crate::encode_response_for_minor(minor, &response).unwrap();
+                    auth::write_frame_async(
+                        &mut server,
+                        &response,
+                        Instant::now() + Duration::from_secs(2),
+                    )
+                    .await
+                    .unwrap();
+                    if done {
+                        break;
+                    }
+                }
+            };
+            tokio::join!(caller, daemon);
+        }
     }
 
     // Catches sending new operations to an old daemon, including minor-zero peers.

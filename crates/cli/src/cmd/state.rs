@@ -19,7 +19,7 @@ use fl_core::ref_index::{
 use fl_core::state::{
     HandoffEntry, MemoryBasis, MemoryCategory, MemoryEntry, MemoryLifecycle, MergeMode,
     RuntimeEntry, SensitivityPatch, StateConcern, StateEntry, StatePayload, StateScope,
-    StateSearchHit, UpsertStateArgs, validate_slug,
+    StateSearchHit, UpsertStateArgs, is_internal_hosted_runtime_key, validate_slug,
 };
 use fl_core::store::{AgentRegistry, Handles, StateStore};
 use fl_exec::state_sync::{sync_state, verify_state};
@@ -762,6 +762,32 @@ pub fn parse_merge_mode(s: &str) -> Result<MergeMode, String> {
     })
 }
 
+pub(super) fn validate_runtime_key(scope: &StateScope, key: &str) -> Result<String, String> {
+    let slug = validate_slug(key).map_err(|e| e.to_string())?;
+    if is_internal_hosted_runtime_key(scope, StateConcern::Runtime, &slug) {
+        return Err("reserved internal hosted runtime key".into());
+    }
+    Ok(slug)
+}
+
+fn is_visible_state_entry(entry: &StateEntry) -> bool {
+    !is_internal_hosted_runtime_key(&entry.scope, entry.concern, &entry.slug)
+}
+
+/// Entries exposed by FerroState. Keep internal hosted recovery data out of the
+/// search corpus before either ranking leg runs or builds its index.
+pub(super) fn list_visible_state(
+    store: &impl StateStore,
+    scope: Option<&StateScope>,
+    concern: Option<StateConcern>,
+) -> Result<Vec<StateEntry>, String> {
+    let mut entries = store
+        .list_state(scope, concern)
+        .map_err(|e| e.to_string())?;
+    entries.retain(is_visible_state_entry);
+    Ok(entries)
+}
+
 /// Resolve `<id-or-key>` in `store` per Spec §5.2:
 /// 1. `urn:uuid:...` -> `get_state`
 /// 2. Bare digits (`1`, `2`, …) -> `resolve_handle(Kind::State, n)` -> `get_state`
@@ -777,12 +803,16 @@ pub fn resolve_state_in_store<S: StateStore + Handles>(
     if let Ok(r) = id_or_key.parse::<Ref>()
         && !matches!(r, Ref::Slug(_))
     {
-        let iri = match r {
-            Ref::Iri(iri) => iri,
+        let missing = || match &r {
+            Ref::Handle(h) => format!("no state entry with handle {h} in this store"),
+            _ => format!("no state entry matching `{id_or_key}`"),
+        };
+        let iri = match &r {
+            Ref::Iri(iri) => iri.clone(),
             Ref::Handle(h) => store
-                .resolve_handle(Kind::State, h)
+                .resolve_handle(Kind::State, *h)
                 .map_err(|e| e.to_string())?
-                .ok_or_else(|| format!("no state entry with handle {h} in this store"))?,
+                .ok_or_else(missing)?,
             Ref::Issue(_) | Ref::Slug(_) => {
                 return Err(format!(
                     "`{id_or_key}` is an issue reference, not a state handle, IRI, or key"
@@ -792,7 +822,8 @@ pub fn resolve_state_in_store<S: StateStore + Handles>(
         return store
             .get_state(&StateId(iri))
             .map_err(|e| e.to_string())?
-            .ok_or_else(|| format!("no state entry matching `{id_or_key}`"));
+            .filter(is_visible_state_entry)
+            .ok_or_else(missing);
     }
 
     let slug = validate_slug(id_or_key).map_err(|e| e.to_string())?;
@@ -805,6 +836,7 @@ pub fn resolve_state_in_store<S: StateStore + Handles>(
         return store
             .get_state_by_key(scope, c, &slug)
             .map_err(|e| e.to_string())?
+            .filter(is_visible_state_entry)
             .ok_or_else(|| {
                 format!(
                     "no state entry for `({}, {}, {slug})`",
@@ -823,6 +855,7 @@ pub fn resolve_state_in_store<S: StateStore + Handles>(
         if let Some(e) = store
             .get_state_by_key(scope, c, &slug)
             .map_err(|e| e.to_string())?
+            .filter(is_visible_state_entry)
         {
             matches.push(e);
         }
@@ -875,7 +908,7 @@ pub fn render_state_markdown(
 ) -> String {
     let visible: Vec<&StateEntry> = entries
         .iter()
-        .filter(|e| include_sensitive || !e.sensitive)
+        .filter(|e| is_visible_state_entry(e) && (include_sensitive || !e.sensitive))
         .collect();
 
     let mut out = String::from("# FerroLoop State Summary\n\n");
@@ -1286,11 +1319,12 @@ pub fn run(env: &StateEnv<'_>, cmd: StateCmd) -> Result<(), String> {
                 let merge_mode = parse_merge_mode(&merge)?;
                 let json_val: serde_json::Value = serde_json::from_str(&value)
                     .map_err(|e| format!("invalid `--value` JSON: {e}"))?;
+                let slug = validate_runtime_key(&parsed_scope, &key)?;
                 let store = env.open_for_scope(Some(&parsed_scope))?;
                 let entry = store
                     .upsert_state(UpsertStateArgs {
                         scope: parsed_scope,
-                        slug: key,
+                        slug,
                         sensitivity: sensitivity_from_flags(sensitive, not_sensitive),
                         payload: StatePayload::Runtime(RuntimeEntry {
                             value: json_val,
@@ -1369,9 +1403,7 @@ pub fn run(env: &StateEnv<'_>, cmd: StateCmd) -> Result<(), String> {
                 concern.as_deref().map(parse_concern).transpose()?;
             let effective_limit = effective_search_limit(limit);
             let store = env.open_for_scope(parsed_scope.as_ref())?;
-            let entries: Vec<StateEntry> = store
-                .list_state(parsed_scope.as_ref(), parsed_concern)
-                .map_err(|e| e.to_string())?;
+            let entries = list_visible_state(&store, parsed_scope.as_ref(), parsed_concern)?;
             let ranked = rank_for_mode(
                 &store,
                 mode,
@@ -1417,18 +1449,17 @@ pub fn run(env: &StateEnv<'_>, cmd: StateCmd) -> Result<(), String> {
             let parsed_cat: Option<MemoryCategory> =
                 category.as_deref().map(parse_memory_category).transpose()?;
             let store = env.open_for_scope(parsed_scope.as_ref())?;
-            let entries: Vec<StateEntry> = store
-                .list_state(parsed_scope.as_ref(), parsed_concern)
-                .map_err(|e| e.to_string())?
-                .into_iter()
-                .filter(|e| match &e.payload {
-                    StatePayload::Memory(m) => {
-                        (include_retired || m.lifecycle == MemoryLifecycle::Active)
-                            && parsed_cat.is_none_or(|c| m.category == c)
-                    }
-                    _ => parsed_cat.is_none(),
-                })
-                .collect();
+            let entries: Vec<StateEntry> =
+                list_visible_state(&store, parsed_scope.as_ref(), parsed_concern)?
+                    .into_iter()
+                    .filter(|e| match &e.payload {
+                        StatePayload::Memory(m) => {
+                            (include_retired || m.lifecycle == MemoryLifecycle::Active)
+                                && parsed_cat.is_none_or(|c| m.category == c)
+                        }
+                        _ => parsed_cat.is_none(),
+                    })
+                    .collect();
             if json {
                 println!("{}", serde_json::to_string_pretty(&entries).unwrap());
             } else {

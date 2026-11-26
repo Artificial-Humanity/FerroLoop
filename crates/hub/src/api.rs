@@ -65,6 +65,7 @@ use fl_wire::dispatcher::{
     preflight_session_reset, push_operator_prompt_to_route, push_operator_prompt_with_intent,
     push_to_route_for_recipient,
 };
+use fl_wire::hosted_recovery_notice::NOTICE_STATE_SLUG_PREFIX;
 use fl_wire::identity::{RouteTable, normalize_persona};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -535,7 +536,7 @@ fn route_http_request(state: &HubState, req: &HttpRequest) -> HttpResponse {
             handle_post_session_bulk_action(state, &authority, req)
         }
         ("GET", "/api/v1/commands") => handle_get_commands(state),
-        ("GET", "/api/v1/hosted-sessions") => handle_get_hosted_sessions(state),
+        ("GET", "/api/v1/hosted-sessions") => handle_get_hosted_sessions(state, &authority),
         ("POST", "/api/v1/state/checkpoint") => {
             handle_post_state_checkpoint(state, &authority, req)
         }
@@ -2813,6 +2814,8 @@ fn is_reserved_hub_slug(slug: &str) -> bool {
     slug.starts_with("hub-pairing-")
         || slug.starts_with("hub-session-")
         || slug.starts_with("hub-node-")
+        || slug.starts_with(crate::lifecycle::HOSTED_RESPAWN_STATE_SLUG_PREFIX)
+        || slug.starts_with(NOTICE_STATE_SLUG_PREFIX)
 }
 
 fn is_internal_hub_entry(entry: &StateEntry) -> bool {
@@ -3094,10 +3097,7 @@ fn handle_post_state(
 
     let normalized_slug = slug.trim().to_ascii_lowercase();
     if is_reserved_hub_slug(&normalized_slug) {
-        return HttpResponse::json(
-            403,
-            json!({ "error": "reserved internal hub authentication slug prefix" }),
-        );
+        return HttpResponse::json(403, json!({ "error": "reserved internal hub slug prefix" }));
     }
 
     let sensitive_flag = obj.get("sensitive").and_then(Value::as_bool);
@@ -3270,7 +3270,7 @@ fn handle_post_state_checkpoint(
         if is_reserved_hub_slug(&normalized) {
             return HttpResponse::json(
                 403,
-                json!({ "error": "reserved internal hub authentication slug prefix" }),
+                json!({ "error": "reserved internal hub slug prefix" }),
             );
         }
     }
@@ -5693,15 +5693,18 @@ fn handle_dynamic_api_routes(
         }
     }
 
-    // /api/v1/hosted-sessions/:id/restart
-    if segments.len() == 5
-        && segments[0] == "api"
-        && segments[1] == "v1"
-        && segments[2] == "hosted-sessions"
-        && segments[4] == "restart"
-        && method == "POST"
-    {
-        return handle_post_hosted_session_restart(state, authority, &percent_decode(segments[3]));
+    // /api/v1/hosted-sessions/:id/{restart,recovery-evidence}
+    if let ["api", "v1", "hosted-sessions", id, action] = segments.as_slice() {
+        match (method, *action) {
+            ("POST", "restart") => {
+                return handle_post_hosted_session_restart(state, authority, &percent_decode(id));
+            }
+            ("GET", "recovery-evidence") => {
+                return handle_get_hosted_recovery_evidence(state, authority, &percent_decode(id))
+                    .with_header("Cache-Control", "no-store");
+            }
+            _ => {}
+        }
     }
 
     // /api/v1/sessions/:id/queue/:prompt_id or /api/v1/sessions/:id/queue/:prompt_id/send-now
@@ -9069,14 +9072,75 @@ pub(crate) fn run_remodel(
     }
 }
 
-fn handle_get_hosted_sessions(state: &HubState) -> HttpResponse {
+fn handle_get_hosted_sessions(state: &HubState, authority: &HubAuthority) -> HttpResponse {
+    #[derive(Serialize)]
+    struct HostedSessionView {
+        #[serde(flatten)]
+        record: lifecycle::HostedSessionRecord,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        recovery_attention: Option<lifecycle::HostedRecoveryAttention>,
+    }
+
     let Ok(store) = open_store_response(state) else {
         return store_open_failure();
     };
-    match lifecycle::list_hosted_sessions(&*store) {
-        Ok(sessions) => HttpResponse::json(200, json!({ "sessions": sessions })),
-        Err(e) => lifecycle_error_response(&e),
+    let sessions = match lifecycle::list_hosted_sessions(&*store) {
+        Ok(sessions) => sessions,
+        Err(e) => return lifecycle_error_response(&e),
+    };
+    let owner = authority.is_owner();
+    let sessions: Vec<_> = sessions
+        .into_iter()
+        .map(|record| {
+            let recovery_attention = if owner
+                && record.hosted
+                && !matches!(
+                    record.status.as_str(),
+                    lifecycle::STATUS_DECOMMISSIONING | lifecycle::STATUS_DECOMMISSIONED
+                ) {
+                lifecycle::load_hosted_respawn_state(&*store, &record.session_id)
+                    .ok()
+                    .and_then(|state| state.recovery_attention)
+            } else {
+                None
+            };
+            HostedSessionView {
+                record,
+                recovery_attention,
+            }
+        })
+        .collect();
+    HttpResponse::json(200, json!({ "sessions": sessions }))
+}
+
+fn handle_get_hosted_recovery_evidence(
+    state: &HubState,
+    authority: &HubAuthority,
+    id: &str,
+) -> HttpResponse {
+    if !authority.is_owner() {
+        return HttpResponse::json(
+            403,
+            json!({ "error": "only Owner authority may read hosted recovery evidence" }),
+        );
     }
+    let Ok(store) = open_store_response(state) else {
+        return store_open_failure();
+    };
+    let evidence = match lifecycle::hosted_recovery_evidence(&*store, id) {
+        Ok(evidence) => evidence,
+        Err(err) => return lifecycle_error_response(&err),
+    };
+    let evidence = evidence.map(|exit| {
+        json!({
+            "exit_code": exit.exit.code,
+            "signal": exit.exit.signal,
+            "started_at_ms": exit.started_at_ms,
+            "captured_at_ms": exit.captured_at_ms,
+            "terminal_tail": exit.terminal_tail,
+        })
+    });
+    HttpResponse::json(200, json!({ "session_id": id, "evidence": evidence }))
 }
 
 fn handle_post_hosted_session_restart(
@@ -11179,6 +11243,56 @@ mod tests {
         assert!(owner.iter().all(|h| h.entry.slug != "hub-session-abc123"));
     }
 
+    #[test]
+    fn private_hosted_exit_evidence_is_excluded_even_from_owner_state_views() {
+        let (_dir, store) = test_store(fl_store::BackendKind::Redb);
+        let slugs = [
+            lifecycle::hosted_respawn_state_slug("claude:fixture"),
+            "hosted-recovery-notice-018fcf7c-a219-7777-8888-000000006872".into(),
+        ];
+        for slug in &slugs {
+            store
+                .upsert_state(UpsertStateArgs {
+                    scope: StateScope::Workspace,
+                    slug: slug.clone(),
+                    sensitivity: SensitivityPatch::SetSensitive,
+                    payload: StatePayload::Runtime(RuntimeEntry {
+                        value: json!({"terminal_tail": "privatecapturedoutput"}),
+                        merge_mode: MergeMode::LastWriter,
+                    }),
+                    at: stamp::now(),
+                    by: "fixture".into(),
+                })
+                .unwrap();
+        }
+        let owner = HubAuthority::Owner {
+            login: "owner".into(),
+        };
+        let state = handle_get_state(&store, &owner, &HttpRequest::new("GET", "/api/v1/state"));
+        assert_eq!(state.status, 200);
+        assert_eq!(state.json_value().unwrap()["entries"], json!([]));
+        let entries = store.list_state(None, None).unwrap();
+        let (hits, total) = search_state_for_hub(
+            &store,
+            &entries,
+            "privatecapturedoutput",
+            None,
+            None,
+            10,
+            true,
+        );
+        assert!(hits.is_empty());
+        assert_eq!(total, 0);
+        for slug in slugs {
+            let write = HttpRequest::new("POST", "/api/v1/state").with_json_body(&json!({
+                "slug": slug,
+                "concern": "runtime",
+                "value": "overwrite attempt",
+            }));
+            assert_eq!(handle_post_state(&store, &owner, &write).status, 403);
+        }
+    }
+
     fn sensitive_handoff_entry(n: u64) -> StateEntry {
         StateEntry {
             id: StateId(seq_iri(n)),
@@ -11725,9 +11839,10 @@ mod tests {
             let store = state.open_store().unwrap();
             lifecycle::persist_hosted_session(&*store, &record, "test").unwrap();
         }
-        let response = handle_get_hosted_sessions(&state);
-        assert_eq!(response.status, 200);
-        let json = response.json_value().unwrap();
+        let target = "/api/v1/hosted-sessions";
+        let (status, json) = roles_call(&state, "GET", target, "owner-test-tok", None);
+        assert_eq!(status, 200);
+        assert!(json["sessions"][0].get("recovery_attention").is_none());
         assert_eq!(
             json["sessions"][0]["stop_reason"],
             "prerequisite_unavailable"
@@ -11736,6 +11851,164 @@ mod tests {
             json["sessions"][0]["launch_prerequisite_detail"],
             "/private/control.sock: NotFound"
         );
+    }
+
+    #[test]
+    fn hosted_sessions_http_recovery_attention_is_owner_only() {
+        let (_tmp, state) = roles_test_state();
+        let record: lifecycle::HostedSessionRecord = serde_json::from_value(json!({
+            "session_id":"codex:ada", "persona":"ada", "project":"ferroloop", "role":"assistant",
+            "vendor":"codex", "model":null, "node_id":"ai-lab-0", "hosted":true, "status":"stopped",
+            "stop_reason":"crash_loop", "restart_policy":"on-failure", "restart_count":0,
+            "tmux_target":null, "cwd":null, "hydration_dispatched":false, "created_at_ms":1,
+            "updated_at_ms":1, "decommission_prepared_at_ms":null
+        }))
+        .unwrap();
+        {
+            let store = state.open_store().unwrap();
+            lifecycle::persist_hosted_session(&*store, &record, "test").unwrap();
+            store
+                .upsert_state(UpsertStateArgs {
+                    scope: StateScope::Workspace,
+                    slug: lifecycle::hosted_respawn_state_slug(&record.session_id),
+                    sensitivity: SensitivityPatch::SetSensitive,
+                    payload: StatePayload::Runtime(RuntimeEntry {
+                        value: json!({"recovery_attention": "exhausted", "recovery_attempts": 6}),
+                        merge_mode: MergeMode::LastWriter,
+                    }),
+                    at: stamp::now(),
+                    by: "test".into(),
+                })
+                .unwrap();
+        }
+
+        let target = "/api/v1/hosted-sessions";
+        let (status, peer) = roles_call(&state, "GET", target, "peer-test-tok", None);
+        assert_eq!(status, 200);
+        assert_eq!(peer["sessions"], json!([record]));
+        let (status, mut owner) = roles_call(&state, "GET", target, "owner-test-tok", None);
+        assert_eq!(status, 200);
+        let session = owner["sessions"][0].as_object_mut().unwrap();
+        assert_eq!(
+            session.remove("recovery_attention"),
+            Some(json!("exhausted"))
+        );
+        assert_eq!(owner, peer);
+    }
+
+    #[test]
+    fn hosted_recovery_evidence_http_requires_owner_and_active_exact_incident() {
+        let (_tmp, state) = roles_test_state();
+        let mut record: lifecycle::HostedSessionRecord = serde_json::from_value(json!({
+            "session_id":"codex:ada", "persona":"ada", "project":"ferroloop", "role":"assistant",
+            "vendor":"codex", "model":null, "node_id":"ai-lab-0", "hosted":true, "status":"stopped",
+            "stop_reason":"crash_loop", "restart_policy":"on-failure", "restart_count":0,
+            "tmux_target":null, "cwd":null, "hydration_dispatched":false, "created_at_ms":1,
+            "updated_at_ms":1
+        }))
+        .unwrap();
+        let slug = lifecycle::hosted_respawn_state_slug(&record.session_id);
+        let seed = |value| {
+            state
+                .open_store()
+                .unwrap()
+                .upsert_state(UpsertStateArgs {
+                    scope: StateScope::Workspace,
+                    slug: slug.clone(),
+                    sensitivity: SensitivityPatch::SetSensitive,
+                    payload: StatePayload::Runtime(RuntimeEntry {
+                        value,
+                        merge_mode: MergeMode::LastWriter,
+                    }),
+                    at: stamp::now(),
+                    by: "test".into(),
+                })
+                .unwrap();
+        };
+        lifecycle::persist_hosted_session(&*state.open_store().unwrap(), &record, "test").unwrap();
+        let stream = json!({ "host": "00000000000000000000000000000000", "session": "Ada.codex", "epoch": 5 });
+        let tail = "private vendor diagnostic\nsecond line";
+        let mut respawn = json!({
+            "recovery_attention": "exhausted",
+            "exit_evidence": { "exits": [{
+                "stream": stream,
+                "attempt": "Baseline",
+                "observed_at_ms": 20,
+                "evidence": {
+                    "stream": stream,
+                    "exit": { "code": 1, "signal": null },
+                    "started_at_ms": 10,
+                    "captured_at_ms": 20,
+                    "terminal_tail": tail,
+                },
+            }] },
+        });
+        seed(respawn.clone());
+
+        let target = "/api/v1/hosted-sessions/codex%3Aada/recovery-evidence";
+        let request = HttpRequest::new("GET", target);
+        assert_eq!(handle_http_request(&state, &request).status, 401);
+        let peer = handle_http_request(
+            &state,
+            &request
+                .clone()
+                .with_header("authorization", "Bearer peer-test-tok")
+                .with_header("x-fl-agent", "owner"),
+        );
+        assert_eq!(peer.status, 403);
+        assert!(!String::from_utf8_lossy(&peer.body).contains("private vendor diagnostic"));
+
+        let owner = request.with_header("authorization", "Bearer owner-test-tok");
+        let response = handle_http_request(&state, &owner);
+        assert_eq!(response.status, 200);
+        assert!(
+            response
+                .headers
+                .contains(&("Cache-Control".into(), "no-store".into()))
+        );
+        assert_eq!(
+            response.json_value().unwrap(),
+            json!({
+                "session_id": "codex:ada",
+                "evidence": {
+                    "started_at_ms": 10, "captured_at_ms": 20, "exit_code": 1,
+                    "signal": null, "terminal_tail": tail,
+                },
+            })
+        );
+        let (status, list) = roles_call(
+            &state,
+            "GET",
+            "/api/v1/hosted-sessions",
+            "owner-test-tok",
+            None,
+        );
+        assert_eq!(status, 200);
+        assert_eq!(list["sessions"][0]["recovery_attention"], "exhausted");
+        assert!(!list.to_string().contains("private vendor diagnostic"));
+        for alias in ["ada", "Codex%3Aada", "%20codex%3Aada"] {
+            let (status, _) = roles_call(
+                &state,
+                "GET",
+                &format!("/api/v1/hosted-sessions/{alias}/recovery-evidence"),
+                "owner-test-tok",
+                None,
+            );
+            assert_eq!(status, 404, "alias {alias} resolved to a private incident");
+        }
+
+        respawn["exit_evidence"]["exits"][0]["evidence"]["terminal_tail"] =
+            json!("x".repeat(fl_host_proto::MAX_HOSTED_EXIT_TAIL_BYTES + 1));
+        seed(respawn);
+        assert_eq!(handle_http_request(&state, &owner).status, 500);
+
+        seed(json!({ "recovery_attention": "exhausted" }));
+        let response = handle_http_request(&state, &owner);
+        assert_eq!(response.status, 200);
+        assert_eq!(response.json_value().unwrap()["evidence"], Value::Null);
+        record.status = lifecycle::STATUS_DECOMMISSIONED.into();
+        lifecycle::persist_hosted_session(&*state.open_store().unwrap(), &record, "test").unwrap();
+        assert_eq!(handle_http_request(&state, &owner).status, 404);
     }
 }
 
