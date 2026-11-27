@@ -829,6 +829,20 @@ mod tests {
         );
         fs::remove_file(&main).unwrap();
 
+        // A link loop is unreadable evidence, not a missing file.
+        let loop_back = home.join("checkout/loop.json");
+        symlink(&loop_back, &main).unwrap();
+        symlink(&main, &loop_back).unwrap();
+        assert_eq!(
+            claude_updates(home, &keep_env),
+            Unknown("managed-settings.json unreadable")
+        );
+        assert_eq!(
+            claude_hosted(home),
+            Unknown("managed-settings.json unreadable")
+        );
+        fs::remove_file(&main).unwrap();
+
         // The user settings.json still refuses a link, even to a regular file.
         fs::create_dir_all(home.join(".claude")).unwrap();
         symlink(&disabling, home.join(".claude/settings.json")).unwrap();
@@ -921,6 +935,62 @@ mod tests {
         assert_eq!(
             vendor(&observed, "grok").cli.configured_updates,
             VendorUpdateStatus::Unknown("config.toml not a regular file or too large")
+        );
+    }
+
+    /// Only managed Claude settings follow a final symlink. The Codex and Grok config files
+    /// refuse one even when its target is a regular file that would decide the result.
+    #[cfg(unix)]
+    #[test]
+    fn codex_and_grok_config_files_refuse_symlinks_to_regular_files() {
+        use VendorUpdateStatus::Unknown;
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let codex_home = root.path().join("codex-home");
+        let grok_home = root.path().join("grok-home");
+        fs::create_dir_all(codex_home.join("app-server-daemon")).unwrap();
+        fs::create_dir_all(&grok_home).unwrap();
+        let codex_target = write(
+            root.path(),
+            "checkout/codex.toml",
+            "check_for_update_on_startup = false\n",
+        );
+        let daemon_target = write(
+            root.path(),
+            "checkout/daemon.json",
+            r#"{"updater":{"autoUpdateEnabled":false}}"#,
+        );
+        let grok_target = write(
+            root.path(),
+            "checkout/grok.toml",
+            "[cli]\nauto_update = false\n",
+        );
+        symlink(&codex_target, codex_home.join("config.toml")).unwrap();
+        symlink(
+            &daemon_target,
+            codex_home.join("app-server-daemon/settings.json"),
+        )
+        .unwrap();
+        symlink(&grok_target, grok_home.join("config.toml")).unwrap();
+
+        let env = [
+            ("CODEX_HOME", codex_home.as_os_str()),
+            ("GROK_HOME", grok_home.as_os_str()),
+        ];
+        let observed = facts(Some(root.path()), None, &env);
+        let codex = vendor(&observed, "codex");
+        assert_eq!(
+            codex.cli.configured_updates,
+            Unknown("config.toml not a regular file or too large")
+        );
+        assert_eq!(
+            codex.daemon.as_ref().unwrap().configured_updates,
+            Unknown("settings.json not a regular file or too large")
+        );
+        assert_eq!(
+            vendor(&observed, "grok").cli.configured_updates,
+            Unknown("config.toml not a regular file or too large")
         );
     }
 
