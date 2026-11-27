@@ -10551,7 +10551,7 @@ pub struct RemodelRequest {
     /// `prepare` or `execute` (the default).
     #[serde(default)]
     pub mode: Option<String>,
-    /// Allow prepare or execute even when the destination daemon rejects sign-in or has none.
+    /// Allow prepare or execute even when the destination daemon or a running seat indicates a sign-in problem.
     #[serde(default)]
     pub allow_blocked_sign_in: bool,
     #[serde(default)]
@@ -10787,10 +10787,11 @@ pub(crate) fn remodel_precheck<S: AgentRegistry + StateStore + Catalog>(
     observe: impl FnOnce(&LaunchAuthTarget) -> Result<Option<LaunchSignInIssue>, LifecycleError>,
 ) -> Result<(), LifecycleError> {
     let plan = plan_remodel(store, env, target, req, caller)?;
-    check_remodel_launch(env, &plan, observe).map(drop)
+    check_remodel_launch(store, env, &plan, observe).map(drop)
 }
 
-fn check_remodel_launch(
+fn check_remodel_launch<S: StateStore>(
+    store: &S,
     env: &LifecycleEnv<'_>,
     plan: &RemodelPlan,
     observe: impl FnOnce(&LaunchAuthTarget) -> Result<Option<LaunchSignInIssue>, LifecycleError>,
@@ -10802,13 +10803,43 @@ fn check_remodel_launch(
     let Some(issue) = observe(target)? else {
         return Ok(Vec::new());
     };
-    if issue.blocks_remodel() && !plan.allow_blocked_sign_in {
+    let flagged_seats: BTreeSet<String> = if issue == LaunchSignInIssue::Inconclusive {
+        list_hosted_sessions(store)?
+            .into_iter()
+            .filter(|record| {
+                record.hosted
+                    && record.status.eq_ignore_ascii_case(STATUS_RUNNING)
+                    && record.vendor.eq_ignore_ascii_case(&plan.to.vendor)
+                    && record.active_block().is_some_and(|block| {
+                        block.reason == fl_watch::HostedBlockReason::VendorSignIn
+                    })
+            })
+            .map(|record| format!("`{}`", record.session_id))
+            .collect()
+    } else {
+        BTreeSet::new()
+    };
+    let flagged = !flagged_seats.is_empty();
+    let message = if flagged {
+        let (seat_is, that_seat) = if flagged_seats.len() == 1 {
+            ("a running hosted Codex seat is", "that seat")
+        } else {
+            ("running hosted Codex seats are", "those seats")
+        };
+        let seats = flagged_seats.into_iter().collect::<Vec<_>>().join(", ");
+        format!(
+            "Codex sign-in could not be verified, and {seat_is} flagged at a vendor sign-in \
+             screen: {seats}. Check sign-in on {that_seat}, then retry the remodel."
+        )
+    } else {
+        issue.message().to_string()
+    };
+    if (issue.blocks_remodel() || flagged) && !plan.allow_blocked_sign_in {
         return Err(LifecycleError::Conflict(format!(
-            "{} To proceed anyway, use --allow-blocked-sign-in (API: allow_blocked_sign_in).",
-            issue.message()
+            "{message} To proceed anyway, use --allow-blocked-sign-in (API: allow_blocked_sign_in)."
         )));
     }
-    Ok(vec![issue.message().into()])
+    Ok(vec![message])
 }
 
 /// Store-dependent checks before a remodel's first side effect, in the order the siblings make
@@ -11278,7 +11309,7 @@ fn remodel_fenced<S: AgentRegistry + StateStore + Catalog + MessageStore>(
     spin: &mut SpinUpFn<'_, S>,
 ) -> Result<RemodelResponse, LifecycleError> {
     let plan = plan_remodel(store, env, target, req, caller)?;
-    let mut warnings = check_remodel_launch(env, &plan, |target| {
+    let mut warnings = check_remodel_launch(store, env, &plan, |target| {
         observed_launch_auth(observations, target)
     })?;
     let to = &plan.to;

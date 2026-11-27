@@ -737,6 +737,85 @@ fn balance_excludes_unusable_codex_sign_in_and_releases_the_store_for_the_probe(
 }
 
 #[test]
+fn balance_backfills_a_flagged_codex_destination_with_a_verified_one() {
+    use crate::lifecycle::{Caller, FakeRuntime, SpinUpRequest, TEST_LAUNCH_AUTH};
+    use fl_core::LaunchSignInIssue;
+
+    let tmp = TempDir::new().unwrap();
+    std::fs::create_dir(tmp.path().join(".git")).unwrap();
+    let verified_cwd = tmp.path().join("verified");
+    std::fs::create_dir(&verified_cwd).unwrap();
+    let verified_cwd = verified_cwd.canonicalize().unwrap();
+    let _trusted = lifecycle::trusted_codex_home(tmp.path(), tmp.path());
+    let state = hub(&tmp);
+    quota(&state, "claude", 95.0);
+    quota(&state, "codex", 10.0);
+    let fake = FakeRuntime::default();
+    let env = fake.env(tmp.path());
+    {
+        let store = state.open_store().unwrap();
+        for (persona, vendor, cwd) in [
+            ("ada", "claude", tmp.path()),
+            ("bo", "claude", verified_cwd.as_path()),
+            ("cy", "codex", tmp.path()),
+        ] {
+            lifecycle::spin_up(
+                &*store,
+                &env,
+                &SpinUpRequest {
+                    persona: persona.into(),
+                    project: "FerroLoop".into(),
+                    role: "assistant".into(),
+                    vendor: vendor.into(),
+                    cwd: Some(cwd.display().to_string()),
+                    ..SpinUpRequest::default()
+                },
+                "owner",
+                Caller::Owner,
+            )
+            .unwrap();
+        }
+        let mut cy = lifecycle::get_hosted_session_by_id(&*store, "codex:cy")
+            .unwrap()
+            .unwrap();
+        cy.block = Some(fl_watch::HostedBlock {
+            reason: fl_watch::HostedBlockReason::VendorSignIn,
+            observed_at_ms: 1_000,
+        });
+        lifecycle::persist_hosted_session(&*store, &cy, "owner").unwrap();
+    }
+    fake.calls.borrow_mut().clear();
+    TEST_LAUNCH_AUTH.with(|slot| {
+        *slot.borrow_mut() = Some(Box::new(move |target| {
+            (target.cwd != verified_cwd).then_some(LaunchSignInIssue::Inconclusive)
+        }))
+    });
+
+    let policy = serde_json::from_value(json!({"allowed_target_vendors": ["codex"]})).unwrap();
+    let (plan, observations) = crate::balance_api::checked_plan_with_auth(
+        &state,
+        &env,
+        &[],
+        Caller::Owner,
+        Some(&policy),
+        &[],
+        1_000,
+    )
+    .unwrap_or_else(|_| panic!("the plan failed"));
+    assert_eq!(plan.switches.len(), 1, "{plan:#?}");
+    assert_eq!(plan.switches[0].session_id, "claude:bo", "{plan:#?}");
+    assert!(
+        plan.skipped.iter().any(|seat| {
+            seat.session_id == "claude:ada"
+                && seat.detail.contains("flagged at a vendor sign-in screen")
+        }),
+        "{plan:#?}"
+    );
+    assert_eq!(observations.len(), 2);
+    assert!(fake.calls.borrow().is_empty());
+}
+
+#[test]
 fn balance_probes_in_planner_order_within_the_sign_in_budget() {
     use crate::lifecycle::{Caller, FakeRuntime, SpinUpRequest, TEST_LAUNCH_AUTH};
     use fl_core::LaunchSignInIssue;
