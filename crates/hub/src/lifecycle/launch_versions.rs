@@ -780,21 +780,35 @@ fn save_live_versions<S: StateStore>(
     versions: HostedVendorVersions,
 ) -> Result<bool, LifecycleError> {
     let session_id = receipt.session_id.clone();
+    let launch = receipt.id;
     save_versions(store, receipt, versions)?;
     // Check after the write, not before. Decommission marks the record decommissioned
     // before it forgets the session's receipts. So either its cleanup runs after this
     // write and deletes it, or this read sees the decommissioned record. A check before
     // the write would miss a decommission that lands between the check and the write.
-    Ok(!forget_if_decommissioned(store, &session_id))
+    Ok(!forget_if_decommissioned(store, &session_id, launch))
 }
 
-/// Forget a session's receipts when its hosted record is absent or decommissioned.
-/// Every launch is recorded after its running record is saved, and records are never
-/// deleted, so an absent record is not a session that is still starting. This cleanup is
-/// best-effort: a read error keeps the receipts, and a failed delete is only logged.
-fn forget_if_decommissioned<S: StateStore>(store: &S, session_id: &str) -> bool {
-    let gone = match get_hosted_session_record(store, session_id) {
-        Ok(record) => record.is_none_or(|record| is_decommissioned(&record)),
+/// Forget a session's receipts up to `launch` when its hosted record is absent or
+/// decommissioned. Every launch is recorded after its running record is saved, and records
+/// are never deleted, so an absent record is not a session that is still starting. This
+/// cleanup is best-effort: a read error or a record this binary cannot read keeps the
+/// receipts, and a failed delete is only logged. A newer launch of a re-spun session id
+/// keeps its queue entry and receipts.
+fn forget_if_decommissioned<S: StateStore>(
+    store: &S,
+    session_id: &str,
+    launch: uuid::Uuid,
+) -> bool {
+    let gone = match hosted_session_gone(store, session_id) {
+        Ok(Some(gone)) => gone,
+        Ok(None) => {
+            eprintln!(
+                "hub: keeping hosted launch version evidence of an unreadable session record \
+                 ({session_id})"
+            );
+            return false;
+        }
         Err(error) => {
             eprintln!(
                 "hub: error reading hosted session for launch version evidence ({session_id}): {error}"
@@ -802,13 +816,34 @@ fn forget_if_decommissioned<S: StateStore>(store: &S, session_id: &str) -> bool 
             return false;
         }
     };
-    if gone && let Err(error) = forget_session(store, session_id) {
+    if gone && let Err(error) = forget_session_through(store, session_id, Some(launch)) {
         eprintln!(
             "hub: error removing hosted launch version evidence of a decommissioned session \
              ({session_id}): {error}"
         );
     }
     gone
+}
+
+/// Whether a session's hosted record is absent or decommissioned. `None` when the stored
+/// entry exists but is not a hosted record of this session that this binary can read, as
+/// when an older or newer binary wrote it. Such a session is not known to be gone.
+fn hosted_session_gone<S: StateStore>(
+    store: &S,
+    session_id: &str,
+) -> Result<Option<bool>, LifecycleError> {
+    let session_id = session_id.trim();
+    let Some(entry) = store.get_state_by_key(
+        &StateScope::Workspace,
+        StateConcern::Runtime,
+        &hosted_session_slug(session_id),
+    )?
+    else {
+        return Ok(Some(true));
+    };
+    Ok(decode::<HostedSessionRecord>(entry)
+        .filter(|record| record.session_id == session_id)
+        .map(|record| is_decommissioned(&record)))
 }
 
 fn save_generation<S: StateStore>(
@@ -915,11 +950,23 @@ pub(super) fn forget_session<S: StateStore>(
     store: &S,
     session_id: &str,
 ) -> Result<(), LifecycleError> {
+    forget_session_through(store, session_id, None)
+}
+
+/// Like [`forget_session`], but with `through` set only launches up to that id are removed.
+/// A newer launch belongs to a later spin-up of the same session id, so its queue entry,
+/// its receipts and an index that points to it are kept.
+fn forget_session_through<S: StateStore>(
+    store: &S,
+    session_id: &str,
+    through: Option<uuid::Uuid>,
+) -> Result<(), LifecycleError> {
+    let settled = |id: uuid::Uuid| through.is_none_or(|through| id <= through);
     // Version evidence never blocks decommission. An invalid or busy queue keeps its
     // entries, and the receipt keys below are still removed.
     if let Err(error) = update_pending(store, |pending| {
         let before = pending.len();
-        pending.retain(|receipt| receipt.session_id != session_id);
+        pending.retain(|receipt| receipt.session_id != session_id || !settled(receipt.id));
         pending.len() != before
     }) {
         eprintln!(
@@ -927,8 +974,20 @@ pub(super) fn forget_session<S: StateStore>(
         );
     }
     let slug = session_index_slug(session_id);
-    if let Some(index) = read::<_, SessionReceipts>(store, &slug)? {
+    let index = read::<_, SessionReceipts>(store, &slug)?;
+    if through.is_some() && !index.as_ref().is_some_and(|index| settled(index.launch)) {
+        // The index is missing, unreadable, or owned by a newer launch.
+        return Ok(());
+    }
+    if let Some(index) = index {
         for receipt in &index.slugs {
+            // A reused legacy generation key can already hold a newer launch's receipt.
+            if through.is_some()
+                && !read::<_, LaunchReceipt>(store, receipt)?
+                    .is_some_and(|saved| saved.session_id == session_id && settled(saved.id))
+            {
+                continue;
+            }
             store.delete_state_by_key(&StateScope::Workspace, StateConcern::Runtime, receipt)?;
         }
     }
@@ -2001,6 +2060,87 @@ mod tests {
             hosted_vendor_versions_for_stream(&store, queued.stream.as_ref().unwrap()).unwrap(),
             Some(observed.versions)
         );
+    }
+
+    #[test]
+    fn versions_are_kept_when_the_session_record_cannot_be_read() {
+        let store = MemStore::default();
+        let queued = receipt(1);
+        seed(&store, &queued);
+        // A newer or older binary wrote a record this binary cannot decode. Even its
+        // decommissioned status does not prove the session is gone.
+        write(
+            &store,
+            hosted_session_slug(&queued.session_id),
+            &serde_json::json!({
+                "session_id": queued.session_id, "persona": "ada",
+                "project": "ferroloop", "role": "assistant", "vendor": "codex",
+                "node_id": DEFAULT_NODE_ID, "hosted": true, "status": STATUS_DECOMMISSIONED,
+                "restart_policy": "on-failure", "restart_count": 0,
+                "hydration_dispatched": false, "hydration_status": "a-future-status",
+                "created_at_ms": 1000, "updated_at_ms": 1000,
+            }),
+        )
+        .unwrap();
+        assert!(
+            get_hosted_session_record(&store, &queued.session_id)
+                .unwrap()
+                .is_none()
+        );
+
+        let observed = commit(&store, queued.clone(), sample(Some("1.0.0"), None), true)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(session_keys(&store, &queued.session_id).len(), 3);
+        assert_eq!(
+            hosted_vendor_versions_for_stream(&store, queued.stream.as_ref().unwrap()).unwrap(),
+            Some(observed.versions)
+        );
+    }
+
+    #[test]
+    fn versions_cleanup_after_decommission_keeps_a_newer_launch() {
+        let store = MemStore::default();
+        let older = receipt(1);
+        seed(&store, &older);
+        // The older launch's observer read the decommissioned record. Before its cleanup
+        // ran, the same session id was spun up again and its first launch settled.
+        save_record(&store, &older.session_id, STATUS_DECOMMISSIONED);
+        let newer = receipt(2);
+        seed(&store, &newer);
+        save_versions(&store, newer.clone(), sample(Some("1.1.0"), None)).unwrap();
+        let newer_keys = session_keys(&store, &newer.session_id);
+        assert_eq!(newer_keys.len(), 3);
+
+        // The older launch settles. Its post-write check still reads the decommissioned
+        // record, so it cleans up, but only up to its own launch.
+        assert!(
+            commit(&store, older.clone(), sample(Some("1.0.0"), None), true)
+                .unwrap()
+                .is_none()
+        );
+
+        let (pending, _): (Vec<LaunchReceipt>, _) = load_revision(&store, &queue_slug()).unwrap();
+        assert_eq!(
+            pending.iter().map(|item| item.id).collect::<Vec<_>>(),
+            [newer.id]
+        );
+        assert_eq!(session_keys(&store, &newer.session_id), newer_keys);
+        let index = read::<_, SessionReceipts>(&store, &session_index_slug(&newer.session_id))
+            .unwrap()
+            .unwrap();
+        assert_eq!(index.launch, newer.id);
+        assert_eq!(
+            hosted_vendor_versions_for_stream(&store, newer.stream.as_ref().unwrap())
+                .unwrap()
+                .and_then(|versions| versions.cli),
+            Some("1.1.0".into())
+        );
+
+        // Decommission's own cleanup is not bounded and still removes everything.
+        forget_session(&store, &newer.session_id).unwrap();
+        assert!(session_keys(&store, &newer.session_id).is_empty());
     }
 
     #[test]
