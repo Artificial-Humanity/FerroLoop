@@ -35,6 +35,8 @@ use fl_core::vendor_adapter::{
 };
 #[cfg(unix)]
 use ring::rand::{SecureRandom, SystemRandom};
+#[cfg(unix)]
+use semver::Version;
 use serde::Deserialize;
 #[cfg(unix)]
 use serde::Serialize;
@@ -69,8 +71,9 @@ const LAUNCH_CONNECT_TIMEOUT: Duration = Duration::from_millis(250);
 /// Shared deadline for the sign-in RPCs after connecting.
 #[cfg(unix)]
 const LAUNCH_AUTH_PROBE_TIMEOUT: Duration = Duration::from_millis(750);
+/// Earliest Codex version with verified launch-auth replies.
 #[cfg(unix)]
-const LAUNCH_AUTH_DAEMON_VERSION: &str = "0.172.0";
+const MIN_LAUNCH_AUTH_DAEMON_VERSION: Version = Version::new(0, 172, 0);
 #[cfg(unix)]
 const ACCOUNT_RATE_LIMITS_READ: &str = "account/rateLimits/read";
 #[cfg(unix)]
@@ -1112,15 +1115,21 @@ fn launch_account_sign_in_issue(stream: UnixStream, cwd: &str) -> Option<LaunchS
     }
     // The first initialize can latch the originator for the daemon's lifetime. Allow any
     // existing originator and check the version in the first userAgent product token.
-    let product_and_version = initialize["userAgent"]
+    let supports_probe = initialize["userAgent"]
         .as_str()
         .and_then(|ua| ua.split_whitespace().next())
-        .and_then(|token| token.split_once('/'));
-    let issue = match product_and_version {
-        Some((originator, LAUNCH_AUTH_DAEMON_VERSION)) if !originator.is_empty() => {
-            check_default_route_sign_in(&mut conn, cwd)
-        }
-        _ => Some(LaunchSignInIssue::Inconclusive),
+        .and_then(|token| token.split_once('/'))
+        .filter(|(originator, _)| !originator.is_empty())
+        .and_then(|(_, version)| Version::parse(version).ok())
+        .is_some_and(|version| {
+            !version
+                .cmp_precedence(&MIN_LAUNCH_AUTH_DAEMON_VERSION)
+                .is_lt()
+        });
+    let issue = if supports_probe {
+        check_default_route_sign_in(&mut conn, cwd)
+    } else {
+        Some(LaunchSignInIssue::Inconclusive)
     };
     let _ = conn.send(OP_CLOSE, &1000u16.to_be_bytes());
     issue
@@ -1134,24 +1143,26 @@ fn check_default_route_sign_in(conn: &mut Conn, cwd: &str) -> Option<LaunchSignI
         return Some(Inconclusive);
     };
     let config = &config["config"];
-    // A custom provider or backend can launch independently of the managed ChatGPT account.
-    match config.get("model_provider") {
-        Some(Value::Null) => {}
-        Some(Value::String(provider)) if provider == "openai" => {}
-        Some(Value::String(provider)) if !provider.is_empty() => return None,
+    let custom_provider = match config.get("model_provider") {
+        Some(Value::Null) => false,
+        Some(Value::String(provider)) if !provider.is_empty() => provider != "openai",
         _ => return Some(Inconclusive),
-    }
-    match config.get("chatgpt_base_url") {
-        Some(Value::Null) => {}
-        Some(Value::String(url)) if url.trim_end_matches('/') == CODEX_DEFAULT_CHATGPT_BASE_URL => {
+    };
+    let custom_chatgpt_url = match config.get("chatgpt_base_url") {
+        Some(Value::Null) => false,
+        Some(Value::String(url)) if !url.is_empty() => {
+            url.trim_end_matches('/') != CODEX_DEFAULT_CHATGPT_BASE_URL
         }
-        Some(Value::String(url)) if !url.is_empty() => return None,
         _ => return Some(Inconclusive),
-    }
-    match config.get("openai_base_url") {
-        Some(Value::Null) => {}
-        Some(Value::String(url)) if !url.is_empty() => return None,
+    };
+    let custom_openai_url = match config.get("openai_base_url") {
+        Some(Value::Null) => false,
+        Some(Value::String(url)) if !url.is_empty() => true,
         _ => return Some(Inconclusive),
+    };
+    // A custom provider or backend can launch independently of the managed ChatGPT account.
+    if custom_provider || custom_chatgpt_url || custom_openai_url {
+        return None;
     }
 
     // The legacy status response exposes the exact auth mode. Account summaries
@@ -1192,18 +1203,28 @@ fn check_default_route_sign_in(conn: &mut Conn, cwd: &str) -> Option<LaunchSignI
         json!({ "excludeResetCreditDetails": true }),
     ) {
         Ok(reply)
-            if reply["rateLimits"]
-                .as_object()
-                .is_some_and(|limits| !limits.is_empty())
+            if is_rate_limit_snapshot(&reply["rateLimits"])
                 && reply["rateLimitsByLimitId"]
                     .as_object()
-                    .is_some_and(|limits| !limits.is_empty()) =>
+                    .is_some_and(|limits| {
+                        !limits.is_empty() && limits.values().all(is_rate_limit_snapshot)
+                    }) =>
         {
             None
         }
         Err(RpcReplyError::Rejected(error)) => Some(classify_launch_auth_error(&error)),
         _ => Some(Inconclusive),
     }
+}
+
+#[cfg(unix)]
+fn is_rate_limit_snapshot(snapshot: &Value) -> bool {
+    matches!(
+        snapshot.get("limitId"),
+        Some(Value::Null | Value::String(_))
+    ) && ["primary", "secondary"].into_iter().all(|key| {
+        matches!(snapshot.get(key), Some(Value::Null)) || snapshot[key]["usedPercent"].is_number()
+    })
 }
 
 #[cfg(unix)]
@@ -3096,17 +3117,22 @@ mod tests {
     }
 
     #[test]
-    fn launch_auth_accepts_redacted_replies_from_the_live_codex_daemon() {
+    fn launch_auth_accepts_the_captured_and_newer_compatible_daemon_replies() {
         let capture = captured_launch_auth();
-        assert_eq!(
-            replay_launch_auth(vec![
-                capture["initialize"].clone(),
-                capture["config_read"].clone(),
-                capture["get_auth_status"].clone(),
-                capture["account_rate_limits_read"].clone(),
-            ]),
-            None
-        );
+        let mut newer_initialize = capture["initialize"].clone();
+        newer_initialize["result"]["userAgent"] =
+            json!("latched-client/0.173.0+build (ferroloop; 0.1.0)");
+        for initialize in [capture["initialize"].clone(), newer_initialize] {
+            assert_eq!(
+                replay_launch_auth(vec![
+                    initialize,
+                    capture["config_read"].clone(),
+                    capture["get_auth_status"].clone(),
+                    capture["account_rate_limits_read"].clone(),
+                ]),
+                None
+            );
+        }
     }
 
     #[test]
@@ -3152,8 +3178,17 @@ mod tests {
                 Inconclusive,
             ),
             (json!({"id": 4, "result": {"rateLimits": {}}}), Inconclusive),
+            (
+                json!({"id": 4, "result": {"rateLimits": {"newField": true}, "rateLimitsByLimitId": {"codex": {"newField": true}}}}),
+                Inconclusive,
+            ),
+            (
+                json!({"id": 4, "result": {"rateLimits": {"limitId": "codex", "primary": null, "secondary": null}, "rateLimitsByLimitId": {"codex": true}}}),
+                Inconclusive,
+            ),
         ];
-        let capture = captured_launch_auth();
+        let mut capture = captured_launch_auth();
+        capture["initialize"]["result"]["userAgent"] = json!("codex-tui/0.173.0");
         for (response, expected) in responses {
             assert_eq!(
                 replay_launch_auth(vec![
@@ -3163,6 +3198,32 @@ mod tests {
                     response,
                 ]),
                 Some(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn launch_auth_accepts_any_numeric_used_percent_and_rejects_non_numbers() {
+        let capture = captured_launch_auth();
+        for (used_percent, expected) in [
+            (json!(12.5), None),
+            (json!(12), None),
+            (json!("12.5"), Some(LaunchSignInIssue::Inconclusive)),
+            (json!(null), Some(LaunchSignInIssue::Inconclusive)),
+        ] {
+            let mut reply = capture["account_rate_limits_read"].clone();
+            reply["result"]["rateLimits"]["primary"]["usedPercent"] = used_percent.clone();
+            reply["result"]["rateLimitsByLimitId"]["codex"]["primary"]["usedPercent"] =
+                used_percent.clone();
+            assert_eq!(
+                replay_launch_auth(vec![
+                    capture["initialize"].clone(),
+                    capture["config_read"].clone(),
+                    capture["get_auth_status"].clone(),
+                    reply,
+                ]),
+                expected,
+                "usedPercent {used_percent}"
             );
         }
     }
@@ -3239,13 +3300,25 @@ mod tests {
     #[test]
     fn launch_auth_does_not_query_unknown_daemon_versions_or_config_shapes() {
         let capture = captured_launch_auth();
-        for user_agent in ["codex-tui/0.173.0", "codex-tui/0.172.0-beta.1", "unknown"] {
+        for user_agent in [
+            "codex-tui/0.171.9",
+            "codex-tui/0.172.0-beta.1",
+            "codex-tui/0.173",
+            "/0.173.0",
+            "unknown",
+        ] {
             assert_eq!(
                 replay_launch_auth(vec![json!({"id": 1, "result": {"userAgent": user_agent}})]),
                 Some(LaunchSignInIssue::Inconclusive)
             );
         }
-        for config in [json!({}), json!({"model_provider": 0}), Value::Null] {
+        for config in [
+            json!({}),
+            json!({"model_provider": 0}),
+            json!({"model_provider": "custom"}),
+            json!({"model_provider": null, "chatgpt_base_url": "https://other.example"}),
+            Value::Null,
+        ] {
             assert_eq!(
                 replay_launch_auth(vec![
                     capture["initialize"].clone(),
