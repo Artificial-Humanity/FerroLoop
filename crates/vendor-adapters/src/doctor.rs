@@ -1,4 +1,4 @@
-use std::fs::OpenOptions;
+use std::fs::{File, OpenOptions};
 use std::io::{self, Read};
 use std::path::Path;
 
@@ -43,6 +43,22 @@ fn read_bounded_regular_bytes(
     if !metadata.is_file() || metadata.len() > limit {
         return Err(io::ErrorKind::InvalidData.into());
     }
+    let Some(file) = open_regular(path, links)? else {
+        return Ok(None);
+    };
+    let mut contents = Vec::new();
+    file.take(limit + 1).read_to_end(&mut contents)?;
+    if contents.len() as u64 > limit {
+        return Err(io::ErrorKind::InvalidData.into());
+    }
+    Ok(Some(contents))
+}
+
+/// Open `path` without waiting on a FIFO and confirm through the open handle that it is a
+/// regular file, which closes the race with a file swapped after the caller's pre-check.
+/// With [`FinalLink::Follow`], a link target removed after that pre-check reads as a
+/// missing file (`Ok(None)`); with [`FinalLink::Refuse`] every open error is returned.
+fn open_regular(path: &Path, links: FinalLink) -> io::Result<Option<File>> {
     let mut options = OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
@@ -53,16 +69,17 @@ fn read_bounded_regular_bytes(
             FinalLink::Follow => libc::O_NONBLOCK,
         });
     }
-    let file = options.open(path)?;
+    let file = match options.open(path) {
+        Ok(file) => file,
+        Err(error) if links == FinalLink::Follow && error.kind() == io::ErrorKind::NotFound => {
+            return Ok(None);
+        }
+        Err(error) => return Err(error),
+    };
     if !file.metadata()?.is_file() {
         return Err(io::ErrorKind::InvalidData.into());
     }
-    let mut contents = Vec::new();
-    file.take(limit + 1).read_to_end(&mut contents)?;
-    if contents.len() as u64 > limit {
-        return Err(io::ErrorKind::InvalidData.into());
-    }
-    Ok(Some(contents))
+    Ok(Some(file))
 }
 
 /// Fixed, non-sensitive reasons for one settings file whose update control is unknown.
@@ -746,7 +763,6 @@ mod tests {
     fn claude_follows_symlinked_managed_settings_to_regular_files_only() {
         use VendorUpdateStatus::{Disabled, Enabled, Unknown};
         use std::os::unix::fs::symlink;
-        use std::time::{Duration, Instant};
 
         let root = tempfile::tempdir().unwrap();
         let home = root.path();
@@ -791,7 +807,6 @@ mod tests {
         make_fifo(&fifo);
         fs::remove_file(&main).unwrap();
         symlink(&fifo, &main).unwrap();
-        let started = Instant::now();
         assert_eq!(
             claude_updates(home, &[]),
             Unknown("managed-settings.json not a regular file or too large")
@@ -806,7 +821,6 @@ mod tests {
             claude_updates(home, &[]),
             Unknown("managed-settings.d not a regular file or too large")
         );
-        assert!(started.elapsed() < Duration::from_secs(5));
         fs::remove_file(&drop_in).unwrap();
         symlink(home.join("checkout"), &main).unwrap();
         assert_eq!(
@@ -830,6 +844,60 @@ mod tests {
         let path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
         // SAFETY: `path` is a valid NUL-terminated C string for the duration of the call.
         assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+    }
+
+    /// The open-and-fstat step on its own, past the caller's metadata pre-check: a FIFO
+    /// reached through a followed link must be rejected without waiting for a writer.
+    /// The call runs on a thread so a blocking open fails the test instead of hanging it.
+    #[cfg(unix)]
+    #[test]
+    fn followed_open_rejects_fifo_without_waiting() {
+        use std::os::unix::fs::symlink;
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let root = tempfile::tempdir().unwrap();
+        let fifo = root.path().join("fifo.json");
+        make_fifo(&fifo);
+        let link = root.path().join("managed-settings.json");
+        symlink(&fifo, &link).unwrap();
+
+        let (sender, receiver) = mpsc::channel();
+        let opener = link.clone();
+        std::thread::spawn(move || {
+            let result = open_regular(&opener, FinalLink::Follow).map(|file| file.is_some());
+            let _ = sender.send(result.map_err(|error| error.kind()));
+        });
+        let result = match receiver.recv_timeout(Duration::from_secs(5)) {
+            Ok(result) => result,
+            Err(_) => {
+                // Release the blocked reader before failing so the thread can exit.
+                let _ = fs::OpenOptions::new().write(true).open(&fifo);
+                panic!("opening a linked FIFO waited for a writer");
+            }
+        };
+        assert_eq!(result, Err(io::ErrorKind::InvalidData));
+    }
+
+    /// A link target removed between the pre-check and the open reads as a missing file
+    /// when links are followed, and stays an open error when they are refused.
+    #[cfg(unix)]
+    #[test]
+    fn followed_open_treats_vanished_target_as_missing() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let link = root.path().join("managed-settings.json");
+        symlink(root.path().join("removed.json"), &link).unwrap();
+        assert!(matches!(open_regular(&link, FinalLink::Follow), Ok(None)));
+
+        let missing = root.path().join("settings.json");
+        assert_eq!(
+            open_regular(&missing, FinalLink::Refuse)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::NotFound
+        );
     }
 
     #[test]
