@@ -698,6 +698,42 @@ impl FerroStore {
         })
     }
 
+    /// Delete a state key, when `expected` is set only while its head revision agrees.
+    /// The check and the delete run in one write transaction.
+    fn delete_state_when(
+        &self,
+        scope: &StateScope,
+        concern: StateConcern,
+        slug: &str,
+        expected: Option<&RevisionId>,
+    ) -> Result<bool, StoreError> {
+        let key = state_key(scope, concern, slug)?;
+        self.with_write(|txn| {
+            if let Some(expected) = expected
+                && state_by_key(txn, &self.label, &key)?
+                    .as_ref()
+                    .map(|entry| &entry.head_revision)
+                    != Some(expected)
+            {
+                return Ok(false);
+            }
+            doc::raise_format(txn, FORMAT_WITH_STATE)?;
+            let Some(id_str) = doc::get_json::<String>(txn, STATE_KEYS, &key)? else {
+                return Ok(false);
+            };
+            txn.delete(STATE_KEYS, &key);
+            txn.delete(STATE_ENTRIES, &id_str);
+            txn.delete(STATE_CONFLICTS, &id_str);
+            if let Ok(id_iri) = Iri::parse(&id_str)
+                && let Ok((target, Kind::State)) = doc::locate(txn, &self.label, &id_iri)
+            {
+                txn.delete(STATE_ENTRIES, target.as_str());
+                txn.delete(STATE_CONFLICTS, target.as_str());
+            }
+            Ok(true)
+        })
+    }
+
     fn upsert_state_when(
         &self,
         args: UpsertStateArgs,
@@ -883,24 +919,17 @@ impl StateStore for FerroStore {
         concern: StateConcern,
         slug: &str,
     ) -> Result<bool, StoreError> {
-        let slug = validate_slug(slug).map_err(|err| StoreError::InvalidState(err.to_string()))?;
-        let key = doc::triple(&scope.as_wire(), concern.as_wire(), &slug);
-        self.with_write(|txn| {
-            doc::raise_format(txn, FORMAT_WITH_STATE)?;
-            let Some(id_str) = doc::get_json::<String>(txn, STATE_KEYS, &key)? else {
-                return Ok(false);
-            };
-            txn.delete(STATE_KEYS, &key);
-            txn.delete(STATE_ENTRIES, &id_str);
-            txn.delete(STATE_CONFLICTS, &id_str);
-            if let Ok(id_iri) = Iri::parse(&id_str)
-                && let Ok((target, Kind::State)) = doc::locate(txn, &self.label, &id_iri)
-            {
-                txn.delete(STATE_ENTRIES, target.as_str());
-                txn.delete(STATE_CONFLICTS, target.as_str());
-            }
-            Ok(true)
-        })
+        self.delete_state_when(scope, concern, slug, None)
+    }
+
+    fn delete_state_if_current(
+        &self,
+        scope: &StateScope,
+        concern: StateConcern,
+        slug: &str,
+        expected: &RevisionId,
+    ) -> Result<bool, StoreError> {
+        self.delete_state_when(scope, concern, slug, Some(expected))
     }
 
     fn list_state(

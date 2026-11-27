@@ -1515,6 +1515,40 @@ impl AgentRegistry for MemStore {
     }
 }
 
+impl MemStore {
+    /// Delete a state key, when `expected` is set only while its head revision agrees.
+    /// The check and the delete share one borrow, so no write lands between them.
+    fn delete_state_when(
+        &self,
+        scope: &StateScope,
+        concern: StateConcern,
+        slug: &str,
+        expected: Option<&RevisionId>,
+    ) -> Result<bool, StoreError> {
+        let slug = validate_slug(slug).map_err(|e| StoreError::InvalidState(e.to_string()))?;
+        let key = (scope.as_wire(), concern.as_wire().to_string(), slug);
+        let mut s = self.inner.borrow_mut();
+        let Some(id) = s.state_by_key.get(&key).cloned() else {
+            return Ok(false);
+        };
+        let resolved = StateId(s.resolve(id.iri()));
+        if let Some(expected) = expected
+            && s.state_entries
+                .get(&resolved)
+                .map(|entry| &entry.head_revision)
+                != Some(expected)
+        {
+            return Ok(false);
+        }
+        s.state_by_key.remove(&key);
+        s.state_entries.remove(&id);
+        s.state_entries.remove(&resolved);
+        s.state_conflicts.remove(&id);
+        s.state_conflicts.remove(&resolved);
+        Ok(true)
+    }
+}
+
 impl StateStore for MemStore {
     fn upsert_state(&self, args: UpsertStateArgs) -> Result<StateEntry, StoreError> {
         let slug =
@@ -1679,18 +1713,17 @@ impl StateStore for MemStore {
         concern: StateConcern,
         slug: &str,
     ) -> Result<bool, StoreError> {
-        let slug = validate_slug(slug).map_err(|e| StoreError::InvalidState(e.to_string()))?;
-        let key = (scope.as_wire(), concern.as_wire().to_string(), slug);
-        let mut s = self.inner.borrow_mut();
-        let Some(id) = s.state_by_key.remove(&key) else {
-            return Ok(false);
-        };
-        let resolved = StateId(s.resolve(id.iri()));
-        s.state_entries.remove(&id);
-        s.state_entries.remove(&resolved);
-        s.state_conflicts.remove(&id);
-        s.state_conflicts.remove(&resolved);
-        Ok(true)
+        self.delete_state_when(scope, concern, slug, None)
+    }
+
+    fn delete_state_if_current(
+        &self,
+        scope: &StateScope,
+        concern: StateConcern,
+        slug: &str,
+        expected: &RevisionId,
+    ) -> Result<bool, StoreError> {
+        self.delete_state_when(scope, concern, slug, Some(expected))
     }
 
     fn list_state(

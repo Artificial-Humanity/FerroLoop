@@ -11550,7 +11550,9 @@ fn require_runtime(
 }
 
 /// Put the record of `session_id` back as it was before a failed remodel's spin-up wrote it:
-/// `before` when there was one, else the record marked decommissioned.
+/// `before` when there was one, else the record marked decommissioned. A record left
+/// decommissioned also loses the launch version receipts of the failed spin-up, as a
+/// regular decommission does.
 fn undo_new_record<S: AgentRegistry + StateStore>(
     store: &S,
     session_id: &str,
@@ -11563,21 +11565,24 @@ fn undo_new_record<S: AgentRegistry + StateStore>(
     else {
         return Ok(());
     };
-    let changed = match before {
+    let (changed, decommissioned) = match before {
         Some(before) if before != now => {
             persist_hosted_session(store, &before, by)?;
-            true
+            (true, is_decommissioned(&before))
         }
-        Some(_) => false,
-        None if is_decommissioned(&now) => false,
+        Some(_) => (false, is_decommissioned(&now)),
+        None if is_decommissioned(&now) => (false, true),
         None => {
             now.status = STATUS_DECOMMISSIONED.to_string();
             now.hydration_generation = None;
             now.updated_at_ms = now_ms();
             persist_hosted_session(store, &now, by)?;
-            true
+            (true, true)
         }
     };
+    if decommissioned {
+        launch_versions::forget_session(store, session_id)?;
+    }
     if changed {
         refresh_decommission_tombstones(store, home_override);
     }

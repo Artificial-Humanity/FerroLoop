@@ -822,6 +822,23 @@ pub trait StateStore {
         concern: StateConcern,
         slug: &str,
     ) -> Result<bool, StoreError>;
+    /// [`Self::delete_state_by_key`] only while the key's current head revision is
+    /// `expected`. Returns `false`, and deletes nothing, when the key is missing or now
+    /// holds another revision. This default checks and then deletes, so it is not atomic:
+    /// stores supporting concurrent callers must check and delete in one transaction.
+    fn delete_state_if_current(
+        &self,
+        scope: &StateScope,
+        concern: StateConcern,
+        slug: &str,
+        expected: &RevisionId,
+    ) -> Result<bool, StoreError> {
+        let current = self.get_state_by_key(scope, concern, slug)?;
+        if current.as_ref().map(|entry| &entry.head_revision) != Some(expected) {
+            return Ok(false);
+        }
+        self.delete_state_by_key(scope, concern, slug)
+    }
     fn list_state(
         &self,
         scope: Option<&StateScope>,
