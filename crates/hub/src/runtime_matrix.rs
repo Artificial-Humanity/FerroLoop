@@ -841,15 +841,28 @@ fn version_env(path: &Path) -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
 /// `grok`), or the baseline alone for any other name. It never sees `FL_VAULT_MASTER_KEY`,
 /// `FL_HUB_*`, GitHub credentials, another vendor's keys or a proxy.
 pub fn run_version(path: &Path, timeout: Duration) -> Result<String, String> {
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+    let mut argv = vec![name.into(), "--version".into()];
+    let mut policy_env = Vec::new();
+    if let Some(adapter) = crate::lifecycle::launch_versions::vendor_version_adapters()
+        .and_then(|adapters| adapters.lookup_by_binary_name(name))
+    {
+        adapter.apply_cli_update_policy(&mut argv, &mut policy_env);
+    }
     let mut cmd = Command::new(path);
-    cmd.env_clear().envs(version_env(path));
+    cmd.args(&argv[1..])
+        .env_clear()
+        .envs(version_env(path))
+        .envs(policy_env);
     run_version_command(cmd, timeout)
 }
 
 /// Run a version probe with a caller-specified executable and environment.
 pub(crate) fn run_version_command(mut cmd: Command, timeout: Duration) -> Result<String, String> {
-    cmd.arg("--version")
-        .stdin(Stdio::null())
+    cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     #[cfg(unix)]

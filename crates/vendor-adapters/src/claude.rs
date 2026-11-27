@@ -31,6 +31,10 @@ use fl_core::vendor_adapter::{
 };
 use serde_json::Value;
 
+use fl_core::{VendorDoctorContext, VendorUpdateStatus};
+
+use crate::doctor::{SETTINGS_JSON, read_settings};
+
 pub use fl_core::PostCompactionContext as ClaudePostCompactionContext;
 
 /// First-launch modal printed by Claude Code when auto mode asks for environment setup.
@@ -303,6 +307,49 @@ impl fl_core::VendorVersionAdapter for ClaudeHostAdapter {
         "claude"
     }
 
+    fn auto_update_disable_env(&self) -> Option<(&'static str, &'static str)> {
+        Some(CLAUDE_AUTO_UPDATE_DISABLED)
+    }
+
+    /// Each control is read from the process environment and from the `env` block of the
+    /// user `settings.json` (in `$CLAUDE_CONFIG_DIR`, else `~/.claude`). Claude does not
+    /// document which source wins when both set a control, so a disagreement, or a source
+    /// that cannot be read, leaves that control unknown. Either control disabling updates
+    /// disables them.
+    fn configured_cli_updates(&self, context: &VendorDoctorContext<'_>) -> VendorUpdateStatus {
+        let settings = match context.config_home("CLAUDE_CONFIG_DIR", ".claude") {
+            Some(dir) => read_settings(
+                &dir.join("settings.json"),
+                &SETTINGS_JSON,
+                ClaudeSettingsEnv::parse,
+            ),
+            None => Err("config directory unavailable"),
+        };
+        let mut unknown = None;
+        for (index, key) in CLAUDE_UPDATE_CONTROLS.into_iter().enumerate() {
+            let from_env = context
+                .var(key)
+                .map_or(Ok(None), |value| claude_update_switch(value.to_str()));
+            let from_settings = settings.as_ref().map_err(|reason| *reason).and_then(|env| {
+                env.0[index]
+                    .as_deref()
+                    .map_or(Ok(None), |value| claude_update_switch(Some(value)))
+            });
+            let control = match (from_env, from_settings) {
+                (Ok(None), other) | (other, Ok(None)) => other,
+                (Ok(env), Ok(settings)) if env == settings => Ok(env),
+                (Err(reason), _) | (_, Err(reason)) => Err(reason),
+                _ => Err("environment and settings.json disagree"),
+            };
+            match control {
+                Ok(Some(true)) => return VendorUpdateStatus::Disabled,
+                Ok(_) => {}
+                Err(reason) => unknown = unknown.or(Some(reason)),
+            }
+        }
+        unknown.map_or(VendorUpdateStatus::Enabled, VendorUpdateStatus::Unknown)
+    }
+
     fn version_from_executable(&self, executable: &Path) -> Option<String> {
         if !executable.is_absolute()
             || !executable
@@ -314,6 +361,53 @@ impl fl_core::VendorVersionAdapter for ClaudeHostAdapter {
         let version = executable.file_name()?.to_str()?;
         let version = version.strip_suffix(".exe").unwrap_or(version);
         crate::valid_release_version(version).map(str::to_owned)
+    }
+}
+
+const CLAUDE_AUTO_UPDATE_DISABLED: (&str, &str) = ("DISABLE_AUTOUPDATER", "1");
+
+/// Update controls Claude Code honours in its environment, in [`ClaudeSettingsEnv`] order.
+const CLAUDE_UPDATE_CONTROLS: [&str; 2] = [CLAUDE_AUTO_UPDATE_DISABLED.0, "DISABLE_UPDATES"];
+
+/// `Ok(Some(true))` disables updates, `Ok(Some(false))` explicitly keeps them, and
+/// `Ok(None)` is unset. Other values are unknown rather than guessed.
+fn claude_update_switch(value: Option<&str>) -> Result<Option<bool>, &'static str> {
+    let Some(value) = value else {
+        return Err("unrecognised value");
+    };
+    if value.is_empty() {
+        Ok(None)
+    } else if value == "1" || value.eq_ignore_ascii_case("true") {
+        Ok(Some(true))
+    } else if value == "0" || value.eq_ignore_ascii_case("false") {
+        Ok(Some(false))
+    } else {
+        Err("unrecognised value")
+    }
+}
+
+/// The [`CLAUDE_UPDATE_CONTROLS`] values in the `env` block of a user `settings.json`.
+#[derive(Default)]
+struct ClaudeSettingsEnv([Option<String>; 2]);
+
+impl ClaudeSettingsEnv {
+    /// Claude requires an object whose `env` maps names to strings. Anything else is
+    /// invalid, because Claude may then ignore the file or the block.
+    fn parse(source: &str) -> Option<Self> {
+        let Value::Object(mut settings) = serde_json::from_str::<Value>(source).ok()? else {
+            return None;
+        };
+        let env = match settings.remove("env") {
+            None => return Some(Self::default()),
+            Some(Value::Object(env)) => env,
+            Some(_) => return None,
+        };
+        if !env.values().all(Value::is_string) {
+            return None;
+        }
+        Some(Self(CLAUDE_UPDATE_CONTROLS.map(|key| {
+            env.get(key).and_then(Value::as_str).map(str::to_owned)
+        })))
     }
 }
 

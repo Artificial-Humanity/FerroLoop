@@ -50,7 +50,7 @@ pub use units::user_unit_directives;
 /// `schema_version` of the printed report.
 pub const DOCTOR_SCHEMA_VERSION: u32 = 1;
 
-/// The check ids, in the order the report lists them.
+/// Stable report check IDs.
 pub mod ids {
     pub const RELEASE_IDENTITY: &str = "G7.release-identity";
     pub const RECEIPT_INTEGRITY: &str = "G7.receipt-integrity";
@@ -59,9 +59,11 @@ pub mod ids {
     pub const VAULT_PERMS: &str = "G7.vault-perms";
     pub const CODE_UI_AGREE: &str = "G7.code-ui-agree";
     pub const UNIT_ORDER: &str = "G7.unit-order";
+    pub const VENDOR_VERSION_DRIFT: &str = "vendor.version-drift";
+    pub const VENDOR_UPDATE_POLICY: &str = "vendor.update-policy";
 }
 
-/// Every check id, in report order.
+/// The install checks, in report order.
 pub const CHECK_IDS: [&str; 7] = [
     ids::RELEASE_IDENTITY,
     ids::RECEIPT_INTEGRITY,
@@ -159,6 +161,12 @@ impl DoctorReport {
             summary,
             checks,
         }
+    }
+
+    /// Append additional observations and recompute the summary and overall status.
+    pub fn with_checks(mut self, checks: impl IntoIterator<Item = DoctorCheck>) -> Self {
+        self.checks.extend(checks);
+        Self::new(self.checks)
     }
 
     /// `0` when no check failed, `1` when at least one did. `warn`, `not-installed` and

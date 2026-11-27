@@ -1,15 +1,28 @@
-use std::fs::{self, OpenOptions};
-use std::io::Read;
+use std::fs;
 use std::path::Path;
 
-use fl_core::VendorVersionAdapter;
+use fl_core::{VendorDoctorContext, VendorUpdateStatus, VendorVersionAdapter};
+
+use crate::doctor::read_bounded_regular_file;
 
 #[derive(Debug)]
 pub(crate) struct MuseVersionAdapter;
 
+const AUTO_UPDATE_DISABLED: (&str, &str) = ("MUSE_NO_AUTO_UPDATE", "1");
+
 impl VendorVersionAdapter for MuseVersionAdapter {
     fn vendor_id(&self) -> &'static str {
         "muse"
+    }
+
+    fn auto_update_disable_env(&self) -> Option<(&'static str, &'static str)> {
+        Some(AUTO_UPDATE_DISABLED)
+    }
+
+    fn configured_cli_updates(&self, context: &VendorDoctorContext<'_>) -> VendorUpdateStatus {
+        let (key, disabled) = AUTO_UPDATE_DISABLED;
+        // The native launcher suppresses the updater only on an exact string match.
+        VendorUpdateStatus::from_enabled(context.var(key).is_none_or(|value| value != disabled))
     }
 
     fn version_from_executable(&self, executable: &Path) -> Option<String> {
@@ -26,7 +39,7 @@ impl VendorVersionAdapter for MuseVersionAdapter {
         // The launcher reads this exact sibling file and executes the named sibling binary.
         // Other installed binaries cannot establish which one the launcher selects.
         let directory = executable.parent()?;
-        let selection = read_bounded_regular_file(&directory.join(".muse-version"), 160)?;
+        let selection = read_bounded_regular_file(&directory.join(".muse-version"), 160).ok()??;
         let version = runtime_version(selection.trim_end_matches('\n'))?;
         let runtime = fs::symlink_metadata(directory.join(format!("muse-bin-{version}"))).ok()?;
         if !runtime.is_file() {
@@ -73,34 +86,15 @@ channel_url="https://api.meta.ai/muse-code/channels/$channel"
 
     // The vendor wrapper resolves its own directory, reads the marker there and
     // execs the selected sibling. A custom executable named muse may do anything.
-    read_bounded_regular_file(path, 64 * 1024).is_some_and(|script| {
-        script.starts_with(HEADER)
-            && script.contains(INSTALL_DIR)
-            && script.contains(SELECTOR)
-            && script.contains(r#"  dir="$(resolve_install_dir)""#)
-            && script.contains(r#"  binary="$(active_binary "$dir" 2>/dev/null || true)""#)
-            && script.ends_with(ENTRYPOINT)
-    })
-}
-
-fn read_bounded_regular_file(path: &Path, limit: u64) -> Option<String> {
-    let metadata = path.symlink_metadata().ok()?;
-    if !metadata.is_file() || metadata.len() > limit {
-        return None;
-    }
-    let mut options = OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        // Keep a replacement symlink or FIFO from redirecting or blocking the read.
-        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
-    }
-    let file = options.open(path).ok()?;
-    if !file.metadata().ok()?.is_file() {
-        return None;
-    }
-    let mut contents = String::new();
-    file.take(limit + 1).read_to_string(&mut contents).ok()?;
-    (contents.len() as u64 <= limit).then_some(contents)
+    read_bounded_regular_file(path, 64 * 1024)
+        .ok()
+        .flatten()
+        .is_some_and(|script| {
+            script.starts_with(HEADER)
+                && script.contains(INSTALL_DIR)
+                && script.contains(SELECTOR)
+                && script.contains(r#"  dir="$(resolve_install_dir)""#)
+                && script.contains(r#"  binary="$(active_binary "$dir" 2>/dev/null || true)""#)
+                && script.ends_with(ENTRYPOINT)
+        })
 }

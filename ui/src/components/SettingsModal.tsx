@@ -125,14 +125,7 @@ export type DoctorCheckStatus =
   | "unsupported";
 
 export interface DoctorCheckItem {
-  id:
-    | "G7.release-identity"
-    | "G7.receipt-integrity"
-    | "G7.path-ownership"
-    | "G7.store-health"
-    | "G7.vault-perms"
-    | "G7.code-ui-agree"
-    | "G7.unit-order";
+  id: string;
   title: string;
   status: DoctorCheckStatus;
   detail: string;

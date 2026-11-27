@@ -9,9 +9,11 @@
 //! Zero `codex exec resume` fallback, zero raw `state_5.sqlite` `UPDATE` statements, and zero
 //! lock-file deletions occur in this adapter.
 
+use std::collections::BTreeMap;
 use std::ffi::OsStr;
+use std::io;
 #[cfg(unix)]
-use std::io::{self, Read, Write};
+use std::io::{Read, Write};
 #[cfg(unix)]
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -28,17 +30,21 @@ use fl_core::vendor_adapter::{
     ConfigEffectiveScope, LaunchPrerequisiteRefusal, LaunchSignInIssue, NormalizedSessionTurn,
     TeardownOutcome, TeardownTarget, TranscriptNormalizeReport, TurnDeliveryOutcome,
     TurnDeliveryRequest, VendorAdapterError, VendorConfigSpec, VendorDaemonLaunchEvidence,
-    VendorHostAdapter, VendorLaunchPlan, VendorLaunchRequest, VendorStartupPromptRule,
+    VendorDoctorContext, VendorHostAdapter, VendorInstalledVersion, VendorLaunchPlan,
+    VendorLaunchRequest, VendorRuntimeFacts, VendorStartupPromptRule, VendorUpdateStatus,
 };
 #[cfg(unix)]
 use ring::rand::{SecureRandom, SystemRandom};
 #[cfg(unix)]
 use semver::Version;
+use serde::Deserialize;
 #[cfg(unix)]
 use serde::Serialize;
 use serde_json::Value;
 #[cfg(unix)]
 use serde_json::json;
+
+use crate::doctor::{CONFIG_TOML, SETTINGS_JSON, configured_updates};
 
 /// Default overall timeout for a Codex app-server control socket RPC sequence.
 pub const CODEX_RPC_TIMEOUT: Duration = Duration::from_secs(10);
@@ -259,9 +265,224 @@ fn codex_prerequisite_refusal(socket: &Path, result: &str) -> LaunchPrerequisite
     }
 }
 
+const CLI_STARTUP_UPDATE_KEY: &str = "check_for_update_on_startup";
+
+#[derive(Default, Deserialize)]
+struct CodexCliConfig {
+    check_for_update_on_startup: Option<bool>,
+}
+
+// Match the recognized settings and validation in Codex 0.172.0's daemon updater loader.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+struct DaemonSettings {
+    #[serde(rename = "remoteControlEnabled")]
+    _remote_control_enabled: bool,
+    #[serde(rename = "featureOverrides")]
+    _feature_overrides: BTreeMap<String, bool>,
+    shutdown_grace_seconds: u32,
+    updater: DaemonUpdaterSettings,
+}
+
+impl Default for DaemonSettings {
+    fn default() -> Self {
+        Self {
+            _remote_control_enabled: false,
+            _feature_overrides: BTreeMap::new(),
+            shutdown_grace_seconds: 60,
+            updater: DaemonUpdaterSettings::default(),
+        }
+    }
+}
+
+impl DaemonSettings {
+    fn parse(source: &str) -> Option<Self> {
+        serde_json::from_str::<Self>(source)
+            .ok()
+            .filter(|settings| {
+                settings.shutdown_grace_seconds <= 300
+                    && settings.updater.update_interval_minutes > 0
+            })
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+struct DaemonUpdaterSettings {
+    auto_update_enabled: bool,
+    update_interval_minutes: u32,
+}
+
+impl Default for DaemonUpdaterSettings {
+    fn default() -> Self {
+        Self {
+            auto_update_enabled: true,
+            update_interval_minutes: 60,
+        }
+    }
+}
+
+fn doctor_codex_home(context: &VendorDoctorContext<'_>) -> Result<PathBuf, &'static str> {
+    if let Some(path) = context.var("CODEX_HOME").filter(|value| !value.is_empty()) {
+        let path = PathBuf::from(path);
+        return (path.is_absolute() && path.is_dir())
+            .then_some(path)
+            .ok_or("CODEX_HOME not an absolute directory");
+    }
+    context
+        .home
+        .filter(|home| home.is_absolute())
+        .map(|home| home.join(".codex"))
+        .ok_or("home directory unavailable")
+}
+
+fn doctor_daemon_package(home: &Path) -> io::Result<Option<&'static str>> {
+    fn entry_exists(path: &Path) -> io::Result<bool> {
+        match path.symlink_metadata() {
+            Ok(_) => Ok(true),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
+    // Codex's managed installer gives the dedicated selector and dedicated daemon
+    // artifacts precedence over retained standalone daemon state.
+    if entry_exists(&home.join("packages/app-server-daemon/current"))? {
+        return Ok(Some("app-server-daemon"));
+    }
+    let state = home.join("app-server-daemon");
+    for (package, artifacts) in [
+        (
+            "app-server-daemon",
+            [
+                "daemon.pid",
+                "daemon.stderr.log",
+                "daemon-updater.pid",
+                "daemon-updater.stderr.log",
+            ],
+        ),
+        (
+            "standalone",
+            [
+                "app-server.pid",
+                "app-server.stderr.log",
+                "app-server-updater.pid",
+                "app-server-updater.stderr.log",
+            ],
+        ),
+    ] {
+        for artifact in artifacts {
+            if entry_exists(&state.join(artifact))? {
+                return Ok(Some(package));
+            }
+        }
+    }
+    Ok(None)
+}
+
+fn doctor_daemon_version(home: &Path) -> VendorInstalledVersion {
+    let package = match doctor_daemon_package(home) {
+        Ok(Some(package)) => package,
+        Ok(None) => return VendorInstalledVersion::Absent,
+        Err(_) => return VendorInstalledVersion::Unknown,
+    };
+    let current = home.join("packages").join(package).join("current");
+    let filename = format!("codex{}", std::env::consts::EXE_SUFFIX);
+    let packaged = current.join("bin").join(&filename);
+    let selected = if packaged.is_file() {
+        packaged
+    } else {
+        current.join(filename)
+    };
+    match VendorInstalledVersion::for_executable(&selected, |path| {
+        let (installed_package, version) = installed_package_version(path)?;
+        (installed_package == package).then(|| version.to_owned())
+    }) {
+        known @ VendorInstalledVersion::Known(_) => known,
+        // The selector or artifacts show which package the daemon uses, even when
+        // the selected executable is missing or does not identify a release.
+        VendorInstalledVersion::Absent | VendorInstalledVersion::Unknown => {
+            VendorInstalledVersion::Unknown
+        }
+    }
+}
+
+fn is_startup_update_override(arg: &str) -> bool {
+    arg.split_once('=')
+        .is_some_and(|(key, _)| key.trim() == CLI_STARTUP_UPDATE_KEY)
+}
+
 impl fl_core::VendorVersionAdapter for CodexHostAdapter {
     fn vendor_id(&self) -> &'static str {
         "codex"
+    }
+
+    fn apply_cli_update_policy(&self, argv: &mut Vec<String>, _env: &mut Vec<(String, String)>) {
+        if argv.is_empty() {
+            return;
+        }
+        // Codex reads this as a client config override. The managed app-server
+        // updater owns a separate setting and never receives this command.
+        let mut index = 1;
+        while let Some(arg) = argv.get(index).filter(|arg| *arg != "--") {
+            if matches!(arg.as_str(), "-c" | "--config") {
+                if argv
+                    .get(index + 1)
+                    .is_some_and(|value| is_startup_update_override(value))
+                {
+                    argv.drain(index..index + 2);
+                } else {
+                    index += 2;
+                }
+            } else if arg
+                .strip_prefix("--config=")
+                .or_else(|| arg.strip_prefix("-c="))
+                .or_else(|| arg.strip_prefix("-c"))
+                .is_some_and(is_startup_update_override)
+            {
+                argv.remove(index);
+            } else {
+                index += 1;
+            }
+        }
+        argv.splice(
+            1..1,
+            ["-c".into(), format!("{CLI_STARTUP_UPDATE_KEY}=false")],
+        );
+    }
+
+    fn configured_cli_updates(&self, context: &VendorDoctorContext<'_>) -> VendorUpdateStatus {
+        let home = match doctor_codex_home(context) {
+            Ok(home) => home,
+            Err(reason) => return VendorUpdateStatus::Unknown(reason),
+        };
+        configured_updates(
+            &home.join("config.toml"),
+            &CONFIG_TOML,
+            |source| toml::from_str::<CodexCliConfig>(source).ok(),
+            |config| config.check_for_update_on_startup.unwrap_or(true),
+        )
+    }
+
+    fn doctor_daemon_facts(&self, context: &VendorDoctorContext<'_>) -> Option<VendorRuntimeFacts> {
+        let home = match doctor_codex_home(context) {
+            Ok(home) => home,
+            Err(reason) => {
+                return Some(VendorRuntimeFacts {
+                    installed_version: VendorInstalledVersion::Unknown,
+                    configured_updates: VendorUpdateStatus::Unknown(reason),
+                });
+            }
+        };
+        Some(VendorRuntimeFacts {
+            installed_version: doctor_daemon_version(&home),
+            configured_updates: configured_updates(
+                &home.join("app-server-daemon/settings.json"),
+                &SETTINGS_JSON,
+                DaemonSettings::parse,
+                |settings| settings.updater.auto_update_enabled,
+            ),
+        })
     }
 
     fn version_from_executable(&self, executable: &Path) -> Option<String> {

@@ -1288,8 +1288,8 @@ fn pin_launch_config(launch: &mut Option<LaunchSpec>, config_home: Option<&Path>
     }
 }
 
-fn apply_vendor_launch_env(
-    env_vec: &mut Vec<(String, String)>,
+fn finalize_vendor_launch_spec(
+    spec: &mut LaunchSpec,
     vendor: &str,
     persona: &str,
     home: Option<&Path>,
@@ -1301,10 +1301,15 @@ fn apply_vendor_launch_env(
         home,
         hydration_generation,
     );
-    env_vec.retain(|(k, _)| {
+    spec.env.retain(|(k, _)| {
         k != "AGENT_HYDRATION_GENERATION" && !vendor_env.iter().any(|(vk, _)| vk == k)
     });
-    env_vec.extend(vendor_env);
+    spec.env.extend(vendor_env);
+    if let Some(adapter) =
+        launch_versions::vendor_version_adapters().and_then(|adapters| adapters.lookup(vendor))
+    {
+        adapter.apply_cli_update_policy(&mut spec.argv, &mut spec.env);
+    }
 }
 
 #[cfg(test)]
@@ -1398,8 +1403,8 @@ fn launch_spec_for_with_session(
                     env: plan.env,
                     argv: plan.argv,
                 };
-                apply_vendor_launch_env(
-                    &mut spec.env,
+                finalize_vendor_launch_spec(
+                    &mut spec,
                     vendor,
                     persona,
                     home.as_deref(),
@@ -1431,8 +1436,8 @@ fn launch_spec_for_with_session(
                         options,
                     )
                     .map_err(|why| invalid_field("posture", &why))?;
-                apply_vendor_launch_env(
-                    &mut spec.env,
+                finalize_vendor_launch_spec(
+                    &mut spec,
                     vendor,
                     persona,
                     home.as_deref(),
@@ -1455,8 +1460,8 @@ fn launch_spec_for_with_session(
             options,
         )
         .map_err(|why| invalid_field("posture", &why))?;
-    apply_vendor_launch_env(
-        &mut spec.env,
+    finalize_vendor_launch_spec(
+        &mut spec,
         vendor,
         persona,
         home.as_deref(),
@@ -1509,8 +1514,8 @@ fn resume_spec_for_with_session(
                     env: plan.env,
                     argv: plan.argv,
                 };
-                apply_vendor_launch_env(
-                    &mut spec.env,
+                finalize_vendor_launch_spec(
+                    &mut spec,
                     vendor,
                     persona,
                     home.as_deref(),
@@ -1544,8 +1549,8 @@ fn resume_spec_for_with_session(
             options,
         )
         .map_err(|why| invalid_field("posture", &why))?;
-    apply_vendor_launch_env(
-        &mut spec.env,
+    finalize_vendor_launch_spec(
+        &mut spec,
         vendor,
         persona,
         home.as_deref(),

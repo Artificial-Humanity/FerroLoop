@@ -29,6 +29,12 @@ use std::sync::{Arc, RwLock};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+mod doctor;
+pub use doctor::{
+    VendorDoctorContext, VendorDoctorFacts, VendorInstalledVersion, VendorRuntimeFacts,
+    VendorUpdateStatus,
+};
+
 /// Exact session-identity binding pinning an adapter operation to a specific agent generation,
 /// host session, optional OS `(pid, start_time_ticks)` birth tuple, and optional explicit vendor
 /// session ID.
@@ -688,10 +694,58 @@ pub struct VendorCliVersionProbe {
     pub parse: fn(&str) -> Option<&str>,
 }
 
+/// Accept only bounded SemVer release identifiers in vendor observations and persisted baselines.
+pub fn valid_release_version(version: &str) -> Option<&str> {
+    const MAX_VERSION_BYTES: usize = 128;
+    (version.len() <= MAX_VERSION_BYTES && semver::Version::parse(version).is_ok())
+        .then_some(version)
+}
+
 /// Version evidence for one hosted vendor. Concrete install and protocol knowledge stays in the
 /// vendor adapter crate. Unknown evidence is `None`.
 pub trait VendorVersionAdapter: fmt::Debug + Send + Sync {
     fn vendor_id(&self) -> &'static str;
+
+    fn cli_binary_name(&self) -> &'static str {
+        self.vendor_id()
+    }
+
+    /// The supported environment setting that suppresses the CLI's own auto-updater, if any.
+    fn auto_update_disable_env(&self) -> Option<(&'static str, &'static str)> {
+        None
+    }
+
+    /// Apply the CLI's startup update policy to a command (with the executable in argv[0]).
+    /// Only touches argv and the child environment. Safe to apply more than once.
+    fn apply_cli_update_policy(&self, _argv: &mut Vec<String>, env: &mut Vec<(String, String)>) {
+        if let Some((name, value)) = self.auto_update_disable_env() {
+            env.retain(|(key, _)| key != name);
+            env.push((name.into(), value.into()));
+        }
+    }
+
+    /// Observe documented CLI update controls in the caller's environment and config.
+    /// Implementations only read passive evidence and never start a process.
+    fn configured_cli_updates(&self, context: &VendorDoctorContext<'_>) -> VendorUpdateStatus {
+        let Some((key, disabled)) = self.auto_update_disable_env() else {
+            return VendorUpdateStatus::Unknown("no documented update control");
+        };
+        match context.var(key) {
+            None => VendorUpdateStatus::Enabled,
+            Some(value) if value.is_empty() => VendorUpdateStatus::Enabled,
+            Some(value) if value == disabled => VendorUpdateStatus::Disabled,
+            Some(_) => VendorUpdateStatus::Unknown("unrecognised value"),
+        }
+    }
+
+    /// Observe the separately managed daemon's installed image and on-disk update setting.
+    /// Never connect to the daemon or inspect a running service.
+    fn doctor_daemon_facts(
+        &self,
+        _context: &VendorDoctorContext<'_>,
+    ) -> Option<VendorRuntimeFacts> {
+        None
+    }
 
     /// Read passive evidence for an executable the caller has already resolved to its absolute,
     /// canonical path. This may read install metadata but must not start a process.
@@ -741,6 +795,13 @@ impl VendorVersionRegistry {
 
     pub fn lookup(&self, vendor_id: &str) -> Option<&dyn VendorVersionAdapter> {
         self.adapters.get(vendor_id).map(Arc::as_ref)
+    }
+
+    pub fn lookup_by_binary_name(&self, name: &str) -> Option<&dyn VendorVersionAdapter> {
+        self.adapters
+            .values()
+            .find(|adapter| adapter.cli_binary_name() == name)
+            .map(Arc::as_ref)
     }
 }
 

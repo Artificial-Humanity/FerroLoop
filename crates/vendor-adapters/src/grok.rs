@@ -1,13 +1,67 @@
 use std::path::Path;
 
-use fl_core::VendorVersionAdapter;
+use fl_core::{VendorDoctorContext, VendorUpdateStatus, VendorVersionAdapter};
+use serde::Deserialize;
+
+use crate::doctor::{CONFIG_TOML, configured_updates};
 
 #[derive(Debug)]
 pub(crate) struct GrokVersionAdapter;
 
+const AUTO_UPDATE_DISABLED: (&str, &str) = ("GROK_DISABLE_AUTOUPDATER", "1");
+
+#[derive(Default, Deserialize)]
+struct GrokConfig {
+    #[serde(default)]
+    cli: GrokCliConfig,
+}
+
+#[derive(Default, Deserialize)]
+struct GrokCliConfig {
+    auto_update: Option<bool>,
+}
+
 impl VendorVersionAdapter for GrokVersionAdapter {
     fn vendor_id(&self) -> &'static str {
         "grok"
+    }
+
+    fn auto_update_disable_env(&self) -> Option<(&'static str, &'static str)> {
+        Some(AUTO_UPDATE_DISABLED)
+    }
+
+    fn configured_cli_updates(&self, context: &VendorDoctorContext<'_>) -> VendorUpdateStatus {
+        if let Some(disable) = context.var(AUTO_UPDATE_DISABLED.0) {
+            let Some(disable) = disable.to_str() else {
+                return VendorUpdateStatus::Unknown("unrecognised value");
+            };
+            // The vendor treats these values as unset, case-insensitively.
+            if !["", "0", "false", "off", "no"]
+                .iter()
+                .any(|falsy| disable.eq_ignore_ascii_case(falsy))
+            {
+                return VendorUpdateStatus::Disabled;
+            }
+        }
+        // These opt-in overlays can supersede the user file. Don't read inline config
+        // from the environment or assume the base setting would still be effective.
+        for (key, reason) in [
+            ("GROK_CONFIG", "GROK_CONFIG overlay"),
+            ("GROK_CONFIG_PATH", "GROK_CONFIG_PATH overlay"),
+        ] {
+            if context.var(key).is_some_and(|value| !value.is_empty()) {
+                return VendorUpdateStatus::Unknown(reason);
+            }
+        }
+        let Some(home) = context.config_home("GROK_HOME", ".grok") else {
+            return VendorUpdateStatus::Unknown("config directory unavailable");
+        };
+        configured_updates(
+            &home.join("config.toml"),
+            &CONFIG_TOML,
+            |source| toml::from_str::<GrokConfig>(source).ok(),
+            |config| config.cli.auto_update.unwrap_or(true),
+        )
     }
 
     fn version_from_executable(&self, executable: &Path) -> Option<String> {

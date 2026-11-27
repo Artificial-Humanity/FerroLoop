@@ -251,20 +251,11 @@ fn host_store_paths(db: Option<&Path>, bound_cwd: Option<&Path>) -> Vec<PathBuf>
             let default = crate::default_state_store_path().ok();
             let config_path = crate::config::path();
             match crate::config::load(config_path.as_deref()) {
-                Ok(cfg) => {
-                    let mut paths: Vec<_> = super::hub::configured_hub_store_path(&cfg, bound_cwd)
-                        .into_iter()
-                        .collect();
-                    // Direct `fl agent` launches use the workspace default even inside a
-                    // bound project. Hub launches can use either store.
-                    if let Some(workspace) =
-                        default.as_deref().map(|p| cfg.workspace_state_store(p))
-                        && !paths.contains(&workspace)
-                    {
-                        paths.push(workspace);
-                    }
-                    paths
-                }
+                Ok(cfg) => super::hub::hosted_version_store_paths(
+                    Some(&cfg),
+                    bound_cwd,
+                    default.as_deref(),
+                ),
                 Err(error) => {
                     eprintln!(
                         "warning: failed to load {}: {error:#}; using default store",

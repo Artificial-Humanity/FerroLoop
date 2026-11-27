@@ -42,7 +42,8 @@ File naming in this directory follows
   observational `GET /api/v1/gate/vault-consumers` (configuration facts only), and where the
   protection ends.
 * [doctor.md](doctor.md) — `fl doctor` and the Hub's `GET /api/v1/doctor`: the seven observational
-  `G7.*` checks, their statuses, the exit codes, the JSON contract, and what doctor never does.
+  `G7.*` checks, passive vendor version drift and update policy, check statuses, exit codes,
+  and the JSON contract.
 * [browse.md](browse.md) — `fl browse`: a token-efficient accessibility snapshot of a web page
   (`snapshot`), a UI and accessibility gate that `fl gate` can run (`check`), and the two
   tiers behind them (`doctor`): the built-in HTML distiller and an optional headless browser

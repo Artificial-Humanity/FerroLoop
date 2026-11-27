@@ -1,12 +1,18 @@
 //! `fl doctor` (#205 phase A3), driven as a black box. It only observes: these tests check the
-//! report (the seven ids, the statuses, the JSON contract), the exit codes (0 no failure, 1 a
+//! report (check IDs, statuses, the JSON contract), the exit codes (0 no failure, 1 a
 //! failure, 3 a refused repair) and, above all, that NOTHING was written, anywhere.
 
 use assert_cmd::Command;
+use fl_core::at::At;
+use fl_core::doctor::ids::{VENDOR_UPDATE_POLICY, VENDOR_VERSION_DRIFT};
 use fl_core::install::{
     InstallReceipt, OwnedAlias, OwnedPath, OwnedPathKind, OwnedUnit, Product, Profile,
     RECEIPT_SCHEMA_VERSION, ReceiptLayout, ReceiptRelease, ReleaseKind,
 };
+use fl_core::state::{
+    MergeMode, RuntimeEntry, SensitivityPatch, StatePayload, StateScope, UpsertStateArgs,
+};
+use fl_core::store::StateStore;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -82,6 +88,11 @@ impl World {
         c.env_clear()
             .env("HOME", self.home.path())
             .env("FL_INSTALL_ROOT", self.root.path())
+            .env("PATH", self.home.path().join(".local/bin"))
+            .env(
+                "DOCTOR_PROBE_SENTINEL",
+                self.home.path().join("vendor-executed"),
+            )
             .current_dir(self.cwd.path());
         c
     }
@@ -104,9 +115,12 @@ impl World {
 
     /// Run `fl doctor --json` plus `args`: the exit code and the parsed report.
     fn doctor(&self, args: &[&str]) -> (i32, Value) {
+        self.doctor_with(self.fl(), args)
+    }
+
+    fn doctor_with(&self, mut command: Command, args: &[&str]) -> (i32, Value) {
         let before = self.trees();
-        let out = self
-            .fl()
+        let out = command
             .arg("doctor")
             .arg("--json")
             .args(args)
@@ -117,6 +131,18 @@ impl World {
         let v: Value = serde_json::from_slice(&out.stdout)
             .unwrap_or_else(|e| panic!("not JSON ({e}): {}", String::from_utf8_lossy(&out.stdout)));
         (code, v)
+    }
+
+    fn fake_vendor(&self, relative: &str) -> PathBuf {
+        let path = self.home.path().join(relative);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            b"#!/bin/sh\nprintf executed > \"$DOCTOR_PROBE_SENTINEL\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        path
     }
 
     /// A real install under the isolated root, and the receipt that owns it.
@@ -288,7 +314,14 @@ fn an_empty_home_is_unmanaged_not_healthy_and_nothing_is_written() {
         .iter()
         .map(|c| c["id"].as_str().unwrap())
         .collect();
-    assert_eq!(ids, IDS);
+    assert_eq!(
+        ids,
+        [
+            IDS.as_slice(),
+            &[VENDOR_VERSION_DRIFT, VENDOR_UPDATE_POLICY]
+        ]
+        .concat()
+    );
     for id in &IDS[1..] {
         assert_eq!(status(&v, id), "not-installed", "{id}: {}", detail(&v, id));
     }
@@ -569,11 +602,433 @@ fn the_human_report_lists_every_check_and_the_overall() {
     let out = w.fl().arg("doctor").output().unwrap();
     assert_eq!(out.status.code(), Some(0));
     let text = String::from_utf8(out.stdout).unwrap();
-    for id in IDS {
+    for id in IDS
+        .into_iter()
+        .chain([VENDOR_VERSION_DRIFT, VENDOR_UPDATE_POLICY])
+    {
         assert!(text.contains(id), "{id} missing: {text}");
     }
     assert!(text.contains("overall:"), "{text}");
     assert!(text.contains("nothing was changed"), "{text}");
+}
+
+const FIRST_VENDOR_LAUNCH: u128 = 0x0193_6a64_ae00_7000_8000_0000_0000_0001;
+
+/// Seed the host-local writer's persisted baseline shape without starting a hosted session.
+fn seed_vendor_baseline(
+    store: &impl StateStore,
+    vendor: &str,
+    cli: Option<&str>,
+    daemon: Option<&str>,
+) {
+    seed_vendor_baseline_with_launches(
+        store,
+        vendor,
+        cli.map(|version| (version, FIRST_VENDOR_LAUNCH)),
+        daemon.map(|version| (version, FIRST_VENDOR_LAUNCH)),
+    );
+}
+
+fn seed_vendor_baseline_with_launches(
+    store: &impl StateStore,
+    vendor: &str,
+    cli: Option<(&str, u128)>,
+    daemon: Option<(&str, u128)>,
+) {
+    let identity = std::fs::read_to_string("/etc/machine-id")
+        .ok()
+        .filter(|id| !id.trim().is_empty())
+        .or_else(|| std::fs::read_to_string("/etc/hostname").ok())
+        .unwrap_or_else(|| "workspace-local".into());
+    let host = sha(identity.trim().as_bytes());
+    let digest = sha(format!("{}/{vendor}", &host[..40]).as_bytes());
+    let known = |(version, launch): (&str, u128)| json!({ "version": version, "launch": uuid::Uuid::from_u128(launch) });
+    store
+        .upsert_state(UpsertStateArgs {
+            scope: StateScope::Workspace,
+            slug: format!("hosted-vendor-baseline-{}", &digest[..40]),
+            sensitivity: SensitivityPatch::SetSensitive,
+            payload: StatePayload::Runtime(RuntimeEntry {
+                value: json!({
+                    "cli": cli.map(known),
+                    "daemon": daemon.map(known),
+                    "last_applied": null,
+                }),
+                merge_mode: MergeMode::LastWriter,
+            }),
+            at: At::from_unix_millis(1),
+            by: "test".into(),
+        })
+        .unwrap();
+}
+
+#[test]
+fn vendor_checks_use_passive_facts_and_the_selected_hub_history() {
+    let w = World::new();
+    let muse = w.fake_vendor(".local/bin/muse-bin-1.4.25-R1");
+    std::os::unix::fs::symlink(&muse, muse.with_file_name("muse")).unwrap();
+    let project_store = w.cwd.path().join("project.fls");
+    let workspace_store = w.home.path().join("workspace.fls");
+    let config = w.home.path().join(".config/fl/config.toml");
+    std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+    let project = format!(
+        "[[project]]\nroot = {:?}\nstore = {:?}\n",
+        w.cwd.path(),
+        project_store
+    );
+    std::fs::write(&config, &project).unwrap();
+    let store = fl_store::FerroStore::open(&project_store).unwrap();
+    seed_vendor_baseline(&store, "muse", Some("1.4.25-R1"), None);
+    drop(store);
+
+    let (code, report) = w.doctor(&[]);
+    assert_eq!(code, 0);
+    assert_eq!(status(&report, VENDOR_VERSION_DRIFT), "pass");
+    assert_eq!(status(&report, VENDOR_UPDATE_POLICY), "warn");
+    assert!(
+        detail(&report, VENDOR_VERSION_DRIFT)
+            .contains("muse CLI: installed 1.4.25-R1, last hosted 1.4.25-R1")
+    );
+    assert!(
+        detail(&report, VENDOR_UPDATE_POLICY)
+            .contains("muse CLI: configured enabled, hosted launch disabled")
+    );
+
+    let store = fl_store::FerroStore::open(&workspace_store).unwrap();
+    seed_vendor_baseline(&store, "muse", Some("1.4.24-R1"), None);
+    seed_vendor_baseline(&store, "antigravity", Some("0.10.0"), None);
+    drop(store);
+    std::fs::write(
+        &config,
+        format!("[state]\nstore = {workspace_store:?}\n{project}"),
+    )
+    .unwrap();
+    w.fake_vendor(".local/bin/agy");
+    let (code, report) = w.doctor(&[]);
+    assert_eq!(code, 0);
+    assert_eq!(status(&report, VENDOR_VERSION_DRIFT), "warn");
+    let versions = detail(&report, VENDOR_VERSION_DRIFT);
+    assert!(versions.contains("muse CLI: installed 1.4.25-R1, last hosted 1.4.24-R1 (changed)"));
+    assert!(versions.contains("antigravity CLI: installed unknown, last hosted 0.10.0"));
+    assert!(versions.contains("grok CLI: installed absent, last hosted unknown"));
+
+    let mut command = w.fl();
+    command
+        .env("FL_DB", &project_store)
+        .env("AGY_CLI_DISABLE_AUTO_UPDATE", "true")
+        .env("MUSE_NO_AUTO_UPDATE", "1");
+    let (_, report) = w.doctor_with(command, &[]);
+    assert_eq!(status(&report, VENDOR_VERSION_DRIFT), "unsupported");
+    assert_eq!(status(&report, VENDOR_UPDATE_POLICY), "pass");
+    assert!(
+        detail(&report, VENDOR_UPDATE_POLICY)
+            .contains("muse CLI: configured disabled, hosted launch disabled")
+    );
+
+    let missing_store = w.cwd.path().join("missing.fls");
+    let mut command = w.fl();
+    command.env("FL_DB", &workspace_store);
+    let (_, report) = w.doctor_with(command, &["--db", missing_store.to_str().unwrap()]);
+    assert_eq!(status(&report, VENDOR_VERSION_DRIFT), "unsupported");
+    assert!(
+        detail(&report, VENDOR_VERSION_DRIFT)
+            .contains("muse CLI: installed 1.4.25-R1, last hosted unknown")
+    );
+    assert!(!w.home.path().join("vendor-executed").exists());
+}
+
+#[test]
+fn vendor_history_uses_the_latest_component_across_both_default_stores() {
+    let w = World::new();
+    let cli = w.fake_vendor(
+        ".codex/packages/standalone/releases/0.171.0-x86_64-unknown-linux-gnu/bin/codex",
+    );
+    let cli_link = w.home.path().join(".local/bin/codex");
+    std::fs::create_dir_all(cli_link.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(&cli, cli_link).unwrap();
+    let daemon = w.fake_vendor(
+        ".codex/packages/app-server-daemon/releases/0.172.0-x86_64-unknown-linux-gnu/bin/codex",
+    );
+    let release = daemon.parent().unwrap().parent().unwrap();
+    let package = release.parent().unwrap().parent().unwrap();
+    std::os::unix::fs::symlink(release, package.join("current")).unwrap();
+
+    let project = w.cwd.path().join("project.fls");
+    let workspace = w.home.path().join(".local/share/fl/fl.fls");
+    let config = w.home.path().join(".config/fl/config.toml");
+    std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+    std::fs::write(
+        &config,
+        format!(
+            "[[project]]\nroot = {:?}\nstore = {project:?}\n",
+            w.cwd.path()
+        ),
+    )
+    .unwrap();
+    std::fs::create_dir_all(workspace.parent().unwrap()).unwrap();
+    let launch = |order: u128| FIRST_VENDOR_LAUNCH + order - 1;
+    for (path, cli, daemon) in [
+        (&project, ("0.170.0", launch(2)), ("0.172.0", launch(3))),
+        (&workspace, ("0.171.0", launch(4)), ("0.169.0", launch(1))),
+    ] {
+        let store = fl_store::FerroStore::open(path).unwrap();
+        seed_vendor_baseline_with_launches(&store, "codex", Some(cli), Some(daemon));
+    }
+
+    let (_, report) = w.doctor(&[]);
+    assert_eq!(status(&report, VENDOR_VERSION_DRIFT), "pass");
+    let versions = detail(&report, VENDOR_VERSION_DRIFT);
+    assert!(versions.contains("codex CLI: installed 0.171.0, last hosted 0.171.0 |"));
+    assert!(versions.contains("codex daemon: installed 0.172.0, last hosted 0.172.0 |"));
+
+    let mut command = w.fl();
+    command.env("FL_DB", &workspace);
+    let (_, report) = w.doctor_with(command, &[]);
+    let versions = detail(&report, VENDOR_VERSION_DRIFT);
+    assert!(versions.contains("codex CLI: installed 0.171.0, last hosted 0.171.0 |"));
+    assert!(versions.contains("codex daemon: installed 0.172.0, last hosted 0.169.0 (changed)"));
+
+    let mut command = w.fl();
+    command.env("FL_DB", &workspace);
+    let (_, report) = w.doctor_with(command, &["--db", project.to_str().unwrap()]);
+    let versions = detail(&report, VENDOR_VERSION_DRIFT);
+    assert!(versions.contains("codex CLI: installed 0.171.0, last hosted 0.170.0 (changed)"));
+    assert!(versions.contains("codex daemon: installed 0.172.0, last hosted 0.172.0 |"));
+
+    for invalid in [
+        ("invalid", launch(5)),
+        ("0.169.0", 0xf193_6a64_ae00_4000_8000_0000_0000_0005),
+        ("0.169.0", 0xf193_6a64_ae00_7000_f000_0000_0000_0005),
+    ] {
+        let store = fl_store::FerroStore::open(&workspace).unwrap();
+        seed_vendor_baseline_with_launches(
+            &store,
+            "codex",
+            Some(("0.171.0", launch(4))),
+            Some(invalid),
+        );
+        drop(store);
+        let (_, report) = w.doctor(&[]);
+        assert_eq!(status(&report, VENDOR_VERSION_DRIFT), "pass");
+        assert!(
+            detail(&report, VENDOR_VERSION_DRIFT)
+                .contains("codex daemon: installed 0.172.0, last hosted 0.172.0 |")
+        );
+    }
+    assert!(!w.home.path().join("vendor-executed").exists());
+}
+
+#[test]
+fn a_writer_locked_vendor_history_is_unknown_and_observational() {
+    let w = World::new();
+    let muse = w.fake_vendor(".local/bin/muse-bin-1.4.25-R1");
+    std::os::unix::fs::symlink(&muse, muse.with_file_name("muse")).unwrap();
+    let store_path = w.cwd.path().join("host.redb");
+    let writer = fl_store::RedbStore::open(&store_path).unwrap();
+    seed_vendor_baseline(&writer, "muse", Some("1.4.24-R1"), None);
+    let (code, report) = w.doctor(&["--db", store_path.to_str().unwrap()]);
+    assert_eq!(code, 0);
+    assert_eq!(status(&report, VENDOR_VERSION_DRIFT), "unsupported");
+    assert!(
+        detail(&report, VENDOR_VERSION_DRIFT)
+            .contains("muse CLI: installed 1.4.25-R1, last hosted unknown")
+    );
+    assert!(!w.cwd.path().join("host.fls").exists());
+}
+
+#[test]
+fn codex_client_and_shared_daemon_have_independent_versions_and_update_settings() {
+    use std::os::unix::net::UnixListener;
+
+    let w = World::new();
+    let cli = w.fake_vendor(
+        ".codex/packages/standalone/releases/0.171.0-x86_64-unknown-linux-gnu/bin/codex",
+    );
+    let cli_link = w.home.path().join(".local/bin/codex");
+    std::fs::create_dir_all(cli_link.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(&cli, &cli_link).unwrap();
+    let daemon = w.fake_vendor(
+        ".codex/packages/app-server-daemon/releases/0.172.0-x86_64-unknown-linux-gnu/bin/codex",
+    );
+    let release = daemon.parent().unwrap().parent().unwrap();
+    let package = release.parent().unwrap().parent().unwrap();
+    std::os::unix::fs::symlink(release, package.join("current")).unwrap();
+    let config = w.home.path().join(".codex");
+    std::fs::write(
+        config.join("config.toml"),
+        "check_for_update_on_startup = false",
+    )
+    .unwrap();
+    let daemon_config = config.join("app-server-daemon");
+    std::fs::create_dir_all(&daemon_config).unwrap();
+    std::fs::write(
+        daemon_config.join("settings.json"),
+        r#"{"updater":{"autoUpdateEnabled":true,"updateIntervalMinutes":15}}"#,
+    )
+    .unwrap();
+    let socket = config.join("app-server-control/app-server-control.sock");
+    std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+    let listener = UnixListener::bind(socket).unwrap();
+    listener.set_nonblocking(true).unwrap();
+
+    let store_path = w.cwd.path().join("host.fls");
+    let store = fl_store::FerroStore::open(&store_path).unwrap();
+    seed_vendor_baseline(&store, "codex", Some("0.171.0"), Some("0.170.0"));
+    drop(store);
+    let (code, report) = w.doctor(&["--db", store_path.to_str().unwrap()]);
+    assert_eq!(code, 0);
+    assert_eq!(status(&report, VENDOR_VERSION_DRIFT), "warn");
+    assert_eq!(status(&report, VENDOR_UPDATE_POLICY), "warn");
+    let versions = detail(&report, VENDOR_VERSION_DRIFT);
+    assert!(versions.contains("codex CLI: installed 0.171.0, last hosted 0.171.0 |"));
+    assert!(versions.contains("codex daemon: installed 0.172.0, last hosted 0.170.0 (changed)"));
+    let policies = detail(&report, VENDOR_UPDATE_POLICY);
+    assert!(policies.contains("codex CLI: configured disabled, hosted launch disabled"));
+    assert!(policies.contains("codex daemon: configured enabled (shared daemon)"));
+
+    // An invalid daemon file is unknown with a short reason, never its contents.
+    let settings = daemon_config.join("settings.json");
+    let valid = std::fs::read(&settings).unwrap();
+    std::fs::write(
+        &settings,
+        r#"{"updater":{"autoUpdateEnabled":false,"updateIntervalMinutes":0},"x":"private-marker"}"#,
+    )
+    .unwrap();
+    let (code, report) = w.doctor(&["--db", store_path.to_str().unwrap()]);
+    assert_eq!(code, 0);
+    let policies = detail(&report, VENDOR_UPDATE_POLICY);
+    assert!(
+        policies.contains(
+            "codex daemon: configured unknown (shared daemon; settings.json failed validation)"
+        ),
+        "{policies}"
+    );
+    assert!(!policies.contains("private-marker"));
+    std::fs::write(
+        config.join("config.toml"),
+        "check_for_update_on_startup = 0",
+    )
+    .unwrap();
+    let (_, report) = w.doctor(&["--db", store_path.to_str().unwrap()]);
+    assert!(detail(&report, VENDOR_UPDATE_POLICY).contains(
+        "codex CLI: configured unknown (config.toml failed validation), hosted launch disabled"
+    ));
+    std::fs::write(&settings, valid).unwrap();
+    std::fs::write(
+        config.join("config.toml"),
+        "check_for_update_on_startup = false",
+    )
+    .unwrap();
+
+    let oversized = format!("1.2.3-{}", "a".repeat(128));
+    for malformed in ["", "1.2.3\u{1b}[31m", oversized.as_str()] {
+        let store = fl_store::FerroStore::open(&store_path).unwrap();
+        seed_vendor_baseline(&store, "codex", Some(malformed), Some("0.172.0"));
+        drop(store);
+        let (_, report) = w.doctor(&["--db", store_path.to_str().unwrap()]);
+        assert_eq!(status(&report, VENDOR_VERSION_DRIFT), "unsupported");
+        let versions = detail(&report, VENDOR_VERSION_DRIFT);
+        assert!(versions.contains("codex CLI: installed 0.171.0, last hosted unknown |"));
+        assert!(versions.contains("codex daemon: installed 0.172.0, last hosted 0.172.0 |"));
+        assert!(!versions.contains("(changed)"));
+    }
+
+    assert_eq!(
+        listener.accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock,
+        "doctor contacted the Codex daemon"
+    );
+}
+
+#[test]
+fn hub_owner_doctor_uses_the_isolated_home_and_store() {
+    const ISOLATED_HOME: &str = "FL_TEST_DOCTOR_ISOLATED_HOME";
+    const OWNER: &str = "doctor-owner-test-token";
+
+    if let Some(home) = std::env::var_os(ISOLATED_HOME).map(PathBuf::from) {
+        fl_hub::lifecycle::set_global_vendor_version_adapters(
+            fl_vendor_adapters::default_vendor_version_registry(),
+        );
+        let hub = fl_hub::HubState::new(fl_hub::HubServerConfig {
+            home_override: Some(home.clone()),
+            store_path: home.join("host.fls"),
+            repo_root: home,
+            owner_token: Some(OWNER.into()),
+            ..Default::default()
+        });
+        let request = fl_hub::HttpRequest::new("GET", "/api/v1/doctor")
+            .with_header("Authorization", format!("Bearer {OWNER}"));
+        let response = fl_hub::handle_http_request(&hub, &request);
+        assert_eq!(response.status, 200);
+        let report = response.json_value().unwrap();
+        let versions = detail(&report, VENDOR_VERSION_DRIFT);
+        assert!(
+            versions.contains("codex CLI: installed 0.171.0, last hosted 0.171.0 |"),
+            "{versions}"
+        );
+        assert!(
+            versions.contains("codex daemon: installed 0.172.0, last hosted 0.170.0 (changed)"),
+            "{versions}"
+        );
+        assert!(
+            detail(&report, VENDOR_UPDATE_POLICY)
+                .contains("codex CLI: configured disabled, hosted launch disabled")
+        );
+        return;
+    }
+
+    let local = World::new();
+    let ambient = World::new();
+    for (world, version, checks_for_updates) in
+        [(&local, "0.171.0", false), (&ambient, "0.175.0", true)]
+    {
+        let exe = world.fake_vendor(&format!(
+            ".codex/packages/standalone/releases/{version}-x86_64-unknown-linux-gnu/bin/codex"
+        ));
+        let launch = world.home.path().join(".local/bin/codex");
+        std::fs::create_dir_all(launch.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(exe, launch).unwrap();
+        std::fs::write(
+            world.home.path().join(".codex/config.toml"),
+            format!("check_for_update_on_startup = {checks_for_updates}"),
+        )
+        .unwrap();
+    }
+    let daemon = local.fake_vendor(
+        ".codex/packages/app-server-daemon/releases/0.172.0-x86_64-unknown-linux-gnu/bin/codex",
+    );
+    let release = daemon.parent().unwrap().parent().unwrap();
+    let package = release.parent().unwrap().parent().unwrap();
+    std::os::unix::fs::symlink(release, package.join("current")).unwrap();
+    let store = fl_store::FerroStore::open(local.home.path().join("host.fls")).unwrap();
+    seed_vendor_baseline(&store, "codex", Some("0.171.0"), Some("0.170.0"));
+    drop(store);
+
+    let before = (local.trees(), ambient.trees());
+    let out = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "hub_owner_doctor_uses_the_isolated_home_and_store",
+        ])
+        .env_clear()
+        .env(ISOLATED_HOME, local.home.path())
+        .env("HOME", ambient.home.path())
+        .env("FL_INSTALL_ROOT", local.root.path())
+        .env("PATH", ambient.home.path().join(".local/bin"))
+        .env("CODEX_HOME", ambient.home.path().join(".codex"))
+        .env(
+            "DOCTOR_PROBE_SENTINEL",
+            ambient.home.path().join("vendor-executed"),
+        )
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!((local.trees(), ambient.trees()), before);
 }
 
 #[test]

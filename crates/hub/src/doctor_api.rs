@@ -3,7 +3,7 @@
 //! **Owner only.** The answer names filesystem paths and permissions, so a Peer gets a 403 and an
 //! unauthenticated caller a 401. The body is the [`fl_core::doctor::DoctorReport`]:
 //! `{ "schema_version", "overall", "summary", "checks": [ { "id", "title", "status", "detail" } ] }`
-//! with the seven `G7.*` checks in a fixed order and no timestamp.
+//! with the seven `G7.*` checks followed by passive vendor checks, and no timestamp.
 //!
 //! The hub reports on its own context: its build stamp (`fl-hub`), the install receipt under
 //! `$FL_INSTALL_ROOT` or the home directory, its configured store (verified read-only through
@@ -18,6 +18,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
+use fl_core::VendorDoctorContext;
 use fl_core::doctor::{StoreFact, StoreFacts};
 use fl_core::install::resolve_layout;
 use fl_install::{Observe, UiDir, observe};
@@ -47,10 +48,17 @@ pub(crate) fn report(state: &HubState) -> Result<Value, String> {
         notes: Vec::new(),
     };
     let home_override = state.config.home_override.as_deref();
+    // Match runtime discovery: an override Hub observes only its home's installation
+    // and settings, without the ambient PATH or vendor configuration overrides.
+    let path = if home_override.is_some() {
+        None
+    } else {
+        std::env::var_os("PATH")
+    };
     let report = observe(Observe {
         binary: crate::version_api::build_info(),
         binary_name: "fl-hub",
-        home,
+        home: home.clone(),
         layout,
         ui_dir: state
             .config
@@ -63,6 +71,23 @@ pub(crate) fn report(state: &HubState) -> Result<Value, String> {
         stores,
         budget: PATH_BUDGET,
     });
+    let report = crate::with_vendor_doctor_checks(
+        report,
+        crate::lifecycle::launch_versions::vendor_version_adapters(),
+        &VendorDoctorContext {
+            home: home.as_deref(),
+            path: path.as_deref(),
+            env: &|key| {
+                if home_override.is_some() {
+                    None
+                } else {
+                    std::env::var_os(key)
+                }
+            },
+        },
+        [store.as_path()],
+        state.store_backend,
+    );
     serde_json::to_value(&report).map_err(|e| e.to_string())
 }
 

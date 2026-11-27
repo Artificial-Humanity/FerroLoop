@@ -648,6 +648,7 @@ dependencies = [
  "socket2",
  "tempfile",
  "thiserror",
+ "toml",
 ]
 
 [[package]]

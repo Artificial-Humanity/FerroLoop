@@ -8,7 +8,7 @@ use fl_core::state::{
     HOSTED_VERSION_BASELINE_PREFIX, HOSTED_VERSION_GENERATION_PREFIX, HOSTED_VERSION_INDEX_PREFIX,
     HOSTED_VERSION_LAUNCH_PREFIX, HOSTED_VERSION_QUEUE_PREFIX,
 };
-use fl_core::vendor_adapter::VendorDaemonLaunchEvidence;
+use fl_core::vendor_adapter::{VendorDaemonLaunchEvidence, valid_release_version};
 use fl_core::{RevisionId, VendorVersionRegistry};
 use fl_host_proto::StreamId;
 use fl_store::{AnyStore, BackendKind, StoreOptions, Unmigrated, choose_backend, physical_path};
@@ -47,6 +47,10 @@ pub fn set_global_vendor_version_adapters(
     registry: VendorVersionRegistry,
 ) -> &'static VendorVersionRegistry {
     ADAPTERS.get_or_init(|| registry)
+}
+
+pub(crate) fn vendor_version_adapters() -> Option<&'static VendorVersionRegistry> {
+    ADAPTERS.get()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -157,6 +161,7 @@ impl ProcessIdentity {
             .env("PATH", "")
             .envs(probe.env.iter().copied())
             .current_dir(home.path());
+        command.arg("--version");
         let output = crate::runtime_matrix::run_version_command(command, timeout).ok()?;
         (probe.parse)(&output).map(str::to_owned)
     }
@@ -412,8 +417,8 @@ fn session_index_slug(session_id: &str) -> String {
     )
 }
 
-fn baseline_slug(receipt: &LaunchReceipt) -> String {
-    let key = format!("{}/{}", receipt.host, receipt.vendor);
+fn baseline_slug(host: &str, vendor: &str) -> String {
+    let key = format!("{host}/{vendor}");
     format!("{HOSTED_VERSION_BASELINE_PREFIX}{}", digest(key.as_bytes()))
 }
 
@@ -605,6 +610,63 @@ pub fn read_hosted_vendor_versions(
         .zip(streams)
         .map(|(entry, stream)| versions_for_stream(entry.and_then(decode), stream))
         .collect())
+}
+
+/// Read the most recent known hosted versions for vendors on this machine across the stores.
+/// A store that cannot be read, or an invalid or absent baseline, supplies no version.
+pub(crate) fn read_local_vendor_baselines<'a>(
+    paths: impl IntoIterator<Item = &'a Path>,
+    backend: Option<fl_store::BackendKind>,
+    vendors: impl IntoIterator<Item = &'static str>,
+) -> Vec<(Option<String>, Option<String>)> {
+    let keys: Vec<_> = vendors
+        .into_iter()
+        .map(|vendor| baseline_slug(local_host_key(), vendor))
+        .collect();
+    let mut baselines: Vec<[Option<KnownVersion>; 2]> = vec![[None, None]; keys.len()];
+    for path in paths {
+        let Ok(entries) = fl_store::health::read_state_keys(
+            path,
+            backend,
+            &StateScope::Workspace,
+            StateConcern::Runtime,
+            &keys,
+            0,
+        ) else {
+            continue;
+        };
+        for (entry, latest) in entries.into_iter().zip(&mut baselines) {
+            let Some(StatePayload::Runtime(runtime)) = entry.map(|entry| entry.payload) else {
+                continue;
+            };
+            let mut baseline = runtime.value;
+            for (component, current) in ["cli", "daemon"].into_iter().zip(latest) {
+                let candidate = baseline
+                    .get_mut(component)
+                    .and_then(|value| serde_json::from_value::<KnownVersion>(value.take()).ok());
+                if let Some(candidate) = candidate
+                    // Launch IDs are time-ordered UUIDv7. Other UUID versions cannot order history.
+                    && candidate.launch.get_version_num() == 7
+                    && candidate.launch.get_variant() == uuid::Variant::RFC4122
+                    && valid_release_version(&candidate.version).is_some()
+                    && current
+                        .as_ref()
+                        .is_none_or(|known| known.launch < candidate.launch)
+                {
+                    *current = Some(candidate);
+                }
+            }
+        }
+    }
+    baselines
+        .into_iter()
+        .map(|[cli, daemon]| {
+            (
+                cli.map(|known| known.version),
+                daemon.map(|known| known.version),
+            )
+        })
+        .collect()
 }
 
 fn versions_for_stream(
@@ -840,7 +902,7 @@ fn compare_versions<S: StateStore>(
     receipt: &LaunchReceipt,
     versions: HostedVendorVersions,
 ) -> Result<HostedVendorVersions, LifecycleError> {
-    let slug = baseline_slug(receipt);
+    let slug = baseline_slug(&receipt.host, &receipt.vendor);
     for _ in 0..STATE_UPDATE_ATTEMPTS {
         let (mut baseline, revision): (VendorBaseline, _) = load_revision(store, &slug)?;
         let compared = baseline.apply(receipt.id, versions.clone());
@@ -1524,8 +1586,9 @@ mod tests {
         assert_eq!(versions[0].changes[0].previous, "1.0.0");
         assert!(versions[1].changes.is_empty());
         assert!(versions[2].changes.is_empty());
+        let latest = receipt(4);
         let (baseline, _): (VendorBaseline, _) =
-            load_revision(&writer, &baseline_slug(&receipt(4))).unwrap();
+            load_revision(&writer, &baseline_slug(&latest.host, &latest.vendor)).unwrap();
         assert_eq!(baseline.cli.unwrap().launch, launch(4));
     }
 
@@ -1553,7 +1616,7 @@ mod tests {
         let first = receipt(1);
         let second = receipt(2);
         seed(&store, &second);
-        let baseline_slug = baseline_slug(&second);
+        let baseline_slug = baseline_slug(&second.host, &second.vendor);
         let mut baseline = VendorBaseline::default();
         baseline.apply(first.id, sample(Some("1.0.0"), None));
         let expected = baseline.apply(second.id, sample(Some("2.0.0"), None));
@@ -1662,7 +1725,7 @@ mod tests {
             Some(observed.versions)
         );
         let (baseline, _): (VendorBaseline, _) =
-            load_revision(&store, &baseline_slug(&latest)).unwrap();
+            load_revision(&store, &baseline_slug(&latest.host, &latest.vendor)).unwrap();
         assert_eq!(baseline.cli.unwrap().launch, latest.id);
 
         // An older launch that settles late removes its own keys again.
@@ -1676,6 +1739,68 @@ mod tests {
             hosted_vendor_versions_for_stream(&store, other.stream.as_ref().unwrap())
                 .unwrap()
                 .is_some()
+        );
+    }
+
+    #[test]
+    fn doctor_history_survives_receipt_pruning_and_decommission() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("workspace.fls");
+        let store = fl_store::FerroStore::open(&path).unwrap();
+        // Production launch IDs are time-ordered UUIDv7. Doctor orders history by them.
+        let v7 = |index: u8| {
+            uuid::Builder::from_unix_timestamp_millis(
+                1_700_000_000_000 + u64::from(index),
+                &[0; 10],
+            )
+            .into_uuid()
+        };
+        let mut first = None;
+        for index in 1..=10 {
+            let mut launch = receipt(index);
+            launch.id = v7(index);
+            // Launch 9 updates the CLI. Launch 10 cannot identify the CLI at all.
+            let cli = match index {
+                ..=8 => Some("1.0.0"),
+                9 => Some("1.1.0"),
+                _ => None,
+            };
+            seed(&store, &launch);
+            commit(&store, launch.clone(), sample(cli, Some("2.0.0")), true)
+                .unwrap()
+                .unwrap();
+            assert_eq!(receipt_keys(&store, "codex:ada").len(), 2, "launch {index}");
+            first.get_or_insert(launch);
+        }
+        // Launch 9's receipt is gone; the newest receipt records an unknown CLI.
+        let first = first.unwrap();
+        let newest: Vec<LaunchReceipt> = receipt_keys(&store, "codex:ada")
+            .iter()
+            .map(|slug| read(&store, slug).unwrap().unwrap())
+            .collect();
+        assert!(newest.iter().all(|receipt| receipt.id == v7(10)));
+        assert!(
+            newest
+                .iter()
+                .all(|receipt| receipt.versions.as_ref().unwrap().cli.is_none())
+        );
+        assert!(
+            hosted_vendor_versions_for_stream(&store, first.stream.as_ref().unwrap())
+                .unwrap()
+                .is_none()
+        );
+        // Doctor still selects the newest valid version per component from the baseline.
+        let expected = vec![(Some("1.1.0".to_owned()), Some("2.0.0".to_owned()))];
+        assert_eq!(
+            read_local_vendor_baselines([path.as_path()], None, ["codex"]),
+            expected
+        );
+
+        delete_hosted_respawn_state(&store, "codex:ada").unwrap();
+        assert!(receipt_keys(&store, "codex:ada").is_empty());
+        assert_eq!(
+            read_local_vendor_baselines([path.as_path()], None, ["codex"]),
+            expected
         );
     }
 
@@ -1715,7 +1840,7 @@ mod tests {
         assert!(receipt_keys(&store, "codex:ada").is_empty());
         // The host baseline still carries the last known version for drift detection.
         let (baseline, _): (VendorBaseline, _) =
-            load_revision(&store, &baseline_slug(&saved)).unwrap();
+            load_revision(&store, &baseline_slug(&saved.host, &saved.vendor)).unwrap();
         assert_eq!(baseline.cli.unwrap().version, "1.0.0");
     }
 

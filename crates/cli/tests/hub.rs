@@ -802,31 +802,34 @@ impl TestEnv {
 
     /// Start `fl hub serve` in `cwd` on an ephemeral port; returns the guard and the base URL.
     fn serve_in(&self, cwd: &Path, extra_args: &[&str]) -> (RunningHubGuard, String) {
-        let mut cmd = self.fl_in(cwd);
-        cmd.args(["hub", "serve", "--listen", "127.0.0.1:0"])
-            .args(extra_args)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null());
-        let mut child = cmd.spawn().unwrap();
-        let mut reader = BufReader::new(child.stdout.take().unwrap());
-        // The guard kills the child if the banner never comes.
-        let guard = RunningHubGuard { child };
-        let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let mut line = String::new();
-            let _ = reader.read_line(&mut line);
-            let _ = tx.send(line);
-        });
-        let line = rx
-            .recv_timeout(Duration::from_secs(120))
-            .expect("no readiness banner from `fl hub serve` within 120s");
-        let base = line
-            .trim()
-            .strip_prefix("ferroloop-hub listening on ")
-            .unwrap_or_else(|| panic!("no readiness banner from `fl hub serve`: {line:?}"))
-            .to_string();
-        (guard, base)
+        serve_test_hub(self.fl_in(cwd), extra_args)
     }
+}
+
+fn serve_test_hub(mut cmd: Command, extra_args: &[&str]) -> (RunningHubGuard, String) {
+    cmd.args(["hub", "serve", "--listen", "127.0.0.1:0"])
+        .args(extra_args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let mut child = cmd.spawn().unwrap();
+    let mut reader = BufReader::new(child.stdout.take().unwrap());
+    // The guard kills the child if the banner never comes.
+    let guard = RunningHubGuard { child };
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut line = String::new();
+        let _ = reader.read_line(&mut line);
+        let _ = tx.send(line);
+    });
+    let line = rx
+        .recv_timeout(Duration::from_secs(120))
+        .expect("no readiness banner from `fl hub serve` within 120s");
+    let base = line
+        .trim()
+        .strip_prefix("ferroloop-hub listening on ")
+        .unwrap_or_else(|| panic!("no readiness banner from `fl hub serve`: {line:?}"))
+        .to_string();
+    (guard, base)
 }
 
 fn hub_get(base: &str, path: &str) -> Value {
@@ -842,6 +845,75 @@ fn hub_get(base: &str, path: &str) -> Value {
         .unwrap();
     assert_eq!(resp.status().as_u16(), 200, "GET {path}");
     resp.body_mut().read_json().unwrap()
+}
+
+#[cfg(unix)]
+#[test]
+fn runtime_account_probes_suppress_updates_in_their_vendor_launchers() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let env = TestEnv::new();
+    env.write_repo_root_config("");
+    let fixtures = [
+        (
+            "muse",
+            "FL_HUB_MUSE_BIN",
+            "MUSE_NO_AUTO_UPDATE",
+            "usage --json",
+            r#"{"allowance":{"tier":"fixture-muse"}}"#,
+        ),
+        (
+            "claude",
+            "FL_HUB_CLAUDE_BIN",
+            "DISABLE_AUTOUPDATER",
+            "auth status --json",
+            r#"{"subscriptionType":"fixture-claude"}"#,
+        ),
+    ];
+    let mut cmd = env.fl();
+    cmd.env_clear()
+        .env("HOME", &env.root)
+        .env("XDG_CONFIG_HOME", &env.cfg_dir)
+        .env("XDG_DATA_HOME", &env.data_dir)
+        .env("XDG_RUNTIME_DIR", &env.root)
+        .env("PATH", env.root.join("empty-path"))
+        .env("FL_WIRE_DISABLE_HOST_DISCOVERY", "1");
+    for (vendor, binary_var, update_var, args, output) in fixtures {
+        let script = env.root.join(format!("account-{vendor}"));
+        fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\n[ \"$*\" = '{args}' ] || exit 2\n\
+                 [ \"${{{update_var}:-}}\" = 1 ] || : > \"$HOME/{vendor}-updated\"\n\
+                 printf '%s\\n' '{output}'\n"
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
+        cmd.env(binary_var, script).env(update_var, "0");
+    }
+
+    let (_guard, base) = serve_test_hub(cmd, &[]);
+    let http: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_global(Some(Duration::from_secs(10)))
+        .build()
+        .into();
+    for vendor in ["muse", "claude"] {
+        let report: Value = http
+            .post(&format!("{base}/api/v1/runtimes/probe"))
+            .header("Authorization", &format!("Bearer {REPO_ROOT_OWNER_TOKEN}"))
+            .send_json(json!({ "target": vendor }))
+            .unwrap()
+            .body_mut()
+            .read_json()
+            .unwrap();
+        assert_eq!(
+            report["vendor_quotas"][vendor]["tier"].as_str(),
+            Some(format!("fixture-{vendor}").as_str()),
+            "{report}"
+        );
+        assert!(!env.root.join(format!("{vendor}-updated")).exists());
+    }
 }
 
 /// The canonical paths `/api/v1/worktrees` lists.

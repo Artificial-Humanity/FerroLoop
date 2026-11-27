@@ -6,6 +6,7 @@
 mod antigravity;
 pub mod claude;
 pub mod codex;
+mod doctor;
 mod grok;
 mod muse;
 
@@ -14,6 +15,7 @@ pub use codex::CodexHostAdapter;
 
 use std::sync::Arc;
 
+use fl_core::vendor_adapter::valid_release_version;
 use fl_core::{VendorHostAdapterRegistry, VendorVersionRegistry};
 
 /// Build a [`VendorHostAdapterRegistry`] pre-populated with all concrete vendor host adapters
@@ -41,12 +43,6 @@ pub fn default_vendor_version_registry() -> VendorVersionRegistry {
     registry
 }
 
-fn valid_release_version(version: &str) -> Option<&str> {
-    const MAX_VERSION_BYTES: usize = 128;
-    (version.len() <= MAX_VERSION_BYTES && semver::Version::parse(version).is_ok())
-        .then_some(version)
-}
-
 #[cfg(test)]
 mod version_evidence_tests {
     use super::default_vendor_version_registry;
@@ -63,6 +59,64 @@ mod version_evidence_tests {
             fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
         }
         path
+    }
+
+    #[test]
+    fn startup_update_policy_overrides_existing_values_and_is_idempotent() {
+        let registry = default_vendor_version_registry();
+        for (binary, key, value) in [
+            ("claude", "DISABLE_AUTOUPDATER", "1"),
+            ("agy", "AGY_CLI_DISABLE_AUTO_UPDATE", "true"),
+            ("grok", "GROK_DISABLE_AUTOUPDATER", "1"),
+            ("muse", "MUSE_NO_AUTO_UPDATE", "1"),
+        ] {
+            let adapter = registry.lookup_by_binary_name(binary).unwrap();
+            let mut argv = vec![binary.into(), "--version".into()];
+            let mut env = vec![
+                (key.into(), "0".into()),
+                ("TERM".into(), "xterm".into()),
+                (key.into(), "false".into()),
+            ];
+            for _ in 0..2 {
+                adapter.apply_cli_update_policy(&mut argv, &mut env);
+            }
+            assert_eq!(argv, [binary, "--version"]);
+            assert_eq!(
+                env,
+                [("TERM".into(), "xterm".into()), (key.into(), value.into())]
+            );
+        }
+        let adapter = registry.lookup("codex").unwrap();
+        let mut argv = [
+            "/some/install/codex",
+            "--config",
+            "check_for_update_on_startup=true",
+            "-c",
+            "model_reasoning_effort=high",
+            "--config=check_for_update_on_startup=true",
+            "-ccheck_for_update_on_startup = true",
+            "--",
+            "--config=check_for_update_on_startup=true",
+        ]
+        .map(str::to_owned)
+        .to_vec();
+        let mut env = Vec::new();
+        for _ in 0..2 {
+            adapter.apply_cli_update_policy(&mut argv, &mut env);
+        }
+        assert_eq!(
+            argv,
+            [
+                "/some/install/codex",
+                "-c",
+                "check_for_update_on_startup=false",
+                "-c",
+                "model_reasoning_effort=high",
+                "--",
+                "--config=check_for_update_on_startup=true",
+            ]
+        );
+        assert!(env.is_empty());
     }
 
     #[test]
