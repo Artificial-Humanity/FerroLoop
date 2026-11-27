@@ -1743,6 +1743,68 @@ mod tests {
     }
 
     #[test]
+    fn doctor_history_survives_receipt_pruning_and_decommission() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("workspace.fls");
+        let store = fl_store::FerroStore::open(&path).unwrap();
+        // Production launch IDs are time-ordered UUIDv7. Doctor orders history by them.
+        let v7 = |index: u8| {
+            uuid::Builder::from_unix_timestamp_millis(
+                1_700_000_000_000 + u64::from(index),
+                &[0; 10],
+            )
+            .into_uuid()
+        };
+        let mut first = None;
+        for index in 1..=10 {
+            let mut launch = receipt(index);
+            launch.id = v7(index);
+            // Launch 9 updates the CLI. Launch 10 cannot identify the CLI at all.
+            let cli = match index {
+                ..=8 => Some("1.0.0"),
+                9 => Some("1.1.0"),
+                _ => None,
+            };
+            seed(&store, &launch);
+            commit(&store, launch.clone(), sample(cli, Some("2.0.0")), true)
+                .unwrap()
+                .unwrap();
+            assert_eq!(receipt_keys(&store, "codex:ada").len(), 2, "launch {index}");
+            first.get_or_insert(launch);
+        }
+        // Launch 9's receipt is gone; the newest receipt records an unknown CLI.
+        let first = first.unwrap();
+        let newest: Vec<LaunchReceipt> = receipt_keys(&store, "codex:ada")
+            .iter()
+            .map(|slug| read(&store, slug).unwrap().unwrap())
+            .collect();
+        assert!(newest.iter().all(|receipt| receipt.id == v7(10)));
+        assert!(
+            newest
+                .iter()
+                .all(|receipt| receipt.versions.as_ref().unwrap().cli.is_none())
+        );
+        assert!(
+            hosted_vendor_versions_for_stream(&store, first.stream.as_ref().unwrap())
+                .unwrap()
+                .is_none()
+        );
+        // Doctor still selects the newest valid version per component from the baseline.
+        let expected = vec![(Some("1.1.0".to_owned()), Some("2.0.0".to_owned()))];
+        assert_eq!(
+            read_local_vendor_baselines([path.as_path()], None, ["codex"]),
+            expected
+        );
+
+        delete_hosted_respawn_state(&store, "codex:ada").unwrap();
+        assert!(receipt_keys(&store, "codex:ada").is_empty());
+        assert_eq!(
+            read_local_vendor_baselines([path.as_path()], None, ["codex"]),
+            expected
+        );
+    }
+
+    #[test]
     fn versions_decommission_forgets_session_receipts() {
         let store = MemStore::default();
         let saved = receipt(1);

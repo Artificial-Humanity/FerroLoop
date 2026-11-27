@@ -121,10 +121,12 @@ unit names in the directory are not read.
 **`vendor.version-drift`.** Compares passively identified installed versions with the most
 recent known hosted launch version for each vendor component on this machine. The Codex CLI
 and shared daemon have independent baselines. The installed daemon version comes from the
-selected package, and the hosted baseline records the daemon observed at launch. A known
-version difference is `warn`. An opaque installation or missing, unreadable, or writer-locked
-history is shown as `unknown`. Doctor reads selected files and package paths and makes no
-vendor CLI call or daemon connection.
+selected package, and the hosted baseline records the daemon observed at launch. The baseline
+is per host and vendor, so it is kept when the Hub deletes superseded launch receipts or
+decommissions a session. A launch that cannot identify a component does not replace that
+component's last known version. A known version difference is `warn`. An opaque installation
+or missing, unreadable, or writer-locked history is shown as `unknown`. Doctor reads selected
+files and package paths and makes no vendor CLI call or daemon connection.
 
 The CLI finds the latest valid observation for each component across the configured Hub store
 and the workspace store. The Hub store resolves to `[state].store` when configured, or to the
