@@ -571,7 +571,7 @@ pub(super) fn remember_launch<S: StateStore>(
             daemon_expected: receipt.daemon_expected,
             ..Default::default()
         };
-        if let Err(error) = save_versions(store, receipt, versions) {
+        if let Err(error) = save_live_versions(store, receipt, versions) {
             eprintln!("hub: error recording hosted launch version evidence: {error}");
         }
     }
@@ -772,6 +772,80 @@ fn save_versions<S: StateStore>(
     retire_superseded(store, &receipt)
 }
 
+/// Save observed versions, then delete them again if the session has been decommissioned.
+/// Returns whether the session is still live, so a caller can skip announcing the result.
+fn save_live_versions<S: StateStore>(
+    store: &S,
+    receipt: LaunchReceipt,
+    versions: HostedVendorVersions,
+) -> Result<bool, LifecycleError> {
+    let session_id = receipt.session_id.clone();
+    let launch = receipt.id;
+    save_versions(store, receipt, versions)?;
+    // Check after the write, not before. Decommission marks the record decommissioned
+    // before it forgets the session's receipts. So either its cleanup runs after this
+    // write and deletes it, or this read sees the decommissioned record. A check before
+    // the write would miss a decommission that lands between the check and the write.
+    Ok(!forget_if_decommissioned(store, &session_id, launch))
+}
+
+/// Forget a session's receipts up to `launch` when its hosted record is absent or
+/// decommissioned. Every launch is recorded after its running record is saved, and records
+/// are never deleted, so an absent record is not a session that is still starting. This
+/// cleanup is best-effort: a read error or a record this binary cannot read keeps the
+/// receipts, and a failed delete is only logged. A newer launch of a re-spun session id
+/// keeps its queue entry and receipts.
+fn forget_if_decommissioned<S: StateStore>(
+    store: &S,
+    session_id: &str,
+    launch: uuid::Uuid,
+) -> bool {
+    let gone = match hosted_session_gone(store, session_id) {
+        Ok(Some(gone)) => gone,
+        Ok(None) => {
+            eprintln!(
+                "hub: keeping hosted launch version evidence of an unreadable session record \
+                 ({session_id})"
+            );
+            return false;
+        }
+        Err(error) => {
+            eprintln!(
+                "hub: error reading hosted session for launch version evidence ({session_id}): {error}"
+            );
+            return false;
+        }
+    };
+    if gone && let Err(error) = forget_session_through(store, session_id, Some(launch)) {
+        eprintln!(
+            "hub: error removing hosted launch version evidence of a decommissioned session \
+             ({session_id}): {error}"
+        );
+    }
+    gone
+}
+
+/// Whether a session's hosted record is absent or decommissioned. `None` when the stored
+/// entry exists but is not a hosted record of this session that this binary can read, as
+/// when an older or newer binary wrote it. Such a session is not known to be gone.
+fn hosted_session_gone<S: StateStore>(
+    store: &S,
+    session_id: &str,
+) -> Result<Option<bool>, LifecycleError> {
+    let session_id = session_id.trim();
+    let Some(entry) = store.get_state_by_key(
+        &StateScope::Workspace,
+        StateConcern::Runtime,
+        &hosted_session_slug(session_id),
+    )?
+    else {
+        return Ok(Some(true));
+    };
+    Ok(decode::<HostedSessionRecord>(entry)
+        .filter(|record| record.session_id == session_id)
+        .map(|record| is_decommissioned(&record)))
+}
+
 fn save_generation<S: StateStore>(
     store: &S,
     receipt: &LaunchReceipt,
@@ -876,11 +950,23 @@ pub(super) fn forget_session<S: StateStore>(
     store: &S,
     session_id: &str,
 ) -> Result<(), LifecycleError> {
+    forget_session_through(store, session_id, None)
+}
+
+/// Like [`forget_session`], but with `through` set only launches up to that id are removed.
+/// A newer launch belongs to a later spin-up of the same session id, so its queue entry,
+/// its receipts and an index that points to it are kept.
+fn forget_session_through<S: StateStore>(
+    store: &S,
+    session_id: &str,
+    through: Option<uuid::Uuid>,
+) -> Result<(), LifecycleError> {
+    let settled = |id: uuid::Uuid| through.is_none_or(|through| id <= through);
     // Version evidence never blocks decommission. An invalid or busy queue keeps its
     // entries, and the receipt keys below are still removed.
     if let Err(error) = update_pending(store, |pending| {
         let before = pending.len();
-        pending.retain(|receipt| receipt.session_id != session_id);
+        pending.retain(|receipt| receipt.session_id != session_id || !settled(receipt.id));
         pending.len() != before
     }) {
         eprintln!(
@@ -888,8 +974,20 @@ pub(super) fn forget_session<S: StateStore>(
         );
     }
     let slug = session_index_slug(session_id);
-    if let Some(index) = read::<_, SessionReceipts>(store, &slug)? {
+    let index = read::<_, SessionReceipts>(store, &slug)?;
+    if through.is_some() && !index.as_ref().is_some_and(|index| settled(index.launch)) {
+        // The index is missing, unreadable, or owned by a newer launch.
+        return Ok(());
+    }
+    if let Some(index) = index {
         for receipt in &index.slugs {
+            // A reused legacy generation key can already hold a newer launch's receipt.
+            if through.is_some()
+                && !read::<_, LaunchReceipt>(store, receipt)?
+                    .is_some_and(|saved| saved.session_id == session_id && settled(saved.id))
+            {
+                continue;
+            }
             store.delete_state_by_key(&StateScope::Workspace, StateConcern::Runtime, receipt)?;
         }
     }
@@ -953,7 +1051,10 @@ fn commit<S: StateStore>(
     versions.fill_missing(observed);
     let versions = compare_versions(store, &receipt, versions)?;
     let id = receipt.id;
-    save_versions(store, receipt, versions.clone())?;
+    if !save_live_versions(store, receipt, versions.clone())? {
+        // `forget_session` also removed this launch from the queue.
+        return Ok(None);
+    }
     let applied = update_pending(store, |pending| {
         let Some(index) = pending.iter().position(|current| current.id == id) else {
             return false;
@@ -1289,7 +1390,29 @@ mod tests {
         }
     }
 
+    /// Save a hosted record for `session_id` with `status`, as spin-up does before a launch.
+    fn save_record(store: &impl StateStore, session_id: &str, status: &str) {
+        let (vendor, persona) = session_id.split_once(':').unwrap();
+        let record: HostedSessionRecord = serde_json::from_value(serde_json::json!({
+            "session_id": session_id, "persona": persona,
+            "project": "ferroloop", "role": "assistant", "vendor": vendor,
+            "node_id": DEFAULT_NODE_ID, "hosted": true, "status": status,
+            "restart_policy": "on-failure", "restart_count": 0,
+            "hydration_dispatched": false, "hydration_status": "unconfirmed",
+            "created_at_ms": 1000, "updated_at_ms": 1000,
+        }))
+        .unwrap();
+        persist_hosted_session(store, &record, "test").unwrap();
+    }
+
+    /// Queue a launch. Like spin-up, it first saves a running record if there is none.
     fn seed(store: &impl StateStore, receipt: &LaunchReceipt) {
+        if get_hosted_session_record(store, &receipt.session_id)
+            .unwrap()
+            .is_none()
+        {
+            save_record(store, &receipt.session_id, STATUS_RUNNING);
+        }
         assert!(
             update_pending(store, |pending| {
                 pending.push(receipt.clone());
@@ -1862,6 +1985,372 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    /// The per-session index and the launch and generation receipts of `session_id`.
+    fn session_keys(store: &impl StateStore, session_id: &str) -> Vec<String> {
+        let mut keys = receipt_keys(store, session_id);
+        if read::<_, SessionReceipts>(store, &session_index_slug(session_id))
+            .unwrap()
+            .is_some()
+        {
+            keys.push(session_index_slug(session_id));
+        }
+        keys
+    }
+
+    #[test]
+    fn versions_of_a_decommissioned_session_are_not_left_behind() {
+        let store = MemStore::default();
+        let queued = receipt(1);
+        seed(&store, &queued);
+        let mut unqueued = receipt(2);
+        unqueued.session_id = "codex:bea".into();
+        unqueued.stream.as_mut().unwrap().session = SessionId::new("Bea.codex").unwrap();
+        save_record(&store, &unqueued.session_id, STATUS_RUNNING);
+        // Decommission marked both records, but its queue cleanup did not complete,
+        // or it ran before these launches settled.
+        save_record(&store, &queued.session_id, STATUS_DECOMMISSIONED);
+        save_record(&store, &unqueued.session_id, STATUS_DECOMMISSIONED);
+
+        assert!(
+            commit(&store, queued.clone(), sample(Some("1.0.0"), None), true)
+                .unwrap()
+                .is_none()
+        );
+        // The launch recorder saves a launch directly when the queue cannot accept it.
+        assert!(!save_live_versions(&store, unqueued.clone(), sample(None, None)).unwrap());
+
+        for session_id in ["codex:ada", "codex:bea"] {
+            assert!(session_keys(&store, session_id).is_empty(), "{session_id}");
+        }
+        assert!(
+            hosted_vendor_versions_for_stream(&store, queued.stream.as_ref().unwrap())
+                .unwrap()
+                .is_none()
+        );
+        let (pending, _): (Vec<LaunchReceipt>, _) = load_revision(&store, &queue_slug()).unwrap();
+        assert!(pending.is_empty());
+        // The host baseline is kept for drift detection.
+        let (baseline, _): (VendorBaseline, _) =
+            load_revision(&store, &baseline_slug(&queued.host, &queued.vendor)).unwrap();
+        assert_eq!(baseline.cli.unwrap().version, "1.0.0");
+    }
+
+    #[test]
+    fn versions_of_a_live_session_are_kept() {
+        let store = MemStore::default();
+        let queued = receipt(1);
+        seed(&store, &queued);
+        let mut unqueued = receipt(2);
+        unqueued.session_id = "codex:bea".into();
+        unqueued.stream.as_mut().unwrap().session = SessionId::new("Bea.codex").unwrap();
+        // A stopped session is not decommissioned. Its version evidence stays.
+        save_record(&store, &unqueued.session_id, STATUS_STOPPED);
+
+        let observed = commit(&store, queued.clone(), sample(Some("1.0.0"), None), true)
+            .unwrap()
+            .unwrap();
+        assert!(save_live_versions(&store, unqueued.clone(), sample(None, None)).unwrap());
+
+        for session_id in ["codex:ada", "codex:bea"] {
+            assert_eq!(session_keys(&store, session_id).len(), 3, "{session_id}");
+        }
+        assert_eq!(
+            hosted_vendor_versions_for_stream(&store, queued.stream.as_ref().unwrap()).unwrap(),
+            Some(observed.versions)
+        );
+    }
+
+    #[test]
+    fn versions_are_kept_when_the_session_record_cannot_be_read() {
+        let store = MemStore::default();
+        let queued = receipt(1);
+        seed(&store, &queued);
+        // A newer or older binary wrote a record this binary cannot decode. Even its
+        // decommissioned status does not prove the session is gone.
+        write(
+            &store,
+            hosted_session_slug(&queued.session_id),
+            &serde_json::json!({
+                "session_id": queued.session_id, "persona": "ada",
+                "project": "ferroloop", "role": "assistant", "vendor": "codex",
+                "node_id": DEFAULT_NODE_ID, "hosted": true, "status": STATUS_DECOMMISSIONED,
+                "restart_policy": "on-failure", "restart_count": 0,
+                "hydration_dispatched": false, "hydration_status": "a-future-status",
+                "created_at_ms": 1000, "updated_at_ms": 1000,
+            }),
+        )
+        .unwrap();
+        assert!(
+            get_hosted_session_record(&store, &queued.session_id)
+                .unwrap()
+                .is_none()
+        );
+
+        let observed = commit(&store, queued.clone(), sample(Some("1.0.0"), None), true)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(session_keys(&store, &queued.session_id).len(), 3);
+        assert_eq!(
+            hosted_vendor_versions_for_stream(&store, queued.stream.as_ref().unwrap()).unwrap(),
+            Some(observed.versions)
+        );
+    }
+
+    #[test]
+    fn versions_cleanup_after_decommission_keeps_a_newer_launch() {
+        let store = MemStore::default();
+        let older = receipt(1);
+        seed(&store, &older);
+        // The older launch's observer read the decommissioned record. Before its cleanup
+        // ran, the same session id was spun up again and its first launch settled.
+        save_record(&store, &older.session_id, STATUS_DECOMMISSIONED);
+        let newer = receipt(2);
+        seed(&store, &newer);
+        save_versions(&store, newer.clone(), sample(Some("1.1.0"), None)).unwrap();
+        let newer_keys = session_keys(&store, &newer.session_id);
+        assert_eq!(newer_keys.len(), 3);
+
+        // The older launch settles. Its post-write check still reads the decommissioned
+        // record, so it cleans up, but only up to its own launch.
+        assert!(
+            commit(&store, older.clone(), sample(Some("1.0.0"), None), true)
+                .unwrap()
+                .is_none()
+        );
+
+        let (pending, _): (Vec<LaunchReceipt>, _) = load_revision(&store, &queue_slug()).unwrap();
+        assert_eq!(
+            pending.iter().map(|item| item.id).collect::<Vec<_>>(),
+            [newer.id]
+        );
+        assert_eq!(session_keys(&store, &newer.session_id), newer_keys);
+        let index = read::<_, SessionReceipts>(&store, &session_index_slug(&newer.session_id))
+            .unwrap()
+            .unwrap();
+        assert_eq!(index.launch, newer.id);
+        assert_eq!(
+            hosted_vendor_versions_for_stream(&store, newer.stream.as_ref().unwrap())
+                .unwrap()
+                .and_then(|versions| versions.cli),
+            Some("1.1.0".into())
+        );
+
+        // Decommission's own cleanup is not bounded and still removes everything.
+        forget_session(&store, &newer.session_id).unwrap();
+        assert!(session_keys(&store, &newer.session_id).is_empty());
+    }
+
+    #[test]
+    fn versions_of_a_session_without_a_hosted_record_are_not_left_behind() {
+        let store = MemStore::default();
+        let queued = receipt(1);
+        seed(&store, &queued);
+        // Records are never deleted, so an absent record is not a session that is starting.
+        assert!(
+            store
+                .delete_state_by_key(
+                    &StateScope::Workspace,
+                    StateConcern::Runtime,
+                    &hosted_session_slug(&queued.session_id),
+                )
+                .unwrap()
+        );
+        assert!(
+            get_hosted_session_record(&store, &queued.session_id)
+                .unwrap()
+                .is_none()
+        );
+
+        assert!(
+            commit(&store, queued.clone(), sample(Some("1.0.0"), None), true)
+                .unwrap()
+                .is_none()
+        );
+
+        assert!(session_keys(&store, &queued.session_id).is_empty());
+        let (pending, _): (Vec<LaunchReceipt>, _) = load_revision(&store, &queue_slug()).unwrap();
+        assert!(pending.is_empty());
+        // The host baseline is kept for drift detection.
+        let (baseline, _): (VendorBaseline, _) =
+            load_revision(&store, &baseline_slug(&queued.host, &queued.vendor)).unwrap();
+        assert_eq!(baseline.cli.unwrap().version, "1.0.0");
+    }
+
+    #[test]
+    fn versions_are_kept_when_the_session_record_read_fails() {
+        /// A `MemStore` whose reads of one key fail once `fail` is set.
+        struct FailingRecordStore {
+            inner: MemStore,
+            fail: std::cell::RefCell<Option<String>>,
+        }
+        impl StateStore for FailingRecordStore {
+            fn upsert_state(
+                &self,
+                args: UpsertStateArgs,
+            ) -> Result<fl_core::state::StateEntry, StoreError> {
+                self.inner.upsert_state(args)
+            }
+            fn retire_memory(
+                &self,
+                scope: &StateScope,
+                slug: &str,
+                lifecycle: fl_core::state::MemoryLifecycle,
+                superseded_by: Option<fl_core::ids::StateId>,
+                at: fl_core::At,
+                by: &str,
+            ) -> Result<fl_core::state::StateEntry, StoreError> {
+                self.inner
+                    .retire_memory(scope, slug, lifecycle, superseded_by, at, by)
+            }
+            fn get_state(
+                &self,
+                id: &fl_core::ids::StateId,
+            ) -> Result<Option<fl_core::state::StateEntry>, StoreError> {
+                self.inner.get_state(id)
+            }
+            fn get_state_by_key(
+                &self,
+                scope: &StateScope,
+                concern: StateConcern,
+                slug: &str,
+            ) -> Result<Option<fl_core::state::StateEntry>, StoreError> {
+                if self.fail.borrow().as_deref() == Some(slug) {
+                    return Err(StoreError::Backend("injected record read error".into()));
+                }
+                self.inner.get_state_by_key(scope, concern, slug)
+            }
+            fn delete_state_by_key(
+                &self,
+                scope: &StateScope,
+                concern: StateConcern,
+                slug: &str,
+            ) -> Result<bool, StoreError> {
+                self.inner.delete_state_by_key(scope, concern, slug)
+            }
+            fn list_state(
+                &self,
+                scope: Option<&StateScope>,
+                concern: Option<StateConcern>,
+            ) -> Result<Vec<fl_core::state::StateEntry>, StoreError> {
+                self.inner.list_state(scope, concern)
+            }
+            fn state_revisions(
+                &self,
+                id: &fl_core::ids::StateId,
+            ) -> Result<Vec<fl_core::state::StateRevision>, StoreError> {
+                self.inner.state_revisions(id)
+            }
+            fn list_conflicts(&self) -> Result<Vec<fl_core::state::StateConflict>, StoreError> {
+                self.inner.list_conflicts()
+            }
+            fn resolve_conflict(
+                &self,
+                id: &fl_core::ids::StateId,
+                keep: &fl_core::ids::RevisionId,
+                at: fl_core::At,
+                by: &str,
+            ) -> Result<fl_core::state::StateEntry, StoreError> {
+                self.inner.resolve_conflict(id, keep, at, by)
+            }
+            fn state_revisions_after(
+                &self,
+                after_seq: u64,
+            ) -> Result<Vec<(u64, fl_core::state::StateRevision)>, StoreError> {
+                self.inner.state_revisions_after(after_seq)
+            }
+            fn import_state_revisions(
+                &self,
+                revisions: &[fl_core::state::StateRevision],
+                merge_at: fl_core::At,
+            ) -> Result<(), StoreError> {
+                self.inner.import_state_revisions(revisions, merge_at)
+            }
+            fn sync_cursor(
+                &self,
+                remote: &str,
+            ) -> Result<Option<fl_core::state::StateSyncCursor>, StoreError> {
+                self.inner.sync_cursor(remote)
+            }
+            fn set_sync_cursor(
+                &self,
+                cursor: fl_core::state::StateSyncCursor,
+            ) -> Result<(), StoreError> {
+                self.inner.set_sync_cursor(cursor)
+            }
+        }
+
+        let store = FailingRecordStore {
+            inner: MemStore::default(),
+            fail: std::cell::RefCell::new(None),
+        };
+        let launch = receipt(1);
+        save_record(&store, &launch.session_id, STATUS_DECOMMISSIONED);
+        // A failed read does not prove the session is gone, even a decommissioned one.
+        store
+            .fail
+            .replace(Some(hosted_session_slug(&launch.session_id)));
+        assert!(hosted_session_gone(&store, &launch.session_id).is_err());
+
+        assert!(save_live_versions(&store, launch.clone(), sample(Some("1.0.0"), None)).unwrap());
+
+        assert_eq!(session_keys(&store, &launch.session_id).len(), 3);
+        assert_eq!(
+            hosted_vendor_versions_for_stream(&store, launch.stream.as_ref().unwrap())
+                .unwrap()
+                .and_then(|versions| versions.cli),
+            Some("1.0.0".into())
+        );
+    }
+
+    #[test]
+    fn versions_cleanup_after_decommission_keeps_a_reused_key_it_does_not_own() {
+        let mut first = receipt(1);
+        first.stream = None;
+        let first_slug = receipt_slug(&first);
+        let generation = generation_slug(&first.session_id, &first.generation);
+        // A legacy generation key now holds a newer launch of this session, which saved
+        // its receipt before its index update, or a receipt of another session.
+        let mut newer = receipt(2);
+        newer.stream = None;
+        newer.generation.clone_from(&first.generation);
+        newer.versions = Some(sample(Some("1.1.0"), None));
+        let mut foreign = receipt(1);
+        foreign.stream = None;
+        foreign.session_id = "codex:bea".into();
+        foreign.versions = Some(sample(Some("1.1.0"), None));
+        for occupant in [newer, foreign] {
+            let store = MemStore::default();
+            save_versions(&store, first.clone(), sample(Some("1.0.0"), None)).unwrap();
+            assert_eq!(session_keys(&store, &first.session_id).len(), 3);
+            write(&store, generation.clone(), &occupant).unwrap();
+            save_record(&store, &first.session_id, STATUS_DECOMMISSIONED);
+
+            assert!(forget_if_decommissioned(
+                &store,
+                &first.session_id,
+                first.id
+            ));
+
+            let kept: Option<LaunchReceipt> = read(&store, &generation).unwrap();
+            assert_eq!(
+                kept.map(|kept| (kept.id, kept.session_id)),
+                Some((occupant.id, occupant.session_id.clone()))
+            );
+            // The settled launch's own receipt and the index that points to it are removed.
+            assert!(
+                read::<_, LaunchReceipt>(&store, &first_slug)
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                read::<_, SessionReceipts>(&store, &session_index_slug(&first.session_id))
+                    .unwrap()
+                    .is_none()
+            );
+        }
     }
 
     #[test]
