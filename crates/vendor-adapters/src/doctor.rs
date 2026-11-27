@@ -5,18 +5,37 @@ use std::path::Path;
 use fl_core::VendorUpdateStatus;
 const MAX_SETTINGS_BYTES: u64 = 1024 * 1024;
 
+/// What a reader does with a symbolic link as the final path component.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FinalLink {
+    /// The link is not followed, so the path is not a regular file.
+    Refuse,
+    /// The link is followed. A link whose target is missing reads as a missing file.
+    Follow,
+}
+
 /// A missing file is distinct from unavailable evidence. Never wait on a FIFO
 /// or follow a final symlink substituted for this file.
 pub(crate) fn read_bounded_regular_file(path: &Path, limit: u64) -> io::Result<Option<String>> {
-    read_bounded_regular_bytes(path, limit)?
+    read_bounded_regular_bytes(path, limit, FinalLink::Refuse)?
         .map(|bytes| String::from_utf8(bytes).map_err(|_| io::ErrorKind::InvalidData.into()))
         .transpose()
 }
 
 /// Like [`read_bounded_regular_file`], but `InvalidData` only means the path is not a
-/// regular file or exceeds `limit`; the contents are not decoded.
-fn read_bounded_regular_bytes(path: &Path, limit: u64) -> io::Result<Option<Vec<u8>>> {
-    let metadata = match path.symlink_metadata() {
+/// regular file or exceeds `limit`; the contents are not decoded. With
+/// [`FinalLink::Follow`] a final symlink is followed, but the opened file must still be a
+/// regular file, so a link to a FIFO or device is neither waited on nor read.
+fn read_bounded_regular_bytes(
+    path: &Path,
+    limit: u64,
+    links: FinalLink,
+) -> io::Result<Option<Vec<u8>>> {
+    let metadata = match links {
+        FinalLink::Refuse => path.symlink_metadata(),
+        FinalLink::Follow => path.metadata(),
+    };
+    let metadata = match metadata {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error),
@@ -29,7 +48,10 @@ fn read_bounded_regular_bytes(path: &Path, limit: u64) -> io::Result<Option<Vec<
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        options.custom_flags(match links {
+            FinalLink::Refuse => libc::O_NOFOLLOW | libc::O_NONBLOCK,
+            FinalLink::Follow => libc::O_NONBLOCK,
+        });
     }
     let file = options.open(path)?;
     if !file.metadata()?.is_file() {
@@ -67,12 +89,14 @@ pub(crate) const MANAGED_SETTINGS_D: SettingsFile = settings_file!("managed-sett
 
 /// Read and validate one settings file. A missing file is the vendor default. Anything
 /// else that is not a valid document yields a reason naming only the file and the problem.
+/// `links` says whether a final symlink is followed; only managed settings follow one.
 pub(crate) fn read_settings<T: Default>(
     path: &Path,
     file: &SettingsFile,
+    links: FinalLink,
     parse: impl FnOnce(&str) -> Option<T>,
 ) -> Result<T, &'static str> {
-    match read_bounded_regular_bytes(path, MAX_SETTINGS_BYTES) {
+    match read_bounded_regular_bytes(path, MAX_SETTINGS_BYTES, links) {
         Ok(None) => Ok(T::default()),
         Ok(Some(contents)) => std::str::from_utf8(&contents)
             .ok()
@@ -89,7 +113,7 @@ pub(crate) fn configured_updates<T: Default>(
     parse: impl FnOnce(&str) -> Option<T>,
     enabled: impl FnOnce(T) -> bool,
 ) -> VendorUpdateStatus {
-    match read_settings(path, file, parse) {
+    match read_settings(path, file, FinalLink::Refuse, parse) {
         Ok(settings) => VendorUpdateStatus::from_enabled(enabled(settings)),
         Err(reason) => VendorUpdateStatus::Unknown(reason),
     }
@@ -712,16 +736,92 @@ mod tests {
             make_fifo(&path);
             assert_eq!(claude_updates(home, &[]), rejected);
             fs::remove_file(&path).unwrap();
-
-            // Claude follows a symlinked managed file; Doctor reports it unknown instead.
-            fs::create_dir_all(managed_dir(home)).unwrap();
-            std::os::unix::fs::symlink(&target, managed_dir(home).join("managed-settings.json"))
-                .unwrap();
-            assert_eq!(
-                claude_updates(home, &[]),
-                Unknown("managed-settings.json not a regular file or too large")
-            );
         }
+    }
+
+    /// Claude follows a symlinked managed file, so Doctor does too. The target must still be
+    /// a regular file, and the user `settings.json` still refuses links.
+    #[cfg(unix)]
+    #[test]
+    fn claude_follows_symlinked_managed_settings_to_regular_files_only() {
+        use VendorUpdateStatus::{Disabled, Enabled, Unknown};
+        use std::os::unix::fs::symlink;
+        use std::time::{Duration, Instant};
+
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path();
+        let disabling = write(
+            home,
+            "checkout/disable.json",
+            r#"{"env":{"DISABLE_AUTOUPDATER":"1"}}"#,
+        );
+        let keeping = write(
+            home,
+            "checkout/keep.json",
+            r#"{"env":{"DISABLE_AUTOUPDATER":"0"}}"#,
+        );
+        let main = managed_dir(home).join("managed-settings.json");
+        fs::create_dir_all(managed_dir(home)).unwrap();
+
+        // A linked managed-settings.json that disables updates outranks the environment.
+        symlink(&disabling, &main).unwrap();
+        let keep_env = [("DISABLE_AUTOUPDATER", OsStr::new("0"))];
+        assert_eq!(claude_updates(home, &keep_env), Disabled);
+        assert_eq!(claude_hosted(home), Disabled);
+
+        // A linked drop-in is honoured and replaces the main file's value.
+        let drop_in = managed_dir(home).join("managed-settings.d/50-keep.json");
+        fs::create_dir_all(drop_in.parent().unwrap()).unwrap();
+        symlink(&keeping, &drop_in).unwrap();
+        assert_eq!(claude_updates(home, &[]), Enabled);
+        assert_eq!(claude_hosted(home), Enabled);
+        fs::remove_file(&drop_in).unwrap();
+
+        // A dangling link reads as a missing file and sets nothing, as it does for Claude.
+        fs::remove_file(&main).unwrap();
+        symlink(home.join("checkout/missing.json"), &main).unwrap();
+        assert_eq!(claude_updates(home, &keep_env), Enabled);
+        assert_eq!(claude_hosted(home), Disabled);
+        symlink(home.join("checkout/missing.json"), &drop_in).unwrap();
+        assert_eq!(claude_updates(home, &keep_env), Enabled);
+        fs::remove_file(&drop_in).unwrap();
+
+        // A link to a FIFO or a directory is unknown, and the FIFO is never waited on.
+        let fifo = home.join("checkout/fifo.json");
+        make_fifo(&fifo);
+        fs::remove_file(&main).unwrap();
+        symlink(&fifo, &main).unwrap();
+        let started = Instant::now();
+        assert_eq!(
+            claude_updates(home, &[]),
+            Unknown("managed-settings.json not a regular file or too large")
+        );
+        assert_eq!(
+            claude_hosted(home),
+            Unknown("managed-settings.json not a regular file or too large")
+        );
+        fs::remove_file(&main).unwrap();
+        symlink(&fifo, &drop_in).unwrap();
+        assert_eq!(
+            claude_updates(home, &[]),
+            Unknown("managed-settings.d not a regular file or too large")
+        );
+        assert!(started.elapsed() < Duration::from_secs(5));
+        fs::remove_file(&drop_in).unwrap();
+        symlink(home.join("checkout"), &main).unwrap();
+        assert_eq!(
+            claude_updates(home, &[]),
+            Unknown("managed-settings.json not a regular file or too large")
+        );
+        fs::remove_file(&main).unwrap();
+
+        // The user settings.json still refuses a link, even to a regular file.
+        fs::create_dir_all(home.join(".claude")).unwrap();
+        symlink(&disabling, home.join(".claude/settings.json")).unwrap();
+        assert_eq!(
+            claude_updates(home, &[]),
+            Unknown("settings.json not a regular file or too large")
+        );
     }
 
     #[cfg(unix)]
