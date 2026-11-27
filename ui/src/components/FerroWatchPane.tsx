@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import type { HubApiClient } from "../api/client";
+import { HubApiError, type HubApiClient } from "../api/client";
 import { FerroWatchUsage } from "./FerroWatchUsage";
 import { formatCurrencyFromMicros, useActiveCurrency } from "../lib/currency";
 import { formatTimestamp, useActiveTimeZone } from "../lib/datetime";
@@ -1192,6 +1192,9 @@ export const FerroWatchPane: React.FC<FerroWatchPaneProps> = ({
       setRemodelError(
         err instanceof Error ? err.message : "Failed to remodel agent session.",
       );
+      if (err instanceof HubApiError && typeof err.details?.handshake_queue_error === "string") {
+        await loadSummary(appliedOverrides);
+      }
     } finally {
       setRemodeling(false);
     }

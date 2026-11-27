@@ -1089,7 +1089,26 @@ export class HubApiClient {
   public async getSessionQueue(sessionId: string): Promise<SessionQueueResponse> {
     return this.request<SessionQueueResponse>(
       `/api/v1/sessions/${encodeURIComponent(sessionId)}/queue`,
+      { cache: "no-store" },
     );
+  }
+
+  public async getQueuedPromptAttachment(url: string): Promise<Blob> {
+    const prefix = "/api/v1/attachments/";
+    const name = url.startsWith(prefix) ? url.slice(prefix.length) : "";
+    if (!name || name === "." || name === ".." || /[/\\]/.test(name)) {
+      throw new Error("Invalid queued attachment reference");
+    }
+    const headers = new Headers();
+    const token = this.getToken();
+    if (token) headers.set("Authorization", `Bearer ${token}`);
+    const response = await this.fetchImpl(`${this.baseUrl}${prefix}${encodeURIComponent(name)}`, {
+      headers,
+      credentials: "same-origin",
+      redirect: "error",
+    });
+    if (!response.ok) throw new HubApiError(response.status, "Queued attachment unavailable");
+    return response.blob();
   }
 
   public async clearSession(
@@ -1255,6 +1274,7 @@ export class HubApiClient {
     prompt_id: string;
     is_busy?: boolean;
     queue: QueuedOperatorPrompt[];
+    queue_epoch?: string;
   }> {
     return this.request(
       `/api/v1/sessions/${encodeURIComponent(sessionId)}/queue/${encodeURIComponent(promptId)}`,

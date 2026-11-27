@@ -611,8 +611,11 @@ fn claude_record_session_id(record: Option<&serde_json::Value>) -> Option<String
         .map(str::to_string)
 }
 
-fn claude_record_matches_native_session(record: Option<&serde_json::Value>, native: &str) -> bool {
-    claude_record_session_id(record).as_deref() == Some(native)
+fn claude_record_matches_native_session(
+    record: Option<&serde_json::Value>,
+    native: &str,
+) -> Option<bool> {
+    claude_record_session_id(record).map(|id| id == native)
 }
 
 /// `true` when the session record says Claude is waiting for input. An absent or unreadable
@@ -2669,17 +2672,39 @@ struct ResolvedClaudeHost {
     is_pty: bool,
 }
 
+enum ClaudeHostResolutionError {
+    Unavailable(String),
+    Identity(&'static str),
+}
+
 fn resolve_claude_host(target: &str, pid: u32) -> Result<ResolvedClaudeHost, String> {
+    resolve_claude_host_checked(target, pid).map_err(|error| match error {
+        ClaudeHostResolutionError::Unavailable(message) => message,
+        ClaudeHostResolutionError::Identity(message) => message.into(),
+    })
+}
+
+fn resolve_claude_host_checked(
+    target: &str,
+    pid: u32,
+) -> Result<ResolvedClaudeHost, ClaudeHostResolutionError> {
     if !host_discovery_allowed() {
-        return Err("Claude host discovery is unavailable".into());
+        return Err(ClaudeHostResolutionError::Unavailable(
+            "Claude host discovery is unavailable".into(),
+        ));
     }
-    let endpoint = crate::runtime_context::host_endpoint().map_err(|e| e.to_string())?;
-    let mut client =
-        fl_host_proto::BlockingHostClient::connect(&endpoint).map_err(|e| e.to_string())?;
-    let sessions = client.list_sessions().map_err(|e| e.to_string())?;
+    let endpoint = crate::runtime_context::host_endpoint()
+        .map_err(|error| ClaudeHostResolutionError::Unavailable(error.to_string()))?;
+    let mut client = fl_host_proto::BlockingHostClient::connect(&endpoint)
+        .map_err(|error| ClaudeHostResolutionError::Unavailable(error.to_string()))?;
+    let sessions = client
+        .list_sessions()
+        .map_err(|error| ClaudeHostResolutionError::Unavailable(error.to_string()))?;
     let summary = crate::vendor_adapter::select_claude_host_session(&sessions, target)
-        .map_err(str::to_string)?
-        .ok_or_else(|| "no running canonical Claude host session".to_string())?;
+        .map_err(ClaudeHostResolutionError::Identity)?
+        .ok_or(ClaudeHostResolutionError::Identity(
+            "no running canonical Claude host session",
+        ))?;
     if pid != 0 {
         let mut ancestry = Vec::new();
         let mut current = pid;
@@ -2698,7 +2723,9 @@ fn resolve_claude_host(target: &str, pid: u32) -> Result<ResolvedClaudeHost, Str
             .is_some_and(|session| session.stream == summary.stream)
             || matching.next().is_some()
         {
-            return Err("Claude host PID identity is unconfirmed or ambiguous".into());
+            return Err(ClaudeHostResolutionError::Identity(
+                "Claude host PID identity is unconfirmed or ambiguous",
+            ));
         }
     }
     Ok(ResolvedClaudeHost {
@@ -2892,6 +2919,47 @@ fn composer_occupied_error() -> String {
     format!(
         "{COMPOSER_OCCUPIED_BY_NON_WIRE_INPUT_PREFIX} composer_occupied: composer holds non-wire input or active dialog; holding delivery without sending keys"
     )
+}
+
+/// Zero-key pre-paste flush refusal on a composer that changed since the flush was
+/// chosen. A recognised payload keeps its repair hint; otherwise nothing is claimed
+/// about what the composer now holds.
+fn composer_changed_error_for_screen(screen: &str) -> String {
+    match recognised_composer_payload_in_screen(screen) {
+        Some(payload) => composer_occupied_error_with_payload(Some(payload)),
+        None => format!(
+            "{COMPOSER_OCCUPIED_BY_NON_WIRE_INPUT_PREFIX} composer_occupied: Claude composer changed before input; holding delivery without sending keys"
+        ),
+    }
+}
+
+/// Zero-key pre-paste flush refusal on a dim Claude inline suggestion. There is
+/// nothing for the operator to clear; a later probe retries the prompt.
+fn composer_suggestion_error() -> String {
+    format!(
+        "{COMPOSER_OCCUPIED_BY_NON_WIRE_INPUT_PREFIX} composer_suggestion: Claude shows an inline suggestion; holding delivery without sending keys and retrying later"
+    )
+}
+
+#[cfg(test)]
+#[test]
+fn flush_hold_reasons_stay_zero_key_and_truthful() {
+    let suggestion = composer_suggestion_error();
+    let changed = composer_changed_error_for_screen(
+        "────────────────────\n❯ other text\n────────────────────\n",
+    );
+    for err in [&suggestion, &changed] {
+        assert!(is_composer_occupied_zero_keys_error(err), "{err}");
+        assert!(!err.contains("repair:"), "{err}");
+        assert!(!err.contains("non-wire input"), "{err}");
+        assert!(!is_composer_session_busy_error(err), "{err}");
+    }
+    assert!(suggestion.contains("composer_suggestion: Claude shows an inline suggestion"));
+    assert!(changed.contains("composer_occupied: Claude composer changed before input"));
+    assert_eq!(
+        composer_changed_error_for_screen("────────────────────\n❯ /clear\n────────────────────\n"),
+        composer_occupied_error_with_payload(Some("/clear"))
+    );
 }
 
 /// Composer could not be located, so nothing was proven about its contents (#545-3).
@@ -3739,22 +3807,36 @@ fn capture_bound_host_screen(
     client: &mut fl_host_proto::BlockingHostClient,
     stream: &fl_host_proto::StreamId,
 ) -> Option<RenderedCursorScreen> {
-    let screen = client.capture_rendered(stream.clone()).ok()?;
-    if screen.stream != *stream {
-        return None;
-    }
-    Some(RenderedCursorScreen::from_host(screen))
+    capture_exact_bound_host_screen(client, stream).ok()
 }
 
-fn capture_bound_claude_composer(
+fn capture_exact_bound_host_screen(
     client: &mut fl_host_proto::BlockingHostClient,
     stream: &fl_host_proto::StreamId,
-) -> Option<RenderedCursorScreen> {
-    let (screen, dim_suffix_line) = client.capture_rendered_cursor_style(stream.clone()).ok()?;
+) -> Result<RenderedCursorScreen, fl_host_proto::HostError> {
+    let screen = client.capture_rendered(stream.clone())?;
     if screen.stream != *stream {
-        return None;
+        return Err(fl_host_proto::HostError::StaleEpoch {
+            stream: stream.clone(),
+        });
     }
-    Some(RenderedCursorScreen::from_bound_claude_host(
+    Ok(RenderedCursorScreen::from_host(screen))
+}
+
+// Registration-bound Claude input reads the cursor style so an inline dim
+// suggestion is not mistaken for an operator draft. Hosts without the style
+// feature return a plain capture, which fails closed as an operator draft.
+fn capture_exact_bound_claude_composer(
+    client: &mut fl_host_proto::BlockingHostClient,
+    stream: &fl_host_proto::StreamId,
+) -> Result<RenderedCursorScreen, fl_host_proto::HostError> {
+    let (screen, dim_suffix_line) = client.capture_rendered_cursor_style(stream.clone())?;
+    if screen.stream != *stream {
+        return Err(fl_host_proto::HostError::StaleEpoch {
+            stream: stream.clone(),
+        });
+    }
+    Ok(RenderedCursorScreen::from_bound_claude_host(
         screen,
         dim_suffix_line,
     ))
@@ -4207,7 +4289,7 @@ fn check_bound_claude_input(
 ) -> Result<(), String> {
     let contents = &screen.contents;
     if !usable_bound_claude_screen(screen) {
-        return Err("hosted Claude screen cannot be confirmed".into());
+        return Err(composer_unlocated_error());
     }
     if claude_screen_is_busy_main(contents) {
         return Err(composer_session_busy_error());
@@ -4236,7 +4318,10 @@ fn check_bound_claude_input(
         }
     };
     if !owned {
-        return Err("prompt submission unconfirmed: Claude composer changed before input".into());
+        return Err(match phase {
+            BoundInputPhase::Payload => composer_occupied_error_for_screen(contents),
+            _ => "prompt submission unconfirmed: Claude composer changed before input".into(),
+        });
     }
     Ok(())
 }
@@ -4405,7 +4490,7 @@ fn deliver_via_tmux_paste_with_resolved_host(
         fl_host_proto::StreamId,
         bool,
     )>,
-    bound_validate: Option<&dyn Fn() -> Result<(), String>>,
+    bound_input: Option<&BoundClaudeInput<'_>>,
     recovery: Option<&RecoveryPasteGuard<'_>>,
 ) -> Result<(), String> {
     let trimmed = text.trim();
@@ -4416,36 +4501,51 @@ fn deliver_via_tmux_paste_with_resolved_host(
         return recovery.refuse(FenceRecoveryOutcome::HostedBindingUnavailable);
     }
     let strict_claude = opts.is_claude_route && resolved.is_some() && recovery.is_none();
-    let capture_claude = if strict_claude && bound_validate.is_some() {
-        capture_bound_claude_composer
-    } else {
-        capture_bound_host_screen
-    };
+    if bound_input.is_some() && !strict_claude {
+        return Err("Claude terminal delivery requires its bound Host stream".into());
+    }
     if let Some((mut client, stream, is_pty)) = resolved.or_else(|| {
         (std::env::var_os("FL_WIRE_TMUX_BIN").is_none()
             && !(opts.is_claude_route && target.starts_with('%')))
         .then(|| resolve_live_host_session_with_mode(target))
         .flatten()
     }) {
-        if strict_claude
-            && (!is_pty
-                || !capture_bound_host_screen(&mut client, &stream)
-                    .as_ref()
-                    .is_some_and(usable_bound_claude_screen))
-        {
-            return Err("hosted Claude screen cannot be confirmed".into());
+        let strict_capture = |client: &mut fl_host_proto::BlockingHostClient, keys_attempted| {
+            checked_claude_screen(client, &stream, bound_input.is_some()).map_err(|error| {
+                if let Some(input) = bound_input {
+                    input.fail(error, keys_attempted)
+                } else {
+                    "hosted Claude screen cannot be confirmed".into()
+                }
+            })
+        };
+        if strict_claude {
+            if !is_pty {
+                return Err("hosted Claude screen cannot be confirmed".into());
+            }
+            strict_capture(&mut client, false)?;
         }
-        if let Some(validate) = bound_validate {
-            validate()?;
+        if let Some(input) = bound_input {
+            input.validate(false)?;
         }
         let client_cell = std::cell::RefCell::new(client);
         let payload_written = std::cell::Cell::new(false);
-        let keys_written = std::cell::Cell::new(false);
+        let keys_attempted = std::cell::Cell::new(false);
+        let enter_attempted = std::cell::Cell::new(false);
         let capture_failed = std::cell::Cell::new(false);
         let grant = client_cell
             .borrow_mut()
             .claim_controller(stream.clone())
             .map_err(|e| {
+                if let Some(input) = bound_input {
+                    return input.fail(
+                        bound_claude_host_error(
+                            e,
+                            "Claude hosted terminal cannot claim input control",
+                        ),
+                        false,
+                    );
+                }
                 if let Some(recovery) = recovery {
                     recovery
                         .permission
@@ -4483,11 +4583,11 @@ fn deliver_via_tmux_paste_with_resolved_host(
                 let screen = if let Some(recovery) = recovery {
                     recovery.observe(capture_bound_host_screen(&mut client, &stream))
                 } else if strict_claude {
-                    capture_claude(&mut client, &stream)
+                    strict_capture(&mut client, keys_attempted.get()).ok()
                 } else {
                     capture_host_rendered_screen(&mut client, &stream)
                 };
-                if strict_claude && !screen.as_ref().is_some_and(usable_bound_claude_screen) {
+                if strict_claude && screen.is_none() {
                     capture_failed.set(true);
                     return None;
                 }
@@ -4496,12 +4596,13 @@ fn deliver_via_tmux_paste_with_resolved_host(
             || {
                 let mut client = client_cell.borrow_mut();
                 if strict_claude {
-                    let screen = capture_claude(&mut client, &stream);
-                    if !screen.as_ref().is_some_and(usable_bound_claude_screen) {
-                        capture_failed.set(true);
-                        return None;
+                    match strict_capture(&mut client, keys_attempted.get()) {
+                        Ok(screen) => Some(ScreenCapture::from_rendered_screen(screen)),
+                        Err(_) => {
+                            capture_failed.set(true);
+                            None
+                        }
                     }
-                    screen.map(ScreenCapture::from_rendered_screen)
                 } else if let Some(recovery) = recovery {
                     recovery
                         .observe(capture_bound_host_screen(&mut client, &stream))
@@ -4518,31 +4619,28 @@ fn deliver_via_tmux_paste_with_resolved_host(
                 }
             },
             || {
-                if strict_claude
-                    && (capture_failed.get()
-                        || !capture_bound_host_screen(&mut client_cell.borrow_mut(), &stream)
-                            .as_ref()
-                            .is_some_and(usable_bound_claude_screen))
-                {
-                    return Err("hosted Claude screen cannot be confirmed".into());
-                }
-                if let Some(validate) = bound_validate {
-                    let screen = capture_claude(&mut client_cell.borrow_mut(), &stream)
-                        .ok_or_else(|| "hosted Claude screen cannot be confirmed".to_string())?;
-                    check_bound_claude_input(
-                        &screen,
-                        &checked_route_keys,
-                        trimmed,
-                        BoundInputPhase::Payload,
-                    )
-                    .map_err(|err| {
-                        if keys_written.get() {
-                            format!("prompt submission unconfirmed: {err}")
-                        } else {
-                            err
-                        }
-                    })?;
-                    validate()?;
+                if strict_claude {
+                    if capture_failed.get() {
+                        return Err("hosted Claude screen cannot be confirmed".into());
+                    }
+                    let screen =
+                        strict_capture(&mut client_cell.borrow_mut(), keys_attempted.get())?;
+                    if let Some(input) = bound_input {
+                        check_bound_claude_input(
+                            &screen,
+                            &checked_route_keys,
+                            trimmed,
+                            BoundInputPhase::Payload,
+                        )
+                        .map_err(|err| {
+                            if keys_attempted.get() {
+                                format!("prompt submission unconfirmed: {err}")
+                            } else {
+                                err
+                            }
+                        })?;
+                        input.validate(keys_attempted.get())?;
+                    }
                 }
                 let payload: Vec<u8> = if opts.bracketed {
                     format!("\x1b[200~{trimmed}\x1b[201~").into_bytes()
@@ -4555,6 +4653,7 @@ fn deliver_via_tmux_paste_with_resolved_host(
                             capture_bound_host_screen(&mut client_cell.borrow_mut(), &stream);
                         recovery.authorize_write(screen.as_ref(), None)?;
                     }
+                    keys_attempted.set(true);
                     let outcome = client_cell
                         .borrow_mut()
                         .write_raw(stream.clone(), grant.lease, payload)
@@ -4563,33 +4662,50 @@ fn deliver_via_tmux_paste_with_resolved_host(
                         return Err(format!("fl-host write_raw payload returned {outcome:?}"));
                     }
                     payload_written.set(true);
-                    keys_written.set(true);
                 }
                 Ok(())
             },
             || {
-                if strict_claude
-                    && (capture_failed.get()
-                        || !capture_bound_host_screen(&mut client_cell.borrow_mut(), &stream)
-                            .as_ref()
-                            .is_some_and(usable_bound_claude_screen))
-                {
-                    return Err("hosted Claude screen cannot be confirmed".into());
+                if bound_input.is_some_and(|input| input.automatic) {
+                    // Automatic delivery never clears an earlier draft or repeats Enter.
+                    if !payload_written.get() {
+                        return Err(composer_occupied_error());
+                    }
+                    if enter_attempted.get() {
+                        return Err(
+                            "prompt submission unconfirmed: automatic parked delivery did not retry Enter"
+                                .into(),
+                        );
+                    }
                 }
-                if let Some(validate) = bound_validate {
-                    let screen = capture_claude(&mut client_cell.borrow_mut(), &stream)
-                        .ok_or_else(|| {
-                            "prompt submission unconfirmed: hosted Claude screen unavailable"
-                                .to_string()
-                        })?;
-                    let phase = if payload_written.get() {
-                        BoundInputPhase::Submit
-                    } else {
-                        BoundInputPhase::FlushEarlier
-                    };
-                    check_bound_claude_input(&screen, &checked_route_keys, trimmed, phase)
-                        .map_err(|err| format!("prompt submission unconfirmed: {err}"))?;
-                    validate()?;
+                if strict_claude {
+                    if capture_failed.get() {
+                        return Err("hosted Claude screen cannot be confirmed".into());
+                    }
+                    let screen =
+                        strict_capture(&mut client_cell.borrow_mut(), keys_attempted.get())?;
+                    if let Some(input) = bound_input {
+                        let phase = if payload_written.get() {
+                            BoundInputPhase::Submit
+                        } else {
+                            BoundInputPhase::FlushEarlier
+                        };
+                        check_bound_claude_input(&screen, &checked_route_keys, trimmed, phase)
+                            .map_err(|err| {
+                                if keys_attempted.get() {
+                                    format!("prompt submission unconfirmed: {err}")
+                                } else if is_composer_occupied_zero_keys_error(&err) {
+                                    err
+                                } else if screen.ghost_styled {
+                                    // Zero-key FlushEarlier refusal on a dim
+                                    // suggestion: hold rather than fence.
+                                    composer_suggestion_error()
+                                } else {
+                                    composer_changed_error_for_screen(&screen.contents)
+                                }
+                            })?;
+                        input.validate(keys_attempted.get())?;
+                    }
                 }
                 if let Some(recovery) = recovery {
                     if !payload_written.get() {
@@ -4598,6 +4714,8 @@ fn deliver_via_tmux_paste_with_resolved_host(
                     let screen = capture_bound_host_screen(&mut client_cell.borrow_mut(), &stream);
                     recovery.authorize_write(screen.as_ref(), Some(trimmed))?;
                 }
+                keys_attempted.set(true);
+                enter_attempted.set(true);
                 let outcome = client_cell
                     .borrow_mut()
                     .write_raw(stream.clone(), grant.lease, b"\r".to_vec())
@@ -4605,12 +4723,19 @@ fn deliver_via_tmux_paste_with_resolved_host(
                 if !matches!(outcome, fl_host_proto::SendOutcome::Written) {
                     return Err(format!("fl-host write_raw Enter returned {outcome:?}"));
                 }
-                keys_written.set(true);
                 Ok(())
             },
             || {},
             |_| {},
         );
+        if bound_input.is_some_and(|input| input.automatic)
+            && delivery.is_ok()
+            && capture_failed.get()
+        {
+            return Err(
+                "prompt submission unconfirmed: hosted Claude screen could not be rechecked".into(),
+            );
+        }
         if recovery.is_some_and(|guard| guard.permission.get() == Ok(false))
             && let Some(wire_id) = extract_wire_message_id(trimmed)
         {
@@ -7993,112 +8118,311 @@ pub fn dispatch_claude_peer_prompt(
         .map_err(|e| format!("failed to write to Claude peer socket: {e}"))
 }
 
-/// Dispatch hosted Claude terminal input only through a pinned explicit registration.
-/// This path never falls through to a peer socket, tmux, or a newly discovered route.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClaudeBoundError {
     Refused(String),
     Delivery(String),
+    /// The composer stopped delivery before any keys were sent to this host stream.
+    Held {
+        reason: String,
+        stream: fl_host_proto::StreamId,
+    },
 }
 
-pub fn dispatch_bound_claude_operator_prompt(
-    binding: &crate::vendor_adapter::ClaudeRegistrationBinding,
-    sender_name: &str,
-    body: &str,
-) -> Result<(), ClaudeBoundError> {
-    let entry = binding
-        .revalidate()
-        .map_err(|e| ClaudeBoundError::Refused(e.to_string()))?;
-    let VendorRoute::Claude {
-        pid,
-        session_id,
-        key_path,
-        ..
-    } = &entry.route
-    else {
+type ClaudeRegistrationBinding = crate::vendor_adapter::ClaudeRegistrationBinding;
+
+struct BoundClaudeHost<'a> {
+    host: ResolvedClaudeHost,
+    target: String,
+    screen: RenderedCursorScreen,
+    pid: u32,
+    key_path: Option<&'a Path>,
+}
+
+fn bound_claude_hold(stream: &fl_host_proto::StreamId, reason: String) -> ClaudeBoundError {
+    ClaudeBoundError::Held {
+        reason,
+        stream: stream.clone(),
+    }
+}
+
+#[derive(Clone, Copy)]
+enum BoundClaudeCheckError {
+    Unavailable(&'static str),
+    Refused(&'static str),
+}
+
+impl BoundClaudeCheckError {
+    fn dispatch_error(self, stream: Option<&fl_host_proto::StreamId>) -> ClaudeBoundError {
+        match self {
+            Self::Unavailable(reason) => match stream {
+                Some(stream) => bound_claude_hold(stream, composer_unlocated_error()),
+                None => ClaudeBoundError::Refused(reason.into()),
+            },
+            Self::Refused(reason) => ClaudeBoundError::Refused(reason.into()),
+        }
+    }
+}
+
+struct BoundClaudeInput<'a> {
+    check: &'a dyn Fn() -> Result<(), BoundClaudeCheckError>,
+    zero_key_error: std::cell::Cell<Option<BoundClaudeCheckError>>,
+    automatic: bool,
+}
+
+impl BoundClaudeInput<'_> {
+    fn validate(&self, keys_attempted: bool) -> Result<(), String> {
+        (self.check)().map_err(|error| self.fail(error, keys_attempted))
+    }
+
+    fn fail(&self, error: BoundClaudeCheckError, keys_attempted: bool) -> String {
+        let detail = match error {
+            BoundClaudeCheckError::Unavailable(reason) | BoundClaudeCheckError::Refused(reason) => {
+                reason
+            }
+        };
+        if keys_attempted {
+            return format!("prompt submission unconfirmed: {detail}");
+        }
+        if !matches!(
+            self.zero_key_error.get(),
+            Some(BoundClaudeCheckError::Refused(_))
+        ) {
+            self.zero_key_error.set(Some(error));
+        }
+        detail.into()
+    }
+}
+
+fn check_bound_claude_registration(
+    binding: &ClaudeRegistrationBinding,
+) -> Result<&RouteEntry, BoundClaudeCheckError> {
+    use crate::vendor_adapter::ClaudeRegistrationError;
+    binding.revalidate().map_err(|error| match error {
+        ClaudeRegistrationError::Source(reason) => BoundClaudeCheckError::Unavailable(reason),
+        ClaudeRegistrationError::Refused(reason) => BoundClaudeCheckError::Refused(reason),
+    })
+}
+
+fn read_bound_claude_record(
+    pid: u32,
+    key_path: Option<&Path>,
+    native_session: &str,
+) -> Result<serde_json::Value, BoundClaudeCheckError> {
+    let unavailable = || {
+        BoundClaudeCheckError::Unavailable(
+            "Claude process session record is unavailable; re-register and resubmit",
+        )
+    };
+    let record = read_claude_session_record(pid, key_path).ok_or_else(unavailable)?;
+    if !claude_record_matches_native_session(Some(&record), native_session)
+        .ok_or_else(unavailable)?
+    {
+        return Err(BoundClaudeCheckError::Refused(
+            "Claude conversation changed; re-register and resubmit",
+        ));
+    }
+    claude_record_status(Some(&record)).ok_or_else(unavailable)?;
+    Ok(record)
+}
+
+fn bound_claude_host_error(
+    error: fl_host_proto::HostError,
+    unsupported: &'static str,
+) -> BoundClaudeCheckError {
+    match error {
+        fl_host_proto::HostError::StaleEpoch { .. }
+        | fl_host_proto::HostError::PtyEpochEvicted { .. } => {
+            BoundClaudeCheckError::Refused("Claude host session changed; re-register and resubmit")
+        }
+        fl_host_proto::HostError::Unsupported { .. } => BoundClaudeCheckError::Refused(unsupported),
+        _ => BoundClaudeCheckError::Unavailable("Claude hosted terminal is unavailable"),
+    }
+}
+
+fn checked_claude_screen(
+    client: &mut fl_host_proto::BlockingHostClient,
+    stream: &fl_host_proto::StreamId,
+    bound_composer: bool,
+) -> Result<RenderedCursorScreen, BoundClaudeCheckError> {
+    let screen = if bound_composer {
+        capture_exact_bound_claude_composer(client, stream)
+    } else {
+        capture_exact_bound_host_screen(client, stream)
+    }
+    .map_err(|error| {
+        bound_claude_host_error(
+            error,
+            "Claude hosted terminal cannot capture a rendered composer",
+        )
+    })?;
+    if !usable_bound_claude_screen(&screen) {
+        return Err(BoundClaudeCheckError::Unavailable(
+            "hosted Claude screen cannot be confirmed",
+        ));
+    }
+    Ok(screen)
+}
+
+fn prepare_bound_claude_host<'a>(
+    binding: &'a ClaudeRegistrationBinding,
+    parked_stream: Option<&fl_host_proto::StreamId>,
+) -> Result<BoundClaudeHost<'a>, ClaudeBoundError> {
+    let entry = check_bound_claude_registration(binding)
+        .map_err(|error| error.dispatch_error(parked_stream))?;
+    let VendorRoute::Claude { pid, key_path, .. } = &entry.route else {
         return Err(ClaudeBoundError::Refused(
             "Claude registration is no longer current; re-register and resubmit".into(),
         ));
     };
-    // A process can switch Claude conversations without replacing its registration.
-    // Bind its current session record to the pinned native UUID before host selection.
-    if !claude_record_matches_native_session(
-        read_claude_session_record(*pid, key_path.as_deref()).as_ref(),
-        binding.native_session(),
-    ) {
-        return Err(ClaudeBoundError::Refused(
-            "Claude process session is unavailable or changed; re-register and resubmit".into(),
-        ));
-    }
+    let pid = *pid;
+    let key_path = key_path.as_deref();
+    // A live process can change conversations without replacing its registration.
+    read_bound_claude_record(pid, key_path, binding.native_session())
+        .map_err(|error| error.dispatch_error(parked_stream))?;
     let target = format!("claude:{}", binding.persona());
-    let mut host = resolve_claude_host(&target, *pid).map_err(ClaudeBoundError::Refused)?;
-    if !host.is_pty
-        || !capture_bound_host_screen(&mut host.client, &host.stream)
-            .as_ref()
-            .is_some_and(usable_bound_claude_screen)
+    let mut host = resolve_claude_host_checked(&target, pid).map_err(|error| match error {
+        ClaudeHostResolutionError::Unavailable(_) => match parked_stream {
+            Some(stream) => bound_claude_hold(stream, composer_unlocated_error()),
+            None => ClaudeBoundError::Refused("Claude hosted terminal is unavailable".into()),
+        },
+        ClaudeHostResolutionError::Identity(message) => ClaudeBoundError::Refused(message.into()),
+    })?;
+    if parked_stream.is_some_and(|stream| *stream != host.stream) {
+        return Err(ClaudeBoundError::Refused(
+            "Claude host session changed; re-register and resubmit".into(),
+        ));
+    }
+    if !host.is_pty {
+        return Err(ClaudeBoundError::Refused(
+            "Claude host session has no terminal composer".into(),
+        ));
+    }
+
+    let screen = checked_claude_screen(&mut host.client, &host.stream, true)
+        .map_err(|error| error.dispatch_error(Some(&host.stream)))?;
+    // A replacement may occur while Host is reading the terminal.
+    check_bound_claude_registration(binding)
+        .map_err(|error| error.dispatch_error(Some(&host.stream)))?;
+    let record = read_bound_claude_record(pid, key_path, binding.native_session())
+        .map_err(|error| error.dispatch_error(Some(&host.stream)))?;
+    let record = Some(&record);
+    if claude_screen_is_busy_main(&screen.contents)
+        || !(claude_session_deliverable(record)
+            || (claude_session_busy(record)
+                && screen_proves_claude_background_wait(&screen.contents)))
     {
-        return Err(ClaudeBoundError::Refused(
-            "Claude composer cannot be confirmed".into(),
+        return Err(bound_claude_hold(
+            &host.stream,
+            composer_session_busy_error(),
         ));
     }
-    let record = read_claude_session_record(*pid, key_path.as_deref());
-    if !claude_session_deliverable(record.as_ref()) {
-        let proves_wait = claude_session_busy(record.as_ref())
-            && host.is_pty
-            && capture_bound_host_screen(&mut host.client, &host.stream).is_some_and(|screen| {
-                usable_bound_claude_screen(&screen)
-                    && screen_proves_claude_background_wait(&screen.contents)
-            });
-        if !proves_wait {
-            return Err(ClaudeBoundError::Delivery(composer_session_busy_error()));
-        }
-    }
-    // Recheck source after host lookup, directly before acquiring the controller and writing.
-    binding
-        .revalidate()
-        .map_err(|e| ClaudeBoundError::Refused(e.to_string()))?;
-    if !claude_record_matches_native_session(
-        read_claude_session_record(*pid, key_path.as_deref()).as_ref(),
-        binding.native_session(),
+    Ok(BoundClaudeHost {
+        host,
+        target,
+        screen,
+        pid,
+        key_path,
+    })
+}
+
+/// Check a parked prompt's original Claude terminal without acquiring input control or sending keys.
+pub fn probe_bound_claude_composer_ready(
+    binding: &ClaudeRegistrationBinding,
+    stream: &fl_host_proto::StreamId,
+) -> Result<(), ClaudeBoundError> {
+    let bound = prepare_bound_claude_host(binding, Some(stream))?;
+    // A parked prompt can only start on a clean composer. It cannot flush an
+    // older Wire draft, even when the shared probe recognizes that draft.
+    match probe_claude_composer_ready_from_screen(
+        &bound.screen.contents,
+        bound.screen.cursor_state(),
+        &[],
     ) {
-        return Err(ClaudeBoundError::Refused(
-            "Claude process session is unavailable or changed; re-register and resubmit".into(),
-        ));
+        Some(true) => Ok(()),
+        Some(false) => Err(bound_claude_hold(stream, composer_occupied_error())),
+        None => Err(bound_claude_hold(stream, composer_unlocated_error())),
     }
+}
+
+/// Dispatch hosted Claude terminal input only through a pinned explicit registration.
+/// This path never falls through to a peer socket, tmux, or a newly discovered route.
+pub fn dispatch_bound_claude_operator_prompt(
+    binding: &ClaudeRegistrationBinding,
+    sender_name: &str,
+    body: &str,
+) -> Result<(), ClaudeBoundError> {
+    dispatch_bound_claude_prompt(binding, None, sender_name, body, false)
+}
+
+/// Dispatch a parked prompt only to the original registered conversation and host stream.
+pub fn dispatch_parked_claude_operator_prompt(
+    binding: &ClaudeRegistrationBinding,
+    stream: &fl_host_proto::StreamId,
+    sender_name: &str,
+    body: &str,
+    intent: OperatorPromptIntent,
+) -> Result<(), ClaudeBoundError> {
+    dispatch_bound_claude_prompt(
+        binding,
+        Some(stream),
+        sender_name,
+        body,
+        intent == OperatorPromptIntent::Ordinary,
+    )
+}
+
+fn dispatch_bound_claude_prompt(
+    binding: &ClaudeRegistrationBinding,
+    parked_stream: Option<&fl_host_proto::StreamId>,
+    sender_name: &str,
+    body: &str,
+    automatic: bool,
+) -> Result<(), ClaudeBoundError> {
+    let BoundClaudeHost {
+        host,
+        target,
+        pid,
+        key_path,
+        ..
+    } = prepare_bound_claude_host(binding, parked_stream)?;
     let opts = TmuxPasteOptions {
         bracketed: true,
         verify_submission: true,
-        session_id: Some(session_id.as_str()),
+        session_id: Some(binding.native_session()),
         is_muse_route: false,
         is_claude_route: true,
         composer_style: ComposerStyle::Ruled,
     };
     let text = sanitize_for_paste(&prefixed_operator_body(sender_name, body));
-    let validate = || {
-        binding.revalidate().map_err(|_| {
-            "Claude identity changed during terminal delivery; delivery may be unconfirmed"
-                .to_string()
-        })?;
-        if !claude_record_matches_native_session(
-            read_claude_session_record(*pid, key_path.as_deref()).as_ref(),
-            binding.native_session(),
-        ) {
-            return Err(
-                "Claude conversation changed during terminal delivery; delivery may be unconfirmed"
-                    .into(),
-            );
-        }
+    let check = || {
+        check_bound_claude_registration(binding)?;
+        read_bound_claude_record(pid, key_path, binding.native_session())?;
         Ok(())
     };
+    let input = BoundClaudeInput {
+        check: &check,
+        zero_key_error: std::cell::Cell::new(None),
+        automatic,
+    };
+    let stream = host.stream.clone();
     deliver_via_tmux_paste_with_resolved_host(
         &target,
         &text,
         opts,
         Some((host.client, host.stream, host.is_pty)),
-        Some(&validate),
+        Some(&input),
         None,
     )
-    .map_err(ClaudeBoundError::Delivery)
+    .map_err(|error| {
+        if let Some(verification) = input.zero_key_error.take() {
+            verification.dispatch_error(Some(&stream))
+        } else if is_composer_occupied_zero_keys_error(&error) {
+            bound_claude_hold(&stream, error)
+        } else {
+            ClaudeBoundError::Delivery(error)
+        }
+    })
 }
 
 pub fn dispatch_operator_prompt_to_route(
@@ -8688,8 +9012,10 @@ mod tests {
             Arc,
             atomic::{AtomicUsize, Ordering},
         };
-        const STALE_DIM_SUGGESTION: usize = 13;
-        const REDRAWN_PROMPT: usize = 14;
+        const STALE_DIM_SUGGESTION: usize = 18;
+        const REDRAWN_PROMPT: usize = 19;
+        const DIM_AT_FLUSH: usize = 20;
+        const PLAIN_HOST_DIM_SUGGESTION: usize = 21;
         let _lock = TMUX_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = TempDir::new().unwrap();
         fs::set_permissions(tmp.path(), fs::Permissions::from_mode(0o700)).unwrap();
@@ -8784,7 +9110,7 @@ mod tests {
                                     host: HostInstance::new([5; 16]),
                                     features: match scenario.load(Ordering::SeqCst) {
                                         1 => 0,
-                                        STALE_DIM_SUGGESTION | REDRAWN_PROMPT => {
+                                        STALE_DIM_SUGGESTION | REDRAWN_PROMPT | DIM_AT_FLUSH => {
                                             RENDERED_PTY_FEATURE | RENDERED_CURSOR_STYLE_FEATURE
                                         }
                                         _ => RENDERED_PTY_FEATURE,
@@ -8817,10 +9143,15 @@ mod tests {
                                     if scenario.load(Ordering::SeqCst) == 7 {
                                         fs::write(&record_path, r#"{"status":"idle","sessionId":"replacement"}"#).unwrap();
                                     }
-                                    if scenario.load(Ordering::SeqCst) == 2 {
+                                    if scenario.load(Ordering::SeqCst) == 2
+                                        || (scenario.load(Ordering::SeqCst) == 15 && capture_number >= 3)
+                                    {
                                         stream.epoch = SessionEpoch(4);
                                     }
-                                    let stale_suggestion = scenario.load(Ordering::SeqCst) == STALE_DIM_SUGGESTION;
+                                    let stale_suggestion = matches!(
+                                        scenario.load(Ordering::SeqCst),
+                                        STALE_DIM_SUGGESTION | PLAIN_HOST_DIM_SUGGESTION
+                                    ) || (scenario.load(Ordering::SeqCst) == DIM_AT_FLUSH && capture_number >= 5);
                                     let screen = RenderedScreen {
                                             schema: 1,
                                             stream,
@@ -8828,6 +9159,8 @@ mod tests {
                                                 5 => String::new(),
                                                 6 => "unlocated screen".into(),
                                                 11 if capture_number >= 4 => "────────────────────\n❯ owner draft\n────────────────────\n".into(),
+                                                13 => "────────────────────\n❯ \n────────────────────\n  esc to interrupt\n".into(),
+                                                14 => "✻ Waiting for 1 background agent to finish\n────────────────────\n❯ \n────────────────────\n  ⏵⏵ auto mode on · ← 1 agent · ↓ to manage\n\n  ● main\n  ◯ fixture-agent (running)\n".into(),
                                                 _ => format!("────────────────────\n❯ {}\n────────────────────\n", composer.lock().unwrap()),
                                             },
                                             cursor_row: u16::from(stale_suggestion),
@@ -8863,7 +9196,15 @@ mod tests {
                                     } else {
                                         let bytes = bytes.into_vec();
                                         if bytes == b"\r" {
-                                            composer.lock().unwrap().clear();
+                                            // One stale redraw after successful Enter, then resume normal behavior.
+                                            if scenario.load(Ordering::SeqCst) == 16 {
+                                                scenario.store(0, Ordering::SeqCst);
+                                            } else if scenario.load(Ordering::SeqCst) != STALE_DIM_SUGGESTION {
+                                                composer.lock().unwrap().clear();
+                                                if scenario.load(Ordering::SeqCst) == 17 {
+                                                    scenario.store(2, Ordering::SeqCst);
+                                                }
+                                            }
                                         } else if scenario.load(Ordering::SeqCst) != STALE_DIM_SUGGESTION {
                                             let text = String::from_utf8_lossy(&bytes);
                                             *composer.lock().unwrap() = text.trim_start_matches("\x1b[200~").trim_end_matches("\x1b[201~").to_string();
@@ -9003,15 +9344,163 @@ mod tests {
                 dispatch_bound_claude_operator_prompt(&binding, "owner", "fixture message")
                     .is_err()
             );
+            assert!(matches!(
+                probe_bound_claude_composer_ready(&binding, &claude_stream),
+                Err(ClaudeBoundError::Refused(_))
+            ));
             assert_eq!(claims.lock().unwrap().len(), before_claims);
             assert_eq!(writes.lock().unwrap().len(), before_writes);
             let mut correct = make_summary("fixture-536.claude");
             if let ChildState::Running(ref mut child) = correct.state {
                 child.pid = pid;
             }
+            *sessions.lock().unwrap() = vec![correct.clone()];
+            let set_status = |status| {
+                fs::write(
+                    tmp.path().join(format!("{pid}.json")),
+                    serde_json::json!({"status": status, "sessionId": native}).to_string(),
+                )
+                .unwrap();
+            };
+
+            set_status("busy");
+            let parked =
+                dispatch_bound_claude_operator_prompt(&binding, "owner", "fixture message");
+            assert_eq!(
+                parked,
+                Err(bound_claude_hold(
+                    &claude_stream,
+                    composer_session_busy_error()
+                ))
+            );
+            assert_eq!(
+                probe_bound_claude_composer_ready(&binding, &claude_stream),
+                parked
+            );
+            scenario.store(14, Ordering::SeqCst);
+            assert_eq!(
+                probe_bound_claude_composer_ready(&binding, &claude_stream),
+                Ok(())
+            );
+
+            set_status("idle");
+            scenario.store(13, Ordering::SeqCst);
+            assert_eq!(
+                probe_bound_claude_composer_ready(&binding, &claude_stream),
+                parked
+            );
+            scenario.store(5, Ordering::SeqCst);
+            assert_eq!(
+                probe_bound_claude_composer_ready(&binding, &claude_stream),
+                Err(bound_claude_hold(
+                    &claude_stream,
+                    composer_unlocated_error()
+                ))
+            );
+            scenario.store(0, Ordering::SeqCst);
+            *composer.lock().unwrap() = "owner draft".into();
+            assert_eq!(
+                probe_bound_claude_composer_ready(&binding, &claude_stream),
+                Err(bound_claude_hold(&claude_stream, composer_occupied_error()))
+            );
+            composer.lock().unwrap().clear();
+
+            let dispatch_parked = |intent| {
+                dispatch_parked_claude_operator_prompt(
+                    &binding,
+                    &claude_stream,
+                    "owner",
+                    "fixture message",
+                    intent,
+                )
+            };
+            let record_path = tmp.path().join(format!("{pid}.json"));
+            let unavailable = Err(bound_claude_hold(
+                &claude_stream,
+                composer_unlocated_error(),
+            ));
+            // The original ID survives a missing, partially written or incomplete status file.
+            fs::remove_file(&record_path).unwrap();
+            for partial in [
+                None,
+                Some("{"),
+                Some(r#"{"status":"idle"}"#),
+                Some(r#"{"sessionId":"dce797a0-d963-4c1b-a06b-7fa6bffda7fa"}"#),
+            ] {
+                if let Some(partial) = partial {
+                    fs::write(&record_path, partial).unwrap();
+                }
+                assert_eq!(
+                    probe_bound_claude_composer_ready(&binding, &claude_stream),
+                    unavailable
+                );
+                assert_eq!(dispatch_parked(OperatorPromptIntent::Ordinary), unavailable);
+                assert!(matches!(
+                    dispatch_bound_claude_operator_prompt(&binding, "owner", "fixture message"),
+                    Err(ClaudeBoundError::Refused(_))
+                ));
+            }
+            set_status("idle");
+            assert_eq!(
+                probe_bound_claude_composer_ready(&binding, &claude_stream),
+                Ok(())
+            );
+            fs::write(&source, "{broken").unwrap();
+            assert_eq!(
+                probe_bound_claude_composer_ready(&binding, &claude_stream),
+                unavailable
+            );
+            assert_eq!(dispatch_parked(OperatorPromptIntent::Ordinary), unavailable);
+            fs::write(&source, serde_json::to_vec(&table).unwrap()).unwrap();
+
+            // Host identity must match even when registration and native session still do.
+            let mut replacement = correct.clone();
+            replacement.stream.epoch = SessionEpoch(4);
+            if let ChildState::Running(ref mut child) = replacement.state {
+                child.session_epoch = SessionEpoch(4);
+            }
+            *sessions.lock().unwrap() = vec![replacement];
+            assert!(matches!(
+                probe_bound_claude_composer_ready(&binding, &claude_stream),
+                Err(ClaudeBoundError::Refused(_))
+            ));
+            assert!(matches!(
+                dispatch_parked_claude_operator_prompt(
+                    &binding,
+                    &claude_stream,
+                    "owner",
+                    "fixture message",
+                    OperatorPromptIntent::Ordinary,
+                ),
+                Err(ClaudeBoundError::Refused(_))
+            ));
+            assert_eq!(claims.lock().unwrap().len(), before_claims);
+            assert_eq!(writes.lock().unwrap().len(), before_writes);
+
             *sessions.lock().unwrap() = vec![correct];
-            dispatch_bound_claude_operator_prompt(&binding, "owner", "fixture message").unwrap();
-            assert!(writes.lock().unwrap().len() > before_writes);
+            assert_eq!(
+                probe_bound_claude_composer_ready(&binding, &claude_stream),
+                Ok(())
+            );
+            assert_eq!(claims.lock().unwrap().len(), before_claims);
+            assert_eq!(writes.lock().unwrap().len(), before_writes);
+            dispatch_parked_claude_operator_prompt(
+                &binding,
+                &claude_stream,
+                "owner",
+                "fixture message",
+                OperatorPromptIntent::Ordinary,
+            )
+            .unwrap();
+            {
+                let writes = writes.lock().unwrap();
+                assert_eq!(writes.len(), before_writes + 2);
+                assert_eq!(&writes[before_writes].0, &claude_stream);
+                assert_eq!(
+                    &writes[before_writes + 1],
+                    &(claude_stream.clone(), b"\r".to_vec())
+                );
+            }
             assert_eq!(claims.lock().unwrap().last(), Some(&claude_stream));
             let after_success_claims = claims.lock().unwrap().len();
             let after_success_writes = writes.lock().unwrap().len();
@@ -9032,11 +9521,62 @@ mod tests {
             .unwrap();
             scenario.store(8, Ordering::SeqCst);
             let before = writes.lock().unwrap().len();
-            assert!(
-                dispatch_bound_claude_operator_prompt(&binding, "owner", "fixture message")
-                    .is_err()
-            );
+            assert!(matches!(
+                dispatch_parked_claude_operator_prompt(
+                    &binding,
+                    &claude_stream,
+                    "owner",
+                    "fixture message",
+                    OperatorPromptIntent::Ordinary,
+                ),
+                Err(ClaudeBoundError::Refused(_))
+            ));
             assert_eq!(writes.lock().unwrap().len(), before);
+            // A stale epoch during controller claim or a recapture after claim
+            // gives a proven zero-key refusal, even if initial capture succeeded.
+            set_status("idle");
+            for case in [3, 15] {
+                scenario.store(case, Ordering::SeqCst);
+                rendered_captures.store(0, Ordering::SeqCst);
+                let attempted_before = attempted_writes.lock().unwrap().len();
+                assert!(matches!(
+                    dispatch_parked(OperatorPromptIntent::Ordinary),
+                    Err(ClaudeBoundError::Refused(reason)) if reason.contains("host session changed")
+                ));
+                assert_eq!(attempted_writes.lock().unwrap().len(), attempted_before);
+            }
+
+            scenario.store(16, Ordering::SeqCst);
+            let before = writes.lock().unwrap().len();
+            let error = dispatch_parked(OperatorPromptIntent::Ordinary).unwrap_err();
+            assert!(
+                matches!(error, ClaudeBoundError::Delivery(reason) if reason.contains("did not retry Enter"))
+            );
+            {
+                let writes = writes.lock().unwrap();
+                assert_eq!(writes.len(), before + 2);
+                assert_eq!(writes.last().unwrap().1, b"\r");
+            }
+            composer.lock().unwrap().clear();
+            scenario.store(16, Ordering::SeqCst);
+            let before = writes.lock().unwrap().len();
+            dispatch_parked(OperatorPromptIntent::OwnerSendNow).unwrap();
+            {
+                let writes = writes.lock().unwrap();
+                assert_eq!(writes.len(), before + 3);
+                assert_eq!(writes[before + 1].1, b"\r");
+                assert_eq!(writes[before + 2].1, b"\r");
+            }
+
+            // An epoch change after keys were acknowledged is unconfirmed.
+            scenario.store(17, Ordering::SeqCst);
+            let before = writes.lock().unwrap().len();
+            assert!(matches!(
+                dispatch_parked(OperatorPromptIntent::Ordinary),
+                Err(ClaudeBoundError::Delivery(reason)) if reason.contains("could not be rechecked")
+            ));
+            assert_eq!(writes.lock().unwrap().len(), before + 2);
+
             // If the conversation changes after payload write, never send Enter;
             // report a delivery failure because input already reached the terminal.
             fs::write(
@@ -9106,14 +9646,66 @@ mod tests {
             scenario.store(REDRAWN_PROMPT, Ordering::SeqCst);
             let before = writes.lock().unwrap().len();
             dispatch_bound_claude_operator_prompt(&binding, "owner", slash_command).unwrap();
-            let out = writes.lock().unwrap();
+            {
+                let out = writes.lock().unwrap();
+                assert_eq!(
+                    &out[before..],
+                    &[
+                        (claude_stream.clone(), b"\x1b[200~/clear\x1b[201~".to_vec()),
+                        (claude_stream.clone(), b"\r".to_vec()),
+                    ]
+                );
+            }
+
+            // A parked prompt's zero-key probe reads the same styled capture:
+            // a dim suggestion is a clean composer, while a host without the
+            // style feature fails closed and keeps the prompt held.
+            *composer.lock().unwrap() = slash_command.into();
+            scenario.store(STALE_DIM_SUGGESTION, Ordering::SeqCst);
             assert_eq!(
-                &out[before..],
-                &[
-                    (claude_stream.clone(), b"\x1b[200~/clear\x1b[201~".to_vec()),
-                    (claude_stream.clone(), b"\r".to_vec()),
-                ]
+                probe_bound_claude_composer_ready(&binding, &claude_stream),
+                Ok(())
             );
+            scenario.store(0, Ordering::SeqCst);
+            assert_eq!(
+                probe_bound_claude_composer_ready(&binding, &claude_stream),
+                Err(bound_claude_hold(&claude_stream, composer_occupied_error()))
+            );
+            // The same cursor-at-suggestion screen from a host that advertises
+            // only the rendered PTY feature: no dim style is reported, so the
+            // probe holds and nothing is delivered or recorded.
+            let probe_keys = vec![format!("host:{}", claude_stream.session.as_str())];
+            scenario.store(PLAIN_HOST_DIM_SUGGESTION, Ordering::SeqCst);
+            let before = writes.lock().unwrap().len();
+            let attempted_before = attempted_writes.lock().unwrap().len();
+            assert_eq!(
+                probe_bound_claude_composer_ready(&binding, &claude_stream),
+                Err(bound_claude_hold(&claude_stream, composer_occupied_error()))
+            );
+            assert_eq!(writes.lock().unwrap().len(), before);
+            assert_eq!(attempted_writes.lock().unwrap().len(), attempted_before);
+            assert!(!route_has_unconfirmed_wire_deliveries(&probe_keys));
+
+            // A dim suggestion that appears at the pre-paste flush Enter is
+            // refused before any key write, so it holds instead of fencing.
+            let flush_keys = vec![format!("host:{}", claude_stream.session.as_str())];
+            *composer.lock().unwrap() = "earlier message".into();
+            record_unconfirmed_wire_delivery(&flush_keys, "dim-flush-fixture", "earlier message");
+            scenario.store(DIM_AT_FLUSH, Ordering::SeqCst);
+            rendered_captures.store(0, Ordering::SeqCst);
+            let before = writes.lock().unwrap().len();
+            let result =
+                dispatch_bound_claude_operator_prompt(&binding, "owner", "fixture message");
+            clear_unconfirmed_wire_deliveries(&flush_keys);
+            assert!(
+                matches!(&result, Err(ClaudeBoundError::Held { reason, stream })
+                    if stream == &claude_stream
+                        && is_composer_occupied_zero_keys_error(reason)
+                        && *reason == composer_suggestion_error()),
+                "{result:?}"
+            );
+            assert_eq!(writes.lock().unwrap().len(), before);
+            composer.lock().unwrap().clear();
         }
         let _ = stop_tx.send(());
         server.join().unwrap();
@@ -23082,23 +23674,35 @@ exit 1"#,
     #[test]
     fn pinned_native_session_requires_matching_current_record() {
         let native = "dce797a0-d963-4c1b-a06b-7fa6bffda7fa";
-        assert!(!claude_record_matches_native_session(None, native));
-        assert!(!claude_record_matches_native_session(
-            Some(&serde_json::json!({"status":"idle"})),
-            native
-        ));
-        assert!(!claude_record_matches_native_session(
-            Some(&serde_json::json!({"sessionId":"  "})),
-            native
-        ));
-        assert!(!claude_record_matches_native_session(
-            Some(&serde_json::json!({"sessionId":"other"})),
-            native
-        ));
-        assert!(claude_record_matches_native_session(
-            Some(&serde_json::json!({"sessionId":native})),
-            native
-        ));
+        assert_eq!(claude_record_matches_native_session(None, native), None);
+        assert_eq!(
+            claude_record_matches_native_session(
+                Some(&serde_json::json!({"status":"idle"})),
+                native
+            ),
+            None
+        );
+        assert_eq!(
+            claude_record_matches_native_session(
+                Some(&serde_json::json!({"sessionId":"  "})),
+                native
+            ),
+            None
+        );
+        assert_eq!(
+            claude_record_matches_native_session(
+                Some(&serde_json::json!({"sessionId":"other"})),
+                native
+            ),
+            Some(false)
+        );
+        assert_eq!(
+            claude_record_matches_native_session(
+                Some(&serde_json::json!({"sessionId":native})),
+                native
+            ),
+            Some(true)
+        );
     }
 
     #[test]

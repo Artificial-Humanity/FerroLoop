@@ -8654,9 +8654,40 @@ pub fn teardown_session<S: AgentRegistry + StateStore>(
     caller: Caller,
     clear_queue: impl FnMut(&str),
 ) -> Result<DecommissionResponse, LifecycleError> {
+    teardown_session_with_queue_cleanup(
+        store,
+        env,
+        target,
+        by,
+        caller,
+        clear_queue_keys(clear_queue),
+    )
+}
+
+pub(crate) enum TeardownQueueCleanup<'a> {
+    Started { vendor: &'a str, persona: &'a str },
+    Key(&'a str),
+}
+
+fn clear_queue_keys(mut clear_queue: impl FnMut(&str)) -> impl FnMut(TeardownQueueCleanup<'_>) {
+    move |cleanup| {
+        if let TeardownQueueCleanup::Key(key) = cleanup {
+            clear_queue(key);
+        }
+    }
+}
+
+pub(crate) fn teardown_session_with_queue_cleanup<S: AgentRegistry + StateStore>(
+    store: &S,
+    env: &LifecycleEnv<'_>,
+    target: &SessionTarget,
+    by: &str,
+    caller: Caller,
+    cleanup_queue: impl FnMut(TeardownQueueCleanup<'_>),
+) -> Result<DecommissionResponse, LifecycleError> {
     with_lifecycle_fence(env, &target.persona, "teardown", |env| {
         let target = reload_lifecycle_target_policy(store, target, true)?;
-        teardown_session_fenced(store, env, &target, by, caller, clear_queue)
+        teardown_session_fenced(store, env, &target, by, caller, cleanup_queue)
     })
 }
 
@@ -8666,7 +8697,7 @@ fn teardown_session_fenced<S: AgentRegistry + StateStore>(
     target: &SessionTarget,
     by: &str,
     caller: Caller,
-    mut clear_queue: impl FnMut(&str),
+    mut cleanup_queue: impl FnMut(TeardownQueueCleanup<'_>),
 ) -> Result<DecommissionResponse, LifecycleError> {
     authorize_teardown(store, target, caller)?;
     let TeardownRuntimePlan {
@@ -8689,11 +8720,15 @@ fn teardown_session_fenced<S: AgentRegistry + StateStore>(
         record.runtime_spawned = false;
     }
 
+    cleanup_queue(TeardownQueueCleanup::Started {
+        vendor: &record.vendor,
+        persona: &record.persona,
+    });
     for key in target.keys() {
         if persona_still_running && key.eq_ignore_ascii_case(&target.persona) {
             continue;
         }
-        clear_queue(key);
+        cleanup_queue(TeardownQueueCleanup::Key(key));
     }
     let session_ids = [
         target.session_id.as_str(),
@@ -11155,7 +11190,7 @@ pub fn remodel_session<S: AgentRegistry + StateStore + Catalog + MessageStore>(
             by,
             caller,
             &observations,
-            clear_queue,
+            clear_queue_keys(clear_queue),
         )
     })
 }
@@ -11169,7 +11204,7 @@ pub(crate) fn remodel_session_with_auth<S: AgentRegistry + StateStore + Catalog 
     by: &str,
     caller: Caller,
     observations: &LaunchAuthObservations,
-    clear_queue: impl FnMut(&str),
+    cleanup_queue: impl FnMut(TeardownQueueCleanup<'_>),
 ) -> Result<RemodelResponse, LifecycleError> {
     remodel_with_auth(
         store,
@@ -11179,7 +11214,7 @@ pub(crate) fn remodel_session_with_auth<S: AgentRegistry + StateStore + Catalog 
         by,
         caller,
         observations,
-        clear_queue,
+        cleanup_queue,
         &mut |store, env, req, by, caller, launch_auth| {
             #[cfg(test)]
             if FAIL_SPIN_UP_VENDORS.with_borrow(|v| v.contains(&req.vendor)) {
@@ -11212,7 +11247,7 @@ fn remodel_with<S: AgentRegistry + StateStore + Catalog + MessageStore>(
     req: &RemodelRequest,
     by: &str,
     caller: Caller,
-    clear_queue: impl FnMut(&str),
+    cleanup_queue: impl FnMut(TeardownQueueCleanup<'_>),
     spin: &mut SpinUpFn<'_, S>,
 ) -> Result<RemodelResponse, LifecycleError> {
     let mut observations = LaunchAuthObservations::new();
@@ -11228,7 +11263,7 @@ fn remodel_with<S: AgentRegistry + StateStore + Catalog + MessageStore>(
         by,
         caller,
         &observations,
-        clear_queue,
+        cleanup_queue,
         spin,
     )
 }
@@ -11242,7 +11277,7 @@ fn remodel_with_auth<S: AgentRegistry + StateStore + Catalog + MessageStore>(
     by: &str,
     caller: Caller,
     observations: &LaunchAuthObservations,
-    clear_queue: impl FnMut(&str),
+    cleanup_queue: impl FnMut(TeardownQueueCleanup<'_>),
     spin: &mut SpinUpFn<'_, S>,
 ) -> Result<RemodelResponse, LifecycleError> {
     with_lifecycle_fence(env, &target.persona, "remodel", |env| {
@@ -11255,7 +11290,7 @@ fn remodel_with_auth<S: AgentRegistry + StateStore + Catalog + MessageStore>(
             by,
             caller,
             observations,
-            clear_queue,
+            cleanup_queue,
             spin,
         )
     })
@@ -11270,7 +11305,7 @@ fn remodel_fenced<S: AgentRegistry + StateStore + Catalog + MessageStore>(
     by: &str,
     caller: Caller,
     observations: &LaunchAuthObservations,
-    clear_queue: impl FnMut(&str),
+    cleanup_queue: impl FnMut(TeardownQueueCleanup<'_>),
     spin: &mut SpinUpFn<'_, S>,
 ) -> Result<RemodelResponse, LifecycleError> {
     let plan = plan_remodel(store, env, target, req, caller)?;
@@ -11337,7 +11372,7 @@ fn remodel_fenced<S: AgentRegistry + StateStore + Catalog + MessageStore>(
             // The warning was added to the remodel response during the precheck.
             LaunchAuth::Observed(target, None)
         });
-    let spun = teardown_session(store, env, target, by, caller, clear_queue)
+    let spun = teardown_session_with_queue_cleanup(store, env, target, by, caller, cleanup_queue)
         .map_err(|e| format!("teardown of `{}` failed: {e}", plan.from_session_id))
         .and_then(|torn| {
             spin(store, env, &plan.spin_up_request(), by, caller, launch_auth)
