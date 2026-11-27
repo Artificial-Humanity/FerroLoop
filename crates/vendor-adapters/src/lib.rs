@@ -174,6 +174,11 @@ mod version_evidence_tests {
             ["claude", "--settings", ours, "--", "--settings", "x"]
         );
         assert_eq!(apply(&["claude"]), ["claude", "--settings", ours]);
+        // Only `--settings` itself counts, not another flag that starts with it.
+        assert_eq!(
+            apply(&["claude", "--settings-file", "x"]),
+            ["claude", "--settings", ours, "--settings-file", "x"]
+        );
         assert!(apply(&[]).is_empty());
     }
 

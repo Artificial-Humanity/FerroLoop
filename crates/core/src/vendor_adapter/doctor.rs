@@ -2,7 +2,7 @@
 
 use std::ffi::{OsStr, OsString};
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use super::{VendorVersionAdapter, VendorVersionRegistry};
 
@@ -97,11 +97,18 @@ impl VendorDoctorContext<'_> {
     }
 
     /// Resolve an absolute system configuration directory such as `/etc/claude-code`,
-    /// under [`Self::system_root`] when it is set.
+    /// under [`Self::system_root`] when it is set. There the drive prefix and root of
+    /// `absolute` are dropped, so `C:\Program Files\ClaudeCode` also stays under the root.
     pub fn system_dir(&self, absolute: &str) -> PathBuf {
+        let absolute = Path::new(absolute);
         match self.system_root {
-            Some(root) => root.join(absolute.trim_start_matches('/')),
-            None => PathBuf::from(absolute),
+            Some(root) => root.join(
+                absolute
+                    .components()
+                    .filter(|component| matches!(component, Component::Normal(_)))
+                    .collect::<PathBuf>(),
+            ),
+            None => absolute.to_path_buf(),
         }
     }
 
@@ -163,5 +170,41 @@ impl VendorVersionRegistry {
                 hosted_cli_updates: adapter.hosted_cli_updates(context),
             })
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn no_env(_: &str) -> Option<OsString> {
+        None
+    }
+
+    fn context(system_root: Option<&Path>) -> VendorDoctorContext<'_> {
+        VendorDoctorContext {
+            home: None,
+            path: None,
+            env: &no_env,
+            system_root,
+        }
+    }
+
+    #[test]
+    fn system_dir_keeps_an_injected_root_and_drops_the_absolute_prefix() {
+        assert_eq!(
+            context(None).system_dir("/etc/claude-code"),
+            Path::new("/etc/claude-code")
+        );
+        let root = Path::new("/tmp/system-root");
+        assert_eq!(
+            context(Some(root)).system_dir("/Library/Application Support/ClaudeCode"),
+            root.join("Library/Application Support/ClaudeCode")
+        );
+        #[cfg(windows)]
+        assert_eq!(
+            context(Some(root)).system_dir(r"C:\Program Files\ClaudeCode"),
+            root.join(r"Program Files\ClaudeCode")
+        );
     }
 }

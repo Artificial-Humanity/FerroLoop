@@ -414,11 +414,20 @@ const CLAUDE_AUTO_UPDATE_DISABLED: (&str, &str) = ("DISABLE_AUTOUPDATER", "1");
 /// an `env` block.
 const CLAUDE_HOSTED_SETTINGS: &str = r#"{"env":{"DISABLE_AUTOUPDATER":"1"}}"#;
 
-/// Claude's system directory for file-based managed settings on Linux.
-const CLAUDE_MANAGED_DIR: &str = "/etc/claude-code";
+/// Claude's documented system directory for file-based managed settings on this platform.
+#[cfg(target_os = "macos")]
+pub(crate) const CLAUDE_MANAGED_DIR: &str = "/Library/Application Support/ClaudeCode";
+#[cfg(windows)]
+pub(crate) const CLAUDE_MANAGED_DIR: &str = r"C:\Program Files\ClaudeCode";
+#[cfg(not(any(target_os = "macos", windows)))]
+pub(crate) const CLAUDE_MANAGED_DIR: &str = "/etc/claude-code";
 
 /// More `managed-settings.d` drop-ins than this leave the managed settings unknown.
 const MAX_MANAGED_DROP_INS: usize = 64;
+
+/// More `managed-settings.d` entries of any kind than this leave the managed settings
+/// unknown, so a directory full of other files is not walked without limit.
+const MAX_MANAGED_DIR_ENTRIES: usize = 256;
 
 /// Either control disabling updates disables them. Otherwise an unknown control, in
 /// control order, gives its reason.
@@ -452,7 +461,10 @@ fn managed_settings_env(dir: &Path) -> Result<ClaudeSettingsEnv, &'static str> {
         Err(_) => return Err(MANAGED_SETTINGS_D.unreadable),
     };
     let mut names = Vec::new();
-    for entry in entries {
+    for (visited, entry) in entries.enumerate() {
+        if visited == MAX_MANAGED_DIR_ENTRIES {
+            return Err("managed-settings.d has too many entries");
+        }
         let name = entry
             .map_err(|_| MANAGED_SETTINGS_D.unreadable)?
             .file_name();

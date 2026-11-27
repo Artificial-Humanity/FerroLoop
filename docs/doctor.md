@@ -163,9 +163,11 @@ value leave them on. Other values are `unknown` (`unrecognised value`).
 For the configured row, Doctor resolves each variable in Claude Code's documented order,
 highest first. The first source that sets the variable decides it:
 
-1. Managed settings files: `/etc/claude-code/managed-settings.json`, then each `*.json` file in
-   `/etc/claude-code/managed-settings.d/` in name order. A later file replaces an earlier
-   value. Hidden files are skipped. An empty file counts as `{}`.
+1. Managed settings files: `managed-settings.json` in the managed directory, then each `*.json`
+   file in its `managed-settings.d/` in name order. A later file replaces an earlier value.
+   Hidden files are skipped. An empty file counts as `{}`. The managed directory is
+   `/etc/claude-code` on Linux and other Unix systems, `/Library/Application Support/ClaudeCode`
+   on macOS, and `C:\Program Files\ClaudeCode` on Windows.
 2. The `env` block of the user `settings.json` in `$CLAUDE_CONFIG_DIR`, or `~/.claude` when
    that variable is not set.
 3. The process environment.
@@ -174,8 +176,10 @@ A missing file sets nothing. A file that exists but cannot be read or fails vali
 each variable it could decide `unknown`, with a reason such as
 `managed-settings.json failed validation`. Validation requires a JSON object whose `env`, when
 present, maps names to strings. More than 64 drop-in files is `unknown`
-(`managed-settings.d has too many files`). If either variable resolves to disabled, updates are
-disabled.
+(`managed-settings.d has too many files`), and so is more than 256 entries of any kind in
+`managed-settings.d/` (`managed-settings.d has too many entries`). A managed settings file that
+is a symbolic link is `unknown`, because Doctor does not follow links. If either variable
+resolves to disabled, updates are disabled.
 
 Doctor does not read project or local settings files (`.claude/settings.json` and
 `.claude/settings.local.json`), because they depend on the working directory. Those files

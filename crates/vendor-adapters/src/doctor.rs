@@ -460,12 +460,20 @@ mod tests {
         );
     }
 
+    /// This platform's managed settings directory under the test system root.
+    fn managed_dir(home: &Path) -> PathBuf {
+        let system_root = home.join("system-root");
+        VendorDoctorContext {
+            home: None,
+            path: None,
+            env: &|_: &str| None,
+            system_root: Some(&system_root),
+        }
+        .system_dir(crate::claude::CLAUDE_MANAGED_DIR)
+    }
+
     fn managed(home: &Path, relative: &str, source: &str) -> PathBuf {
-        write(
-            home,
-            &format!("system-root/etc/claude-code/{relative}"),
-            source,
-        )
+        write(&managed_dir(home), relative, source)
     }
 
     fn claude_hosted(home: &Path) -> VendorUpdateStatus {
@@ -522,17 +530,9 @@ mod tests {
         assert_eq!(claude_updates(home, &[]), Enabled);
         fs::write(&late, r#"{"env":{"DISABLE_AUTOUPDATER":"true"}}"#).unwrap();
         assert_eq!(claude_updates(home, &[]), Disabled);
-        // Hidden files and other extensions are not drop-ins.
-        managed(
-            home,
-            "managed-settings.d/.40-hidden.json",
-            r#"{"env":{"DISABLE_AUTOUPDATER":"0"}}"#,
-        );
-        managed(
-            home,
-            "managed-settings.d/50-notes.txt",
-            r#"{"env":{"DISABLE_AUTOUPDATER":"0"}}"#,
-        );
+        // Hidden files and other extensions are not drop-ins, so they are not validated.
+        managed(home, "managed-settings.d/.40-hidden.json", "{not json");
+        managed(home, "managed-settings.d/50-notes.txt", "{not json");
         assert_eq!(claude_updates(home, &[]), Disabled);
 
         // An invalid managed file is unknown even when the lower sources agree.
@@ -579,6 +579,62 @@ mod tests {
     }
 
     #[test]
+    fn claude_bounds_every_entry_in_the_managed_drop_in_directory() {
+        use VendorUpdateStatus::{Disabled, Unknown};
+
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path();
+        let env = [("DISABLE_UPDATES", OsStr::new("1"))];
+        // Entries that are not drop-ins still count toward the limit.
+        for index in 0..255 {
+            managed(home, &format!("managed-settings.d/{index:03}.txt"), "");
+        }
+        managed(home, "managed-settings.d/.hidden.json", "{}");
+        assert_eq!(claude_updates(home, &env), Disabled);
+        managed(home, "managed-settings.d/256.txt", "");
+        assert_eq!(
+            claude_updates(home, &env),
+            Unknown("managed-settings.d has too many entries")
+        );
+        assert_eq!(
+            claude_hosted(home),
+            Unknown("managed-settings.d has too many entries")
+        );
+    }
+
+    #[test]
+    fn claude_managed_settings_use_the_documented_platform_directory() {
+        let expected = if cfg!(target_os = "macos") {
+            "/Library/Application Support/ClaudeCode"
+        } else if cfg!(windows) {
+            r"C:\Program Files\ClaudeCode"
+        } else {
+            "/etc/claude-code"
+        };
+        assert_eq!(crate::claude::CLAUDE_MANAGED_DIR, expected);
+
+        // The test system root holds the same relative path.
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path();
+        managed(
+            home,
+            "managed-settings.json",
+            r#"{"env":{"DISABLE_AUTOUPDATER":"1"}}"#,
+        );
+        let relative = Path::new(expected)
+            .components()
+            .filter(|component| matches!(component, std::path::Component::Normal(_)))
+            .collect::<PathBuf>();
+        assert!(
+            home.join("system-root")
+                .join(relative)
+                .join("managed-settings.json")
+                .is_file()
+        );
+        assert_eq!(claude_updates(home, &[]), VendorUpdateStatus::Disabled);
+    }
+
+    #[test]
     fn claude_hosted_launches_follow_only_managed_settings() {
         use VendorUpdateStatus::{Disabled, Enabled, Unknown};
 
@@ -615,12 +671,8 @@ mod tests {
             Unknown("managed-settings.json failed validation")
         );
         fs::remove_file(&main).unwrap();
-        fs::create_dir_all(home.join("system-root/etc/claude-code")).unwrap();
-        fs::write(
-            home.join("system-root/etc/claude-code/managed-settings.d"),
-            "{}",
-        )
-        .unwrap();
+        fs::create_dir_all(managed_dir(home)).unwrap();
+        fs::write(managed_dir(home).join("managed-settings.d"), "{}").unwrap();
         assert_eq!(
             claude_hosted(home),
             Unknown("managed-settings.d unreadable")
@@ -659,6 +711,16 @@ mod tests {
             fs::remove_file(&path).unwrap();
             make_fifo(&path);
             assert_eq!(claude_updates(home, &[]), rejected);
+            fs::remove_file(&path).unwrap();
+
+            // Claude follows a symlinked managed file; Doctor reports it unknown instead.
+            fs::create_dir_all(managed_dir(home)).unwrap();
+            std::os::unix::fs::symlink(&target, managed_dir(home).join("managed-settings.json"))
+                .unwrap();
+            assert_eq!(
+                claude_updates(home, &[]),
+                Unknown("managed-settings.json not a regular file or too large")
+            );
         }
     }
 
