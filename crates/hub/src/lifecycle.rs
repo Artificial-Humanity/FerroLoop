@@ -22088,6 +22088,7 @@ mod tests {
                     &mut respawn,
                     &record,
                     None,
+                    None,
                     launcher
                 )
                 .unwrap()
