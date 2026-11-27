@@ -139,7 +139,39 @@ A documented enabled setting on an available runtime is `warn`. The Codex client
 setting and the shared daemon's own updater setting are independent. The hosted CLI policy
 applies to the client; the shared daemon reads its own settings. Doctor reports settings on
 disk, so the running daemon may still have different settings. Settings that cannot be proven
-passively are shown as `unknown`.
+passively are shown as `unknown`, followed by a short fixed reason in parentheses, for example
+`codex daemon: configured unknown (shared daemon; settings.json failed validation)` or
+`grok CLI: configured unknown (GROK_CONFIG_PATH overlay), hosted launch disabled`. A reason
+names only a file or a variable and the problem (`unreadable`, `not a regular file or too
+large`, `failed validation`, `unrecognised value`, an overlay, an unavailable configuration
+directory). It never includes file contents, values, account identifiers or secrets. The JSON
+shape does not change: the reason is part of `detail`.
+
+Settings files are read passively: at most 1 MiB, opened `O_NOFOLLOW|O_NONBLOCK` and
+checked with `fstat`. A symlink, FIFO or other non-regular file is not followed or waited on,
+and is `unknown`. A missing file is the vendor default.
+
+The Codex shared daemon validates its whole `settings.json`. When that validation fails, Doctor
+shows `unknown`. It cannot tell whether Codex then falls back to its defaults, which would turn
+automatic updates on, or keeps the last valid settings.
+
+Claude Code reads `DISABLE_AUTOUPDATER` and `DISABLE_UPDATES` from the process environment and
+from the `env` block of the user `settings.json` in `$CLAUDE_CONFIG_DIR`, or `~/.claude` when
+that variable is not set. In both sources, `1` and `true` (any case) disable updates, `0` and
+`false` (any case) and an empty value leave them on, and other values are `unknown`
+(`unrecognised value`). Doctor combines the two sources for each variable:
+
+* If only one source sets the variable, its value applies.
+* If both sources set the same value, that value applies.
+* If one source disables updates and the other enables them, the result is `unknown`
+  (`environment and settings.json disagree`). Claude Code's documentation does not say which
+  source wins, so Doctor does not guess.
+* If `settings.json` cannot be read or fails validation, the result is `unknown` with that
+  reason, even when the environment disables updates, because the file may set a different value.
+  Validation requires a JSON object whose `env`, when present, maps names to strings.
+
+If either variable resolves to disabled, updates are disabled. Doctor does not read project,
+local or managed Claude settings files.
 
 ## JSON contract
 

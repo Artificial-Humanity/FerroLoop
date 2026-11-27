@@ -42,7 +42,7 @@ use serde_json::Value;
 #[cfg(unix)]
 use serde_json::json;
 
-use crate::doctor::configured_updates;
+use crate::doctor::{CONFIG_TOML, SETTINGS_JSON, configured_updates};
 
 /// Default overall timeout for a Codex app-server control socket RPC sequence.
 pub const CODEX_RPC_TIMEOUT: Duration = Duration::from_secs(10);
@@ -319,15 +319,18 @@ impl Default for DaemonUpdaterSettings {
     }
 }
 
-fn doctor_codex_home(context: &VendorDoctorContext<'_>) -> Option<PathBuf> {
+fn doctor_codex_home(context: &VendorDoctorContext<'_>) -> Result<PathBuf, &'static str> {
     if let Some(path) = context.var("CODEX_HOME").filter(|value| !value.is_empty()) {
         let path = PathBuf::from(path);
-        return (path.is_absolute() && path.is_dir()).then_some(path);
+        return (path.is_absolute() && path.is_dir())
+            .then_some(path)
+            .ok_or("CODEX_HOME not an absolute directory");
     }
     context
         .home
         .filter(|home| home.is_absolute())
         .map(|home| home.join(".codex"))
+        .ok_or("home directory unavailable")
 }
 
 fn doctor_daemon_package(home: &Path) -> io::Result<Option<&'static str>> {
@@ -446,27 +449,33 @@ impl fl_core::VendorVersionAdapter for CodexHostAdapter {
     }
 
     fn configured_cli_updates(&self, context: &VendorDoctorContext<'_>) -> VendorUpdateStatus {
-        let Some(home) = doctor_codex_home(context) else {
-            return VendorUpdateStatus::Unknown;
+        let home = match doctor_codex_home(context) {
+            Ok(home) => home,
+            Err(reason) => return VendorUpdateStatus::Unknown(reason),
         };
         configured_updates(
             &home.join("config.toml"),
+            &CONFIG_TOML,
             |source| toml::from_str::<CodexCliConfig>(source).ok(),
             |config| config.check_for_update_on_startup.unwrap_or(true),
         )
     }
 
     fn doctor_daemon_facts(&self, context: &VendorDoctorContext<'_>) -> Option<VendorRuntimeFacts> {
-        let Some(home) = doctor_codex_home(context) else {
-            return Some(VendorRuntimeFacts {
-                installed_version: VendorInstalledVersion::Unknown,
-                configured_updates: VendorUpdateStatus::Unknown,
-            });
+        let home = match doctor_codex_home(context) {
+            Ok(home) => home,
+            Err(reason) => {
+                return Some(VendorRuntimeFacts {
+                    installed_version: VendorInstalledVersion::Unknown,
+                    configured_updates: VendorUpdateStatus::Unknown(reason),
+                });
+            }
         };
         Some(VendorRuntimeFacts {
             installed_version: doctor_daemon_version(&home),
             configured_updates: configured_updates(
                 &home.join("app-server-daemon/settings.json"),
+                &SETTINGS_JSON,
                 DaemonSettings::parse,
                 |settings| settings.updater.auto_update_enabled,
             ),

@@ -886,6 +886,40 @@ fn codex_client_and_shared_daemon_have_independent_versions_and_update_settings(
     assert!(policies.contains("codex CLI: configured disabled, hosted launch disabled"));
     assert!(policies.contains("codex daemon: configured enabled (shared daemon)"));
 
+    // An invalid daemon file is unknown with a short reason, never its contents.
+    let settings = daemon_config.join("settings.json");
+    let valid = std::fs::read(&settings).unwrap();
+    std::fs::write(
+        &settings,
+        r#"{"updater":{"autoUpdateEnabled":false,"updateIntervalMinutes":0},"x":"private-marker"}"#,
+    )
+    .unwrap();
+    let (code, report) = w.doctor(&["--db", store_path.to_str().unwrap()]);
+    assert_eq!(code, 0);
+    let policies = detail(&report, VENDOR_UPDATE_POLICY);
+    assert!(
+        policies.contains(
+            "codex daemon: configured unknown (shared daemon; settings.json failed validation)"
+        ),
+        "{policies}"
+    );
+    assert!(!policies.contains("private-marker"));
+    std::fs::write(
+        config.join("config.toml"),
+        "check_for_update_on_startup = 0",
+    )
+    .unwrap();
+    let (_, report) = w.doctor(&["--db", store_path.to_str().unwrap()]);
+    assert!(detail(&report, VENDOR_UPDATE_POLICY).contains(
+        "codex CLI: configured unknown (config.toml failed validation), hosted launch disabled"
+    ));
+    std::fs::write(&settings, valid).unwrap();
+    std::fs::write(
+        config.join("config.toml"),
+        "check_for_update_on_startup = false",
+    )
+    .unwrap();
+
     let oversized = format!("1.2.3-{}", "a".repeat(128));
     for malformed in ["", "1.2.3\u{1b}[31m", oversized.as_str()] {
         let store = fl_store::FerroStore::open(&store_path).unwrap();

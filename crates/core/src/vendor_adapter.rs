@@ -728,13 +728,13 @@ pub trait VendorVersionAdapter: fmt::Debug + Send + Sync {
     /// Implementations only read passive evidence and never start a process.
     fn configured_cli_updates(&self, context: &VendorDoctorContext<'_>) -> VendorUpdateStatus {
         let Some((key, disabled)) = self.auto_update_disable_env() else {
-            return VendorUpdateStatus::Unknown;
+            return VendorUpdateStatus::Unknown("no documented update control");
         };
         match context.var(key) {
             None => VendorUpdateStatus::Enabled,
             Some(value) if value.is_empty() => VendorUpdateStatus::Enabled,
             Some(value) if value == disabled => VendorUpdateStatus::Disabled,
-            Some(_) => VendorUpdateStatus::Unknown,
+            Some(_) => VendorUpdateStatus::Unknown("unrecognised value"),
         }
     }
 

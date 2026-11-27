@@ -8,6 +8,14 @@ const MAX_SETTINGS_BYTES: u64 = 1024 * 1024;
 /// A missing file is distinct from unavailable evidence. Never wait on a FIFO
 /// or follow a final symlink substituted for this file.
 pub(crate) fn read_bounded_regular_file(path: &Path, limit: u64) -> io::Result<Option<String>> {
+    read_bounded_regular_bytes(path, limit)?
+        .map(|bytes| String::from_utf8(bytes).map_err(|_| io::ErrorKind::InvalidData.into()))
+        .transpose()
+}
+
+/// Like [`read_bounded_regular_file`], but `InvalidData` only means the path is not a
+/// regular file or exceeds `limit`; the contents are not decoded.
+fn read_bounded_regular_bytes(path: &Path, limit: u64) -> io::Result<Option<Vec<u8>>> {
     let metadata = match path.symlink_metadata() {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -27,27 +35,61 @@ pub(crate) fn read_bounded_regular_file(path: &Path, limit: u64) -> io::Result<O
     if !file.metadata()?.is_file() {
         return Err(io::ErrorKind::InvalidData.into());
     }
-    let mut contents = String::new();
-    file.take(limit + 1).read_to_string(&mut contents)?;
+    let mut contents = Vec::new();
+    file.take(limit + 1).read_to_end(&mut contents)?;
     if contents.len() as u64 > limit {
         return Err(io::ErrorKind::InvalidData.into());
     }
     Ok(Some(contents))
 }
 
+/// Fixed, non-sensitive reasons for one settings file whose update control is unknown.
+pub(crate) struct SettingsFile {
+    unreadable: &'static str,
+    rejected: &'static str,
+    invalid: &'static str,
+}
+
+macro_rules! settings_file {
+    ($name:literal) => {
+        SettingsFile {
+            unreadable: concat!($name, " unreadable"),
+            rejected: concat!($name, " not a regular file or too large"),
+            invalid: concat!($name, " failed validation"),
+        }
+    };
+}
+
+pub(crate) const CONFIG_TOML: SettingsFile = settings_file!("config.toml");
+pub(crate) const SETTINGS_JSON: SettingsFile = settings_file!("settings.json");
+
+/// Read and validate one settings file. A missing file is the vendor default. Anything
+/// else that is not a valid document yields a reason naming only the file and the problem.
+pub(crate) fn read_settings<T: Default>(
+    path: &Path,
+    file: &SettingsFile,
+    parse: impl FnOnce(&str) -> Option<T>,
+) -> Result<T, &'static str> {
+    match read_bounded_regular_bytes(path, MAX_SETTINGS_BYTES) {
+        Ok(None) => Ok(T::default()),
+        Ok(Some(contents)) => std::str::from_utf8(&contents)
+            .ok()
+            .and_then(parse)
+            .ok_or(file.invalid),
+        Err(error) if error.kind() == io::ErrorKind::InvalidData => Err(file.rejected),
+        Err(_) => Err(file.unreadable),
+    }
+}
+
 pub(crate) fn configured_updates<T: Default>(
     path: &Path,
+    file: &SettingsFile,
     parse: impl FnOnce(&str) -> Option<T>,
     enabled: impl FnOnce(T) -> bool,
 ) -> VendorUpdateStatus {
-    let settings = match read_bounded_regular_file(path, MAX_SETTINGS_BYTES) {
-        Ok(None) => Some(T::default()),
-        Ok(Some(contents)) => parse(&contents),
-        Err(_) => None,
-    };
-    match settings.map(enabled) {
-        Some(enabled) => VendorUpdateStatus::from_enabled(enabled),
-        None => VendorUpdateStatus::Unknown,
+    match read_settings(path, file, parse) {
+        Ok(settings) => VendorUpdateStatus::from_enabled(enabled(settings)),
+        Err(reason) => VendorUpdateStatus::Unknown(reason),
     }
 }
 
@@ -132,9 +174,12 @@ mod tests {
         let observed = facts(Some(root.path()), None, &env);
         assert_eq!(
             vendor(&observed, "antigravity").cli.configured_updates,
-            Unknown
+            Unknown("unrecognised value")
         );
-        assert_eq!(vendor(&observed, "grok").cli.configured_updates, Unknown);
+        assert_eq!(
+            vendor(&observed, "grok").cli.configured_updates,
+            Unknown("GROK_CONFIG_PATH overlay")
+        );
         assert_eq!(vendor(&observed, "muse").cli.configured_updates, Disabled);
 
         // An affirmative Grok environment switch suppresses updates despite
@@ -177,7 +222,10 @@ mod tests {
         fs::write(&daemon, r#"{"updater":{"autoUpdateEnabled":false}}"#).unwrap();
         let observed = facts(Some(root.path()), None, &env);
         let codex = vendor(&observed, "codex");
-        assert_eq!(codex.cli.configured_updates, Unknown);
+        assert_eq!(
+            codex.cli.configured_updates,
+            Unknown("config.toml failed validation")
+        );
         assert_eq!(codex.daemon.as_ref().unwrap().configured_updates, Disabled);
 
         fs::write(&daemon, r#"{"updater":null}"#).unwrap();
@@ -188,7 +236,7 @@ mod tests {
                 .as_ref()
                 .unwrap()
                 .configured_updates,
-            Unknown
+            Unknown("settings.json failed validation")
         );
         fs::remove_file(daemon).unwrap();
         let observed = facts(Some(root.path()), None, &env);
@@ -207,7 +255,10 @@ mod tests {
             None,
             &[("CODEX_HOME", missing.as_os_str())],
         );
-        assert_eq!(vendor(&observed, "codex").cli.configured_updates, Unknown);
+        assert_eq!(
+            vendor(&observed, "codex").cli.configured_updates,
+            Unknown("CODEX_HOME not an absolute directory")
+        );
     }
 
     #[test]
@@ -233,7 +284,7 @@ mod tests {
                     .as_ref()
                     .unwrap()
                     .configured_updates,
-                Unknown,
+                Unknown("settings.json failed validation"),
                 "{source}",
             );
         }
@@ -309,6 +360,143 @@ mod tests {
         assert_eq!(version(), Known("0.172.0".into()));
     }
 
+    fn claude_updates(home: &Path, env: &[(&str, &OsStr)]) -> VendorUpdateStatus {
+        vendor(&facts(Some(home), None, env), "claude")
+            .cli
+            .configured_updates
+    }
+
+    #[test]
+    fn claude_reads_update_controls_from_environment_and_user_settings() {
+        use VendorUpdateStatus::{Disabled, Enabled, Unknown};
+
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path();
+        let settings = |source: &str| write(home, ".claude/settings.json", source);
+        let disable = |value: &'static str| [("DISABLE_AUTOUPDATER", OsStr::new(value))];
+
+        // Environment only; values are matched case-insensitively.
+        assert_eq!(claude_updates(home, &[]), Enabled);
+        assert_eq!(claude_updates(home, &disable("1")), Disabled);
+        assert_eq!(claude_updates(home, &disable("TRUE")), Disabled);
+        assert_eq!(claude_updates(home, &disable("False")), Enabled);
+        assert_eq!(claude_updates(home, &disable("0")), Enabled);
+        assert_eq!(
+            claude_updates(home, &disable("yes")),
+            Unknown("unrecognised value")
+        );
+
+        // settings.json only, including the second control.
+        settings(r#"{"env":{"DISABLE_AUTOUPDATER":"true"}}"#);
+        assert_eq!(claude_updates(home, &[]), Disabled);
+        settings(r#"{"env":{"DISABLE_UPDATES":"1","OTHER":"x"},"model":"opus"}"#);
+        assert_eq!(claude_updates(home, &[]), Disabled);
+        settings(r#"{"env":{"DISABLE_AUTOUPDATER":"0"}}"#);
+        assert_eq!(claude_updates(home, &[]), Enabled);
+        settings(r#"{"env":{"DISABLE_AUTOUPDATER":"never"}}"#);
+        assert_eq!(claude_updates(home, &[]), Unknown("unrecognised value"));
+
+        // Both sources agree.
+        settings(r#"{"env":{"DISABLE_AUTOUPDATER":"1"}}"#);
+        assert_eq!(claude_updates(home, &disable("true")), Disabled);
+        settings(r#"{"env":{"DISABLE_AUTOUPDATER":"false"}}"#);
+        assert_eq!(claude_updates(home, &disable("0")), Enabled);
+
+        // Disagreement: Claude does not document which source wins.
+        let disagree = Unknown("environment and settings.json disagree");
+        assert_eq!(claude_updates(home, &disable("1")), disagree);
+        settings(r#"{"env":{"DISABLE_AUTOUPDATER":"1"}}"#);
+        assert_eq!(claude_updates(home, &disable("0")), disagree);
+        // A different control that disables updates still decides.
+        assert_eq!(
+            claude_updates(
+                home,
+                &[
+                    ("DISABLE_AUTOUPDATER", OsStr::new("0")),
+                    ("DISABLE_UPDATES", OsStr::new("1")),
+                ],
+            ),
+            Disabled
+        );
+
+        // Malformed or invalid settings never become the default.
+        let invalid = Unknown("settings.json failed validation");
+        for source in [
+            "{not json",
+            "[]",
+            r#"{"env":null}"#,
+            r#"{"env":["DISABLE_AUTOUPDATER"]}"#,
+            r#"{"env":{"DISABLE_AUTOUPDATER":1}}"#,
+            r#"{"env":{"DISABLE_AUTOUPDATER":"1","OTHER":true}}"#,
+        ] {
+            settings(source);
+            assert_eq!(claude_updates(home, &[]), invalid, "{source}");
+            assert_eq!(claude_updates(home, &disable("1")), invalid, "{source}");
+        }
+        fs::write(home.join(".claude/settings.json"), b"\xff\xfe").unwrap();
+        assert_eq!(claude_updates(home, &[]), invalid);
+
+        // `$CLAUDE_CONFIG_DIR` replaces `~/.claude`.
+        let config = home.join("claude-config");
+        write(
+            &config,
+            "settings.json",
+            r#"{"env":{"DISABLE_UPDATES":"1"}}"#,
+        );
+        settings("{}");
+        assert_eq!(
+            claude_updates(home, &[("CLAUDE_CONFIG_DIR", config.as_os_str())]),
+            Disabled
+        );
+        assert_eq!(
+            claude_updates(home, &[("CLAUDE_CONFIG_DIR", OsStr::new("relative"))]),
+            Unknown("config directory unavailable")
+        );
+    }
+
+    #[test]
+    fn claude_rejects_oversized_or_symlinked_settings_without_following() {
+        use VendorUpdateStatus::Unknown;
+
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path();
+        let rejected = Unknown("settings.json not a regular file or too large");
+        let path = write(home, ".claude/settings.json", "{}");
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(MAX_SETTINGS_BYTES + 1)
+            .unwrap();
+        assert_eq!(
+            claude_updates(home, &[("DISABLE_AUTOUPDATER", OsStr::new("1"))]),
+            rejected
+        );
+
+        #[cfg(unix)]
+        {
+            fs::remove_file(&path).unwrap();
+            let target = write(
+                home,
+                "elsewhere.json",
+                r#"{"env":{"DISABLE_AUTOUPDATER":"1"}}"#,
+            );
+            std::os::unix::fs::symlink(&target, &path).unwrap();
+            assert_eq!(claude_updates(home, &[]), rejected);
+            fs::remove_file(&path).unwrap();
+            make_fifo(&path);
+            assert_eq!(claude_updates(home, &[]), rejected);
+        }
+    }
+
+    #[cfg(unix)]
+    fn make_fifo(path: &Path) {
+        use std::os::unix::ffi::OsStrExt;
+        let path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `path` is a valid NUL-terminated C string for the duration of the call.
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+    }
+
     #[test]
     fn oversized_or_non_regular_config_does_not_report_a_default() {
         let root = tempfile::tempdir().unwrap();
@@ -322,14 +510,14 @@ mod tests {
         let observed = facts(Some(root.path()), None, &[]);
         assert_eq!(
             vendor(&observed, "grok").cli.configured_updates,
-            VendorUpdateStatus::Unknown
+            VendorUpdateStatus::Unknown("config.toml not a regular file or too large")
         );
         fs::remove_file(&config).unwrap();
         fs::create_dir(config).unwrap();
         let observed = facts(Some(root.path()), None, &[]);
         assert_eq!(
             vendor(&observed, "grok").cli.configured_updates,
-            VendorUpdateStatus::Unknown
+            VendorUpdateStatus::Unknown("config.toml not a regular file or too large")
         );
     }
 

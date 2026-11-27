@@ -86,16 +86,19 @@ impl Observations {
             match facts.configured_updates {
                 Enabled => Warn,
                 Disabled => Pass,
-                Unknown => Unsupported,
+                Unknown(_) => Unsupported,
             }
         };
-        let configured = update_status(facts.configured_updates);
-        let detail = match hosted {
-            Some(policy) => format!(
-                "configured {configured}, hosted launch {}",
+        let detail = match (hosted, facts.configured_updates) {
+            (Some(policy), configured) => format!(
+                "configured {}, hosted launch {}",
+                update_status(configured),
                 update_status(policy)
             ),
-            None => format!("configured {configured} (shared daemon)"),
+            (None, Unknown(reason)) => format!("configured unknown (shared daemon; {reason})"),
+            (None, configured) => {
+                format!("configured {} (shared daemon)", update_status(configured))
+            }
         };
         self.rows
             .push((status, format!("{vendor} {component}: {detail}")));
@@ -126,10 +129,81 @@ impl Observations {
     }
 }
 
-fn update_status(status: VendorUpdateStatus) -> &'static str {
+/// The status word, with the fixed non-sensitive reason when it is `unknown`.
+fn update_status(status: VendorUpdateStatus) -> String {
     match status {
-        VendorUpdateStatus::Enabled => "enabled",
-        VendorUpdateStatus::Disabled => "disabled",
-        VendorUpdateStatus::Unknown => "unknown",
+        VendorUpdateStatus::Enabled => "enabled".into(),
+        VendorUpdateStatus::Disabled => "disabled".into(),
+        VendorUpdateStatus::Unknown(reason) => format!("unknown ({reason})"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::ffi::OsString;
+    use std::path::Path;
+
+    use fl_core::doctor::{DoctorReport, Summary};
+    use fl_core::{VendorDoctorContext, VendorRuntimeFacts, VendorVersionAdapter};
+
+    use super::*;
+
+    #[derive(Debug)]
+    struct Stub;
+
+    impl VendorVersionAdapter for Stub {
+        fn vendor_id(&self) -> &'static str {
+            "stub"
+        }
+
+        fn auto_update_disable_env(&self) -> Option<(&'static str, &'static str)> {
+            Some(("STUB_NO_UPDATE", "1"))
+        }
+
+        fn configured_cli_updates(&self, _: &VendorDoctorContext<'_>) -> VendorUpdateStatus {
+            VendorUpdateStatus::Unknown("config.toml unreadable")
+        }
+
+        fn doctor_daemon_facts(&self, _: &VendorDoctorContext<'_>) -> Option<VendorRuntimeFacts> {
+            Some(VendorRuntimeFacts {
+                installed_version: VendorInstalledVersion::Known("1.0.0".into()),
+                configured_updates: VendorUpdateStatus::Unknown("settings.json failed validation"),
+            })
+        }
+
+        fn version_from_executable(&self, _: &Path) -> Option<String> {
+            None
+        }
+    }
+
+    #[test]
+    fn unknown_update_settings_name_a_short_reason() {
+        let mut registry = VendorVersionRegistry::default();
+        registry.register(Stub);
+        let env = |_: &str| -> Option<OsString> { None };
+        let report = DoctorReport {
+            schema_version: 1,
+            overall: CheckStatus::Pass,
+            summary: Summary::default(),
+            checks: Vec::new(),
+        };
+        let report = with_vendor_doctor_checks(
+            report,
+            Some(&registry),
+            &VendorDoctorContext {
+                home: None,
+                path: None,
+                env: &env,
+            },
+            [],
+            None,
+        );
+        let policy = report.check(ids::VENDOR_UPDATE_POLICY).unwrap();
+        assert_eq!(policy.status, CheckStatus::Unsupported);
+        assert_eq!(
+            policy.detail,
+            "stub CLI: configured unknown (config.toml unreadable), hosted launch disabled \
+             | stub daemon: configured unknown (shared daemon; settings.json failed validation)"
+        );
     }
 }

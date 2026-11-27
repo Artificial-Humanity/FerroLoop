@@ -11,7 +11,10 @@ use super::{VendorVersionAdapter, VendorVersionRegistry};
 pub enum VendorUpdateStatus {
     Enabled,
     Disabled,
-    Unknown,
+    /// The setting cannot be proven passively. The reason is a fixed, short phrase such as
+    /// `settings.json failed validation`; being `'static`, it cannot carry file contents,
+    /// account identifiers or other observed values.
+    Unknown(&'static str),
 }
 
 impl VendorUpdateStatus {
@@ -144,7 +147,7 @@ impl VendorVersionRegistry {
                 let hosted_cli_updates = if argv.len() > 1 || !env.is_empty() {
                     VendorUpdateStatus::Disabled
                 } else {
-                    VendorUpdateStatus::Unknown
+                    VendorUpdateStatus::Unknown("no hosted update control")
                 };
                 VendorDoctorFacts {
                     vendor: adapter.vendor_id(),
