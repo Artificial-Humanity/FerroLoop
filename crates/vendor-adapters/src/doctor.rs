@@ -45,9 +45,9 @@ fn read_bounded_regular_bytes(path: &Path, limit: u64) -> io::Result<Option<Vec<
 
 /// Fixed, non-sensitive reasons for one settings file whose update control is unknown.
 pub(crate) struct SettingsFile {
-    unreadable: &'static str,
-    rejected: &'static str,
-    invalid: &'static str,
+    pub(crate) unreadable: &'static str,
+    pub(crate) rejected: &'static str,
+    pub(crate) invalid: &'static str,
 }
 
 macro_rules! settings_file {
@@ -62,6 +62,8 @@ macro_rules! settings_file {
 
 pub(crate) const CONFIG_TOML: SettingsFile = settings_file!("config.toml");
 pub(crate) const SETTINGS_JSON: SettingsFile = settings_file!("settings.json");
+pub(crate) const MANAGED_SETTINGS_JSON: SettingsFile = settings_file!("managed-settings.json");
+pub(crate) const MANAGED_SETTINGS_D: SettingsFile = settings_file!("managed-settings.d");
 
 /// Read and validate one settings file. A missing file is the vendor default. Anything
 /// else that is not a valid document yields a reason naming only the file and the problem.
@@ -122,10 +124,13 @@ mod tests {
                 .find(|(key, _)| *key == name)
                 .map(|(_, value)| OsString::from(value))
         };
+        // Never read the real `/etc` from a test.
+        let system_root = home.map(|home| home.join("system-root"));
         crate::default_vendor_version_registry().doctor_facts(&VendorDoctorContext {
             home,
             path,
             env: &env,
+            system_root: system_root.as_deref(),
         })
     }
 
@@ -402,11 +407,12 @@ mod tests {
         settings(r#"{"env":{"DISABLE_AUTOUPDATER":"false"}}"#);
         assert_eq!(claude_updates(home, &disable("0")), Enabled);
 
-        // Disagreement: Claude does not document which source wins.
-        let disagree = Unknown("environment and settings.json disagree");
-        assert_eq!(claude_updates(home, &disable("1")), disagree);
+        // A settings file `env` value replaces the inherited variable.
+        assert_eq!(claude_updates(home, &disable("1")), Enabled);
+        settings(r#"{"env":{"DISABLE_AUTOUPDATER":""}}"#);
+        assert_eq!(claude_updates(home, &disable("1")), Enabled);
         settings(r#"{"env":{"DISABLE_AUTOUPDATER":"1"}}"#);
-        assert_eq!(claude_updates(home, &disable("0")), disagree);
+        assert_eq!(claude_updates(home, &disable("0")), Disabled);
         // A different control that disables updates still decides.
         assert_eq!(
             claude_updates(
@@ -451,6 +457,173 @@ mod tests {
         assert_eq!(
             claude_updates(home, &[("CLAUDE_CONFIG_DIR", OsStr::new("relative"))]),
             Unknown("config directory unavailable")
+        );
+    }
+
+    fn managed(home: &Path, relative: &str, source: &str) -> PathBuf {
+        write(
+            home,
+            &format!("system-root/etc/claude-code/{relative}"),
+            source,
+        )
+    }
+
+    fn claude_hosted(home: &Path) -> VendorUpdateStatus {
+        vendor(&facts(Some(home), None, &[]), "claude").hosted_cli_updates
+    }
+
+    #[test]
+    fn claude_managed_settings_outrank_user_settings_and_environment() {
+        use VendorUpdateStatus::{Disabled, Enabled, Unknown};
+
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path();
+        let disable = |value: &'static str| [("DISABLE_AUTOUPDATER", OsStr::new(value))];
+        write(
+            home,
+            ".claude/settings.json",
+            r#"{"env":{"DISABLE_AUTOUPDATER":"0"}}"#,
+        );
+
+        // The managed file beats the user file, which beats the environment.
+        let main = managed(
+            home,
+            "managed-settings.json",
+            r#"{"env":{"DISABLE_AUTOUPDATER":"1"}}"#,
+        );
+        assert_eq!(claude_updates(home, &disable("0")), Disabled);
+        fs::write(&main, r#"{"env":{"DISABLE_AUTOUPDATER":"0"}}"#).unwrap();
+        write(
+            home,
+            ".claude/settings.json",
+            r#"{"env":{"DISABLE_AUTOUPDATER":"1"}}"#,
+        );
+        assert_eq!(claude_updates(home, &disable("1")), Enabled);
+        // A managed file that leaves a control unset defers to the lower sources.
+        fs::write(&main, r#"{"env":{"OTHER":"x"}}"#).unwrap();
+        assert_eq!(claude_updates(home, &[]), Disabled);
+        // Claude reads an empty managed file as `{}`.
+        fs::write(&main, "").unwrap();
+        assert_eq!(claude_updates(home, &[]), Disabled);
+
+        // Drop-ins merge after the main file in name order; the later file wins per key.
+        fs::write(&main, r#"{"env":{"DISABLE_AUTOUPDATER":"1"}}"#).unwrap();
+        managed(
+            home,
+            "managed-settings.d/20-keep.json",
+            r#"{"env":{"DISABLE_AUTOUPDATER":"0"}}"#,
+        );
+        assert_eq!(claude_updates(home, &[]), Enabled);
+        let late = managed(
+            home,
+            "managed-settings.d/30-other.json",
+            r#"{"env":{"OTHER":"x"}}"#,
+        );
+        assert_eq!(claude_updates(home, &[]), Enabled);
+        fs::write(&late, r#"{"env":{"DISABLE_AUTOUPDATER":"true"}}"#).unwrap();
+        assert_eq!(claude_updates(home, &[]), Disabled);
+        // Hidden files and other extensions are not drop-ins.
+        managed(
+            home,
+            "managed-settings.d/.40-hidden.json",
+            r#"{"env":{"DISABLE_AUTOUPDATER":"0"}}"#,
+        );
+        managed(
+            home,
+            "managed-settings.d/50-notes.txt",
+            r#"{"env":{"DISABLE_AUTOUPDATER":"0"}}"#,
+        );
+        assert_eq!(claude_updates(home, &[]), Disabled);
+
+        // An invalid managed file is unknown even when the lower sources agree.
+        fs::write(&late, r#"{"env":{"DISABLE_AUTOUPDATER":1}}"#).unwrap();
+        assert_eq!(
+            claude_updates(home, &disable("1")),
+            Unknown("managed-settings.d failed validation")
+        );
+        fs::remove_file(&late).unwrap();
+        fs::write(&main, "{not json").unwrap();
+        assert_eq!(
+            claude_updates(home, &disable("1")),
+            Unknown("managed-settings.json failed validation")
+        );
+
+        // A managed value decides even when the user file is invalid.
+        fs::write(&main, r#"{"env":{"DISABLE_UPDATES":"1"}}"#).unwrap();
+        write(home, ".claude/settings.json", "[]");
+        assert_eq!(claude_updates(home, &[]), Disabled);
+    }
+
+    #[test]
+    fn claude_bounds_the_managed_drop_ins() {
+        use VendorUpdateStatus::{Disabled, Unknown};
+
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path();
+        for index in 0..64 {
+            managed(home, &format!("managed-settings.d/{index:02}.json"), "{}");
+        }
+        assert_eq!(
+            claude_updates(home, &[("DISABLE_UPDATES", OsStr::new("1"))]),
+            Disabled
+        );
+        managed(home, "managed-settings.d/64.json", "{}");
+        assert_eq!(
+            claude_updates(home, &[("DISABLE_UPDATES", OsStr::new("1"))]),
+            Unknown("managed-settings.d has too many files")
+        );
+        assert_eq!(
+            claude_hosted(home),
+            Unknown("managed-settings.d has too many files")
+        );
+    }
+
+    #[test]
+    fn claude_hosted_launches_follow_only_managed_settings() {
+        use VendorUpdateStatus::{Disabled, Enabled, Unknown};
+
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path();
+        // `--settings` outranks the user file.
+        write(
+            home,
+            ".claude/settings.json",
+            r#"{"env":{"DISABLE_AUTOUPDATER":"0"}}"#,
+        );
+        assert_eq!(claude_hosted(home), Disabled);
+
+        let main = managed(
+            home,
+            "managed-settings.json",
+            r#"{"env":{"DISABLE_AUTOUPDATER":"0"}}"#,
+        );
+        assert_eq!(claude_hosted(home), Enabled);
+        fs::write(
+            &main,
+            r#"{"env":{"DISABLE_AUTOUPDATER":"0","DISABLE_UPDATES":"1"}}"#,
+        )
+        .unwrap();
+        assert_eq!(claude_hosted(home), Disabled);
+        // Keeping the other control does not undo FerroLoop's switch.
+        fs::write(&main, r#"{"env":{"DISABLE_UPDATES":"0"}}"#).unwrap();
+        assert_eq!(claude_hosted(home), Disabled);
+        fs::write(&main, r#"{"env":{"DISABLE_AUTOUPDATER":"never"}}"#).unwrap();
+        assert_eq!(claude_hosted(home), Unknown("unrecognised value"));
+        fs::write(&main, r#"{"env":null}"#).unwrap();
+        assert_eq!(
+            claude_hosted(home),
+            Unknown("managed-settings.json failed validation")
+        );
+        fs::remove_file(&main).unwrap();
+        fs::create_dir_all(home.join("system-root/etc/claude-code")).unwrap();
+        fs::write(
+            home.join("system-root/etc/claude-code/managed-settings.d"),
+            "{}",
+        )
+        .unwrap();
+        assert_eq!(
+            claude_hosted(home),
+            Unknown("managed-settings.d unreadable")
         );
     }
 

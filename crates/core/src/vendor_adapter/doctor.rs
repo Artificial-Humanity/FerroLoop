@@ -57,7 +57,8 @@ impl VendorInstalledVersion {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VendorRuntimeFacts {
     pub installed_version: VendorInstalledVersion,
-    /// Setting observed in the current invocation environment or the selected user config file.
+    /// Setting observed in the current invocation environment or the selected user or system
+    /// config files.
     pub configured_updates: VendorUpdateStatus,
 }
 
@@ -75,6 +76,9 @@ pub struct VendorDoctorContext<'a> {
     pub path: Option<&'a OsStr>,
     /// Read only named update controls and config-directory overrides for this invocation.
     pub env: &'a dyn Fn(&str) -> Option<OsString>,
+    /// Directory that stands in for the filesystem root when reading system-wide,
+    /// administrator-managed vendor settings. `None` reads the real paths. Tests set it.
+    pub system_root: Option<&'a Path>,
 }
 
 impl VendorDoctorContext<'_> {
@@ -90,6 +94,15 @@ impl VendorDoctorContext<'_> {
             .map(PathBuf::from)
             .or_else(|| self.home.map(|home| home.join(default_dir)))
             .filter(|path| path.is_absolute())
+    }
+
+    /// Resolve an absolute system configuration directory such as `/etc/claude-code`,
+    /// under [`Self::system_root`] when it is set.
+    pub fn system_dir(&self, absolute: &str) -> PathBuf {
+        match self.system_root {
+            Some(root) => root.join(absolute.trim_start_matches('/')),
+            None => PathBuf::from(absolute),
+        }
     }
 
     fn installed_cli_version(&self, adapter: &dyn VendorVersionAdapter) -> VendorInstalledVersion {
@@ -140,24 +153,14 @@ impl VendorVersionRegistry {
     pub fn doctor_facts(&self, context: &VendorDoctorContext<'_>) -> Vec<VendorDoctorFacts> {
         self.adapters
             .values()
-            .map(|adapter| {
-                let mut argv = vec![adapter.cli_binary_name().into()];
-                let mut env = Vec::new();
-                adapter.apply_cli_update_policy(&mut argv, &mut env);
-                let hosted_cli_updates = if argv.len() > 1 || !env.is_empty() {
-                    VendorUpdateStatus::Disabled
-                } else {
-                    VendorUpdateStatus::Unknown("no hosted update control")
-                };
-                VendorDoctorFacts {
-                    vendor: adapter.vendor_id(),
-                    cli: VendorRuntimeFacts {
-                        installed_version: context.installed_cli_version(adapter.as_ref()),
-                        configured_updates: adapter.configured_cli_updates(context),
-                    },
-                    daemon: adapter.doctor_daemon_facts(context),
-                    hosted_cli_updates,
-                }
+            .map(|adapter| VendorDoctorFacts {
+                vendor: adapter.vendor_id(),
+                cli: VendorRuntimeFacts {
+                    installed_version: context.installed_cli_version(adapter.as_ref()),
+                    configured_updates: adapter.configured_cli_updates(context),
+                },
+                daemon: adapter.doctor_daemon_facts(context),
+                hosted_cli_updates: adapter.hosted_cli_updates(context),
             })
             .collect()
     }

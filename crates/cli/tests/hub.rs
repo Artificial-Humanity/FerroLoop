@@ -866,7 +866,7 @@ fn runtime_account_probes_suppress_updates_in_their_vendor_launchers() {
             "claude",
             "FL_HUB_CLAUDE_BIN",
             "DISABLE_AUTOUPDATER",
-            "auth status --json",
+            r#"--settings {"env":{"DISABLE_AUTOUPDATER":"1"}} auth status --json"#,
             r#"{"subscriptionType":"fixture-claude"}"#,
         ),
     ];

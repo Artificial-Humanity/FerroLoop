@@ -65,7 +65,6 @@ mod version_evidence_tests {
     fn startup_update_policy_overrides_existing_values_and_is_idempotent() {
         let registry = default_vendor_version_registry();
         for (binary, key, value) in [
-            ("claude", "DISABLE_AUTOUPDATER", "1"),
             ("agy", "AGY_CLI_DISABLE_AUTO_UPDATE", "true"),
             ("grok", "GROK_DISABLE_AUTOUPDATER", "1"),
             ("muse", "MUSE_NO_AUTO_UPDATE", "1"),
@@ -86,6 +85,32 @@ mod version_evidence_tests {
                 [("TERM".into(), "xterm".into()), (key.into(), value.into())]
             );
         }
+        let adapter = registry.lookup("claude").unwrap();
+        let mut argv = vec!["/some/install/claude".into(), "--version".into()];
+        let mut env = vec![
+            ("DISABLE_AUTOUPDATER".into(), "0".into()),
+            ("TERM".into(), "xterm".into()),
+        ];
+        for _ in 0..2 {
+            adapter.apply_cli_update_policy(&mut argv, &mut env);
+        }
+        assert_eq!(
+            argv,
+            [
+                "/some/install/claude",
+                "--settings",
+                r#"{"env":{"DISABLE_AUTOUPDATER":"1"}}"#,
+                "--version",
+            ]
+        );
+        assert_eq!(
+            env,
+            [
+                ("TERM".into(), "xterm".into()),
+                ("DISABLE_AUTOUPDATER".into(), "1".into())
+            ]
+        );
+
         let adapter = registry.lookup("codex").unwrap();
         let mut argv = [
             "/some/install/codex",
@@ -117,6 +142,39 @@ mod version_evidence_tests {
             ]
         );
         assert!(env.is_empty());
+    }
+
+    #[test]
+    fn claude_update_policy_leaves_a_caller_settings_flag_alone() {
+        let adapter = default_vendor_version_registry();
+        let adapter = adapter.lookup("claude").unwrap();
+        let apply = |argv: &[&str]| {
+            let mut argv = argv.iter().map(|arg| arg.to_string()).collect::<Vec<_>>();
+            let mut env = Vec::new();
+            adapter.apply_cli_update_policy(&mut argv, &mut env);
+            assert_eq!(env, [("DISABLE_AUTOUPDATER".into(), "1".into())]);
+            argv
+        };
+        let ours = r#"{"env":{"DISABLE_AUTOUPDATER":"1"}}"#;
+        for argv in [
+            &[
+                "claude",
+                "--model",
+                "opus",
+                "--settings",
+                "/team/settings.json",
+            ][..],
+            &["claude", "--settings={}", "auth", "status"],
+        ] {
+            assert_eq!(apply(argv), argv);
+        }
+        // Arguments after `--` are not options and are never changed.
+        assert_eq!(
+            apply(&["claude", "--", "--settings", "x"]),
+            ["claude", "--settings", ours, "--", "--settings", "x"]
+        );
+        assert_eq!(apply(&["claude"]), ["claude", "--settings", ours]);
+        assert!(apply(&[]).is_empty());
     }
 
     #[test]

@@ -1388,7 +1388,7 @@ fn real_host_live_vendor_hydration_register_confirms_and_routes() {
             r##"#!/bin/sh
 root='{root}'
 case '{vendor}' in
-  claude) printf '%s\n' "${{DISABLE_AUTOUPDATER:-missing}}" ;;
+  claude) printf '%s\n' "${{DISABLE_AUTOUPDATER:-missing}}" "$1" "$2" ;;
   antigravity) printf '%s\n' "${{AGY_CLI_DISABLE_AUTO_UPDATE:-missing}}" ;;
   grok) printf '%s\n' "${{GROK_DISABLE_AUTOUPDATER:-missing}}" ;;
   muse) printf '%s\n' "${{MUSE_NO_AUTO_UPDATE:-missing}}" ;;
@@ -1504,6 +1504,7 @@ exec /bin/cat
         let expected = match vendor {
             "antigravity" => "true\n",
             "codex" => "-c\ncheck_for_update_on_startup=false\n",
+            "claude" => "1\n--settings\n{\"env\":{\"DISABLE_AUTOUPDATER\":\"1\"}}\n",
             _ => "1\n",
         };
         assert_eq!(policy, expected, "{vendor} startup update policy");

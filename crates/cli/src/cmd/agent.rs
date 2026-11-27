@@ -2109,12 +2109,14 @@ mod tests {
         assert_eq!(launches.len(), 1);
         let argv = &launches[0].argv;
         assert!(
-            argv.len() >= 8,
+            argv.len() >= 10,
             "expected claude launch argv with session-id and name, got {argv:?}"
         );
         assert_eq!(
-            &argv[1..8],
+            &argv[1..10],
             &[
+                "--settings".to_string(),
+                r#"{"env":{"DISABLE_AUTOUPDATER":"1"}}"#.to_string(),
                 "--remote-control".to_string(),
                 "--permission-mode".to_string(),
                 "auto".to_string(),

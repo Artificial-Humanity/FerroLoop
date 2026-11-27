@@ -33,7 +33,7 @@ use serde_json::Value;
 
 use fl_core::{VendorDoctorContext, VendorUpdateStatus};
 
-use crate::doctor::{SETTINGS_JSON, read_settings};
+use crate::doctor::{MANAGED_SETTINGS_D, MANAGED_SETTINGS_JSON, SETTINGS_JSON, read_settings};
 
 pub use fl_core::PostCompactionContext as ClaudePostCompactionContext;
 
@@ -311,13 +311,43 @@ impl fl_core::VendorVersionAdapter for ClaudeHostAdapter {
         Some(CLAUDE_AUTO_UPDATE_DISABLED)
     }
 
-    /// Each control is read from the process environment and from the `env` block of the
-    /// user `settings.json` (in `$CLAUDE_CONFIG_DIR`, else `~/.claude`). Claude does not
-    /// document which source wins when both set a control, so a disagreement, or a source
-    /// that cannot be read, leaves that control unknown. Either control disabling updates
-    /// disables them.
+    /// Keeps the environment switch and also passes it with `--settings`, which outranks the
+    /// project, local and user settings files. A settings file `env` value replaces the same
+    /// variable from the launching environment, so the switch alone can be undone by any of
+    /// those files. Only managed settings outrank `--settings`.
+    ///
+    /// When argv already has a `--settings` before any `--`, it is left alone and no second
+    /// one is added, because Claude does not document how two such flags combine. That
+    /// launch then relies on the environment switch only. This also makes the policy
+    /// idempotent.
+    fn apply_cli_update_policy(&self, argv: &mut Vec<String>, env: &mut Vec<(String, String)>) {
+        let (name, value) = CLAUDE_AUTO_UPDATE_DISABLED;
+        env.retain(|(key, _)| key != name);
+        env.push((name.into(), value.into()));
+        let Some(options) = argv.get(1..) else {
+            return;
+        };
+        let has_settings = options
+            .iter()
+            .take_while(|arg| *arg != "--")
+            .any(|arg| arg == "--settings" || arg.starts_with("--settings="));
+        if !has_settings {
+            argv.splice(1..1, ["--settings".into(), CLAUDE_HOSTED_SETTINGS.into()]);
+        }
+    }
+
+    /// Each control follows Claude's documented settings precedence, highest first: the
+    /// file-based managed settings (`managed-settings.json`, then the `managed-settings.d`
+    /// drop-ins in name order), the `env` block of the user `settings.json` (in
+    /// `$CLAUDE_CONFIG_DIR`, else `~/.claude`), then the process environment. The first
+    /// source that sets a control decides it. A source above that cannot be read or fails
+    /// validation leaves the control unknown. Either control disabling updates disables them.
+    ///
+    /// Project and local settings files are not read, because they depend on the working
+    /// directory. Remote server-managed settings from claude.ai cannot be observed passively.
     fn configured_cli_updates(&self, context: &VendorDoctorContext<'_>) -> VendorUpdateStatus {
-        let settings = match context.config_home("CLAUDE_CONFIG_DIR", ".claude") {
+        let managed = managed_settings_env(&context.system_dir(CLAUDE_MANAGED_DIR));
+        let user = match context.config_home("CLAUDE_CONFIG_DIR", ".claude") {
             Some(dir) => read_settings(
                 &dir.join("settings.json"),
                 &SETTINGS_JSON,
@@ -325,29 +355,43 @@ impl fl_core::VendorVersionAdapter for ClaudeHostAdapter {
             ),
             None => Err("config directory unavailable"),
         };
-        let mut unknown = None;
-        for (index, key) in CLAUDE_UPDATE_CONTROLS.into_iter().enumerate() {
-            let from_env = context
-                .var(key)
-                .map_or(Ok(None), |value| claude_update_switch(value.to_str()));
-            let from_settings = settings.as_ref().map_err(|reason| *reason).and_then(|env| {
-                env.0[index]
-                    .as_deref()
-                    .map_or(Ok(None), |value| claude_update_switch(Some(value)))
-            });
-            let control = match (from_env, from_settings) {
-                (Ok(None), other) | (other, Ok(None)) => other,
-                (Ok(env), Ok(settings)) if env == settings => Ok(env),
-                (Err(reason), _) | (_, Err(reason)) => Err(reason),
-                _ => Err("environment and settings.json disagree"),
-            };
-            match control {
-                Ok(Some(true)) => return VendorUpdateStatus::Disabled,
-                Ok(_) => {}
-                Err(reason) => unknown = unknown.or(Some(reason)),
-            }
-        }
-        unknown.map_or(VendorUpdateStatus::Enabled, VendorUpdateStatus::Unknown)
+        claude_update_status(
+            CLAUDE_UPDATE_CONTROLS
+                .into_iter()
+                .enumerate()
+                .map(|(index, key)| {
+                    [&managed, &user]
+                        .into_iter()
+                        .find_map(|source| match source {
+                            Err(reason) => Some(Err(*reason)),
+                            Ok(env) => env.0[index]
+                                .as_deref()
+                                .map(|value| claude_update_switch(Some(value))),
+                        })
+                        .unwrap_or_else(|| {
+                            context
+                                .var(key)
+                                .map_or(Ok(None), |value| claude_update_switch(value.to_str()))
+                        })
+                }),
+        )
+    }
+
+    /// Hosted launches carry [`CLAUDE_HOSTED_SETTINGS`] with `--settings`, so only the
+    /// file-based managed settings can override it. Updates stay disabled unless a managed
+    /// file sets `DISABLE_AUTOUPDATER` to a value that keeps them. A managed file that cannot
+    /// be read or fails validation is unknown. Remote server-managed settings from claude.ai
+    /// also outrank `--settings`, but cannot be observed passively.
+    fn hosted_cli_updates(&self, context: &VendorDoctorContext<'_>) -> VendorUpdateStatus {
+        let managed = managed_settings_env(&context.system_dir(CLAUDE_MANAGED_DIR));
+        let hosted = ClaudeSettingsEnv::parse(CLAUDE_HOSTED_SETTINGS).unwrap_or_default();
+        claude_update_status((0..CLAUDE_UPDATE_CONTROLS.len()).map(|index| {
+            let managed = managed.as_ref().map_err(|reason| *reason)?;
+            managed.0[index]
+                .as_deref()
+                .or(hosted.0[index].as_deref())
+                .map_or(Ok(None), |value| claude_update_switch(Some(value)))
+        }))
     }
 
     fn version_from_executable(&self, executable: &Path) -> Option<String> {
@@ -365,6 +409,86 @@ impl fl_core::VendorVersionAdapter for ClaudeHostAdapter {
 }
 
 const CLAUDE_AUTO_UPDATE_DISABLED: (&str, &str) = ("DISABLE_AUTOUPDATER", "1");
+
+/// The inline `--settings` document for hosted commands: [`CLAUDE_AUTO_UPDATE_DISABLED`] in
+/// an `env` block.
+const CLAUDE_HOSTED_SETTINGS: &str = r#"{"env":{"DISABLE_AUTOUPDATER":"1"}}"#;
+
+/// Claude's system directory for file-based managed settings on Linux.
+const CLAUDE_MANAGED_DIR: &str = "/etc/claude-code";
+
+/// More `managed-settings.d` drop-ins than this leave the managed settings unknown.
+const MAX_MANAGED_DROP_INS: usize = 64;
+
+/// Either control disabling updates disables them. Otherwise an unknown control, in
+/// control order, gives its reason.
+fn claude_update_status(
+    controls: impl IntoIterator<Item = Result<Option<bool>, &'static str>>,
+) -> VendorUpdateStatus {
+    let mut unknown = None;
+    for control in controls {
+        match control {
+            Ok(Some(true)) => return VendorUpdateStatus::Disabled,
+            Ok(_) => {}
+            Err(reason) => unknown = unknown.or(Some(reason)),
+        }
+    }
+    unknown.map_or(VendorUpdateStatus::Enabled, VendorUpdateStatus::Unknown)
+}
+
+/// The update controls set by the file-based managed settings in `dir`: `managed-settings.json`
+/// first, then each `*.json` drop-in in `managed-settings.d` (hidden files skipped) in name
+/// order, a later file replacing an earlier value. A missing file or directory sets nothing.
+fn managed_settings_env(dir: &Path) -> Result<ClaudeSettingsEnv, &'static str> {
+    let mut merged = read_settings(
+        &dir.join("managed-settings.json"),
+        &MANAGED_SETTINGS_JSON,
+        parse_managed_settings,
+    )?;
+    let drop_ins = dir.join("managed-settings.d");
+    let entries = match fs::read_dir(&drop_ins) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(merged),
+        Err(_) => return Err(MANAGED_SETTINGS_D.unreadable),
+    };
+    let mut names = Vec::new();
+    for entry in entries {
+        let name = entry
+            .map_err(|_| MANAGED_SETTINGS_D.unreadable)?
+            .file_name();
+        let bytes = name.as_encoded_bytes();
+        if bytes.starts_with(b".") || !bytes.ends_with(b".json") {
+            continue;
+        }
+        if names.len() == MAX_MANAGED_DROP_INS {
+            return Err("managed-settings.d has too many files");
+        }
+        names.push(name);
+    }
+    names.sort();
+    for name in names {
+        let env = read_settings(
+            &drop_ins.join(name),
+            &MANAGED_SETTINGS_D,
+            parse_managed_settings,
+        )?;
+        for (slot, value) in merged.0.iter_mut().zip(env.0) {
+            if value.is_some() {
+                *slot = value;
+            }
+        }
+    }
+    Ok(merged)
+}
+
+/// Claude reads an empty managed settings file as `{}`.
+fn parse_managed_settings(source: &str) -> Option<ClaudeSettingsEnv> {
+    if source.trim().is_empty() {
+        Some(ClaudeSettingsEnv::default())
+    } else {
+        ClaudeSettingsEnv::parse(source)
+    }
+}
 
 /// Update controls Claude Code honours in its environment, in [`ClaudeSettingsEnv`] order.
 const CLAUDE_UPDATE_CONTROLS: [&str; 2] = [CLAUDE_AUTO_UPDATE_DISABLED.0, "DISABLE_UPDATES"];
@@ -386,7 +510,7 @@ fn claude_update_switch(value: Option<&str>) -> Result<Option<bool>, &'static st
     }
 }
 
-/// The [`CLAUDE_UPDATE_CONTROLS`] values in the `env` block of a user `settings.json`.
+/// The [`CLAUDE_UPDATE_CONTROLS`] values in the `env` block of a Claude settings document.
 #[derive(Default)]
 struct ClaudeSettingsEnv([Option<String>; 2]);
 

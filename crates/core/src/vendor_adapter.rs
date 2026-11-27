@@ -738,6 +738,20 @@ pub trait VendorVersionAdapter: fmt::Debug + Send + Sync {
         }
     }
 
+    /// The update state of a CLI that FerroLoop launches with [`Self::apply_cli_update_policy`].
+    /// The default reports disabled whenever the policy changes the command at all.
+    /// Implementations only read passive evidence and never start a process.
+    fn hosted_cli_updates(&self, _context: &VendorDoctorContext<'_>) -> VendorUpdateStatus {
+        let mut argv = vec![self.cli_binary_name().into()];
+        let mut env = Vec::new();
+        self.apply_cli_update_policy(&mut argv, &mut env);
+        if argv.len() > 1 || !env.is_empty() {
+            VendorUpdateStatus::Disabled
+        } else {
+            VendorUpdateStatus::Unknown("no hosted update control")
+        }
+    }
+
     /// Observe the separately managed daemon's installed image and on-disk update setting.
     /// Never connect to the daemon or inspect a running service.
     fn doctor_daemon_facts(
