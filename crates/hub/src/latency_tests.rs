@@ -439,10 +439,12 @@ fn transcript_get_unstable_observation_is_unavailable_then_recovers() {
     crate::discovery::after_next_transcript_read(move || write_ferris_transcript(&home, 4));
     let unavailable = get(&state, path).0;
     assert_eq!(unavailable.status, 503);
-    assert_eq!(
-        unavailable.json_value().unwrap(),
-        json!({"code":"transcript_unavailable", "reason":"unstable_or_unreadable"})
-    );
+    let body = unavailable.json_value().unwrap();
+    assert_eq!(body["code"], "transcript_unavailable");
+    assert_eq!(body["reason"], "unstable_or_unreadable");
+    assert!(body.get("turns").is_none());
+    assert_eq!(body["queue"], json!([]));
+    assert_eq!(body["queue_epoch"], json!(state.queue_epoch));
     assert!(!String::from_utf8_lossy(&unavailable.body).contains(tmp.path().to_str().unwrap()));
     let recovered = get(&state, path).0;
     assert_eq!(recovered.status, 200);
@@ -498,10 +500,12 @@ fn transcript_get_distinguishes_observed_empty_absent_and_fallback() {
 
     let absent = get(&state, "/api/v1/sessions/no-such-session/transcript").0;
     assert_eq!(absent.status, 503);
-    assert_eq!(
-        absent.json_value().unwrap(),
-        json!({"code":"transcript_unavailable", "reason":"source_not_available"})
-    );
+    let body = absent.json_value().unwrap();
+    assert_eq!(body["code"], "transcript_unavailable");
+    assert_eq!(body["reason"], "source_not_available");
+    assert!(body.get("turns").is_none());
+    assert_eq!(body["queue"], json!([]));
+    assert_eq!(body["queue_epoch"], json!(state.queue_epoch));
 
     let sessions = get(&state, "/api/v1/sessions").0.json_value().unwrap();
     let attempt = sessions["sessions"]
@@ -597,6 +601,7 @@ fn transcript_response_reference(
             "is_busy": is_busy,
             "in_flight_unconfirmed": state.session_in_flight_unconfirmed(&canonical_id),
             "queue": queue,
+        "queue_epoch": state.queue_epoch,
             "context_usage": context_usage,
             "quota_usage": quota_usage,
         }),
@@ -919,6 +924,14 @@ fn distinct_zero_key_holds_map_to_exact_hold_reasons_545() {
             "composer_occupied_by_non_wire_input: composer_occupied: composer holds non-wire input or active dialog; holding delivery without sending keys",
             "composer_occupied",
         ),
+        (
+            "composer_occupied_by_non_wire_input: composer_suggestion: Claude shows an inline suggestion; holding delivery without sending keys and retrying later",
+            "composer_suggestion",
+        ),
+        (
+            "composer_occupied_by_non_wire_input: composer_occupied: Claude composer changed before input; holding delivery without sending keys",
+            "composer_occupied",
+        ),
     ] {
         let _err = crate::api::stub_queued_delivery_error(wire_error);
         crate::api::reset_queued_delivery_calls();
@@ -943,7 +956,7 @@ fn distinct_zero_key_holds_map_to_exact_hold_reasons_545() {
         assert!(state.is_composer_held_prompt("conv-ferris-1", &item.id));
         drop(_err);
     }
-    // The mapping itself: exactly the three names, generic falls to occupied.
+    // The mapping itself: exactly the four names, generic falls to occupied.
     assert_eq!(
         crate::composer_hold_reason(
             "composer_occupied_by_non_wire_input: composer holds non-wire input or active dialog; holding delivery without sending keys"

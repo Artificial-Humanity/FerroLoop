@@ -678,6 +678,7 @@ export interface SessionTranscriptResponse {
   is_busy?: boolean;
   in_flight_unconfirmed?: boolean;
   queue?: QueuedOperatorPrompt[];
+  queue_epoch?: string;
   /** Server-measured context usage when the hub reports it. */
   context_usage?: SessionContextUsage | null;
   /** Vendor account quota/allowance usage when reported by the adapter/hub. */
@@ -705,6 +706,9 @@ export interface QueuedOperatorPrompt {
   delivery_state?: "pending" | "sending" | "unconfirmed" | "refused";
   delivery_error?: string | null;
   hold_reason?: string | null;
+  refusal_reason?: string | null;
+  retained_as_draft?: boolean;
+  claude_terminal?: boolean;
   retries_exhausted?: boolean;
   id: string;
   session_id: string;
@@ -721,6 +725,7 @@ export interface SessionQueueResponse {
   is_busy: boolean;
   in_flight_unconfirmed?: boolean;
   queue: QueuedOperatorPrompt[];
+  queue_epoch?: string;
 }
 
 export type ClearSessionMode = "clear" | "reforge";
@@ -1017,6 +1022,7 @@ export interface PromptResponse {
   turn_id?: string;
   failure_stage?: string;
   refusal_reason?: string | null;
+  hold_reason?: string | null;
   delivery_error?: string | null;
   prompt_id?: string;
   prompt?: string;
@@ -1024,6 +1030,7 @@ export interface PromptResponse {
   by?: string;
   queued_prompt?: QueuedOperatorPrompt;
   queue?: QueuedOperatorPrompt[];
+  queue_epoch?: string;
   message?: WireMessage;
   receipts?: WireReceipt[];
   attachments?: SavedPromptAttachment[];
@@ -1050,16 +1057,30 @@ export function codexSendNowReceipt(sessionId: string, response?: PromptResponse
   return { ...response, session_id: sessionId, delivered: false, delivery_stage: "unconfirmed" };
 }
 
+export function composerHoldDetail(reason?: string | null): string {
+  switch (reason) {
+    case "session_busy": return "the session is busy";
+    case "composer_unlocated": return "the session composer could not be located";
+    case "composer_suggestion": return "the session composer shows an inline suggestion";
+    default: return "the session composer is occupied";
+  }
+}
+
 /** Historical submission evidence, not the current queue or model-consumption state. */
 export function promptDeliveryStatus(response?: PromptResponse): string | null {
   switch (response?.delivery_stage) {
     case "vendor_queued": return "Submitted to Codex queue.";
     case "app_server_accepted": return "Codex app server accepted the submission for the targeted turn. This receipt does not confirm model consumption.";
     case "unconfirmed": return "Delivery unconfirmed. Check the session before resending; no automatic retry was made.";
-    case "held":
-      return isPromptDeliveryFailure(response)
-        ? "FerroDeck could not use the session composer. Nothing was sent or queued."
-        : "Held: the session composer is occupied, so nothing was sent.";
+    case "held": {
+      const detail = composerHoldDetail(response.hold_reason);
+      if (isPromptDeliveryFailure(response)) {
+        return response.hold_reason
+          ? `Nothing was sent or queued because ${detail}. Check the session and try again.`
+          : "FerroDeck could not use the session composer. Nothing was sent or queued.";
+      }
+      return `Held: ${detail}, so nothing was sent.`;
+    }
     default: return null;
   }
 }
