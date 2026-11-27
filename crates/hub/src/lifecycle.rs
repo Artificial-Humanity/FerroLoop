@@ -11458,9 +11458,7 @@ fn remodel_fenced<S: AgentRegistry + StateStore + Catalog + MessageStore>(
     if to_session_id != plan.from_session_id
         && let Err(e) = undo_new_record(store, &to_session_id, to_before, by, env.home_override)
     {
-        cleanup_error = Some(format!(
-            "; the record of `{to_session_id}` was not reset: {e}"
-        ));
+        cleanup_error = Some(e.cleanup_note(&to_session_id));
     }
 
     // The persona may now be down and retired: put the old session back. The restore spins up
@@ -11549,39 +11547,79 @@ fn require_runtime(
     Ok(out)
 }
 
+/// Why [`undo_new_record`] did not finish.
+#[derive(Debug)]
+enum UndoRecordError {
+    /// The record was not put back.
+    Record(LifecycleError),
+    /// The record was put back, but the failed spin-up's launch version receipts were not
+    /// removed.
+    Receipts(LifecycleError),
+}
+
+impl UndoRecordError {
+    /// The clause a failed remodel adds to its error about the record of `session_id`.
+    fn cleanup_note(&self, session_id: &str) -> String {
+        match self {
+            Self::Record(e) => format!("; the record of `{session_id}` was not reset: {e}"),
+            Self::Receipts(e) => format!(
+                "; the record of `{session_id}` was reset, but its launch version receipts \
+                 were not removed: {e}"
+            ),
+        }
+    }
+}
+
+impl From<LifecycleError> for UndoRecordError {
+    fn from(error: LifecycleError) -> Self {
+        Self::Record(error)
+    }
+}
+
 /// Put the record of `session_id` back as it was before a failed remodel's spin-up wrote it:
-/// `before` when there was one, else the record marked decommissioned.
+/// `before` when there was one, else the record marked decommissioned. A record left
+/// decommissioned also loses the launch version receipts of the failed spin-up, as a
+/// regular decommission does.
 fn undo_new_record<S: AgentRegistry + StateStore>(
     store: &S,
     session_id: &str,
     before: Option<HostedSessionRecord>,
     by: &str,
     home_override: Option<&Path>,
-) -> Result<(), LifecycleError> {
+) -> Result<(), UndoRecordError> {
     let Some(mut now) =
         find_hosted_session(store, &[session_id])?.filter(|r| r.session_id == session_id)
     else {
         return Ok(());
     };
-    let changed = match before {
+    let (changed, decommissioned) = match before {
         Some(before) if before != now => {
             persist_hosted_session(store, &before, by)?;
-            true
+            (true, is_decommissioned(&before))
         }
-        Some(_) => false,
-        None if is_decommissioned(&now) => false,
+        Some(_) => (false, is_decommissioned(&now)),
+        None if is_decommissioned(&now) => (false, true),
         None => {
             now.status = STATUS_DECOMMISSIONED.to_string();
             now.hydration_generation = None;
             now.updated_at_ms = now_ms();
             persist_hosted_session(store, &now, by)?;
-            true
+            (true, true)
         }
+    };
+    // As in a regular decommission, the receipts are forgotten before the tombstone refresh.
+    // A failure to forget them does not skip the refresh: the tombstones protect the record
+    // just written, and the receipts are only evidence. A retry would not refresh them,
+    // because the record is then already as it should be.
+    let receipts = if decommissioned {
+        launch_versions::forget_session(store, session_id)
+    } else {
+        Ok(())
     };
     if changed {
         refresh_decommission_tombstones(store, home_override);
     }
-    Ok(())
+    receipts.map_err(UndoRecordError::Receipts)
 }
 
 #[cfg(test)]

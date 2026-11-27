@@ -1260,6 +1260,7 @@ delegate! {
         fn get_state(&self, id: &StateId) -> Result<Option<StateEntry>, StoreError>;
         fn get_state_by_key(&self, scope: &StateScope, concern: StateConcern, slug: &str) -> Result<Option<StateEntry>, StoreError>;
         fn delete_state_by_key(&self, scope: &StateScope, concern: StateConcern, slug: &str) -> Result<bool, StoreError>;
+        fn delete_state_if_current(&self, scope: &StateScope, concern: StateConcern, slug: &str, expected: &RevisionId) -> Result<bool, StoreError>;
         fn list_state(&self, scope: Option<&StateScope>, concern: Option<StateConcern>) -> Result<Vec<StateEntry>, StoreError>;
         fn state_revisions(&self, id: &StateId) -> Result<Vec<StateRevision>, StoreError>;
         fn list_conflicts(&self) -> Result<Vec<StateConflict>, StoreError>;
@@ -3256,5 +3257,62 @@ mod tests {
             &dir.path().join("none.redb"),
             Some("bogus")
         ));
+    }
+
+    /// `AnyStore` hands `delete_state_if_current` to its engine. The trait default checks
+    /// and then deletes in two steps, so a rewrite between them is deleted; a race test
+    /// sees a lost delegation only sometimes. A read-only store tells them apart every
+    /// time: the engine checks inside a write transaction, which a read-only store refuses,
+    /// while the default answers a stale revision from a read alone.
+    #[test]
+    fn conditional_delete_reaches_the_engine_and_not_the_trait_default() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("s.redb");
+        let scope = StateScope::Workspace;
+        let write = |store: &RedbStore, value: u64| {
+            store
+                .upsert_state(UpsertStateArgs {
+                    scope: scope.clone(),
+                    slug: "receipt".into(),
+                    sensitivity: SensitivityPatch::Inherit,
+                    payload: StatePayload::Runtime(fl_core::RuntimeEntry {
+                        value: serde_json::json!(value),
+                        merge_mode: fl_core::MergeMode::LastWriter,
+                    }),
+                    at: At::from_unix_millis(value),
+                    by: "ferris".into(),
+                })
+                .unwrap()
+        };
+        let (stale, current) = {
+            let writer = RedbStore::open(&path).unwrap();
+            (write(&writer, 1), write(&writer, 2))
+        };
+        let store: AnyStore = RedbStore::open_read_only(&path, 0).unwrap().into();
+
+        let engine = StateStore::delete_state_if_current(
+            store.as_redb().unwrap(),
+            &scope,
+            StateConcern::Runtime,
+            "receipt",
+            &stale.head_revision,
+        )
+        .expect_err("the engine checks in a write transaction");
+        let any = store
+            .delete_state_if_current(
+                &scope,
+                StateConcern::Runtime,
+                "receipt",
+                &stale.head_revision,
+            )
+            .expect_err("AnyStore runs the engine's check, not the trait default");
+        assert_eq!(any.to_string(), engine.to_string());
+        assert!(any.to_string().contains("read-only"), "{any}");
+        assert_eq!(
+            store
+                .get_state_by_key(&scope, StateConcern::Runtime, "receipt")
+                .unwrap(),
+            Some(current)
+        );
     }
 }

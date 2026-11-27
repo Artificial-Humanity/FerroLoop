@@ -1081,6 +1081,72 @@ impl AgentRegistry for RedbStore {
 }
 
 impl RedbStore {
+    /// Delete a state key, when `expected` is set only while its head revision agrees.
+    /// The check and the delete run in one write transaction.
+    fn delete_state_when(
+        &self,
+        scope: &StateScope,
+        concern: StateConcern,
+        slug: &str,
+        expected: Option<&RevisionId>,
+    ) -> Result<bool, StoreError> {
+        let slug = validate_slug(slug).map_err(|e| StoreError::InvalidState(e.to_string()))?;
+        let scope_wire = scope.as_wire();
+        let concern_wire = concern.as_wire();
+        let tx = self.db.begin_write().map_err(backend)?;
+        raise_format(&tx, FORMAT_WITH_STATE)?;
+        let id_str = {
+            let by_key = tx.open_table(STATE_KEYS).map_err(backend)?;
+            by_key
+                .get((scope_wire.as_str(), concern_wire, slug.as_str()))
+                .map_err(backend)?
+                .map(|g| g.value().to_owned())
+        };
+        let Some(id_str) = id_str else {
+            return Ok(false);
+        };
+        let resolved = Iri::parse(&id_str)
+            .ok()
+            .and_then(|iri| self.resolve_in_wtx(&tx, &iri).ok());
+        if let Some(expected) = expected {
+            let entries = tx.open_table(STATE_ENTRIES).map_err(backend)?;
+            let raw = entries
+                .get(resolved.as_ref().map_or(id_str.as_str(), |r| r.as_str()))
+                .map_err(backend)?
+                .map(|g| g.value().to_owned());
+            let current: Option<StateEntry> = match raw {
+                Some(json) => Some(serde_json::from_str(&json).map_err(decode)?),
+                None => None,
+            };
+            if current.as_ref().map(|entry| &entry.head_revision) != Some(expected) {
+                // Dropping the transaction aborts it; nothing was written.
+                return Ok(false);
+            }
+        }
+        {
+            let mut by_key = tx.open_table(STATE_KEYS).map_err(backend)?;
+            by_key
+                .remove((scope_wire.as_str(), concern_wire, slug.as_str()))
+                .map_err(backend)?;
+        }
+        {
+            let mut entries = tx.open_table(STATE_ENTRIES).map_err(backend)?;
+            entries.remove(id_str.as_str()).map_err(backend)?;
+            if let Some(ref r) = resolved {
+                entries.remove(r.as_str()).map_err(backend)?;
+            }
+        }
+        {
+            let mut conflicts = tx.open_table(STATE_CONFLICTS).map_err(backend)?;
+            conflicts.remove(id_str.as_str()).map_err(backend)?;
+            if let Some(ref r) = resolved {
+                conflicts.remove(r.as_str()).map_err(backend)?;
+            }
+        }
+        tx.commit().map_err(backend)?;
+        Ok(true)
+    }
+
     fn upsert_state_when(
         &self,
         args: UpsertStateArgs,
@@ -1332,40 +1398,17 @@ impl StateStore for RedbStore {
         concern: StateConcern,
         slug: &str,
     ) -> Result<bool, StoreError> {
-        let slug = validate_slug(slug).map_err(|e| StoreError::InvalidState(e.to_string()))?;
-        let scope_wire = scope.as_wire();
-        let concern_wire = concern.as_wire();
-        let tx = self.db.begin_write().map_err(backend)?;
-        raise_format(&tx, FORMAT_WITH_STATE)?;
-        let id_str = {
-            let mut by_key = tx.open_table(STATE_KEYS).map_err(backend)?;
-            by_key
-                .remove((scope_wire.as_str(), concern_wire, slug.as_str()))
-                .map_err(backend)?
-                .map(|g| g.value().to_owned())
-        };
-        let Some(id_str) = id_str else {
-            return Ok(false);
-        };
-        let resolved = Iri::parse(&id_str)
-            .ok()
-            .and_then(|iri| self.resolve_in_wtx(&tx, &iri).ok());
-        {
-            let mut entries = tx.open_table(STATE_ENTRIES).map_err(backend)?;
-            entries.remove(id_str.as_str()).map_err(backend)?;
-            if let Some(ref r) = resolved {
-                entries.remove(r.as_str()).map_err(backend)?;
-            }
-        }
-        {
-            let mut conflicts = tx.open_table(STATE_CONFLICTS).map_err(backend)?;
-            conflicts.remove(id_str.as_str()).map_err(backend)?;
-            if let Some(ref r) = resolved {
-                conflicts.remove(r.as_str()).map_err(backend)?;
-            }
-        }
-        tx.commit().map_err(backend)?;
-        Ok(true)
+        self.delete_state_when(scope, concern, slug, None)
+    }
+
+    fn delete_state_if_current(
+        &self,
+        scope: &StateScope,
+        concern: StateConcern,
+        slug: &str,
+        expected: &RevisionId,
+    ) -> Result<bool, StoreError> {
+        self.delete_state_when(scope, concern, slug, Some(expected))
     }
 
     fn list_state(

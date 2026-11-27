@@ -2615,7 +2615,7 @@ impl RemoteControl for MemRemote {
 /// How many cases [`agent_registry`] runs. Update deliberately — see [`run_suite`].
 const AGENT_REGISTRY_CASES: usize = 8;
 /// How many cases [`state_store`] runs. Update deliberately — see [`run_suite`].
-const STATE_STORE_CASES: usize = 10;
+const STATE_STORE_CASES: usize = 11;
 /// How many cases [`message_store`] runs. Update deliberately — see [`run_suite`].
 const MESSAGE_STORE_CASES: usize = 11;
 /// How many cases [`workflow_store`] runs. Update deliberately — see [`run_suite`].
@@ -2647,6 +2647,7 @@ pub fn state_store<S: StateStore + Catalog + Handles, G>(make: impl Fn() -> (S, 
         mismatched_runtime_merge_modes_fail_closed_to_conflict::<S>,
         runtime_append_and_last_writer_auto_merge_without_conflict::<S>,
         offline_same_key_collision_aliases_unpublished_local_id_to_remote::<S>,
+        conditional_delete_removes_only_the_expected_revision::<S>,
     ];
     run_suite("state-store", STATE_STORE_CASES, cases, make);
 }
@@ -3368,6 +3369,80 @@ fn memory_superseded_validates_target_exists_and_is_memory<S: StateStore>(s: &S)
         }
         other => panic!("expected Memory payload, got {other:?}"),
     }
+}
+
+fn conditional_delete_removes_only_the_expected_revision<S: StateStore>(s: &S) {
+    use crate::state::{
+        MergeMode, RuntimeEntry, SensitivityPatch, StateConcern, StatePayload, StateScope,
+        UpsertStateArgs,
+    };
+    let scope = StateScope::Workspace;
+    let write = |value: u64| {
+        s.upsert_state(UpsertStateArgs {
+            scope: scope.clone(),
+            slug: "launch_receipt".into(),
+            sensitivity: SensitivityPatch::Inherit,
+            payload: StatePayload::Runtime(RuntimeEntry {
+                value: serde_json::json!(value),
+                merge_mode: MergeMode::LastWriter,
+            }),
+            at: At::from_unix_millis(value),
+            by: "ferris".into(),
+        })
+        .unwrap()
+    };
+    let read = || {
+        s.get_state_by_key(&scope, StateConcern::Runtime, "launch_receipt")
+            .unwrap()
+    };
+
+    // A missing key is not deleted.
+    let first = write(1);
+    assert!(
+        s.delete_state_by_key(&scope, StateConcern::Runtime, "launch_receipt")
+            .unwrap()
+    );
+    assert!(
+        !s.delete_state_if_current(
+            &scope,
+            StateConcern::Runtime,
+            "launch_receipt",
+            &first.head_revision
+        )
+        .unwrap()
+    );
+
+    // A key rewritten since its revision was read is kept.
+    let stale = write(2);
+    let newer = write(3);
+    assert_ne!(stale.head_revision, newer.head_revision);
+    assert!(
+        !s.delete_state_if_current(
+            &scope,
+            StateConcern::Runtime,
+            "launch_receipt",
+            &stale.head_revision
+        )
+        .unwrap()
+    );
+    assert_eq!(read(), Some(newer.clone()));
+
+    // The current revision is deleted.
+    assert!(
+        s.delete_state_if_current(
+            &scope,
+            StateConcern::Runtime,
+            "launch_receipt",
+            &newer.head_revision
+        )
+        .unwrap()
+    );
+    assert_eq!(read(), None);
+    assert!(
+        s.list_state(Some(&scope), Some(StateConcern::Runtime))
+            .unwrap()
+            .is_empty()
+    );
 }
 
 fn runtime_append_requires_array_and_rejects_scalar<S: StateStore>(s: &S) {

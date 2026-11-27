@@ -1515,6 +1515,40 @@ impl AgentRegistry for MemStore {
     }
 }
 
+impl MemStore {
+    /// Delete a state key, when `expected` is set only while its head revision agrees.
+    /// The check and the delete share one borrow, so no write lands between them.
+    fn delete_state_when(
+        &self,
+        scope: &StateScope,
+        concern: StateConcern,
+        slug: &str,
+        expected: Option<&RevisionId>,
+    ) -> Result<bool, StoreError> {
+        let slug = validate_slug(slug).map_err(|e| StoreError::InvalidState(e.to_string()))?;
+        let key = (scope.as_wire(), concern.as_wire().to_string(), slug);
+        let mut s = self.inner.borrow_mut();
+        let Some(id) = s.state_by_key.get(&key).cloned() else {
+            return Ok(false);
+        };
+        let resolved = StateId(s.resolve(id.iri()));
+        if let Some(expected) = expected
+            && s.state_entries
+                .get(&resolved)
+                .map(|entry| &entry.head_revision)
+                != Some(expected)
+        {
+            return Ok(false);
+        }
+        s.state_by_key.remove(&key);
+        s.state_entries.remove(&id);
+        s.state_entries.remove(&resolved);
+        s.state_conflicts.remove(&id);
+        s.state_conflicts.remove(&resolved);
+        Ok(true)
+    }
+}
+
 impl StateStore for MemStore {
     fn upsert_state(&self, args: UpsertStateArgs) -> Result<StateEntry, StoreError> {
         let slug =
@@ -1679,18 +1713,17 @@ impl StateStore for MemStore {
         concern: StateConcern,
         slug: &str,
     ) -> Result<bool, StoreError> {
-        let slug = validate_slug(slug).map_err(|e| StoreError::InvalidState(e.to_string()))?;
-        let key = (scope.as_wire(), concern.as_wire().to_string(), slug);
-        let mut s = self.inner.borrow_mut();
-        let Some(id) = s.state_by_key.remove(&key) else {
-            return Ok(false);
-        };
-        let resolved = StateId(s.resolve(id.iri()));
-        s.state_entries.remove(&id);
-        s.state_entries.remove(&resolved);
-        s.state_conflicts.remove(&id);
-        s.state_conflicts.remove(&resolved);
-        Ok(true)
+        self.delete_state_when(scope, concern, slug, None)
+    }
+
+    fn delete_state_if_current(
+        &self,
+        scope: &StateScope,
+        concern: StateConcern,
+        slug: &str,
+        expected: &RevisionId,
+    ) -> Result<bool, StoreError> {
+        self.delete_state_when(scope, concern, slug, Some(expected))
     }
 
     fn list_state(
@@ -2836,6 +2869,131 @@ mod tests {
         assert_eq!(s.routes(&q).unwrap(), None, "per project");
         let err = s.routes(&ProjectId(seq_iri(99))).unwrap_err();
         assert!(matches!(err, StoreError::NotOwned { .. }), "{err:?}");
+    }
+
+    /// A store that keeps the trait's default `delete_state_if_current`.
+    struct DefaultConditionalDelete(MemStore);
+
+    impl StateStore for DefaultConditionalDelete {
+        fn upsert_state(&self, args: UpsertStateArgs) -> Result<StateEntry, StoreError> {
+            self.0.upsert_state(args)
+        }
+        fn retire_memory(
+            &self,
+            scope: &StateScope,
+            slug: &str,
+            lifecycle: MemoryLifecycle,
+            superseded_by: Option<StateId>,
+            at: At,
+            by: &str,
+        ) -> Result<StateEntry, StoreError> {
+            self.0
+                .retire_memory(scope, slug, lifecycle, superseded_by, at, by)
+        }
+        fn get_state(&self, id: &StateId) -> Result<Option<StateEntry>, StoreError> {
+            self.0.get_state(id)
+        }
+        fn get_state_by_key(
+            &self,
+            scope: &StateScope,
+            concern: StateConcern,
+            slug: &str,
+        ) -> Result<Option<StateEntry>, StoreError> {
+            self.0.get_state_by_key(scope, concern, slug)
+        }
+        fn delete_state_by_key(
+            &self,
+            scope: &StateScope,
+            concern: StateConcern,
+            slug: &str,
+        ) -> Result<bool, StoreError> {
+            self.0.delete_state_by_key(scope, concern, slug)
+        }
+        fn list_state(
+            &self,
+            scope: Option<&StateScope>,
+            concern: Option<StateConcern>,
+        ) -> Result<Vec<StateEntry>, StoreError> {
+            self.0.list_state(scope, concern)
+        }
+        fn state_revisions(&self, id: &StateId) -> Result<Vec<StateRevision>, StoreError> {
+            self.0.state_revisions(id)
+        }
+        fn list_conflicts(&self) -> Result<Vec<StateConflict>, StoreError> {
+            self.0.list_conflicts()
+        }
+        fn resolve_conflict(
+            &self,
+            id: &StateId,
+            keep: &RevisionId,
+            at: At,
+            by: &str,
+        ) -> Result<StateEntry, StoreError> {
+            self.0.resolve_conflict(id, keep, at, by)
+        }
+        fn state_revisions_after(
+            &self,
+            after_seq: u64,
+        ) -> Result<Vec<(u64, StateRevision)>, StoreError> {
+            self.0.state_revisions_after(after_seq)
+        }
+        fn import_state_revisions(
+            &self,
+            revisions: &[StateRevision],
+            merge_at: At,
+        ) -> Result<(), StoreError> {
+            self.0.import_state_revisions(revisions, merge_at)
+        }
+        fn sync_cursor(&self, remote: &str) -> Result<Option<StateSyncCursor>, StoreError> {
+            self.0.sync_cursor(remote)
+        }
+        fn set_sync_cursor(&self, cursor: StateSyncCursor) -> Result<(), StoreError> {
+            self.0.set_sync_cursor(cursor)
+        }
+    }
+
+    #[test]
+    fn the_default_conditional_delete_removes_only_the_current_revision() {
+        use crate::state::RuntimeEntry;
+        let s = DefaultConditionalDelete(MemStore::default());
+        let scope = StateScope::Workspace;
+        let write = |value: u64| {
+            s.upsert_state(UpsertStateArgs {
+                scope: scope.clone(),
+                slug: "receipt".into(),
+                sensitivity: SensitivityPatch::Inherit,
+                payload: StatePayload::Runtime(RuntimeEntry {
+                    value: serde_json::json!(value),
+                    merge_mode: MergeMode::LastWriter,
+                }),
+                at: At::from_unix_millis(value),
+                by: "ferris".into(),
+            })
+            .unwrap()
+        };
+        let delete = |expected: &RevisionId| {
+            s.delete_state_if_current(&scope, StateConcern::Runtime, "receipt", expected)
+                .unwrap()
+        };
+        let read = || {
+            s.get_state_by_key(&scope, StateConcern::Runtime, "receipt")
+                .unwrap()
+        };
+
+        // A stale revision keeps the key.
+        let stale = write(1);
+        let current = write(2);
+        assert_ne!(stale.head_revision, current.head_revision);
+        assert!(!delete(&stale.head_revision));
+        assert_eq!(read(), Some(current.clone()));
+
+        // The current revision deletes it.
+        assert!(delete(&current.head_revision));
+        assert_eq!(read(), None);
+
+        // A missing key deletes nothing.
+        assert!(!delete(&current.head_revision));
+        assert_eq!(read(), None);
     }
 }
 

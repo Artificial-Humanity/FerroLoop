@@ -434,6 +434,19 @@ fn read<S: StateStore, T: serde::de::DeserializeOwned>(
     Ok(entry.and_then(decode))
 }
 
+/// The decoded value at `slug` with the head revision it was read at. `None` when the key
+/// is missing or holds a value this binary cannot decode.
+fn read_current<S: StateStore, T: serde::de::DeserializeOwned>(
+    store: &S,
+    slug: &str,
+) -> Result<Option<(T, RevisionId)>, LifecycleError> {
+    let entry = store.get_state_by_key(&StateScope::Workspace, StateConcern::Runtime, slug)?;
+    Ok(entry.and_then(|entry| {
+        let revision = entry.head_revision.clone();
+        decode(entry).map(|value| (value, revision))
+    }))
+}
+
 fn decode<T: serde::de::DeserializeOwned>(entry: fl_core::state::StateEntry) -> Option<T> {
     let StatePayload::Runtime(runtime) = entry.payload else {
         return None;
@@ -894,11 +907,20 @@ fn delete_superseded<S: StateStore>(
     newest: uuid::Uuid,
 ) -> Result<(), LifecycleError> {
     for slug in slugs {
-        let superseded = read::<_, LaunchReceipt>(store, slug)?
-            .is_some_and(|receipt| receipt.session_id == session_id && receipt.id < newest);
-        if superseded {
-            store.delete_state_by_key(&StateScope::Workspace, StateConcern::Runtime, slug)?;
-        }
+        // Each key is deleted only at the revision that was checked. A newer launch that
+        // reuses a legacy generation can write its receipt here after the check; that
+        // receipt is kept.
+        let Some((_, revision)) = read_current::<_, LaunchReceipt>(store, slug)?
+            .filter(|(receipt, _)| receipt.session_id == session_id && receipt.id < newest)
+        else {
+            continue;
+        };
+        store.delete_state_if_current(
+            &StateScope::Workspace,
+            StateConcern::Runtime,
+            slug,
+            &revision,
+        )?;
     }
     Ok(())
 }
@@ -974,24 +996,48 @@ fn forget_session_through<S: StateStore>(
         );
     }
     let slug = session_index_slug(session_id);
-    let index = read::<_, SessionReceipts>(store, &slug)?;
-    if through.is_some() && !index.as_ref().is_some_and(|index| settled(index.launch)) {
+    let Some(through) = through else {
+        if let Some(index) = read::<_, SessionReceipts>(store, &slug)? {
+            for receipt in &index.slugs {
+                store.delete_state_by_key(
+                    &StateScope::Workspace,
+                    StateConcern::Runtime,
+                    receipt,
+                )?;
+            }
+        }
+        store.delete_state_by_key(&StateScope::Workspace, StateConcern::Runtime, &slug)?;
+        return Ok(());
+    };
+    // Each key is deleted only at the revision whose owner was checked. A decommission,
+    // a new launch and a settle can interleave here: a key rewritten after the check
+    // belongs to a newer launch and is kept.
+    let Some((index, index_revision)) = read_current::<_, SessionReceipts>(store, &slug)?
+        .filter(|(index, _)| index.launch <= through)
+    else {
         // The index is missing, unreadable, or owned by a newer launch.
         return Ok(());
+    };
+    for receipt in &index.slugs {
+        // A reused legacy generation key can already hold a newer launch's receipt.
+        let Some((_, revision)) = read_current::<_, LaunchReceipt>(store, receipt)?
+            .filter(|(saved, _)| saved.session_id == session_id && saved.id <= through)
+        else {
+            continue;
+        };
+        store.delete_state_if_current(
+            &StateScope::Workspace,
+            StateConcern::Runtime,
+            receipt,
+            &revision,
+        )?;
     }
-    if let Some(index) = index {
-        for receipt in &index.slugs {
-            // A reused legacy generation key can already hold a newer launch's receipt.
-            if through.is_some()
-                && !read::<_, LaunchReceipt>(store, receipt)?
-                    .is_some_and(|saved| saved.session_id == session_id && settled(saved.id))
-            {
-                continue;
-            }
-            store.delete_state_by_key(&StateScope::Workspace, StateConcern::Runtime, receipt)?;
-        }
-    }
-    store.delete_state_by_key(&StateScope::Workspace, StateConcern::Runtime, &slug)?;
+    store.delete_state_if_current(
+        &StateScope::Workspace,
+        StateConcern::Runtime,
+        &slug,
+        &index_revision,
+    )?;
     Ok(())
 }
 
@@ -2179,113 +2225,197 @@ mod tests {
         assert_eq!(baseline.cli.unwrap().version, "1.0.0");
     }
 
+    /// A `MemStore` whose reads of one key fail once `fail` is set, and which rewrites a
+    /// key in `rewrite` just before a conditional delete of it.
+    #[derive(Default)]
+    struct HookedStore {
+        inner: MemStore,
+        fail: std::cell::RefCell<Option<String>>,
+        rewrite: std::cell::RefCell<std::collections::BTreeMap<String, serde_json::Value>>,
+    }
+    impl StateStore for HookedStore {
+        fn upsert_state(
+            &self,
+            args: UpsertStateArgs,
+        ) -> Result<fl_core::state::StateEntry, StoreError> {
+            self.inner.upsert_state(args)
+        }
+        fn retire_memory(
+            &self,
+            scope: &StateScope,
+            slug: &str,
+            lifecycle: fl_core::state::MemoryLifecycle,
+            superseded_by: Option<fl_core::ids::StateId>,
+            at: fl_core::At,
+            by: &str,
+        ) -> Result<fl_core::state::StateEntry, StoreError> {
+            self.inner
+                .retire_memory(scope, slug, lifecycle, superseded_by, at, by)
+        }
+        fn get_state(
+            &self,
+            id: &fl_core::ids::StateId,
+        ) -> Result<Option<fl_core::state::StateEntry>, StoreError> {
+            self.inner.get_state(id)
+        }
+        fn get_state_by_key(
+            &self,
+            scope: &StateScope,
+            concern: StateConcern,
+            slug: &str,
+        ) -> Result<Option<fl_core::state::StateEntry>, StoreError> {
+            if self.fail.borrow().as_deref() == Some(slug) {
+                return Err(StoreError::Backend("injected record read error".into()));
+            }
+            self.inner.get_state_by_key(scope, concern, slug)
+        }
+        fn delete_state_by_key(
+            &self,
+            scope: &StateScope,
+            concern: StateConcern,
+            slug: &str,
+        ) -> Result<bool, StoreError> {
+            self.inner.delete_state_by_key(scope, concern, slug)
+        }
+        fn delete_state_if_current(
+            &self,
+            scope: &StateScope,
+            concern: StateConcern,
+            slug: &str,
+            expected: &fl_core::ids::RevisionId,
+        ) -> Result<bool, StoreError> {
+            // Another writer takes the key between the caller's read and this delete.
+            let rewrite = self.rewrite.borrow_mut().remove(slug);
+            if let Some(value) = rewrite {
+                self.inner
+                    .upsert_state(write_args(slug.to_owned(), &value).unwrap())?;
+            }
+            self.inner
+                .delete_state_if_current(scope, concern, slug, expected)
+        }
+        fn list_state(
+            &self,
+            scope: Option<&StateScope>,
+            concern: Option<StateConcern>,
+        ) -> Result<Vec<fl_core::state::StateEntry>, StoreError> {
+            self.inner.list_state(scope, concern)
+        }
+        fn state_revisions(
+            &self,
+            id: &fl_core::ids::StateId,
+        ) -> Result<Vec<fl_core::state::StateRevision>, StoreError> {
+            self.inner.state_revisions(id)
+        }
+        fn list_conflicts(&self) -> Result<Vec<fl_core::state::StateConflict>, StoreError> {
+            self.inner.list_conflicts()
+        }
+        fn resolve_conflict(
+            &self,
+            id: &fl_core::ids::StateId,
+            keep: &fl_core::ids::RevisionId,
+            at: fl_core::At,
+            by: &str,
+        ) -> Result<fl_core::state::StateEntry, StoreError> {
+            self.inner.resolve_conflict(id, keep, at, by)
+        }
+        fn state_revisions_after(
+            &self,
+            after_seq: u64,
+        ) -> Result<Vec<(u64, fl_core::state::StateRevision)>, StoreError> {
+            self.inner.state_revisions_after(after_seq)
+        }
+        fn import_state_revisions(
+            &self,
+            revisions: &[fl_core::state::StateRevision],
+            merge_at: fl_core::At,
+        ) -> Result<(), StoreError> {
+            self.inner.import_state_revisions(revisions, merge_at)
+        }
+        fn sync_cursor(
+            &self,
+            remote: &str,
+        ) -> Result<Option<fl_core::state::StateSyncCursor>, StoreError> {
+            self.inner.sync_cursor(remote)
+        }
+        fn set_sync_cursor(
+            &self,
+            cursor: fl_core::state::StateSyncCursor,
+        ) -> Result<(), StoreError> {
+            self.inner.set_sync_cursor(cursor)
+        }
+    }
+
+    impl AgentRegistry for HookedStore {
+        fn upsert_area(
+            &self,
+            area: fl_core::AreaRecord,
+        ) -> Result<fl_core::AreaRecord, StoreError> {
+            self.inner.upsert_area(area)
+        }
+        fn get_area(&self, area_key: &str) -> Result<Option<fl_core::AreaRecord>, StoreError> {
+            self.inner.get_area(area_key)
+        }
+        fn list_areas(&self) -> Result<Vec<fl_core::AreaRecord>, StoreError> {
+            self.inner.list_areas()
+        }
+        fn delete_area(
+            &self,
+            area_key: &str,
+            at: fl_core::At,
+            by: &str,
+        ) -> Result<bool, StoreError> {
+            self.inner.delete_area(area_key, at, by)
+        }
+        fn register_agent(
+            &self,
+            args: fl_core::RegisterAgentArgs,
+        ) -> Result<fl_core::AgentRecord, StoreError> {
+            self.inner.register_agent(args)
+        }
+        fn retire_agent(
+            &self,
+            id: &fl_core::ids::AgentId,
+            at: fl_core::At,
+            by: &str,
+        ) -> Result<fl_core::AgentRecord, StoreError> {
+            self.inner.retire_agent(id, at, by)
+        }
+        fn get_agent(
+            &self,
+            id: &fl_core::ids::AgentId,
+        ) -> Result<Option<fl_core::AgentRecord>, StoreError> {
+            self.inner.get_agent(id)
+        }
+        fn agent_by_name(
+            &self,
+            name_key: &str,
+        ) -> Result<Option<fl_core::AgentRecord>, StoreError> {
+            self.inner.agent_by_name(name_key)
+        }
+        fn list_agents(
+            &self,
+            project: Option<&str>,
+            include_retired: bool,
+        ) -> Result<Vec<fl_core::AgentRecord>, StoreError> {
+            self.inner.list_agents(project, include_retired)
+        }
+        fn registry_events_after(
+            &self,
+            after_seq: u64,
+        ) -> Result<Vec<(u64, fl_core::RegistryEvent)>, StoreError> {
+            self.inner.registry_events_after(after_seq)
+        }
+        fn import_registry_events(
+            &self,
+            events: &[fl_core::RegistryEvent],
+        ) -> Result<(), StoreError> {
+            self.inner.import_registry_events(events)
+        }
+    }
+
     #[test]
     fn versions_are_kept_when_the_session_record_read_fails() {
-        /// A `MemStore` whose reads of one key fail once `fail` is set.
-        struct FailingRecordStore {
-            inner: MemStore,
-            fail: std::cell::RefCell<Option<String>>,
-        }
-        impl StateStore for FailingRecordStore {
-            fn upsert_state(
-                &self,
-                args: UpsertStateArgs,
-            ) -> Result<fl_core::state::StateEntry, StoreError> {
-                self.inner.upsert_state(args)
-            }
-            fn retire_memory(
-                &self,
-                scope: &StateScope,
-                slug: &str,
-                lifecycle: fl_core::state::MemoryLifecycle,
-                superseded_by: Option<fl_core::ids::StateId>,
-                at: fl_core::At,
-                by: &str,
-            ) -> Result<fl_core::state::StateEntry, StoreError> {
-                self.inner
-                    .retire_memory(scope, slug, lifecycle, superseded_by, at, by)
-            }
-            fn get_state(
-                &self,
-                id: &fl_core::ids::StateId,
-            ) -> Result<Option<fl_core::state::StateEntry>, StoreError> {
-                self.inner.get_state(id)
-            }
-            fn get_state_by_key(
-                &self,
-                scope: &StateScope,
-                concern: StateConcern,
-                slug: &str,
-            ) -> Result<Option<fl_core::state::StateEntry>, StoreError> {
-                if self.fail.borrow().as_deref() == Some(slug) {
-                    return Err(StoreError::Backend("injected record read error".into()));
-                }
-                self.inner.get_state_by_key(scope, concern, slug)
-            }
-            fn delete_state_by_key(
-                &self,
-                scope: &StateScope,
-                concern: StateConcern,
-                slug: &str,
-            ) -> Result<bool, StoreError> {
-                self.inner.delete_state_by_key(scope, concern, slug)
-            }
-            fn list_state(
-                &self,
-                scope: Option<&StateScope>,
-                concern: Option<StateConcern>,
-            ) -> Result<Vec<fl_core::state::StateEntry>, StoreError> {
-                self.inner.list_state(scope, concern)
-            }
-            fn state_revisions(
-                &self,
-                id: &fl_core::ids::StateId,
-            ) -> Result<Vec<fl_core::state::StateRevision>, StoreError> {
-                self.inner.state_revisions(id)
-            }
-            fn list_conflicts(&self) -> Result<Vec<fl_core::state::StateConflict>, StoreError> {
-                self.inner.list_conflicts()
-            }
-            fn resolve_conflict(
-                &self,
-                id: &fl_core::ids::StateId,
-                keep: &fl_core::ids::RevisionId,
-                at: fl_core::At,
-                by: &str,
-            ) -> Result<fl_core::state::StateEntry, StoreError> {
-                self.inner.resolve_conflict(id, keep, at, by)
-            }
-            fn state_revisions_after(
-                &self,
-                after_seq: u64,
-            ) -> Result<Vec<(u64, fl_core::state::StateRevision)>, StoreError> {
-                self.inner.state_revisions_after(after_seq)
-            }
-            fn import_state_revisions(
-                &self,
-                revisions: &[fl_core::state::StateRevision],
-                merge_at: fl_core::At,
-            ) -> Result<(), StoreError> {
-                self.inner.import_state_revisions(revisions, merge_at)
-            }
-            fn sync_cursor(
-                &self,
-                remote: &str,
-            ) -> Result<Option<fl_core::state::StateSyncCursor>, StoreError> {
-                self.inner.sync_cursor(remote)
-            }
-            fn set_sync_cursor(
-                &self,
-                cursor: fl_core::state::StateSyncCursor,
-            ) -> Result<(), StoreError> {
-                self.inner.set_sync_cursor(cursor)
-            }
-        }
-
-        let store = FailingRecordStore {
-            inner: MemStore::default(),
-            fail: std::cell::RefCell::new(None),
-        };
+        let store = HookedStore::default();
         let launch = receipt(1);
         save_record(&store, &launch.session_id, STATUS_DECOMMISSIONED);
         // A failed read does not prove the session is gone, even a decommissioned one.
@@ -2351,6 +2481,263 @@ mod tests {
                     .is_none()
             );
         }
+    }
+
+    #[test]
+    fn versions_cleanup_after_decommission_keeps_a_key_rewritten_after_its_check() {
+        let mut first = receipt(1);
+        first.stream = None;
+        let first_slug = receipt_slug(&first);
+        let generation = generation_slug(&first.session_id, &first.generation);
+        let index_slug = session_index_slug(&first.session_id);
+        // A newer launch of the re-spun session id reuses the legacy generation key.
+        let mut newer = receipt(2);
+        newer.stream = None;
+        newer.generation.clone_from(&first.generation);
+        newer.versions = Some(sample(Some("1.1.0"), None));
+        let newer_index = SessionReceipts {
+            launch: newer.id,
+            slugs: vec![receipt_slug(&newer), generation.clone()],
+        };
+
+        let store = HookedStore::default();
+        save_versions(&store, first.clone(), sample(Some("1.0.0"), None)).unwrap();
+        assert_eq!(session_keys(&store, &first.session_id).len(), 3);
+        save_record(&store, &first.session_id, STATUS_DECOMMISSIONED);
+        // The cleanup reads that the first launch owns these keys. Before each delete,
+        // the newer launch settles and rewrites the key.
+        store.rewrite.borrow_mut().extend([
+            (generation.clone(), serde_json::to_value(&newer).unwrap()),
+            (
+                index_slug.clone(),
+                serde_json::to_value(&newer_index).unwrap(),
+            ),
+        ]);
+
+        forget_session_through(&store, &first.session_id, Some(first.id)).unwrap();
+
+        assert!(store.rewrite.borrow().is_empty());
+        let kept: Option<LaunchReceipt> = read(&store, &generation).unwrap();
+        assert_eq!(kept.map(|kept| kept.id), Some(newer.id));
+        let index: Option<SessionReceipts> = read(&store, &index_slug).unwrap();
+        assert_eq!(index.map(|index| index.launch), Some(newer.id));
+        // The first launch's own receipt, which nothing rewrote, is removed.
+        assert!(
+            read::<_, LaunchReceipt>(&store, &first_slug)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn versions_retire_keeps_a_superseded_key_rewritten_after_its_check() {
+        let mut first = receipt(1);
+        first.stream = None;
+        let first_slug = receipt_slug(&first);
+        let generation = generation_slug(&first.session_id, &first.generation);
+        let second = receipt(2);
+        // A newer launch reuses the first launch's legacy generation key.
+        let mut third = receipt(3);
+        third.stream = None;
+        third.generation.clone_from(&first.generation);
+        third.versions = Some(sample(Some("1.2.0"), None));
+
+        let store = HookedStore::default();
+        save_versions(&store, first.clone(), sample(Some("1.0.0"), None)).unwrap();
+        // The second launch's settle reads that the first launch's generation key is
+        // superseded. Before its delete, the third launch writes its receipt there.
+        store
+            .rewrite
+            .borrow_mut()
+            .insert(generation.clone(), serde_json::to_value(&third).unwrap());
+
+        save_versions(&store, second.clone(), sample(Some("1.1.0"), None)).unwrap();
+
+        assert!(store.rewrite.borrow().is_empty());
+        let kept: Option<LaunchReceipt> = read(&store, &generation).unwrap();
+        assert_eq!(kept.map(|kept| kept.id), Some(third.id));
+        // The first launch's own receipt, which nothing rewrote, is removed.
+        assert!(
+            read::<_, LaunchReceipt>(&store, &first_slug)
+                .unwrap()
+                .is_none()
+        );
+        let index: Option<SessionReceipts> =
+            read(&store, &session_index_slug(&first.session_id)).unwrap();
+        assert_eq!(index.map(|index| index.launch), Some(second.id));
+    }
+
+    #[test]
+    fn versions_undo_of_a_failed_spin_up_record_forgets_receipts_it_decommissions() {
+        let home = tempfile::tempdir().unwrap();
+        let launch = receipt(1);
+        let session_id = launch.session_id.clone();
+        // `None`: the spin-up created the record. `Some`: it overwrote this earlier record.
+        for (before, forgotten) in [
+            (None, true),
+            (Some(STATUS_DECOMMISSIONED), true),
+            (Some(STATUS_STOPPED), false),
+        ] {
+            let store = MemStore::default();
+            let before = before.map(|status| {
+                save_record(&store, &session_id, status);
+                get_hosted_session_record(&store, &session_id)
+                    .unwrap()
+                    .unwrap()
+            });
+            // The failed spin-up saved a running record and its launch settled.
+            save_record(&store, &session_id, STATUS_RUNNING);
+            save_versions(&store, launch.clone(), sample(Some("1.0.0"), None)).unwrap();
+            assert_eq!(session_keys(&store, &session_id).len(), 3);
+
+            undo_new_record(
+                &store,
+                &session_id,
+                before.clone(),
+                "owner",
+                Some(home.path()),
+            )
+            .unwrap();
+
+            let undone = get_hosted_session_record(&store, &session_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(is_decommissioned(&undone), forgotten, "{before:?}");
+            assert_eq!(
+                session_keys(&store, &session_id).is_empty(),
+                forgotten,
+                "{before:?}"
+            );
+            assert_eq!(
+                hosted_vendor_versions_for_stream(&store, launch.stream.as_ref().unwrap())
+                    .unwrap()
+                    .is_none(),
+                forgotten,
+                "{before:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn versions_undo_reports_receipts_it_could_not_forget_apart_from_the_record() {
+        let home = tempfile::tempdir().unwrap();
+        let launch = receipt(1);
+        let session_id = launch.session_id.clone();
+        let store = HookedStore::default();
+        // The failed spin-up created a running record and its launch settled.
+        save_record(&store, &session_id, STATUS_RUNNING);
+        let mut record = get_hosted_session_record(&store, &session_id)
+            .unwrap()
+            .unwrap();
+        let native = "019a0000-0000-7000-8000-00000000ada1";
+        record.vendor_session_id = Some(native.into());
+        persist_hosted_session(&store, &record, "test").unwrap();
+        save_versions(&store, launch.clone(), sample(Some("1.0.0"), None)).unwrap();
+        store.fail.replace(Some(session_index_slug(&session_id)));
+
+        let error =
+            undo_new_record(&store, &session_id, None, "owner", Some(home.path())).unwrap_err();
+
+        assert!(matches!(error, UndoRecordError::Receipts(_)), "{error:?}");
+        // The record is reset even though its receipts remain.
+        let undone = get_hosted_session_record(&store, &session_id)
+            .unwrap()
+            .unwrap();
+        assert!(is_decommissioned(&undone));
+        // Its tombstones are refreshed all the same: a retry finds the record unchanged
+        // and would not refresh them.
+        let tombstones = fl_wire::identity::load_decommissioned_session_ids(Some(home.path()));
+        assert!(tombstones.contains(native), "{tombstones:?}");
+        store.fail.replace(None);
+        assert_eq!(session_keys(&store, &session_id).len(), 3);
+    }
+
+    #[test]
+    fn versions_undo_forgets_receipts_of_a_record_already_decommissioned() {
+        let home = tempfile::tempdir().unwrap();
+        let launch = receipt(1);
+        let session_id = launch.session_id.clone();
+        // `true`: the record the spin-up overwrote is the one there now. `false`: the
+        // spin-up created the record, and it is already decommissioned.
+        for had_before in [true, false] {
+            let store = MemStore::default();
+            save_record(&store, &session_id, STATUS_RUNNING);
+            save_versions(&store, launch.clone(), sample(Some("1.0.0"), None)).unwrap();
+            save_record(&store, &session_id, STATUS_DECOMMISSIONED);
+            let now = get_hosted_session_record(&store, &session_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(session_keys(&store, &session_id).len(), 3);
+
+            undo_new_record(
+                &store,
+                &session_id,
+                had_before.then(|| now.clone()),
+                "owner",
+                Some(home.path()),
+            )
+            .unwrap();
+
+            assert_eq!(
+                get_hosted_session_record(&store, &session_id).unwrap(),
+                Some(now),
+                "{had_before}"
+            );
+            assert!(session_keys(&store, &session_id).is_empty(), "{had_before}");
+        }
+    }
+
+    #[test]
+    fn versions_undo_errors_say_whether_the_record_was_reset() {
+        let error = || LifecycleError::Conflict("busy".into());
+        assert_eq!(
+            UndoRecordError::Record(error()).cleanup_note("codex:ada"),
+            format!("; the record of `codex:ada` was not reset: {}", error())
+        );
+        assert_eq!(
+            UndoRecordError::Receipts(error()).cleanup_note("codex:ada"),
+            format!(
+                "; the record of `codex:ada` was reset, but its launch version receipts were \
+                 not removed: {}",
+                error()
+            )
+        );
+    }
+
+    #[test]
+    fn versions_retire_keeps_another_sessions_receipt_in_a_superseded_key() {
+        let mut first = receipt(1);
+        first.stream = None;
+        let first_slug = receipt_slug(&first);
+        let generation = generation_slug(&first.session_id, &first.generation);
+        // An older receipt of another session now holds the first launch's generation key.
+        let mut foreign = receipt(1);
+        foreign.stream = None;
+        foreign.session_id = "codex:bea".into();
+        foreign.versions = Some(sample(Some("1.1.0"), None));
+        let second = receipt(2);
+
+        let store = MemStore::default();
+        save_versions(&store, first.clone(), sample(Some("1.0.0"), None)).unwrap();
+        write(&store, generation.clone(), &foreign).unwrap();
+
+        // The second launch supersedes the first launch's keys.
+        save_versions(&store, second.clone(), sample(Some("1.1.0"), None)).unwrap();
+
+        let kept: Option<LaunchReceipt> = read(&store, &generation).unwrap();
+        assert_eq!(
+            kept.map(|kept| (kept.id, kept.session_id)),
+            Some((foreign.id, foreign.session_id))
+        );
+        // The first launch's own receipt is removed.
+        assert!(
+            read::<_, LaunchReceipt>(&store, &first_slug)
+                .unwrap()
+                .is_none()
+        );
+        let index: Option<SessionReceipts> =
+            read(&store, &session_index_slug(&first.session_id)).unwrap();
+        assert_eq!(index.map(|index| index.launch), Some(second.id));
     }
 
     #[test]
