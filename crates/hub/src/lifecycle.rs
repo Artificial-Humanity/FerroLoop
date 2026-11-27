@@ -8472,7 +8472,13 @@ fn reconcile_dead_hosted_session_fenced<S: StateStore>(
                     }
                 } else {
                     let observed_at_ms = current_respawn_clock_ms();
-                    let evidence = respawn_state.exit_evidence.capture(env.runtime, &record);
+                    let evidence = if blockers::screen_block(&record).is_some() {
+                        // A saved screen flag can outlive its sample. Count the exit without
+                        // fetching a terminal tail that may contain sign-in material.
+                        fl_host_proto::HostedExitEvidenceStatus::Unavailable
+                    } else {
+                        respawn_state.exit_evidence.capture(env.runtime, &record)
+                    };
                     let clean_exit = match &evidence {
                         fl_host_proto::HostedExitEvidenceStatus::Exited(evidence) => {
                             exit_evidence::is_clean_exit(evidence)
@@ -22048,6 +22054,252 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn persisted_screen_block_without_current_evidence_skips_terminal_capture() {
+        use fl_host_proto::{
+            ChildExit, ChildRecord, ChildState, HostInstance, HostedExitEvidence, InputState,
+            SessionEpoch, SessionId, SessionMode, SessionSummary, SpawnKind, StreamId,
+        };
+        use fl_watch::HostedBlockReason::{BlockingDialog, HydrationOverdue, VendorSignIn};
+
+        let tail = "private terminal content";
+        let first_fast_ms = 1_000;
+        let last_in_window_ms = first_fast_ms + AUTO_RESPAWN_WINDOW_MS - 1;
+        for (block_reason, exit_code, stop_reason, pending_at_ms, expect_capture) in [
+            (
+                Some(HydrationOverdue),
+                1,
+                STOP_REASON_RUNTIME_GONE,
+                None,
+                true,
+            ),
+            (None, 1, STOP_REASON_RUNTIME_GONE, None, true),
+            (
+                Some(BlockingDialog),
+                1,
+                STOP_REASON_RUNTIME_GONE,
+                None,
+                false,
+            ),
+            (Some(VendorSignIn), 1, STOP_REASON_RUNTIME_GONE, None, false),
+            (
+                Some(VendorSignIn),
+                1,
+                STOP_REASON_RUNTIME_GONE,
+                Some(last_in_window_ms),
+                false,
+            ),
+            (Some(VendorSignIn), 0, STOP_REASON_CLEAN_EXIT, None, false),
+        ] {
+            let _reset = RecoveryFixtureReset;
+            let home = TempDir::new().unwrap();
+            let _trusted = trusted_codex_home(home.path(), home.path());
+            let store = MemStore::default();
+            register(&store, "captain", "ferroloop", AgentRole::Lead);
+            let fake = FakeRuntime::default();
+            let evidence = blockers::PromptExitEvidence::default();
+            let mut env = fake.env(home.path());
+            env.blocker_evidence = Some(&evidence);
+            let mut record = hosted_record("codex", "signin", STATUS_RUNNING, true);
+            record.cwd = Some(home.path().display().to_string());
+            record.hydration_generation = Some(next_hydration_generation());
+            record.runtime_leader_pid = Some(9876);
+            record.block = block_reason.map(|reason| fl_watch::HostedBlock {
+                reason,
+                observed_at_ms: 1,
+            });
+            persist_hosted_session(&store, &record, "test").unwrap();
+
+            let stream = StreamId {
+                host: HostInstance::new([1; 16]),
+                session: SessionId::new(record.host_session_id.as_deref().unwrap()).unwrap(),
+                epoch: SessionEpoch(1),
+            };
+            let exit = ChildExit {
+                code: Some(exit_code),
+                signal: None,
+            };
+            *fake.hosted_exit_fixture.borrow_mut() = Some(HostedExitEvidence {
+                stream: StreamId {
+                    epoch: SessionEpoch(0),
+                    ..stream.clone()
+                },
+                exit: exit.clone(),
+                started_at_ms: 10,
+                captured_at_ms: 20,
+                terminal_tail: tail.into(),
+            });
+            let mut respawn = HostedRespawnState::default();
+            let launcher = if pending_at_ms.is_some() {
+                for _ in 0..AUTO_RESPAWN_MAX_IN_WINDOW {
+                    let now = respawn.next_allowed_at_ms.unwrap_or(first_fast_ms);
+                    recovery::reserve_attempt(&mut respawn, now);
+                }
+                AUTO_RESPAWN_ACTOR
+            } else {
+                "owner"
+            };
+            let launched_at_ms = respawn
+                .respawn_timestamps_ms
+                .last()
+                .copied()
+                .unwrap_or(first_fast_ms);
+            TEST_RESPAWN_NOW_MS.with(|clock| clock.set(Some(launched_at_ms)));
+            assert!(
+                exit_evidence::spawn_and_remember(
+                    &store,
+                    &env,
+                    &mut respawn,
+                    &record,
+                    None,
+                    None,
+                    launcher
+                )
+                .unwrap()
+            );
+            assert_eq!(respawn.exit_evidence.bound_stream(&record), Some(&stream));
+            // Older builds could save Pending before a failed write of the stopped record.
+            let prior_exit = pending_at_ms.map(|observed_at_ms| {
+                exit_evidence::save_counted_exit(
+                    &store,
+                    &record,
+                    &mut respawn,
+                    fl_host_proto::HostedExitEvidenceStatus::Pending,
+                    observed_at_ms,
+                    "test",
+                )
+                .unwrap();
+                let incident = serde_json::to_value(&respawn.exit_evidence).unwrap();
+                let mut entry = incident["exits"][0].as_object().unwrap().clone();
+                assert_eq!(entry.remove("pending"), Some(serde_json::Value::Bool(true)));
+                entry.insert("screen_tail_withheld".into(), serde_json::Value::Bool(true));
+                (observed_at_ms, serde_json::Value::Object(entry))
+            });
+
+            fake.clear();
+            fake.launches.borrow_mut().clear();
+            fake.presence_of.borrow_mut().insert(
+                record.tmux_target.as_ref().unwrap().clone(),
+                RuntimePresence::Gone,
+            );
+            *fake.hosted_exit_inventory.borrow_mut() = Some(SessionSummary {
+                state: ChildState::CleanupComplete(ChildRecord {
+                    pid: record.runtime_leader_pid.unwrap(),
+                    session: stream.session.clone(),
+                    session_epoch: stream.epoch,
+                    kind: SpawnKind::Pty,
+                    input: InputState::Fenced,
+                    started_at_ms: 10,
+                    exit: Some(exit),
+                    consumer_stalled: false,
+                }),
+                stream: stream.clone(),
+                mode: SessionMode::Pty,
+                acked: 0,
+                latest: 0,
+                input: InputState::Fenced,
+            });
+
+            let first_dead_poll_ms = pending_at_ms.unwrap_or(launched_at_ms) + 1;
+            for now in [
+                first_dead_poll_ms,
+                first_dead_poll_ms + DEAD_STREAK_MIN_SPACING_MS,
+            ] {
+                TEST_RESPAWN_NOW_MS.with(|clock| clock.set(Some(now)));
+                reconcile_dead_hosted_sessions(&store, &env, "test").unwrap();
+            }
+            let stopped = get_hosted_session_by_id(&store, &record.session_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(stopped.status, STATUS_STOPPED);
+            assert_eq!(stopped.stop_reason.as_deref(), Some(stop_reason));
+            assert!(stopped.block.is_none());
+            let expected_lookups = if expect_capture {
+                vec![(stream.clone(), record.session_id.clone())]
+            } else {
+                Vec::new()
+            };
+            assert_eq!(*fake.hosted_exit_lookups.borrow(), expected_lookups);
+
+            let counted = load_hosted_respawn_state(&store, &record.session_id).unwrap();
+            if prior_exit.is_some() {
+                // Both the recovery classification and its original time basis must survive retries.
+                TEST_RESPAWN_SAVE_FAILURE.with(|fail| fail.set(true));
+                assert!(
+                    reconcile_and_respawn_hosted_sessions(&store, &env)
+                        .unwrap()
+                        .is_empty()
+                );
+                TEST_RESPAWN_SAVE_FAILURE.with(|fail| fail.set(false));
+                assert_eq!(
+                    load_hosted_respawn_state(&store, &record.session_id).unwrap(),
+                    counted
+                );
+            }
+            let recovered = reconcile_and_respawn_hosted_sessions(&store, &env).unwrap();
+            if exit_code == 0 {
+                assert_eq!(counted, respawn);
+                assert!(recovered.is_empty());
+                assert!(fake.launches.borrow().is_empty());
+            } else {
+                let incident = serde_json::to_value(&counted.exit_evidence).unwrap();
+                let exits = incident["exits"].as_array().unwrap();
+                assert_eq!(exits.len(), 1);
+                assert_eq!(exits[0]["stream"], serde_json::to_value(stream).unwrap());
+                if expect_capture {
+                    assert_eq!(
+                        counted
+                            .exit_evidence
+                            .latest_evidence()
+                            .unwrap()
+                            .terminal_tail,
+                        tail
+                    );
+                    assert!(exits[0].get("screen_tail_withheld").is_none());
+                } else {
+                    assert_eq!(exits[0].get("evidence"), Some(&serde_json::Value::Null));
+                    assert_eq!(exits[0]["screen_tail_withheld"], true);
+                }
+                assert!(exits[0].get("pending").is_none());
+                if let Some((observed_at_ms, prior_exit)) = prior_exit {
+                    assert!(
+                        recovered.is_empty(),
+                        "the expired reservation still counted at exit"
+                    );
+                    assert!(fake.launches.borrow().is_empty());
+                    let state = load_hosted_respawn_state(&store, &record.session_id).unwrap();
+                    assert_eq!(state.recovery_started_at_ms, Some(observed_at_ms));
+                    assert_eq!(
+                        state.next_allowed_at_ms,
+                        Some(observed_at_ms + recovery::RECOVERY_INTERVAL_MS)
+                    );
+                    assert_eq!(state.respawn_timestamps_ms, respawn.respawn_timestamps_ms);
+                    let incident = serde_json::to_value(&state.exit_evidence).unwrap();
+                    assert_eq!(incident["exits"], serde_json::json!([prior_exit]));
+                    let filter = fl_core::ferrowire::WireFilter {
+                        recipient: Some("captain".into()),
+                        ..Default::default()
+                    };
+                    let mut inbox = store.list_wire_inbox(&filter).unwrap();
+                    assert_eq!(inbox.len(), 1);
+                    let message = &inbox[0].message;
+                    assert!(message.subject.contains("Crash loop"));
+                    assert!(message.body.contains("evidence: unavailable"));
+                    assert!(message.body.contains(
+                        "A vendor sign-in screen or blocking prompt was flagged before an exit"
+                    ));
+                    hosted_recovery_notice::attach_to_local_inbox(&store, &filter, &mut inbox);
+                    assert!(!inbox[0].message.body.contains(tail));
+                } else {
+                    assert_eq!(recovered.len(), 1);
+                    assert_eq!(recovered[0].record.status, STATUS_RUNNING);
+                    assert_eq!(fake.launches.borrow().len(), 1);
+                }
+            }
+            assert_eq!(*fake.hosted_exit_lookups.borrow(), expected_lookups);
+        }
     }
 
     #[test]
