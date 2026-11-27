@@ -907,11 +907,20 @@ fn delete_superseded<S: StateStore>(
     newest: uuid::Uuid,
 ) -> Result<(), LifecycleError> {
     for slug in slugs {
-        let superseded = read::<_, LaunchReceipt>(store, slug)?
-            .is_some_and(|receipt| receipt.session_id == session_id && receipt.id < newest);
-        if superseded {
-            store.delete_state_by_key(&StateScope::Workspace, StateConcern::Runtime, slug)?;
-        }
+        // Each key is deleted only at the revision that was checked. A newer launch that
+        // reuses a legacy generation can write its receipt here after the check; that
+        // receipt is kept.
+        let Some((_, revision)) = read_current::<_, LaunchReceipt>(store, slug)?
+            .filter(|(receipt, _)| receipt.session_id == session_id && receipt.id < newest)
+        else {
+            continue;
+        };
+        store.delete_state_if_current(
+            &StateScope::Workspace,
+            StateConcern::Runtime,
+            slug,
+            &revision,
+        )?;
     }
     Ok(())
 }
@@ -2336,6 +2345,74 @@ mod tests {
         }
     }
 
+    impl AgentRegistry for HookedStore {
+        fn upsert_area(
+            &self,
+            area: fl_core::AreaRecord,
+        ) -> Result<fl_core::AreaRecord, StoreError> {
+            self.inner.upsert_area(area)
+        }
+        fn get_area(&self, area_key: &str) -> Result<Option<fl_core::AreaRecord>, StoreError> {
+            self.inner.get_area(area_key)
+        }
+        fn list_areas(&self) -> Result<Vec<fl_core::AreaRecord>, StoreError> {
+            self.inner.list_areas()
+        }
+        fn delete_area(
+            &self,
+            area_key: &str,
+            at: fl_core::At,
+            by: &str,
+        ) -> Result<bool, StoreError> {
+            self.inner.delete_area(area_key, at, by)
+        }
+        fn register_agent(
+            &self,
+            args: fl_core::RegisterAgentArgs,
+        ) -> Result<fl_core::AgentRecord, StoreError> {
+            self.inner.register_agent(args)
+        }
+        fn retire_agent(
+            &self,
+            id: &fl_core::ids::AgentId,
+            at: fl_core::At,
+            by: &str,
+        ) -> Result<fl_core::AgentRecord, StoreError> {
+            self.inner.retire_agent(id, at, by)
+        }
+        fn get_agent(
+            &self,
+            id: &fl_core::ids::AgentId,
+        ) -> Result<Option<fl_core::AgentRecord>, StoreError> {
+            self.inner.get_agent(id)
+        }
+        fn agent_by_name(
+            &self,
+            name_key: &str,
+        ) -> Result<Option<fl_core::AgentRecord>, StoreError> {
+            self.inner.agent_by_name(name_key)
+        }
+        fn list_agents(
+            &self,
+            project: Option<&str>,
+            include_retired: bool,
+        ) -> Result<Vec<fl_core::AgentRecord>, StoreError> {
+            self.inner.list_agents(project, include_retired)
+        }
+        fn registry_events_after(
+            &self,
+            after_seq: u64,
+        ) -> Result<Vec<(u64, fl_core::RegistryEvent)>, StoreError> {
+            self.inner.registry_events_after(after_seq)
+        }
+        fn import_registry_events(
+            &self,
+            events: &[fl_core::RegistryEvent],
+        ) -> Result<(), StoreError> {
+            self.inner.import_registry_events(events)
+        }
+    }
+
     #[test]
     fn versions_are_kept_when_the_session_record_read_fails() {
         let store = HookedStore::default();
@@ -2453,6 +2530,44 @@ mod tests {
     }
 
     #[test]
+    fn versions_retire_keeps_a_superseded_key_rewritten_after_its_check() {
+        let mut first = receipt(1);
+        first.stream = None;
+        let first_slug = receipt_slug(&first);
+        let generation = generation_slug(&first.session_id, &first.generation);
+        let second = receipt(2);
+        // A newer launch reuses the first launch's legacy generation key.
+        let mut third = receipt(3);
+        third.stream = None;
+        third.generation.clone_from(&first.generation);
+        third.versions = Some(sample(Some("1.2.0"), None));
+
+        let store = HookedStore::default();
+        save_versions(&store, first.clone(), sample(Some("1.0.0"), None)).unwrap();
+        // The second launch's settle reads that the first launch's generation key is
+        // superseded. Before its delete, the third launch writes its receipt there.
+        store
+            .rewrite
+            .borrow_mut()
+            .insert(generation.clone(), serde_json::to_value(&third).unwrap());
+
+        save_versions(&store, second.clone(), sample(Some("1.1.0"), None)).unwrap();
+
+        assert!(store.rewrite.borrow().is_empty());
+        let kept: Option<LaunchReceipt> = read(&store, &generation).unwrap();
+        assert_eq!(kept.map(|kept| kept.id), Some(third.id));
+        // The first launch's own receipt, which nothing rewrote, is removed.
+        assert!(
+            read::<_, LaunchReceipt>(&store, &first_slug)
+                .unwrap()
+                .is_none()
+        );
+        let index: Option<SessionReceipts> =
+            read(&store, &session_index_slug(&first.session_id)).unwrap();
+        assert_eq!(index.map(|index| index.launch), Some(second.id));
+    }
+
+    #[test]
     fn versions_undo_of_a_failed_spin_up_record_forgets_receipts_it_decommissions() {
         let home = tempfile::tempdir().unwrap();
         let launch = receipt(1);
@@ -2501,6 +2616,30 @@ mod tests {
                 "{before:?}"
             );
         }
+    }
+
+    #[test]
+    fn versions_undo_reports_receipts_it_could_not_forget_apart_from_the_record() {
+        let home = tempfile::tempdir().unwrap();
+        let launch = receipt(1);
+        let session_id = launch.session_id.clone();
+        let store = HookedStore::default();
+        // The failed spin-up created a running record and its launch settled.
+        save_record(&store, &session_id, STATUS_RUNNING);
+        save_versions(&store, launch.clone(), sample(Some("1.0.0"), None)).unwrap();
+        store.fail.replace(Some(session_index_slug(&session_id)));
+
+        let error =
+            undo_new_record(&store, &session_id, None, "owner", Some(home.path())).unwrap_err();
+
+        assert!(matches!(error, UndoRecordError::Receipts(_)), "{error:?}");
+        // The record is reset even though its receipts remain.
+        let undone = get_hosted_session_record(&store, &session_id)
+            .unwrap()
+            .unwrap();
+        assert!(is_decommissioned(&undone));
+        store.fail.replace(None);
+        assert_eq!(session_keys(&store, &session_id).len(), 3);
     }
 
     #[test]

@@ -11458,9 +11458,15 @@ fn remodel_fenced<S: AgentRegistry + StateStore + Catalog + MessageStore>(
     if to_session_id != plan.from_session_id
         && let Err(e) = undo_new_record(store, &to_session_id, to_before, by, env.home_override)
     {
-        cleanup_error = Some(format!(
-            "; the record of `{to_session_id}` was not reset: {e}"
-        ));
+        cleanup_error = Some(match e {
+            UndoRecordError::Record(e) => {
+                format!("; the record of `{to_session_id}` was not reset: {e}")
+            }
+            UndoRecordError::Receipts(e) => format!(
+                "; the record of `{to_session_id}` was reset, but its launch version receipts \
+                 were not removed: {e}"
+            ),
+        });
     }
 
     // The persona may now be down and retired: put the old session back. The restore spins up
@@ -11549,6 +11555,22 @@ fn require_runtime(
     Ok(out)
 }
 
+/// Why [`undo_new_record`] did not finish.
+#[derive(Debug)]
+enum UndoRecordError {
+    /// The record was not put back.
+    Record(LifecycleError),
+    /// The record was put back, but the failed spin-up's launch version receipts were not
+    /// removed.
+    Receipts(LifecycleError),
+}
+
+impl From<LifecycleError> for UndoRecordError {
+    fn from(error: LifecycleError) -> Self {
+        Self::Record(error)
+    }
+}
+
 /// Put the record of `session_id` back as it was before a failed remodel's spin-up wrote it:
 /// `before` when there was one, else the record marked decommissioned. A record left
 /// decommissioned also loses the launch version receipts of the failed spin-up, as a
@@ -11559,7 +11581,7 @@ fn undo_new_record<S: AgentRegistry + StateStore>(
     before: Option<HostedSessionRecord>,
     by: &str,
     home_override: Option<&Path>,
-) -> Result<(), LifecycleError> {
+) -> Result<(), UndoRecordError> {
     let Some(mut now) =
         find_hosted_session(store, &[session_id])?.filter(|r| r.session_id == session_id)
     else {
@@ -11580,8 +11602,9 @@ fn undo_new_record<S: AgentRegistry + StateStore>(
             (true, true)
         }
     };
+    // As in a regular decommission, the receipts go before the tombstone refresh.
     if decommissioned {
-        launch_versions::forget_session(store, session_id)?;
+        launch_versions::forget_session(store, session_id).map_err(UndoRecordError::Receipts)?;
     }
     if changed {
         refresh_decommission_tombstones(store, home_override);
