@@ -95,6 +95,7 @@ pub fn run(cmd: Cmd, db: Option<PathBuf>) -> anyhow::Result<i32> {
             home: home.as_deref(),
             path: path.as_deref(),
             env: &|key| std::env::var_os(key),
+            system_root: None,
         },
         history_stores.iter().map(PathBuf::as_path),
         None,

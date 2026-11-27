@@ -84,6 +84,7 @@ pub(crate) fn report(state: &HubState) -> Result<Value, String> {
                     std::env::var_os(key)
                 }
             },
+            system_root: None,
         },
         [store.as_path()],
         state.store_backend,

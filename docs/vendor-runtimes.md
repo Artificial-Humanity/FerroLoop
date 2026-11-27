@@ -200,11 +200,18 @@ the vendor's update command.
 
 | CLI | What FerroLoop passes | Vendor reference |
 | --- | --- | --- |
-| Claude Code | `DISABLE_AUTOUPDATER=1` | [Claude Code setup](https://code.claude.com/docs/en/setup#disable-auto-updates) |
+| Claude Code | `DISABLE_AUTOUPDATER=1`, and `--settings '{"env":{"DISABLE_AUTOUPDATER":"1"}}'` | [Claude Code setup](https://code.claude.com/docs/en/setup#disable-auto-updates), [settings precedence](https://code.claude.com/docs/en/settings#settings-precedence) |
 | Antigravity (`agy`) | `AGY_CLI_DISABLE_AUTO_UPDATE=true` | [Antigravity CLI troubleshooting](https://antigravity.google/docs/cli/troubleshooting) |
 | Grok | `GROK_DISABLE_AUTOUPDATER=1` | [Grok update check suppression](https://github.com/xai-org/grok-build/blob/main/crates/codegen/xai-grok-pager/docs/user-guide/14-headless-mode.md#update-check-suppression) |
 | Muse | `MUSE_NO_AUTO_UPDATE=1` | The Muse installer launcher in `~/.local/bin/muse` checks this before both background and synchronous updates. |
 | Codex client | `-c check_for_update_on_startup=false` | [Codex configuration reference](https://developers.openai.com/codex/config-reference) |
+
+A Claude settings file `env` value replaces the same variable from the environment. A project,
+local or user settings file that sets `DISABLE_AUTOUPDATER` to `0` would undo the environment
+switch alone. `--settings` outranks those files, so only managed settings can override it.
+FerroLoop inserts it after the executable. If a command already has its own `--settings` before
+any `--`, FerroLoop leaves it alone and does not add a second one, because Claude Code does not
+document how two such flags combine. That command then relies on the environment switch only.
 
 For unhosted interactive commands, add these lines to the shell startup file for the account
 that runs them, typically `~/.zshrc` or `~/.bashrc`. For other services, set the corresponding
@@ -216,6 +223,10 @@ export AGY_CLI_DISABLE_AUTO_UPDATE=true
 export GROK_DISABLE_AUTOUPDATER=1
 export MUSE_NO_AUTO_UPDATE=1
 ```
+
+For Claude Code, a settings file can still replace the exported value. To keep updates off
+in every project, set `DISABLE_AUTOUPDATER` to `"1"` in the `env` block of the user
+`settings.json` as well, and do not set it to `"0"` in a project or local file.
 
 For unhosted Codex clients, add `check_for_update_on_startup = false` at the top level of
 `~/.codex/config.toml` (or `$CODEX_HOME/config.toml`). Codex exposes this as a configuration

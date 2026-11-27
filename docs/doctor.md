@@ -134,8 +134,8 @@ project store bound to the current directory when present. `--db` or `FL_DB` con
 the named store. FerroDeck uses its serving Hub's store.
 
 **`vendor.update-policy`.** Shows the update setting observed in this invocation's environment
-or the vendor's user configuration, alongside the policy applied to hosted CLI launches.
-A documented enabled setting on an available runtime is `warn`. The Codex client startup
+or the vendor's user or managed configuration, alongside the policy applied to hosted CLI
+launches. A documented enabled setting on an available runtime is `warn`. The Codex client startup
 setting and the shared daemon's own updater setting are independent. The hosted CLI policy
 applies to the client; the shared daemon reads its own settings. Doctor reports settings on
 disk, so the running daemon may still have different settings. Settings that cannot be proven
@@ -155,23 +155,43 @@ The Codex shared daemon validates its whole `settings.json`. When that validatio
 shows `unknown`. It cannot tell whether Codex then falls back to its defaults, which would turn
 automatic updates on, or keeps the last valid settings.
 
-Claude Code reads `DISABLE_AUTOUPDATER` and `DISABLE_UPDATES` from the process environment and
-from the `env` block of the user `settings.json` in `$CLAUDE_CONFIG_DIR`, or `~/.claude` when
-that variable is not set. In both sources, `1` and `true` (any case) disable updates, `0` and
-`false` (any case) and an empty value leave them on, and other values are `unknown`
-(`unrecognised value`). Doctor combines the two sources for each variable:
+Claude Code reads `DISABLE_AUTOUPDATER` and `DISABLE_UPDATES` from settings files and from the
+process environment. A settings file `env` value replaces the same variable from the
+environment. `1` and `true` (any case) disable updates. `0` and `false` (any case) and an empty
+value leave them on. Other values are `unknown` (`unrecognised value`).
 
-* If only one source sets the variable, its value applies.
-* If both sources set the same value, that value applies.
-* If one source disables updates and the other enables them, the result is `unknown`
-  (`environment and settings.json disagree`). Claude Code's documentation does not say which
-  source wins, so Doctor does not guess.
-* If `settings.json` cannot be read or fails validation, the result is `unknown` with that
-  reason, even when the environment disables updates, because the file may set a different value.
-  Validation requires a JSON object whose `env`, when present, maps names to strings.
+For the configured row, Doctor resolves each variable in Claude Code's documented order,
+highest first. The first source that sets the variable decides it:
 
-If either variable resolves to disabled, updates are disabled. Doctor does not read project,
-local or managed Claude settings files.
+1. Managed settings files: `managed-settings.json` in the managed directory, then each `*.json`
+   file in its `managed-settings.d/` in name order. A later file replaces an earlier value.
+   Hidden files are skipped. An empty file counts as `{}`. The managed directory is
+   `/etc/claude-code` on Linux and other Unix systems, `/Library/Application Support/ClaudeCode`
+   on macOS, and `C:\Program Files\ClaudeCode` on Windows.
+2. The `env` block of the user `settings.json` in `$CLAUDE_CONFIG_DIR`, or `~/.claude` when
+   that variable is not set.
+3. The process environment.
+
+A missing file sets nothing. A file that exists but cannot be read or fails validation makes
+each variable it could decide `unknown`, with a reason such as
+`managed-settings.json failed validation`. Validation requires a JSON object whose `env`, when
+present, maps names to strings. More than 64 drop-in files is `unknown`
+(`managed-settings.d has too many files`), and so is more than 256 entries of any kind in
+`managed-settings.d/` (`managed-settings.d has too many entries`). A managed settings file that
+is a symbolic link is `unknown`, because Doctor does not follow links. If either variable
+resolves to disabled, updates are disabled.
+
+Doctor does not read project or local settings files (`.claude/settings.json` and
+`.claude/settings.local.json`), because they depend on the working directory. Those files
+outrank the user file, so they can change the configured result in a project. Doctor cannot
+observe remote server-managed settings from claude.ai either. They outrank the managed files.
+
+Hosted Claude launches pass `--settings '{"env":{"DISABLE_AUTOUPDATER":"1"}}'` as well as the
+environment switch. `--settings` outranks the project, local and user files, so only managed
+settings can override it. The hosted row is `disabled` unless a managed file sets
+`DISABLE_AUTOUPDATER` to a value that keeps updates on (`enabled`), or a managed file cannot be
+read or fails validation (`unknown`). Remote server-managed settings can also override it, and
+Doctor cannot see them.
 
 ## JSON contract
 

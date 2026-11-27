@@ -194,6 +194,7 @@ mod tests {
                 home: None,
                 path: None,
                 env: &env,
+                system_root: None,
             },
             [],
             None,

@@ -2,7 +2,7 @@
 
 use std::ffi::{OsStr, OsString};
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use super::{VendorVersionAdapter, VendorVersionRegistry};
 
@@ -57,7 +57,8 @@ impl VendorInstalledVersion {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VendorRuntimeFacts {
     pub installed_version: VendorInstalledVersion,
-    /// Setting observed in the current invocation environment or the selected user config file.
+    /// Setting observed in the current invocation environment or the selected user or system
+    /// config files.
     pub configured_updates: VendorUpdateStatus,
 }
 
@@ -75,6 +76,9 @@ pub struct VendorDoctorContext<'a> {
     pub path: Option<&'a OsStr>,
     /// Read only named update controls and config-directory overrides for this invocation.
     pub env: &'a dyn Fn(&str) -> Option<OsString>,
+    /// Directory that stands in for the filesystem root when reading system-wide,
+    /// administrator-managed vendor settings. `None` reads the real paths. Tests set it.
+    pub system_root: Option<&'a Path>,
 }
 
 impl VendorDoctorContext<'_> {
@@ -90,6 +94,22 @@ impl VendorDoctorContext<'_> {
             .map(PathBuf::from)
             .or_else(|| self.home.map(|home| home.join(default_dir)))
             .filter(|path| path.is_absolute())
+    }
+
+    /// Resolve an absolute system configuration directory such as `/etc/claude-code`,
+    /// under [`Self::system_root`] when it is set. There the drive prefix and root of
+    /// `absolute` are dropped, so `C:\Program Files\ClaudeCode` also stays under the root.
+    pub fn system_dir(&self, absolute: &str) -> PathBuf {
+        let absolute = Path::new(absolute);
+        match self.system_root {
+            Some(root) => root.join(
+                absolute
+                    .components()
+                    .filter(|component| matches!(component, Component::Normal(_)))
+                    .collect::<PathBuf>(),
+            ),
+            None => absolute.to_path_buf(),
+        }
     }
 
     fn installed_cli_version(&self, adapter: &dyn VendorVersionAdapter) -> VendorInstalledVersion {
@@ -140,25 +160,51 @@ impl VendorVersionRegistry {
     pub fn doctor_facts(&self, context: &VendorDoctorContext<'_>) -> Vec<VendorDoctorFacts> {
         self.adapters
             .values()
-            .map(|adapter| {
-                let mut argv = vec![adapter.cli_binary_name().into()];
-                let mut env = Vec::new();
-                adapter.apply_cli_update_policy(&mut argv, &mut env);
-                let hosted_cli_updates = if argv.len() > 1 || !env.is_empty() {
-                    VendorUpdateStatus::Disabled
-                } else {
-                    VendorUpdateStatus::Unknown("no hosted update control")
-                };
-                VendorDoctorFacts {
-                    vendor: adapter.vendor_id(),
-                    cli: VendorRuntimeFacts {
-                        installed_version: context.installed_cli_version(adapter.as_ref()),
-                        configured_updates: adapter.configured_cli_updates(context),
-                    },
-                    daemon: adapter.doctor_daemon_facts(context),
-                    hosted_cli_updates,
-                }
+            .map(|adapter| VendorDoctorFacts {
+                vendor: adapter.vendor_id(),
+                cli: VendorRuntimeFacts {
+                    installed_version: context.installed_cli_version(adapter.as_ref()),
+                    configured_updates: adapter.configured_cli_updates(context),
+                },
+                daemon: adapter.doctor_daemon_facts(context),
+                hosted_cli_updates: adapter.hosted_cli_updates(context),
             })
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn no_env(_: &str) -> Option<OsString> {
+        None
+    }
+
+    fn context(system_root: Option<&Path>) -> VendorDoctorContext<'_> {
+        VendorDoctorContext {
+            home: None,
+            path: None,
+            env: &no_env,
+            system_root,
+        }
+    }
+
+    #[test]
+    fn system_dir_keeps_an_injected_root_and_drops_the_absolute_prefix() {
+        assert_eq!(
+            context(None).system_dir("/etc/claude-code"),
+            Path::new("/etc/claude-code")
+        );
+        let root = Path::new("/tmp/system-root");
+        assert_eq!(
+            context(Some(root)).system_dir("/Library/Application Support/ClaudeCode"),
+            root.join("Library/Application Support/ClaudeCode")
+        );
+        #[cfg(windows)]
+        assert_eq!(
+            context(Some(root)).system_dir(r"C:\Program Files\ClaudeCode"),
+            root.join(r"Program Files\ClaudeCode")
+        );
     }
 }
