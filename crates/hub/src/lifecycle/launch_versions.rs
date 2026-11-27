@@ -2626,6 +2626,12 @@ mod tests {
         let store = HookedStore::default();
         // The failed spin-up created a running record and its launch settled.
         save_record(&store, &session_id, STATUS_RUNNING);
+        let mut record = get_hosted_session_record(&store, &session_id)
+            .unwrap()
+            .unwrap();
+        let native = "019a0000-0000-7000-8000-00000000ada1";
+        record.vendor_session_id = Some(native.into());
+        persist_hosted_session(&store, &record, "test").unwrap();
         save_versions(&store, launch.clone(), sample(Some("1.0.0"), None)).unwrap();
         store.fail.replace(Some(session_index_slug(&session_id)));
 
@@ -2638,8 +2644,100 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(is_decommissioned(&undone));
+        // Its tombstones are refreshed all the same: a retry finds the record unchanged
+        // and would not refresh them.
+        let tombstones = fl_wire::identity::load_decommissioned_session_ids(Some(home.path()));
+        assert!(tombstones.contains(native), "{tombstones:?}");
         store.fail.replace(None);
         assert_eq!(session_keys(&store, &session_id).len(), 3);
+    }
+
+    #[test]
+    fn versions_undo_forgets_receipts_of_a_record_already_decommissioned() {
+        let home = tempfile::tempdir().unwrap();
+        let launch = receipt(1);
+        let session_id = launch.session_id.clone();
+        // `true`: the record the spin-up overwrote is the one there now. `false`: the
+        // spin-up created the record, and it is already decommissioned.
+        for had_before in [true, false] {
+            let store = MemStore::default();
+            save_record(&store, &session_id, STATUS_RUNNING);
+            save_versions(&store, launch.clone(), sample(Some("1.0.0"), None)).unwrap();
+            save_record(&store, &session_id, STATUS_DECOMMISSIONED);
+            let now = get_hosted_session_record(&store, &session_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(session_keys(&store, &session_id).len(), 3);
+
+            undo_new_record(
+                &store,
+                &session_id,
+                had_before.then(|| now.clone()),
+                "owner",
+                Some(home.path()),
+            )
+            .unwrap();
+
+            assert_eq!(
+                get_hosted_session_record(&store, &session_id).unwrap(),
+                Some(now),
+                "{had_before}"
+            );
+            assert!(session_keys(&store, &session_id).is_empty(), "{had_before}");
+        }
+    }
+
+    #[test]
+    fn versions_undo_errors_say_whether_the_record_was_reset() {
+        let error = || LifecycleError::Conflict("busy".into());
+        assert_eq!(
+            UndoRecordError::Record(error()).cleanup_note("codex:ada"),
+            format!("; the record of `codex:ada` was not reset: {}", error())
+        );
+        assert_eq!(
+            UndoRecordError::Receipts(error()).cleanup_note("codex:ada"),
+            format!(
+                "; the record of `codex:ada` was reset, but its launch version receipts were \
+                 not removed: {}",
+                error()
+            )
+        );
+    }
+
+    #[test]
+    fn versions_retire_keeps_another_sessions_receipt_in_a_superseded_key() {
+        let mut first = receipt(1);
+        first.stream = None;
+        let first_slug = receipt_slug(&first);
+        let generation = generation_slug(&first.session_id, &first.generation);
+        // An older receipt of another session now holds the first launch's generation key.
+        let mut foreign = receipt(1);
+        foreign.stream = None;
+        foreign.session_id = "codex:bea".into();
+        foreign.versions = Some(sample(Some("1.1.0"), None));
+        let second = receipt(2);
+
+        let store = MemStore::default();
+        save_versions(&store, first.clone(), sample(Some("1.0.0"), None)).unwrap();
+        write(&store, generation.clone(), &foreign).unwrap();
+
+        // The second launch supersedes the first launch's keys.
+        save_versions(&store, second.clone(), sample(Some("1.1.0"), None)).unwrap();
+
+        let kept: Option<LaunchReceipt> = read(&store, &generation).unwrap();
+        assert_eq!(
+            kept.map(|kept| (kept.id, kept.session_id)),
+            Some((foreign.id, foreign.session_id))
+        );
+        // The first launch's own receipt is removed.
+        assert!(
+            read::<_, LaunchReceipt>(&store, &first_slug)
+                .unwrap()
+                .is_none()
+        );
+        let index: Option<SessionReceipts> =
+            read(&store, &session_index_slug(&first.session_id)).unwrap();
+        assert_eq!(index.map(|index| index.launch), Some(second.id));
     }
 
     #[test]

@@ -11458,15 +11458,7 @@ fn remodel_fenced<S: AgentRegistry + StateStore + Catalog + MessageStore>(
     if to_session_id != plan.from_session_id
         && let Err(e) = undo_new_record(store, &to_session_id, to_before, by, env.home_override)
     {
-        cleanup_error = Some(match e {
-            UndoRecordError::Record(e) => {
-                format!("; the record of `{to_session_id}` was not reset: {e}")
-            }
-            UndoRecordError::Receipts(e) => format!(
-                "; the record of `{to_session_id}` was reset, but its launch version receipts \
-                 were not removed: {e}"
-            ),
-        });
+        cleanup_error = Some(e.cleanup_note(&to_session_id));
     }
 
     // The persona may now be down and retired: put the old session back. The restore spins up
@@ -11565,6 +11557,19 @@ enum UndoRecordError {
     Receipts(LifecycleError),
 }
 
+impl UndoRecordError {
+    /// The clause a failed remodel adds to its error about the record of `session_id`.
+    fn cleanup_note(&self, session_id: &str) -> String {
+        match self {
+            Self::Record(e) => format!("; the record of `{session_id}` was not reset: {e}"),
+            Self::Receipts(e) => format!(
+                "; the record of `{session_id}` was reset, but its launch version receipts \
+                 were not removed: {e}"
+            ),
+        }
+    }
+}
+
 impl From<LifecycleError> for UndoRecordError {
     fn from(error: LifecycleError) -> Self {
         Self::Record(error)
@@ -11602,14 +11607,19 @@ fn undo_new_record<S: AgentRegistry + StateStore>(
             (true, true)
         }
     };
-    // As in a regular decommission, the receipts go before the tombstone refresh.
-    if decommissioned {
-        launch_versions::forget_session(store, session_id).map_err(UndoRecordError::Receipts)?;
-    }
+    // As in a regular decommission, the receipts are forgotten before the tombstone refresh.
+    // A failure to forget them does not skip the refresh: the tombstones protect the record
+    // just written, and the receipts are only evidence. A retry would not refresh them,
+    // because the record is then already as it should be.
+    let receipts = if decommissioned {
+        launch_versions::forget_session(store, session_id)
+    } else {
+        Ok(())
+    };
     if changed {
         refresh_decommission_tombstones(store, home_override);
     }
-    Ok(())
+    receipts.map_err(UndoRecordError::Receipts)
 }
 
 #[cfg(test)]
