@@ -260,6 +260,15 @@ main "$@"
             adapter.version_from_executable(&launcher).as_deref(),
             Some("1.4.25-R9361.1")
         );
+        // The launcher marker is never read through a symbolic link.
+        #[cfg(unix)]
+        {
+            let elsewhere = root.path().join("elsewhere-version");
+            fs::rename(&state, &elsewhere).unwrap();
+            std::os::unix::fs::symlink(&elsewhere, &state).unwrap();
+            assert_eq!(adapter.version_from_executable(&launcher), None);
+            fs::remove_file(&state).unwrap();
+        }
         fs::write(&state, "1.4.25-R9361.1\n".repeat(128)).unwrap();
         assert_eq!(adapter.version_from_executable(&launcher), None);
     }

@@ -147,9 +147,11 @@ large`, `failed validation`, `unrecognised value`, an overlay, an unavailable co
 directory). It never includes file contents, values, account identifiers or secrets. The JSON
 shape does not change: the reason is part of `detail`.
 
-Settings files are read passively: at most 1 MiB, opened `O_NOFOLLOW|O_NONBLOCK` and
-checked with `fstat`. A symlink, FIFO or other non-regular file is not followed or waited on,
-and is `unknown`. A missing file is the vendor default.
+Settings files are read passively: at most 1 MiB, opened `O_NONBLOCK` and checked with
+`fstat`. A FIFO or other non-regular file is not waited on, and is `unknown`. Doctor opens
+settings files `O_NOFOLLOW`, so a settings file that is a symbolic link is `unknown`. Claude
+managed settings files are the only exception (see below). A missing file is the vendor
+default.
 
 The Codex shared daemon validates its whole `settings.json`. When that validation fails, Doctor
 shows `unknown`. It cannot tell whether Codex then falls back to its defaults, which would turn
@@ -177,21 +179,35 @@ each variable it could decide `unknown`, with a reason such as
 `managed-settings.json failed validation`. Validation requires a JSON object whose `env`, when
 present, maps names to strings. More than 64 drop-in files is `unknown`
 (`managed-settings.d has too many files`), and so is more than 256 entries of any kind in
-`managed-settings.d/` (`managed-settings.d has too many entries`). A managed settings file that
-is a symbolic link is `unknown`, because Doctor does not follow links. If either variable
-resolves to disabled, updates are disabled.
+`managed-settings.d/` (`managed-settings.d has too many entries`). If either variable resolves
+to disabled, updates are disabled.
+
+Claude Code follows a managed settings file or drop-in that is a symbolic link, so Doctor
+follows it too. Sites often link managed settings from a configuration-management checkout.
+The target must be a regular file. A link to a FIFO, device or directory is `unknown`, and is
+not waited on. A link whose target is missing reads as a missing file and sets nothing, as it
+does for Claude Code. Doctor still does not follow a link at the user `settings.json` or any
+other settings file.
 
 Doctor does not read project or local settings files (`.claude/settings.json` and
 `.claude/settings.local.json`), because they depend on the working directory. Those files
 outrank the user file, so they can change the configured result in a project. Doctor cannot
 observe remote server-managed settings from claude.ai either. They outrank the managed files.
 
+Claude Code can also get managed settings from an MDM or OS policy. On macOS this is a
+configuration profile in the `com.anthropic.claudecode` managed preferences domain. On Windows
+it is the `Settings` registry value under `HKLM\SOFTWARE\Policies\ClaudeCode`. These policies
+outrank the managed files. On Windows, Claude Code can also read the same value under
+`HKCU\SOFTWARE\Policies\ClaudeCode` when no administrator source is present. Doctor does not
+read the configuration profile or the registry.
+
 Hosted Claude launches pass `--settings '{"env":{"DISABLE_AUTOUPDATER":"1"}}'` as well as the
 environment switch. `--settings` outranks the project, local and user files, so only managed
 settings can override it. The hosted row is `disabled` unless a managed file sets
 `DISABLE_AUTOUPDATER` to a value that keeps updates on (`enabled`), or a managed file cannot be
-read or fails validation (`unknown`). Remote server-managed settings can also override it, and
-Doctor cannot see them.
+read or fails validation (`unknown`). Remote server-managed settings, the macOS configuration
+profile and the Windows registry policy can also override it, because they outrank
+`--settings` like the managed files. Doctor cannot see them.
 
 ## JSON contract
 

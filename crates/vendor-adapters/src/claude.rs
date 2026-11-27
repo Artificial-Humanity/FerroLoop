@@ -33,7 +33,9 @@ use serde_json::Value;
 
 use fl_core::{VendorDoctorContext, VendorUpdateStatus};
 
-use crate::doctor::{MANAGED_SETTINGS_D, MANAGED_SETTINGS_JSON, SETTINGS_JSON, read_settings};
+use crate::doctor::{
+    FinalLink, MANAGED_SETTINGS_D, MANAGED_SETTINGS_JSON, SETTINGS_JSON, read_settings,
+};
 
 pub use fl_core::PostCompactionContext as ClaudePostCompactionContext;
 
@@ -344,13 +346,15 @@ impl fl_core::VendorVersionAdapter for ClaudeHostAdapter {
     /// validation leaves the control unknown. Either control disabling updates disables them.
     ///
     /// Project and local settings files are not read, because they depend on the working
-    /// directory. Remote server-managed settings from claude.ai cannot be observed passively.
+    /// directory. Remote server-managed settings from claude.ai cannot be observed passively,
+    /// and the MDM or OS policy (macOS configuration profile, Windows registry) is not read.
     fn configured_cli_updates(&self, context: &VendorDoctorContext<'_>) -> VendorUpdateStatus {
         let managed = managed_settings_env(&context.system_dir(CLAUDE_MANAGED_DIR));
         let user = match context.config_home("CLAUDE_CONFIG_DIR", ".claude") {
             Some(dir) => read_settings(
                 &dir.join("settings.json"),
                 &SETTINGS_JSON,
+                FinalLink::Refuse,
                 ClaudeSettingsEnv::parse,
             ),
             None => Err("config directory unavailable"),
@@ -381,7 +385,8 @@ impl fl_core::VendorVersionAdapter for ClaudeHostAdapter {
     /// file-based managed settings can override it. Updates stay disabled unless a managed
     /// file sets `DISABLE_AUTOUPDATER` to a value that keeps them. A managed file that cannot
     /// be read or fails validation is unknown. Remote server-managed settings from claude.ai
-    /// also outrank `--settings`, but cannot be observed passively.
+    /// and the MDM or OS policy (macOS configuration profile, Windows registry) also outrank
+    /// `--settings`, but Doctor does not read them.
     fn hosted_cli_updates(&self, context: &VendorDoctorContext<'_>) -> VendorUpdateStatus {
         let managed = managed_settings_env(&context.system_dir(CLAUDE_MANAGED_DIR));
         let hosted = ClaudeSettingsEnv::parse(CLAUDE_HOSTED_SETTINGS).unwrap_or_default();
@@ -448,10 +453,13 @@ fn claude_update_status(
 /// The update controls set by the file-based managed settings in `dir`: `managed-settings.json`
 /// first, then each `*.json` drop-in in `managed-settings.d` (hidden files skipped) in name
 /// order, a later file replacing an earlier value. A missing file or directory sets nothing.
+/// Like Claude, a symlinked managed file is followed, and a link whose target is missing is a
+/// missing file. The target must still be a regular file.
 fn managed_settings_env(dir: &Path) -> Result<ClaudeSettingsEnv, &'static str> {
     let mut merged = read_settings(
         &dir.join("managed-settings.json"),
         &MANAGED_SETTINGS_JSON,
+        FinalLink::Follow,
         parse_managed_settings,
     )?;
     let drop_ins = dir.join("managed-settings.d");
@@ -482,6 +490,7 @@ fn managed_settings_env(dir: &Path) -> Result<ClaudeSettingsEnv, &'static str> {
         let env = read_settings(
             &drop_ins.join(name),
             &MANAGED_SETTINGS_D,
+            FinalLink::Follow,
             parse_managed_settings,
         )?;
         for (slot, value) in merged.0.iter_mut().zip(env.0) {
@@ -1200,6 +1209,34 @@ mod tests {
 
     fn sample_binding() -> AdapterIdentityBinding {
         AdapterIdentityBinding::new("claude:ferris", 7, "Ferris.claude", Some((5150, 12345)))
+    }
+
+    #[test]
+    fn update_status_reports_the_first_unknown_reason() {
+        assert_eq!(
+            claude_update_status([
+                Err("managed-settings.json failed validation"),
+                Ok(None),
+                Err("settings.json unreadable"),
+            ]),
+            VendorUpdateStatus::Unknown("managed-settings.json failed validation")
+        );
+        assert_eq!(
+            claude_update_status([Ok(Some(false)), Err("unrecognised value")]),
+            VendorUpdateStatus::Unknown("unrecognised value")
+        );
+    }
+
+    #[test]
+    fn update_status_disabling_control_outranks_an_earlier_unknown() {
+        assert_eq!(
+            claude_update_status([Err("unrecognised value"), Ok(Some(true))]),
+            VendorUpdateStatus::Disabled
+        );
+        assert_eq!(
+            claude_update_status([Ok(Some(false)), Ok(None)]),
+            VendorUpdateStatus::Enabled
+        );
     }
 
     #[test]
