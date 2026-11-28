@@ -2600,10 +2600,12 @@ mod tests {
         let vault_dir = vault_path.parent().unwrap();
         assert_eq!(mode(key_dir), 0o700, "the master key's directory");
         assert_eq!(mode(vault_dir), 0o700, "the vault's directory");
-        assert_ne!(
+        let probe = home.join("probe");
+        fs::create_dir(&probe).unwrap();
+        assert_eq!(
             mode(&home.join(".config")),
-            0o700,
-            "a parent fl does not own"
+            mode(&probe),
+            "a parent fl does not own keeps the default mode"
         );
 
         // An existing directory is the owner's choice: a later write leaves it as it is.

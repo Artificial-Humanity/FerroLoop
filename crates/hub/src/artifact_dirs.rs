@@ -908,8 +908,17 @@ pub(crate) fn serving_roots(state: &HubState) -> Vec<PathBuf> {
 }
 
 /// Best-effort creation of the hub's directories at startup. A failure is logged and ignored.
+///
+/// `[home]` is made first and owner-only: it is also the default home of `vault.enc`, and the
+/// store opens lazily, so on a fresh machine this can be the first thing to create it. A plain
+/// `create_dir_all` of its subdirectories would leave it at the umask's mode (`0775` under umask
+/// `002`), which a later vault write keeps and `G7.vault-perms` reports. Every other place the
+/// hub creates a directory under `[home]` runs in a request handler, after this.
 pub(crate) fn ensure_startup_dirs(state: &HubState) {
     let data = hub_data_home(state);
+    if let Err(e) = fl_core::private_dir::create_private_dir_all(&data) {
+        eprintln!("fl-hub: could not create {}: {e}", data.display());
+    }
     for dir in [
         data.join("artifacts"),
         data.join("attachments"),

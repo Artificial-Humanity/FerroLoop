@@ -135,14 +135,17 @@ mod tests {
         assert_eq!(mode(&leaf), 0o700);
         assert_eq!(mode(&existing), 0o755);
 
-        // Several levels: intermediates take the default mode, the leaf is 0700.
+        // Several levels: intermediates take the default mode (what a plain `mkdir` beside them
+        // gets under this umask), the leaf is 0700.
         let deep = existing.join("a").join("b").join("c");
         create_private_dir_all(&deep).unwrap();
         assert_eq!(mode(&deep), 0o700);
-        assert_ne!(
+        let probe = existing.join("probe");
+        std::fs::create_dir(&probe).unwrap();
+        assert_eq!(
             mode(&existing.join("a")),
-            0o700,
-            "intermediates are not private"
+            mode(&probe),
+            "intermediates take the default mode"
         );
 
         // A second call, and a path under a file, behave like `create_dir_all`.

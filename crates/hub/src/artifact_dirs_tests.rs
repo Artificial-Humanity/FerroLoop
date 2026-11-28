@@ -1417,6 +1417,29 @@ fn startup_creates_the_hub_directories_and_survives_a_failure() {
     ensure_startup_dirs(&HubState::new(cfg));
 }
 
+/// A first `serve` into a fresh home makes `[home]` (the default home of `vault.enc`) owner-only,
+/// so a later vault write does not inherit a group-writable parent.
+#[test]
+fn startup_makes_a_new_data_home_owner_only() {
+    use std::os::unix::fs::PermissionsExt;
+    let env = env();
+    let data = env.target("fresh").join("share").join("fl");
+    let mut cfg = env.state.config.clone();
+    cfg.store_path = data.join("store.redb");
+    ensure_startup_dirs(&HubState::new(cfg));
+    let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode(&data), 0o700, "the data home startup created");
+    assert!(data.join("artifacts").is_dir());
+    assert!(data.join("attachments").is_dir());
+
+    // An existing data home keeps its mode.
+    fs::set_permissions(&data, fs::Permissions::from_mode(0o755)).unwrap();
+    let mut cfg = env.state.config.clone();
+    cfg.store_path = data.join("store.redb");
+    ensure_startup_dirs(&HubState::new(cfg));
+    assert_eq!(mode(&data), 0o755);
+}
+
 #[test]
 fn resolve_path_resolves_symlinks_of_the_nearest_existing_ancestor() {
     let env = env();
