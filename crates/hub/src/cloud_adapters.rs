@@ -262,7 +262,8 @@ fn save(home: &Path, config: &CloudAdaptersConfig) -> io::Result<()> {
     let dir = path
         .parent()
         .ok_or_else(|| io::Error::other("config path has no parent"))?;
-    fs::create_dir_all(dir)?;
+    // `~/.config/fl` also holds the vault key and hub tokens: a new one is owner-only.
+    fl_store::private::create_private_dir_all(dir)?;
     let bytes = serde_json::to_vec_pretty(config).map_err(io::Error::other)?;
     let n = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
     let tmp = dir.join(format!(

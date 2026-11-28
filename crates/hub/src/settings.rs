@@ -581,7 +581,12 @@ pub(crate) fn load_attachment_retention_strict(home: &Path) -> Result<u64, Strin
 
 fn save(home: &Path, settings: &Settings) -> io::Result<()> {
     let bytes = serde_json::to_vec_pretty(settings).map_err(io::Error::other)?;
-    write_file_atomic(&settings_path(home), &bytes)
+    let path = settings_path(home);
+    // `~/.config/fl` also holds the vault key and hub tokens: a new one is owner-only.
+    if let Some(dir) = path.parent() {
+        fl_store::private::create_private_dir_all(dir)?;
+    }
+    write_file_atomic(&path, &bytes)
 }
 
 /// Why `update` did not apply a patch.

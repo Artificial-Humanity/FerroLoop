@@ -273,7 +273,7 @@ impl HubServer {
             ..
         } = self;
         let mut acceptor = make_acceptor(listener);
-        crate::artifact_dirs::ensure_startup_dirs(&state);
+        crate::artifact_dirs::ensure_startup_dirs(&state)?;
         let run_hosted_reconcile = boot_reconcile.is_some();
         if let Some(plan) = boot_reconcile {
             // Not awaited: the reconciliation never holds up the accept loop. It ends with

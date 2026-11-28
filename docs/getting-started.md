@@ -943,8 +943,9 @@ rollback copy.
 A store holds hub pairing codes, session hashes and other records, so it is private to your
 Unix user. A store file `fl` creates is mode `0600`, and a store directory `fl` creates is mode
 `0700` (only the innermost directory that `fl` makes; the directories above it, such as
-`~/.local/share`, keep the default mode), whatever your umask is. `fl` never changes the mode of
-a file or directory that already exists.
+`~/.local/share`, keep the default mode), whatever your umask is. These are the widest modes
+`fl` gives; a umask can only narrow them. `fl` never changes the mode of a file or directory that
+already exists.
 
 If an existing store is open to other users, `fl` still opens it and prints a warning with the
 fix. The warning is for a person at a terminal: `fl` prints it only when stderr is a terminal,

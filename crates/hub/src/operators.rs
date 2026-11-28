@@ -832,7 +832,8 @@ fn read_file(home: &Path) -> Result<Option<OperatorsFile>, OpError> {
 fn write_file(home: &Path, file: &OperatorsFile, exclusive: bool) -> Result<(), OpError> {
     let path = operators_path(home);
     let dir = path.parent().ok_or(OpError::Io)?;
-    fs::create_dir_all(dir).map_err(|_| OpError::Io)?;
+    // `~/.config/fl` also holds the vault key and hub tokens: a new one is owner-only.
+    fl_store::private::create_private_dir_all(dir).map_err(|_| OpError::Io)?;
     let bytes = serde_json::to_vec_pretty(file).map_err(|_| OpError::Io)?;
     // Never write a file `read_file` would refuse to read back.
     if bytes.len() as u64 > MAX_FILE_BYTES {
@@ -6404,5 +6405,74 @@ mod tests {
         let resp = password_login(&state, "nully", &format!("{PASSWORD}\u{0}"));
         assert!(is_invalid_credentials(&resp), "{}", body_text(&resp));
         assert_eq!(evaluated(&state), before, "refused before any hashing");
+    }
+
+    /// The work of the umask test, run in a child under `umask 0`: each writer of a file in
+    /// `~/.config/fl` (settings, operators, cloud adapters), on a fresh home, must leave the
+    /// config directory it created owner-only. A plain `mkdir` there gives `0777`, so `0700` can
+    /// only come from `create_private_dir_all`.
+    fn each_config_writer_makes_a_new_config_dir_owner_only() {
+        let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        let tmp = TempDir::new().unwrap();
+        let probe = tmp.path().join("probe");
+        fs::create_dir(&probe).unwrap();
+        assert_eq!(mode(&probe), 0o777, "the child must run under umask 0");
+
+        type Writer<'a> = (&'a str, &'a dyn Fn(&Path));
+        let writers: [Writer<'_>; 3] = [
+            ("settings", &|home| {
+                crate::settings::update(home, crate::settings::SettingsPatch::default()).unwrap();
+            }),
+            ("operators", &|home| {
+                read_or_seed(home, "owner").unwrap();
+            }),
+            ("cloud adapters", &|home| {
+                crate::cloud_adapters::update(
+                    home,
+                    crate::cloud_adapters::CloudAdaptersPatch::default(),
+                )
+                .unwrap();
+            }),
+        ];
+        for (name, write) in writers {
+            let home = tmp.path().join(name.replace(' ', "-"));
+            fs::create_dir(&home).unwrap();
+            write(&home);
+            let dir = home.join(".config").join("fl");
+            assert_eq!(mode(&dir), 0o700, "{name}: the config directory it created");
+            assert_eq!(
+                mode(&home.join(".config")),
+                0o777,
+                "{name}: an intermediate keeps the default mode"
+            );
+        }
+    }
+
+    #[test]
+    fn a_fresh_config_dir_is_owner_only_whatever_the_umask() {
+        const CHILD: &str = "FL_HUB_CONFIG_DIR_UMASK_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            each_config_writer_makes_a_new_config_dir_owner_only();
+            return;
+        }
+        let exe = std::env::current_exe().unwrap();
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("umask 0; exec \"$0\" --exact operators::tests::a_fresh_config_dir_is_owner_only_whatever_the_umask --test-threads=1")
+            .arg(exe)
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success(),
+            "child failed:\n{stdout}\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        // A filter that matched no test also exits 0: the child must have run exactly this one.
+        assert!(
+            stdout.contains("1 passed"),
+            "the child did not run the test:\n{stdout}"
+        );
     }
 }
