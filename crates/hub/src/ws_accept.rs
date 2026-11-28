@@ -223,6 +223,7 @@ mod tests {
     use fl_core::pr_policy::ReviewerApps;
     use std::collections::VecDeque;
     use std::io::{Read, Write};
+    use std::path::PathBuf;
 
     fn os(code: i32) -> io::Error {
         io::Error::from_raw_os_error(code)
@@ -454,9 +455,13 @@ mod tests {
     }
 
     async fn server(tmp: &tempfile::TempDir) -> HubServer {
+        server_with_store(tmp, tmp.path().join("store.redb")).await
+    }
+
+    async fn server_with_store(tmp: &tempfile::TempDir, store_path: PathBuf) -> HubServer {
         HubServer::bind(HubServerConfig {
             listen: "127.0.0.1:0".into(),
-            store_path: tmp.path().join("store.redb"),
+            store_path,
             repo_root: tmp.path().to_path_buf(),
             ui_dir: None,
             owner_login: "lmcfarlin".into(),
@@ -559,5 +564,23 @@ mod tests {
             .expect("serve did not stop")
             .unwrap();
         assert_eq!(res.unwrap_err().raw_os_error(), Some(libc::EIO));
+    }
+
+    /// The data home is the store's own folder: when startup cannot create it, `serve` returns
+    /// that error before it accepts a connection.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn serve_fails_when_the_data_home_cannot_be_created() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let blocker = tmp.path().join("blocker");
+        std::fs::write(&blocker, b"file").unwrap();
+        let srv = server_with_store(&tmp, blocker.join("store.redb")).await;
+        let res = tokio::time::timeout(Duration::from_secs(5), srv.serve())
+            .await
+            .expect("serve did not stop");
+        let err = res.unwrap_err();
+        assert!(
+            err.to_string().contains(&blocker.display().to_string()),
+            "{err}"
+        );
     }
 }

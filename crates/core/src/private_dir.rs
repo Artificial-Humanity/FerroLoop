@@ -1,5 +1,6 @@
-//! Owner-only directories: a directory `fl` creates to hold secrets or private state is mode 0700,
-//! whatever the umask says, and a directory `fl` did not create keeps its mode.
+//! Owner-only directories: a directory `fl` creates to hold secrets or private state is mode 0700
+//! at most, whatever the umask says (the umask can only narrow it, as `0277` would), and a
+//! directory `fl` did not create keeps its mode.
 //!
 //! `fs::create_dir_all` takes its mode from the umask, so under the common umask `002` a new
 //! `~/.config/fl` came out `0775`, and any group member could replace `vault.key` or a hub token
@@ -20,7 +21,7 @@ use std::os::unix::fs::DirBuilderExt;
 pub const PRIVATE_DIR_MODE: u32 = 0o700;
 
 /// Create `path` and any missing parents; the directory `path` itself gets mode 0700 when this
-/// call creates it. Intermediate directories this call creates use the default mode (the umask):
+/// call creates it (at most 0700: a umask can only narrow it). Intermediate directories this call creates use the default mode (the umask):
 /// `fl` owns the leaf (`~/.config/fl`, `~/.local/share/fl`), not the `~/.config` or
 /// `~/.local/share` above it, and a private mode on a shared parent could lock other users or
 /// tools out of a path `fl` does not own. A directory that already exists is left exactly as it

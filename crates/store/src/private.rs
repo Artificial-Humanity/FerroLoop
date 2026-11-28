@@ -2,8 +2,9 @@
 //! create is never changed.
 //!
 //! A store holds hub pairing codes, session hashes and other records, so the file `fl` creates is
-//! mode 0600 and a store directory `fl` creates is mode 0700, whatever the umask says. The rule
-//! has two halves, and the second matters as much as the first:
+//! mode 0600 and a store directory `fl` creates is mode 0700, at most, whatever the umask says (the
+//! umask can only narrow these modes, never widen them). The rule has two halves, and the second
+//! matters as much as the first:
 //!
 //! * [`create_private_dir_all`] and the file creation in [`RedbStore::open`](crate::RedbStore::open)
 //!   give owner-only modes to what they create, and to nothing else. An existing directory or file
@@ -42,8 +43,8 @@ const FILE_MODE: u32 = 0o600;
 #[cfg_attr(not(unix), allow(dead_code))]
 const MAX_WARNED: usize = 1024;
 
-/// Create `path` and any missing parents; the directory `path` itself gets mode 0700 when this
-/// call creates it, intermediates keep the default mode and an existing directory keeps its mode.
+/// Create `path` and any missing parents; the directory `path` itself gets mode 0700 at most (a
+/// umask can only narrow it) when this call creates it, intermediates keep the default mode and an existing directory keeps its mode.
 /// The one helper every `fl` crate uses for a private directory; see
 /// [`fl_core::private_dir::create_private_dir_all`].
 pub use fl_core::private_dir::create_private_dir_all;

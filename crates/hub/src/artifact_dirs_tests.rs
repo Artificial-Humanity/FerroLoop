@@ -1382,7 +1382,7 @@ fn a_hand_edited_protected_directory_is_never_written_to_or_created() {
     // The stored value is still shown as stored; only the directory in use changes.
     assert_eq!(view["artifacts_dir"], bad_sys.display().to_string());
 
-    ensure_startup_dirs(&env.state);
+    ensure_startup_dirs(&env.state).unwrap();
     assert!(default.is_dir());
     assert!(!env.target("x").exists() && !env.target("y").exists());
 
@@ -1397,24 +1397,49 @@ fn a_hand_edited_protected_directory_is_never_written_to_or_created() {
 // --- startup ----------------------------------------------------------------------------------
 
 #[test]
-fn startup_creates_the_hub_directories_and_survives_a_failure() {
+fn startup_creates_the_hub_directories_and_survives_a_subdirectory_failure() {
     let env = env();
     let sys = env.target("sys");
     settings::update_artifact_dirs(&env.home(), |s| {
         s.artifacts_dir = Some(sys.display().to_string());
     })
     .unwrap();
-    ensure_startup_dirs(&env.state);
+    ensure_startup_dirs(&env.state).unwrap();
     assert!(env.data().join("artifacts").is_dir());
     assert!(env.data().join("attachments").is_dir());
     assert!(sys.is_dir());
 
-    // A store path under a plain file cannot get directories; startup logs and carries on.
+    // The subdirectories are best effort: a plain file in the place of one is logged, and
+    // startup carries on and still makes the others.
+    let data = env.target("subfail");
+    fs::create_dir_all(&data).unwrap();
+    write(&data.join("artifacts"), "file");
+    let mut cfg = env.state.config.clone();
+    cfg.store_path = data.join("store.redb");
+    ensure_startup_dirs(&HubState::new(cfg)).unwrap();
+    assert!(data.join("artifacts").is_file());
+    assert!(data.join("attachments").is_dir());
+}
+
+/// The data home is the store's own folder: when it cannot be created, startup fails and the
+/// error names it.
+#[test]
+fn startup_fails_when_the_data_home_cannot_be_created() {
+    let env = env();
+    // A plain file in the place of the data home.
     let blocker = env.target("blocker");
     write(&blocker, "file");
     let mut cfg = env.state.config.clone();
     cfg.store_path = blocker.join("store.redb");
-    ensure_startup_dirs(&HubState::new(cfg));
+    let err = ensure_startup_dirs(&HubState::new(cfg)).unwrap_err();
+    assert!(
+        err.to_string().contains(&blocker.display().to_string()),
+        "{err}"
+    );
+    // And a data home under a plain file.
+    let mut cfg = env.state.config.clone();
+    cfg.store_path = blocker.join("fl").join("store.redb");
+    assert!(ensure_startup_dirs(&HubState::new(cfg)).is_err());
 }
 
 /// A first `serve` into a fresh home makes `[home]` (the default home of `vault.enc`) owner-only,
@@ -1426,7 +1451,7 @@ fn startup_makes_a_new_data_home_owner_only() {
     let data = env.target("fresh").join("share").join("fl");
     let mut cfg = env.state.config.clone();
     cfg.store_path = data.join("store.redb");
-    ensure_startup_dirs(&HubState::new(cfg));
+    ensure_startup_dirs(&HubState::new(cfg)).unwrap();
     let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
     assert_eq!(mode(&data), 0o700, "the data home startup created");
     assert!(data.join("artifacts").is_dir());
@@ -1436,7 +1461,7 @@ fn startup_makes_a_new_data_home_owner_only() {
     fs::set_permissions(&data, fs::Permissions::from_mode(0o755)).unwrap();
     let mut cfg = env.state.config.clone();
     cfg.store_path = data.join("store.redb");
-    ensure_startup_dirs(&HubState::new(cfg));
+    ensure_startup_dirs(&HubState::new(cfg)).unwrap();
     assert_eq!(mode(&data), 0o755);
 }
 

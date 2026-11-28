@@ -2573,8 +2573,8 @@ mod tests {
         assert_eq!(mode, 0o600);
     }
 
-    /// A first run into a fresh home makes `~/.config/fl` and `~/.local/share/fl` owner-only,
-    /// whatever the umask, so `fl doctor`'s `G7.vault-perms` passes for them. The parents above
+    /// A first run into a fresh home makes `~/.config/fl` and `~/.local/share/fl` owner-only
+    /// (at most 0700, whatever the umask), so `fl doctor`'s `G7.vault-perms` passes for them. The parents above
     /// (`~/.config`, `~/.local/share`) are not `fl`'s and keep the default mode.
     #[cfg(unix)]
     #[test]

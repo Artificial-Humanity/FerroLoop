@@ -605,6 +605,110 @@ fn fl_hub_init_json_writes_config_tokens_and_hub_node() {
     assert_eq!(hub.role, "hub");
 }
 
+/// `cmd` with the umask set to 0 in the child only, between fork and exec.
+fn under_umask_0(mut cmd: Command) -> Command {
+    use std::os::unix::process::CommandExt;
+    // SAFETY: umask is async-signal-safe and touches nothing but the child's own mask.
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::umask(0);
+            Ok(())
+        });
+    }
+    cmd
+}
+
+/// Answers one `POST /api/v1/nodes/enroll` with a node token, the way a hub does.
+fn fake_enroll_hub() -> (String, std::thread::JoinHandle<()>) {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let base_url = format!("http://{}", listener.local_addr().unwrap());
+    let handle = std::thread::spawn(move || {
+        let (mut conn, _) = listener.accept().unwrap();
+        conn.set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let mut req = Vec::new();
+        let mut buf = [0u8; 4096];
+        let header_end = loop {
+            let n = conn.read(&mut buf).unwrap();
+            assert!(n > 0, "the client closed before the request ended");
+            req.extend_from_slice(&buf[..n]);
+            if let Some(i) = req.windows(4).position(|w| w == b"\r\n\r\n") {
+                break i + 4;
+            }
+        };
+        let head = String::from_utf8_lossy(&req[..header_end]).to_ascii_lowercase();
+        assert!(head.starts_with("post /api/v1/nodes/enroll "), "{head}");
+        let len: usize = head
+            .lines()
+            .find_map(|l| l.strip_prefix("content-length:"))
+            .map_or(0, |v| v.trim().parse().unwrap());
+        while req.len() < header_end + len {
+            let n = conn.read(&mut buf).unwrap();
+            assert!(n > 0, "the client closed before the body ended");
+            req.extend_from_slice(&buf[..n]);
+        }
+        let body = json!({ "node_token": "node-secret-token", "node_id": "worker-u" }).to_string();
+        write!(
+            conn,
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .unwrap();
+    });
+    (base_url, handle)
+}
+
+/// `fl hub init` (owner and peer tokens) and `fl hub join` (the node token) each write secrets
+/// into a config directory they may be the first to create. Under umask 0 a plain `mkdir` gives
+/// `0777`: the new `fl` directory must still be owner-only. The `config` directory above it is
+/// an intermediate the same run creates with the default mode, so it proves the umask was 0.
+#[test]
+fn fl_hub_init_and_join_make_a_fresh_config_dir_owner_only_whatever_the_umask() {
+    let env = TestEnv::new();
+
+    let init_home = env.root.join("fresh-init").join("config");
+    let init = under_umask_0({
+        let mut c = env.fl();
+        c.env("XDG_CONFIG_HOME", &init_home)
+            .args(["hub", "init", "--json"]);
+        c
+    });
+    let init_out = run_json(init);
+    assert_eq!(
+        init_out["owner_token_file"].as_str(),
+        init_home.join("fl/hub-owner.token").to_str()
+    );
+    assert_eq!(
+        unix_mode(&init_home),
+        0o777,
+        "fl hub init must run under umask 0"
+    );
+    assert_eq!(unix_mode(&init_home.join("fl")), 0o700, "fl hub init");
+
+    let (base_url, hub) = fake_enroll_hub();
+    let join_home = env.root.join("fresh-join").join("config");
+    let join = under_umask_0({
+        let mut c = env.fl();
+        c.env("XDG_CONFIG_HOME", &join_home).args([
+            "hub", "join", &base_url, "--token", "code", "--name", "worker-u", "--json",
+        ]);
+        c
+    });
+    let joined = run_json(join);
+    hub.join().unwrap();
+    assert_eq!(
+        joined["token_file"].as_str(),
+        join_home.join("fl/hub-node.token").to_str()
+    );
+    assert_eq!(
+        unix_mode(&join_home),
+        0o777,
+        "fl hub join must run under umask 0"
+    );
+    assert_eq!(unix_mode(&join_home.join("fl")), 0o700, "fl hub join");
+}
+
 #[test]
 fn fl_hub_init_service_writes_systemd_unit() {
     let env = TestEnv::new();
