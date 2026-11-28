@@ -12,6 +12,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use fl_core::At;
+use fl_core::private_dir::create_private_dir_all;
 use ring::aead::{AES_256_GCM, Aad, LessSafeKey, Nonce, UnboundKey};
 use ring::rand::{SecureRandom, SystemRandom};
 use serde::{Deserialize, Serialize};
@@ -1105,7 +1106,9 @@ impl VaultLock {
             path: lock_path.clone(),
             cause: e.to_string(),
         };
-        fs::create_dir_all(&parent).map_err(|e| GateError::Io {
+        // The vault's directory holds the secrets: a new one is owner-only (an existing one keeps
+        // its mode, which `fl doctor` reports when others can write it).
+        create_private_dir_all(&parent).map_err(|e| GateError::Io {
             op: "create_dir_all",
             path: parent.clone(),
             cause: e.to_string(),
@@ -1710,7 +1713,8 @@ fn write_tmp_0600_with(
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
     {
-        fs::create_dir_all(parent).map_err(|e| GateError::Io {
+        // `vault.key` and `vault.enc` live here: a directory this call makes is owner-only.
+        create_private_dir_all(parent).map_err(|e| GateError::Io {
             op: "create_dir_all",
             path: parent.to_path_buf(),
             cause: e.to_string(),
@@ -2567,6 +2571,82 @@ mod tests {
         let tmp_path = write_tmp_0600(&tmp.path().join("vault.key"), b"k").unwrap();
         let mode = fs::metadata(&tmp_path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
+    }
+
+    /// A first run into a fresh home makes `~/.config/fl` and `~/.local/share/fl` owner-only,
+    /// whatever the umask, so `fl doctor`'s `G7.vault-perms` passes for them. The parents above
+    /// (`~/.config`, `~/.local/share`) are not `fl`'s and keep the default mode.
+    #[cfg(unix)]
+    #[test]
+    fn a_first_vault_write_makes_owner_only_directories_that_doctor_accepts() {
+        use fl_core::doctor::{CheckStatus, DoctorInputs, NodeMeta, VaultFacts, VaultNode, ids};
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        fs::create_dir(&home).unwrap();
+        let key_path = home.join(".config").join("fl").join("vault.key");
+        let vault_path = home
+            .join(".local")
+            .join("share")
+            .join("fl")
+            .join("vault.enc");
+
+        let key = install_new_master_key(&key_path, [7u8; MASTER_KEY_LEN]).unwrap();
+        let mut vault = Vault::open(&vault_path, key).unwrap();
+        vault.set(args("TOKEN", "secret")).unwrap();
+
+        let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        let key_dir = key_path.parent().unwrap();
+        let vault_dir = vault_path.parent().unwrap();
+        assert_eq!(mode(key_dir), 0o700, "the master key's directory");
+        assert_eq!(mode(vault_dir), 0o700, "the vault's directory");
+        assert_ne!(
+            mode(&home.join(".config")),
+            0o700,
+            "a parent fl does not own"
+        );
+
+        // An existing directory is the owner's choice: a later write leaves it as it is.
+        fs::set_permissions(vault_dir, fs::Permissions::from_mode(0o755)).unwrap();
+        vault.set(args("OTHER", "secret")).unwrap();
+        assert_eq!(mode(vault_dir), 0o755);
+        fs::set_permissions(vault_dir, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let lstat = |p: &Path| {
+            let m = fs::symlink_metadata(p).unwrap();
+            if m.is_dir() {
+                NodeMeta::Dir {
+                    mode: m.mode(),
+                    uid: m.uid(),
+                }
+            } else {
+                NodeMeta::Regular {
+                    mode: m.mode(),
+                    uid: m.uid(),
+                }
+            }
+        };
+        let node = |role: &str, p: &Path| VaultNode {
+            role: role.into(),
+            path: p.display().to_string(),
+            node: lstat(p),
+            parent: lstat(p.parent().unwrap()),
+        };
+        let probe = fl_core::install::MapProbe::new();
+        let mut inputs = DoctorInputs::empty(&probe);
+        inputs.vault = VaultFacts {
+            supported: true,
+            euid: Some(fs::metadata(&home).unwrap().uid()),
+            key_in_env: false,
+            files: vec![node("vault", &vault_path), node("master key", &key_path)],
+        };
+        let report = fl_core::doctor::run(&inputs);
+        let check = report
+            .checks
+            .iter()
+            .find(|c| c.id == ids::VAULT_PERMS)
+            .unwrap();
+        assert_eq!(check.status, CheckStatus::Pass, "{}", check.detail);
     }
 
     #[test]

@@ -39,6 +39,7 @@ pub mod model;
 pub mod notifications;
 pub mod permissions;
 pub mod pr_policy;
+pub mod private_dir;
 pub mod ref_index;
 pub mod routine;
 pub mod routine_authority;

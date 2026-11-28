@@ -98,6 +98,10 @@ another user, a symlink (FerroGate refuses it) or one that is not a regular file
 owner-only but not `0600` is `warn`, as is a parent directory writable by its group or others, and
 a vault with no master key file or `FL_VAULT_MASTER_KEY` (opening it would generate a new key).
 Neither file present is `not-installed`. A platform that reports no modes is `unsupported`.
+A directory that `fl` creates for these files, or for the other files in `~/.config/fl` (the hub
+tokens, `operators.json`, `config.toml`), is mode `0700` whatever the umask; only that leaf
+directory, not a parent such as `~/.config`. `fl` never changes the mode of a directory that
+already exists, so a loose one made by hand or by an older `fl` is reported here and not fixed.
 
 **`G7.code-ui-agree`.** The UI bundle's `build-info.json` against the binary's commit (the rule
 of `GET /api/v1/version`). The CLI looks in `[hub].ui_dir` of the config, else

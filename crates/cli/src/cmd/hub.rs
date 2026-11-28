@@ -894,7 +894,9 @@ fn cmd_init(
     if let Some(dir) = cfg_path.parent()
         && !dir.as_os_str().is_empty()
     {
-        fs::create_dir_all(dir).map_err(|e| (2, format!("{}: {e}", dir.display())))?;
+        // The hub tokens go in here: a new config directory is owner-only.
+        fl_store::private::create_private_dir_all(dir)
+            .map_err(|e| (2, format!("{}: {e}", dir.display())))?;
     }
     let cfg_dir = cfg_path.parent().unwrap_or_else(|| Path::new("."));
     let owner_token_path = cfg_dir.join("hub-owner.token");
@@ -1092,7 +1094,9 @@ fn cmd_join(
     let cfg_path = config_file_path()?;
     let cfg_dir = cfg_path.parent().unwrap_or_else(|| Path::new("."));
     if !cfg_dir.as_os_str().is_empty() {
-        fs::create_dir_all(cfg_dir).map_err(|e| (2, format!("{}: {e}", cfg_dir.display())))?;
+        // The node token goes in here: a new config directory is owner-only.
+        fl_store::private::create_private_dir_all(cfg_dir)
+            .map_err(|e| (2, format!("{}: {e}", cfg_dir.display())))?;
     }
     let token_path = cfg_dir.join("hub-node.token");
     let node_toml_path = cfg_dir.join("node.toml");

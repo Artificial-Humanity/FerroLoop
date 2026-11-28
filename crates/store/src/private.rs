@@ -31,14 +31,11 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 #[cfg(unix)]
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 
 /// The mode of a store file `fl` creates.
 #[cfg(unix)]
 const FILE_MODE: u32 = 0o600;
-/// The mode of a store directory `fl` creates.
-#[cfg(unix)]
-const DIR_MODE: u32 = 0o700;
 /// The most paths the once-per-path warning remembers. A process opens a handful of stores; the
 /// bound only stops a pathological caller from growing the set without end. Past it, no new path
 /// is warned about.
@@ -46,32 +43,10 @@ const DIR_MODE: u32 = 0o700;
 const MAX_WARNED: usize = 1024;
 
 /// Create `path` and any missing parents; the directory `path` itself gets mode 0700 when this
-/// call creates it. Intermediate directories this call creates use the default mode (the umask):
-/// `fl` owns the leaf that holds the store, not the `~/.local/share` or `~/project` above it, and
-/// a private mode on a shared parent could lock other users or tools out of a path `fl` does not
-/// own. A directory that already exists is left exactly as it is, mode included. A path that
-/// exists and is not a directory is an error, as with [`std::fs::create_dir_all`].
-pub fn create_private_dir_all(path: &Path) -> io::Result<()> {
-    if path.as_os_str().is_empty() || path.is_dir() {
-        return Ok(());
-    }
-    #[cfg(unix)]
-    {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        match std::fs::DirBuilder::new().mode(DIR_MODE).create(path) {
-            Ok(()) => Ok(()),
-            // Another process made it between the check and the create: its mode stands.
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists && path.is_dir() => Ok(()),
-            Err(e) => Err(e),
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        std::fs::create_dir_all(path)
-    }
-}
+/// call creates it, intermediates keep the default mode and an existing directory keeps its mode.
+/// The one helper every `fl` crate uses for a private directory; see
+/// [`fl_core::private_dir::create_private_dir_all`].
+pub use fl_core::private_dir::create_private_dir_all;
 
 /// Create the empty store file at `path` with mode 0600, unless something is already there.
 /// `Ok(true)` when this call made it, `Ok(false)` when the path existed (a file, a symlink, a

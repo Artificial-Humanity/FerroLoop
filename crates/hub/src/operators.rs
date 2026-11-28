@@ -832,7 +832,8 @@ fn read_file(home: &Path) -> Result<Option<OperatorsFile>, OpError> {
 fn write_file(home: &Path, file: &OperatorsFile, exclusive: bool) -> Result<(), OpError> {
     let path = operators_path(home);
     let dir = path.parent().ok_or(OpError::Io)?;
-    fs::create_dir_all(dir).map_err(|_| OpError::Io)?;
+    // `~/.config/fl` also holds the vault key and hub tokens: a new one is owner-only.
+    fl_store::private::create_private_dir_all(dir).map_err(|_| OpError::Io)?;
     let bytes = serde_json::to_vec_pretty(file).map_err(|_| OpError::Io)?;
     // Never write a file `read_file` would refuse to read back.
     if bytes.len() as u64 > MAX_FILE_BYTES {
